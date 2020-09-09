@@ -1,12 +1,11 @@
+NOTANGLEFLAGS.py=
+
+
 .PHONY: all
 all: courses.pdf
 
-NOWEAVEFLAGS.tex=	-x -t2
-NOTANGLEFLAGS.py=
-
-courses.pdf: courses.tex
-
-courses.tex: courses.nw
+courses.pdf: courses.nw
+	${NOWEAVE.pdf}
 
 
 .PHONY:
@@ -23,11 +22,13 @@ clean:
 	${RM} courses courses.py courses.pdf courses.tex
 
 
-PKG_NAME-main= 			courses
-PKG_INSTALL_FILES-main= courses
-PKG_PREFIX-main= 		/usr/local
-PKG_INSTALL_DIR-main= 	/bin
-PKG_TARBALL_FILES-main= ${PKG_FILES-main} Makefile
+PKG_PACKAGES= 				courses
+
+PKG_NAME-courses= 			courses
+PKG_INSTALL_FILES-courses= 	courses
+PKG_PREFIX-courses= 		/usr/local
+PKG_INSTALL_DIR-courses= 	/bin
+PKG_TARBALL_FILES-courses= 	${PKG_FILES-courses} Makefile
 
 
 INCLUDE_MAKEFILES=../../makefiles
