@@ -24,9 +24,9 @@ clean:
 
 
 PKG_NAME-main= 			courses
-PKG_FILES-main= 		courses
+PKG_INSTALL_FILES-main= courses
 PKG_PREFIX-main= 		/usr/local
-PKG_DIR-main= 			/bin
+PKG_INSTALL_DIR-main= 	/bin
 PKG_TARBALL_FILES-main= ${PKG_FILES-main} Makefile
 
 
