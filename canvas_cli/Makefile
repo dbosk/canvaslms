@@ -25,6 +25,9 @@ canvas.py: users.nw
 canvas.pdf: assignments.tex
 canvas.py: assignments.nw
 
+canvas.pdf: submissions.tex
+canvas.py: submissions.nw
+
 
 .PHONY: all
 all: canvas.bash
