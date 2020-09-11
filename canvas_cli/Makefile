@@ -22,11 +22,14 @@ canvas.py: courses.nw
 canvas.pdf: users.tex
 canvas.py: users.nw
 
+canvas.pdf: assignments.tex
+canvas.py: assignments.nw
+
 
 .PHONY: all
 all: canvas.bash
 
-canvas.bash:
+canvas.bash: canvas
 	register-python-argcomplete canvas > $@
 
 
