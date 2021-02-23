@@ -19,6 +19,9 @@ canvas: canvas.py
 canvas.pdf: courses.tex
 canvas.py: courses.nw
 
+canvas.pdf: course.tex
+canvas.py: course.nw
+
 canvas.pdf: users.tex
 canvas.py: users.nw
 
@@ -42,7 +45,8 @@ canvas.bash: canvas
 .PHONY: clean
 clean:
 	${RM} canvas canvas.py canvas.pdf canvas.tex
-	${RM} courses.tex users.tex
+	${RM} courses.tex course.tex users.tex assignments.tex
+	${RM} submissions.tex grades.tex
 	${RM} canvas.bash
 
 
