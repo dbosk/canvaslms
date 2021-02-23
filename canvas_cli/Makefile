@@ -31,6 +31,9 @@ canvas.py: submissions.nw
 canvas.pdf: grades.tex
 canvas.py: grades.nw
 
+canvas.pdf: stats.tex
+canvas.py: stats.nw
+
 
 .PHONY: all
 all: canvas.bash
@@ -43,6 +46,7 @@ canvas.bash: canvas
 clean:
 	${RM} canvas canvas.py canvas.pdf canvas.tex
 	${RM} courses.tex users.tex
+	${RM} submissions.tex grades.tex stats.tex
 	${RM} canvas.bash
 
 
