@@ -34,6 +34,9 @@ canvas.py: submissions.nw
 canvas.pdf: grades.tex
 canvas.py: grades.nw
 
+canvas.pdf: contents.tex
+canvas.py: contents.nw
+
 
 .PHONY: all
 all: canvas.bash
