@@ -1,44 +1,37 @@
 NOWEAVEFLAGS.tex=	-n -delay -t2
 NOTANGLEFLAGS.py=
 
+LATEXFLAGS+=	-shell-escape
+TEX_PYTHONTEX=	yes
+
 SRC_DIR=			../src/canvaslms
 
 .PHONY: all
-all: canvas.pdf
+all: canvaslms.pdf
 
-canvas.pdf: canvas.bib
-canvas.pdf: abstract.tex
+canvaslms.pdf: canvaslms.bib
+canvaslms.pdf: abstract.tex
+canvaslms.pdf: canvaslms.tex 
 
-canvas.pdf: canvas.tex 
-canvas.tex: ${SRC_DIR}/canvas.nw
+canvaslms.pdf: ${SRC_DIR}/cli/cli.tex
+canvaslms.pdf: ${SRC_DIR}/cli/courses.tex
+canvaslms.pdf: ${SRC_DIR}/cli/course.tex
+canvaslms.pdf: ${SRC_DIR}/cli/users.tex
+canvaslms.pdf: ${SRC_DIR}/cli/assignments.tex
+canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
+canvaslms.pdf: ${SRC_DIR}/cli/grades.tex
 
-canvas.pdf: courses.tex
-courses.tex: ${SRC_DIR}/courses.nw
-
-canvas.pdf: course.tex
-course.tex: ${SRC_DIR}/course.nw
-
-canvas.pdf: users.tex
-users.tex: ${SRC_DIR}/users.nw
-
-canvas.pdf: assignments.tex
-assignments.tex: ${SRC_DIR}/assignments.nw
-
-canvas.pdf: submissions.tex
-submissions.tex: ${SRC_DIR}/submissions.nw
-
-canvas.pdf: grades.tex
-grades.tex: ${SRC_DIR}/grades.nw
-
-%.tex: ${SRC_DIR}/%.nw
-	${NOWEAVE.tex}
+${SRC_DIR}/%.tex:
+	${MAKE} -C $(dir $@) $(notdir $@)
 
 
 .PHONY: clean
 clean:
-	${RM} canvas.pdf canvas.tex
-	${RM} courses.tex course.tex users.tex assignments.tex
-	${RM} submissions.tex grades.tex
+	${RM} canvaslms.pdf
+
+.PHONY: distclean
+distclean: clean
+	${MAKE} -C ${SRC_DIR} clean distclean
 
 
 INCLUDE_MAKEFILES=../makefiles
