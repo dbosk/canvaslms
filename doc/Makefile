@@ -1,7 +1,7 @@
 NOWEAVEFLAGS.tex=	-n -delay -t2
 NOTANGLEFLAGS.py=
 
-SRC_DIR=			../src/canvaslmscli
+SRC_DIR=			../src/canvaslms
 
 .PHONY: all
 all: canvas.pdf
