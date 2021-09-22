@@ -5,8 +5,8 @@ NOTANGLEFLAGS.py=
 .PHONY: all
 all: __init__.py
 all: courses.py
+all: course.py
 #all: assignments.py
-#all: course.py
 #all: grades.py
 #all: submissions.py
 #all: users.py
