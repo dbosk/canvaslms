@@ -7,8 +7,8 @@ all: __init__.py cli.tex
 all: courses.py courses.tex
 all: users.py users.tex
 all: assignments.py assignments.tex
+all: submissions.py submissions.tex
 #all: grades.py
-#all: submissions.py
 
 __init__.py: cli.py
 	mv $< $@
