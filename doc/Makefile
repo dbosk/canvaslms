@@ -15,7 +15,6 @@ canvaslms.pdf: canvaslms.tex
 
 canvaslms.pdf: ${SRC_DIR}/cli/cli.tex
 canvaslms.pdf: ${SRC_DIR}/cli/courses.tex
-canvaslms.pdf: ${SRC_DIR}/cli/course.tex
 canvaslms.pdf: ${SRC_DIR}/cli/users.tex
 canvaslms.pdf: ${SRC_DIR}/cli/assignments.tex
 canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
