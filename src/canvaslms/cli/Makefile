@@ -6,7 +6,7 @@ NOTANGLEFLAGS.py=
 all: __init__.py cli.tex
 all: courses.py courses.tex
 all: users.py users.tex
-#all: assignments.py
+all: assignments.py assignments.tex
 #all: grades.py
 #all: submissions.py
 
