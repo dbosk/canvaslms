@@ -5,10 +5,10 @@ NOTANGLEFLAGS.py=
 .PHONY: all
 all: __init__.py cli.tex
 all: courses.py courses.tex
+all: users.py users.tex
 #all: assignments.py
 #all: grades.py
 #all: submissions.py
-#all: users.py
 
 __init__.py: cli.py
 	mv $< $@
