@@ -8,7 +8,7 @@ all: courses.py courses.tex
 all: users.py users.tex
 all: assignments.py assignments.tex
 all: submissions.py submissions.tex
-#all: grades.py
+all: grade.py grade.tex
 
 __init__.py: cli.py
 	mv $< $@
@@ -21,7 +21,7 @@ clean:
 	${RM} users.tex users.py
 	${RM} assignments.tex assignments.py
 	${RM} submissions.tex submissions.py
-	${RM} grades.tex grades.py
+	${RM} grade.tex grade.py
 
 
 INCLUDE_MAKEFILES=../../../makefiles
