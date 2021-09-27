@@ -32,8 +32,11 @@ doc/canvaslms.pdf:
 publish-canvaslms: ${dist}
 	python3 -m twine upload -r pypi ${dist}
 
-${dist}: compile
+${dist}: compile canvaslms.bash
 	python3 -m build
+
+canvaslms.bash: install
+	register-python-argcomplete canvaslms > $@
 
 #publish-docker:
 #	sleep 60
@@ -42,7 +45,7 @@ ${dist}: compile
 
 .PHONY: clean
 clean:
-	true
+	${RM} canvaslms.bash
 
 .PHONY: distclean
 distclean:
