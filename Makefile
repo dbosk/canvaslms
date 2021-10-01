@@ -26,7 +26,7 @@ publish: publish-canvaslms doc/canvaslms.pdf
 	git push
 	gh release create -t v${version} v${version} doc/canvaslms.pdf
 
-doc/canvaslms.pdf:
+doc/canvaslms.pdf: $(wildcard src/canvaslms/cli/*.tex)
 	${MAKE} -C $(dir $@) $(notdir $@)
 
 publish-canvaslms: ${dist}
