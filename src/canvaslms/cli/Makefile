@@ -4,6 +4,7 @@ NOTANGLEFLAGS.py=
 
 .PHONY: all
 all: __init__.py cli.tex
+all: login.py login.tex
 all: courses.py courses.tex
 all: users.py users.tex
 all: assignments.py assignments.tex
@@ -17,6 +18,7 @@ __init__.py: cli.py
 .PHONY: clean
 clean:
 	${RM} cli.tex cli.py __init__.py
+	${RM} login.py login.tex
 	${RM} courses.tex courses.py
 	${RM} users.tex users.py
 	${RM} assignments.tex assignments.py
