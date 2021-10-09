@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name = "canvaslms",
-    version = "1.2",
+    version = "1.3",
     author = "Daniel Bosk",
     author_email = "dbosk@kth.se",
     description = "Command-line interface for Canvas LMS",
