@@ -18,8 +18,11 @@ For selecting the course for which to list the users, we use the
 We outline the module:
 <<users.py>>=
 import argparse
+import canvasapi.course
+import canvasapi.group
 import canvaslms.cli
 import canvaslms.cli.courses as courses
+import canvaslms.hacks.canvasapi
 import csv
 import re
 import sys
@@ -43,7 +46,8 @@ def add_users_command(subp):
   users_parser = subp.add_parser("users",
     help="Lists users of a course",
     description="Lists users of a course(s). Output, CSV-format: "
-      "<Canvas ID> <login ID> [<LADOK ID>] <name> [<email>]")
+      "<course> [<group>] [<Canvas ID>] <login ID> [<LADOK ID>] "
+      "<name> [<email>]")
   users_parser.set_defaults(func=users_command)
   courses.add_course_option(users_parser)
   add_group_option(users_parser)
@@ -91,8 +95,10 @@ The attributes that are interesting are
 \item name,
 \item registered email address.
 \end{itemize}
-We will make the LADOK ID and email address optional.
+We will make the Canvas ID, LADOK ID and email address optional.
 <<set up options for selecting user attributes>>=
+users_parser.add_argument("-i", "--canvas-id", action="store_true",
+  help="Include Canvas identifier")
 users_parser.add_argument("-l", "--ladok", action="store_true",
   help="Include LADOK identifier")
 users_parser.add_argument("-e", "--email", action="store_true",
@@ -144,7 +150,9 @@ def make_user_rows(canvas, args, roles):
   for user in users:
     try:
       row = []
-      row.append(user.id)
+      row.append(user.course.course_code)
+      if args.canvas_id:
+        row.append(user.id)
       row.append(user.login_id)
       if args.ladok:
         row.append(user.integration_id)
@@ -178,8 +186,17 @@ def make_user_rows_w_groups(canvas, args, roles):
 
     for user in users:
       try:
-        row = [group.name]
-        row.append(user.id)
+        try:
+          row = [group.category.course.course_code]
+        except AttributeError:
+          pass
+        try:
+          row = [group.course.course_code]
+        except AttributeError:
+          pass
+        row.append(group.name)
+        if args.canvas_id:
+          row.append(user.id)
         row.append(user.login_id)
         if args.ladok:
           row.append(user.integration_id)
@@ -266,6 +283,7 @@ def filter_group_categories(course_list, regex):
   for course in course_list:
     for category in course.get_group_categories():
       if name.search(category.name):
+        category.course = course
         yield category
 @
 
@@ -287,6 +305,10 @@ def filter_groups(items, regex):
   for item in items:
     for group in item.get_groups():
       if name.search(group.name):
+        if isinstance(item, canvasapi.course.Course):
+          group.course = item
+        elif isinstance(item, canvasapi.group.GroupCategory):
+          group.category = item
         yield group
 @
 
@@ -309,10 +331,15 @@ Canvas roles as arguments.
 <<functions>>=
 def list_users(courses, roles):
   """List users in courses with roles"""
+  users = list()
+
   for course in courses:
-    users = course.get_users(enrollment_type=roles)
-    for user in users:
-      yield user
+    course_users = list(course.get_users(enrollment_type=roles))
+    for user in course_users:
+      user.course = course
+    users.extend(course_users)
+
+  return users
 @
 
 Second, we provide the most general function, [[filter_users]], which takes a 
@@ -459,13 +486,13 @@ def process_group_options(canvas, args):
   course_list = courses.process_course_option(canvas, args)
 
   if args.category:
-    return filter_groups(
+    return list(filter_groups(
       filter_group_categories(course_list, args.category),
-      args.group)
+      args.group))
 
-  return filter_groups(
+  return list(filter_groups(
     course_list,
-    args.group)
+    args.group))
 @
 
 \subsection{An option for user or group}
@@ -487,14 +514,13 @@ def add_user_or_group_option(parser):
 
 def process_user_or_group_option(canvas, args):
   """Returns a list of users, filtered either by user regex or by groups"""
-  if args.user:
-    return process_user_option(canvas, args)
+  if args.group or args.category:
+    users = list()
+    for group in process_group_options(canvas, args):
+      users.extend(group.get_users())
 
-  users = []
-  for group in process_group_options(canvas, args):
-    for users in group.get_users():
-      users.append(user)
+    return users
 
-  return users
+  return process_user_option(canvas, args)
 @
 
