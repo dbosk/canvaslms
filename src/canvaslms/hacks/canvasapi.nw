@@ -13,8 +13,10 @@ We do this as follows:
 <<canvasapi.py>>=
 """A module that modifies the classes of the canvasapi package"""
 
+import cachetools
 import canvasapi.assignment
 from canvasapi.user import User
+from datetime import datetime, timedelta
 import functools
 import importlib
 import inspect
@@ -131,6 +133,247 @@ This means we can store and restore the entire hierarchy just by storing the
 [[Canvas]] object.
 If we pickle the [[Canvas]] object, the caches of the [[Course]] objects will 
 be in there, the [[Assignment]] caches will in turn be in them, and so on.
+
+
+\subsection{Wrapping get methods}
+
+We usually have two methods to cache: [[get_x(id, /, **kwargs)]] and 
+[[get_xs(**kwargs)]].
+These should sync.
+In Canvas we an also pass options through keyword arguments, a common one being 
+[[include]] which specifies a list of things to include.
+For instance, when it comes to submissions we can ask Canvas to include grading 
+rubrics.
+This means that we want to maintain these details, so that we don't lose 
+information in the cache.
+
+This means that we need two functions to support the caching:
+\begin{description}
+\item [[must_update_predicate(prev_kwargs, kwargs)]] takes the old keyword 
+arguments ([[prev_kwargs]]) to check if they're a superset of the new keyword 
+arguments ([[kwargs]]).
+If not, the cache doesn't have all necessary information and we must fetch it.
+\item [[merge_kwargs]] will take a list of keyword arguments dictionaries and 
+merge them.
+Most of the time these contain only the key [[include]] whose value is a list 
+of things to include.
+So essentially, we want to take the union of all these sets.
+\end{description}
+We can thus start with the following defaults:
+<<kwargs functions for include keyword>>=
+def must_update_include(prev_kwargs, kwargs):
+  if "include" in kwargs and "include" in prev_kwargs and \
+    set(kwargs["include"]).is_subset(set(prev_kwargs["include"])):
+      return False
+
+  return True
+
+def merge_include(kwargs_list):
+  includes = set()
+
+  for kwargs in kwargs_list:
+    try:
+      includes |= set(kwargs["include"])
+    except KeyError:
+      pass
+
+  return {"include": includes}
+@
+
+<<general class decorator for caching get methods>>=
+class CacheGetMethods:
+  """General class decorator to add caching to get_*{,s} methods"""
+  def __init__(self, attribute_name, cache=dict(), include_plural=True):
+    """No parameters required"""
+    self.__attribute_name = attribute_name
+    self.__include_plural = include_plural
+    self.__cache = cache
+
+  @staticmethod
+  def attrsetter(obj, attribute_name, value):
+    """Sets attribute named attribute_name of object obj to value"""
+    obj.__dict__[attribute_name] = value
+
+  @staticmethod
+  def attrgetter(obj, attribute_name):
+    """Returns the value of attribute named attribute_name of object obj"""
+    return obj.__dict__[attribute_name]
+
+  def __call__(self, cls):
+    """Applies the decorator to the class cls"""
+    <<create decorator functions and update cls>>
+    return cls
+@
+
+We need to update two methods in sync, the [[get_x]] and [[get_xs]] methods.
+This is why we can't just use the decorators from [[cachetools]] or similar.
+<<create decorator functions and update cls>>=
+cache = self.__cache
+
+<<update constructor with new attributes>>
+
+singular_name = self.__attribute_name
+<<update the singular method>>
+
+if self.__include_plural:
+  plural_name = self.__attribute_name + "s"
+  <<update the plural method>>
+@
+
+To update the constructor, we simply wrap it in a new constructor that simply 
+adds the desired attributes.
+<<update constructor with new attributes>>=
+init = cls.__init__
+
+@functools.wraps(init)
+def new_init(*args, **kwargs):
+  self = args[0]
+  <<add cache attributes to constructor body>>
+  init(*args, **kwargs)
+
+cls.__init__ = new_init
+@
+
+We do the same thing for the singular and plural get methods.
+<<update the singular method>>=
+get_attr = self.attrgetter(cls, singular_name)
+
+@functools.wraps(get_attr)
+def new_get_attr(*args, **kwargs):
+  self = args[0]
+  <<add caching for singular attribute>>
+
+self.attrsetter(cls, singular_name, get_attr)
+@
+<<update the plural method>>=
+get_attrs = self.attrgetter(cls, plural_name)
+
+@functools.wraps(get_attrs)
+def new_get_attrs(*args, **kwargs):
+  self = args[0]
+  <<add caching for plural attribute>>
+
+self.attrsetter(cls, plural_name, get_attrs)
+@
+
+\subsection{Caching the get methods}
+
+The idea of the caching is as follows.
+If the plural method ([[get_xs]]) is called, we fetch all items if they haven't 
+been fetched before.
+If the singular method ([[get_x]]) is called, we check for the request in the 
+cache, otherwise we fetch it.
+Each request can specify that Canvas should include extra data.
+We don't want to lose data, so when making a new call, we first check what data 
+has been fetched, so that we never lose data from the cache.
+
+To be able to handle caching, we need attributes to keep track of the cache and 
+which of the two methods have been called.
+<<add cache attributes to constructor body>>=
+self.__cache = cache
+self.__all_fetched = False
+@
+
+In all [[get_attr]] requests, it's the positional arguments ([[*args]]) that 
+identify what to get.
+(However, we need to filter away [[self]], since it's a method. We thus slice 
+[[args[1:]]] instead.)
+The keyword arguments ([[**kwargs]]) specify additional options.
+<<add caching for singular attribute>>=
+if args[1:] in self.__cache:
+  value, prev_kwargs = self.__cache[args[1:]]
+  if must_update_predicate(prev_kwargs, kwargs):
+    value = None
+else:
+  value = None
+
+if not value:
+  value = get_attr(*args, **kwargs)
+@
+<<add caching for plural attribute>>=
+for value, prev_kwargs in self.__cache.values():
+  if must_update_predicate(prev_kwargs, kwargs):
+    self.__all_fetched = False
+
+if not self.__all_fetched:
+  union_kwargs = merge_kwargs(
+    [kwargs for _, kwargs in self.__cache.values()].append(kwargs))
+
+  for value in get_attrs(*args, **union_kwargs):
+    self.__cache[args[1:]] = (value, union_kwargs)
+
+return [value for value, _ in self.__cache.values()]
+@
+
+Now we can treat how we get an individual submission.
+<<return submission of user>>=
+if isinstance(user, User):
+  uid = user.id
+elif isinstance(user, int):
+  uid = user
+else:
+  raise TypeError(f"user must be User or int, not {type(user)}")
+
+submission = None
+
+if "include" in kwargs:
+  to_include = set(kwargs["include"])
+else:
+  to_include = set()
+
+if uid in self.__cache:
+  submission, included = self.__cache[uid]
+  if not set(included).issubset(to_include):
+    submission = None
+    to_include |= set(included)
+
+if not submission or submission.grade not in ["A", "B", "C", "D", "E", "P"]:
+  submission = get_submission(self, user, include=list(to_include))
+  self.__cache[uid] = (submission, to_include)
+
+return submission
+@
+
+Now we can deal with [[get_submissions]].
+As we might call [[get_submission]] before any [[get_submissions]], we cannot 
+rely on the cache as a check.
+We introduce a new attribute.
+<<extend class constructor for decorators>>=
+args[0].__all_fetched = False
+@ Now we can check if this is set or not.
+When we fetch, we want to include any data that was previously included.
+<<return a list of all submissions>>=
+if "include" in kwargs:
+  to_include = set(kwargs["include"])
+else:
+  to_include = set()
+
+if self.__all_fetched:
+  for submission, included in self.__cache.values():
+    if not to_include.issubset(included) or \
+       submission.grade not in ["A", "B", "C", "D", "E", "P"]:
+      self.get_submission(submission.user_id, include=list(to_include))
+else:
+  for _, included in self.__cache.values():
+    to_include |= included
+
+  for submission in get_submissions(self, **kwargs):
+    self.__cache[submission.user_id] = submission
+
+return self.__cache.values()
+@
+\subsection{Caching courses}
+
+The list of courses changes whenever new courses are created that we have 
+access to.
+This usually happens well in advance, so we could have a rather long 
+time-to-live on the courses cache.
+<<construct TTLCache for courses>>=
+self.cache = cachetools.TTLCache(ttl=timedelta(days=30), timer=datetime.now)
+@
+
+Now, let's construct the decorator for the [[Canvas]] class to cache 
+[[get_courses]] and [[get_course]].
 
 
 \subsection{Caching submissions}
