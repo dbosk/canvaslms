@@ -35,7 +35,7 @@ publish-canvaslms: ${dist}
 ${dist}: compile canvaslms.bash
 	python3 -m build
 
-canvaslms.bash: install
+canvaslms.bash:
 	register-python-argcomplete canvaslms > $@
 
 #publish-docker:

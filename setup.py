@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name = "canvaslms",
-    version = "1.5",
+    version = "1.6",
     author = "Daniel Bosk",
     author_email = "dbosk@kth.se",
     description = "Command-line interface for Canvas LMS",
@@ -23,8 +23,10 @@ setup(
         "Intended Audience :: Science/Research",
         "Topic :: Utilities"
     ],
-    package_dir = {"": "src"},
-    packages = ["canvaslms"],
+    package_dir = {
+        "": "src"
+    },
+    packages = find_packages(where="src"),
     entry_points = {
         "console_scripts": [
             "canvaslms = canvaslms.cli:main"
