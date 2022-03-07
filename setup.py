@@ -39,7 +39,9 @@ setup(
     install_requires = [
         "appdirs>=1.4.4",
         "argcomplete>=1.12.3",
+        "cachetools>=4.2.2",
         "canvasapi>=2.0.0",
+        "keyring>=23.0.1",
         "pypandoc>=1.6.4"
     ]
 )
