@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name = "canvaslms",
-    version = "1.6",
+    version = "1.7",
     author = "Daniel Bosk",
     author_email = "dbosk@kth.se",
     description = "Command-line interface for Canvas LMS",
@@ -39,7 +39,9 @@ setup(
     install_requires = [
         "appdirs>=1.4.4",
         "argcomplete>=1.12.3",
+        "cachetools>=4.2.2",
         "canvasapi>=2.0.0",
+        "keyring>=23.0.1",
         "pypandoc>=1.6.4"
     ]
 )
