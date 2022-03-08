@@ -33,7 +33,7 @@ publish-canvaslms: ${dist}
 	python3 -m twine upload -r pypi ${dist}
 
 ${dist}: compile canvaslms.bash
-	python3 -m build
+	python3 setup.py sdist bdist_wheel
 
 canvaslms.bash:
 	register-python-argcomplete canvaslms > $@
