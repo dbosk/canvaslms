@@ -19,6 +19,8 @@ import canvaslms.hacks.canvasapi
 
 import argparse
 import csv
+import datetime as dt
+import importlib
 import re
 import sys
 
@@ -31,6 +33,8 @@ def add_command(subp):
 
 We add the subparser for [[results]].
 The command requires two arguments: course and assignment.
+We can add these by using [[add_assignment_option]], however, we don't need the 
+ungraded flag as we want to export results (\ie graded material).
 <<add results command to subp>>=
 results_parser = subp.add_parser("results",
     help="Lists results of a course",
@@ -38,14 +42,20 @@ results_parser = subp.add_parser("results",
     "to the `ladok report -f` command. Output format, CSV: "
       "<course code> <component code> <student ID> <grade> <grade date>.",
     epilog="If you specify an assignment group, the results of the "
-      "assignments in that group will be summarized. That means that "
-      "all assignments must have a passing grade. If there are assignments "
+      "assignments in that group will be summarized. You can supply your "
+      "own function for summarizing grades through the -S option. The "
+      "default works as follows: "
+      "All assignments must have a passing grade. If there are assignments "
       "with A--F grading scales (in addition to P/F) the avergage of the "
       "A--F grades will be used as final grade for the entire group. If any "
       "assignment has an F, the whole group will evaluate to an F.")
 results_parser.set_defaults(func=results_command)
 assignments.add_assignment_option(results_parser, ungraded=False)
-@ Now, that [[results_command]] function must take three arguments: [[config]], 
+<<add option for custom summary module>>
+<<add option to include Fs>>
+@ We will cover the option for and loading of the custom summary module later, 
+in \cref{custom-summary-module}.
+Now, that [[results_command]] function must take three arguments: [[config]], 
 [[canvas]] and [[args]].
 However, unlike the other commands, we don't want to do the processing for the 
 assignment options using [[process_assignment_option]].
@@ -61,6 +71,14 @@ assignment groups in those courses.
 If the user provides assignment groups, we will automatically summarize the 
 results of all assignments in the assignment group.
 
+We also let the user choose to not include Fs in the output.
+<<add option to include Fs>>=
+results_parser.add_argument("-F", "--include-Fs",
+  required=False, default=False, action="store_true",
+  help="Include failing grades (Fs) in output. By default we only output "
+    "A--Es and Ps.")
+@
+
 We will create a list of results, where each result is a tuple.
 These tuples will then be printed in CSV format to standard output.
 <<get results and print them>>=
@@ -74,6 +92,8 @@ else:
   results = summarize_assignments(canvas, args)
 
 for result in results:
+  if not args.include_Fs and result[3][0] == "F":
+    continue
   output.writerow(result)
 @
 
@@ -128,11 +148,162 @@ def summarize_assignments(canvas, args):
 In this case, we want to have one assignment group per row in the output.
 We want to output course, assignment group, student ID, summarized grade based 
 on all assignments in the group and the latest submission date.
+
+Unlike the previous case, here we must maintain the structure of which 
+assignments belong to which assignment group so that we can check easily that a 
+user has passed all assignments in the group.
 <<functions>>=
-def summarize_assignment_groups(args):
+def summarize_assignment_groups(canvas, args):
   """Summarize assignment groups into a single grade,
   canvas is a Canvas object,
   args is the command-line arguments"""
-  pass
+
+  <<load the correct summary module as summary>>
+
+  courses_list = courses.process_course_option(canvas, args)
+  all_assignments = list(assignments.process_assignment_option(canvas, args))
+
+  for course in courses_list:
+    users_list = list(course.get_users(enrollment_type=["student"]))
+    ag_list = assignments.filter_assignment_groups(
+      course, args.assignment_group)
+
+    for assignment_group in ag_list:
+      assignments_list = list(assignments.filter_assignments_by_group(
+        assignment_group, all_assignments))
+      for user, grade, grade_date in summary.summarize_group(
+        assignments_list, users_list):
+          yield (
+            course.course_code,
+            assignment_group.name,
+            user.integration_id,
+            grade,
+            grade_date
+          )
+@ We will now cover the [[summarize_group]] function in the [[summary]] module.
+
+
+\subsection{Loading a custom summary module}
+
+Different teachers have different policies for merging several assignments into 
+one grade.
+We now want to provide a way to override the default function.
+<<add option for custom summary module>>=
+results_parser.add_argument("-S", "--summary-module",
+  required=False, default="canvaslms.cli.summary",
+  help="Name of Python module to load with a custom summarization function "
+    "to summarize assignment groups. The default module is part of the "
+    "`canvaslms` package: `canvaslms.cli.summary`. This module must contain "
+    "a function `summarize_group(assignments, users)`, where `assignments` "
+    "is a list of assignment `canvasapi.assignment.Assignment` objects and "
+    "`users` is a list of `canvasapi.user.User` objects. The return value "
+    "must be a tuple "
+    "`(user object, grade, grade date)`.")
+@
+
+Now, let's load the module into the identifier [[summary]] for the above code.
+This is a very dangerous construction.
+An attacker can potentially load their own module and have it execute when 
+reporting grades.
+For instance, a malicious module could change grades, \eg always set 
+A's.
+<<load the correct summary module as summary>>=
+summary = importlib.import_module(args.summary_module)
+@
+
+
+\subsection{The default results summarizing module}
+
+We have one requirement on the summary module: it must contain a function 
+[[summarize_group]] that takes two arguments;
+the first being a list of assignments,
+the second being a list of users.
+The [[summarize_group]] function is the function that the above code will call.
+This gives the following outline of the module.
+<<summary.py>>=
+"""Module with a summary function for summarizing assignment groups"""
+
+import datetime as dt
+
+<<helper functions>>
+
+def summarize_group(assignments_list, users_list):
+  """Summarizes a particular set of assignments (assignments_list) for all
+  users in users_list"""
+
+  for user in users_list:
+    grade, grade_date = summarize(user, assignments_list)
+    yield (user, grade, grade_date)
+@
+
+
+\subsection{Summarizing grades: assignment grades to component grade}
+
+Now we will describe the [[summarize]] helper function.
+We want to establish two things: the most recent date and a suitable grade.
+
+For the most recent date, we just check the dates as we iterate through the 
+submissions.
+
+For the grade, as we iterate through we look for P/F and A--E grades.
+We can then check for Fs among the P/F grades, if we find an F the summarized 
+grade will be an F.
+If we find no Fs, then we can compute the average over all A--E grades and use 
+that as the final grade.
+<<helper functions>>=
+def summarize(user, assignments_list):
+  """Extracts user's submissions for assignments in assingments_list to 
+  summarize results into one grade and a grade date"""
+
+  pf_grades = []
+  a2e_grades = []
+  recent_date = dt.date(year=1970, month=1, day=1)
+
+  for assignment in assignments_list:
+    submission = assignment.get_submission(user)
+    grade = submission.grade
+
+    if grade is None:
+      grade = "F"
+
+    if grade in "ABCDE":
+      a2e_grades.append(grade)
+    else:
+      pf_grades.append(grade)
+
+    grade_date = submission.submitted_at or submission.graded_at
+
+    if not grade_date:
+      grade_date = recent_date
+    else:
+      grade_date = dt.date.fromisoformat(grade_date.split("T")[0])
+
+    if grade_date > recent_date:
+      recent_date = grade_date
+
+  if not all(map(lambda x: x == "P", pf_grades)):
+    return ("F", recent_date)
+
+  if a2e_grades:
+    return (a2e_average(a2e_grades), recent_date)
+  return ("P", recent_date)
+@
+
+To compute the average for the A--E grades; we will convert the grades into 
+integers, compute the average, round the value to an integer and convert back.
+<<helper functions>>=
+def a2e_average(grades):
+  """Takes a list of A--E grades, returns the average."""
+  num_grades = map(grade_to_int, grades)
+  avg_grade = round(sum(num_grades)/len(grades))
+  return int_to_grade(avg_grade)
+
+def grade_to_int(grade):
+  grade_map = {"E": 1, "D": 2, "C": 3, "B": 4, "A": 5}
+  return grade_map[grade]
+
+def int_to_grade(int_grade):
+  grade_map_inv = {1: "E", 2: "D", 3: "C", 4: "B", 5: "A"}
+  return grade_map_inv[int_grade]
 @
 

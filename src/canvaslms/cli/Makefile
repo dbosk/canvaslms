@@ -11,6 +11,10 @@ all: assignments.py assignments.tex
 all: submissions.py submissions.tex
 all: grade.py grade.tex
 all: results.py results.tex
+all: summary.py
+
+summary.py: results.nw
+	${NOTANGLE.py}
 
 __init__.py: cli.py
 	mv $< $@
