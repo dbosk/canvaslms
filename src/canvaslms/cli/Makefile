@@ -10,6 +10,11 @@ all: users.py users.tex
 all: assignments.py assignments.tex
 all: submissions.py submissions.tex
 all: grade.py grade.tex
+all: results.py results.tex
+all: summary.py
+
+summary.py: results.nw
+	${NOTANGLE.py}
 
 __init__.py: cli.py
 	mv $< $@
@@ -24,6 +29,7 @@ clean:
 	${RM} assignments.tex assignments.py
 	${RM} submissions.tex submissions.py
 	${RM} grade.tex grade.py
+	${RM} results.py results.tex
 
 
 INCLUDE_MAKEFILES=../../../makefiles
