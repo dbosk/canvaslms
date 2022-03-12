@@ -23,7 +23,6 @@ canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
 canvaslms.pdf: ${SRC_DIR}/cli/results.tex
 canvaslms.pdf: ${SRC_DIR}/grades/grades.tex
-canvaslms.pdf: ${SRC_DIR}/grades/conjunctavg.tex
 
 ${SRC_DIR}/%.tex: ${SRC_DIR}/%.nw
 	${MAKE} -C $(dir $@) $(notdir $@)
