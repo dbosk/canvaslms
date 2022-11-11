@@ -4,8 +4,7 @@ SUBDIR+=		src/canvaslms
 SUBDIR+=		doc
 SUBDIR+=		docker
 
-version=$(shell sed -n 's/^ *version *= *\"\([^\"]\+\)\",/\1/p' setup.py)
-dist=$(addprefix dist/canvaslms-${version}, -py3-none-any.whl .tar.gz)
+version=$(shell sed -n 's/^ *version *= *\"\([^\"]\+\)\",/\1/p' pyproject.toml)
 
 
 .PHONY: all
@@ -30,11 +29,8 @@ publish: publish-canvaslms doc/canvaslms.pdf publish-docker
 doc/canvaslms.pdf: $(wildcard src/canvaslms/cli/*.tex)
 	${MAKE} -C $(dir $@) $(notdir $@)
 
-publish-canvaslms: ${dist}
-	python3 -m twine upload -r pypi ${dist}
-
-${dist}: compile canvaslms.bash
-	python3 setup.py sdist bdist_wheel
+publish-canvaslms: compile
+	poetry publish
 
 canvaslms.bash:
 	register-python-argcomplete canvaslms > $@
