@@ -20,6 +20,7 @@ install: compile
 .PHONY: compile
 compile:
 	${MAKE} -C src/canvaslms all
+	poetry build
 
 .PHONY: publish publish-canvaslms publish-docker
 publish: publish-canvaslms doc/canvaslms.pdf publish-docker
