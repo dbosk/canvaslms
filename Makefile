@@ -33,9 +33,6 @@ doc/canvaslms.pdf: $(wildcard src/canvaslms/cli/*.tex)
 publish-canvaslms: compile
 	poetry publish
 
-canvaslms.bash:
-	register-python-argcomplete canvaslms > $@
-
 publish-docker:
 	sleep 60
 	${MAKE} -C docker publish
@@ -43,7 +40,6 @@ publish-docker:
 
 .PHONY: clean
 clean:
-	${RM} canvaslms.bash
 
 .PHONY: distclean
 distclean:
