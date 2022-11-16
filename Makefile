@@ -4,7 +4,7 @@ SUBDIR+=		src/canvaslms
 SUBDIR+=		doc
 SUBDIR+=		docker
 
-version=$(shell sed -n 's/^ *version *= *\"\([^\"]\+\)\",/\1/p' pyproject.toml)
+version=$(shell sed -n 's/^ *version *= *\"\([^\"]\+\)\"/\1/p' pyproject.toml)
 
 
 .PHONY: all
