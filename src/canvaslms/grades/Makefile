@@ -6,9 +6,11 @@ NOTANGLEFLAGS.py=
 all: grades.tex
 all: conjunctavg.py conjunctavg.tex
 all: disjunctmax.py disjunctmax.tex
+all: disjunctmaxsurvey.py disjunctmaxsurvey.tex
 
 grades.tex: conjunctavg.tex
 grades.tex: disjunctmax.tex
+grades.tex: disjunctmaxsurvey.tex
 
 
 .PHONY: clean
