@@ -1,23 +1,25 @@
 NOWEAVEFLAGS.tex=	-n -delay -t2
 NOTANGLEFLAGS.py=
 
+MODULES+=			conjunctavg.py
+MODULES+=			disjunctmax.py
+MODULES+=			maxgradesurvey.py
 
 .PHONY: all
 all: grades.tex
 all: conjunctavg.py conjunctavg.tex
 all: disjunctmax.py disjunctmax.tex
-all: disjunctmaxsurvey.py disjunctmaxsurvey.tex
+all: maxgradesurvey.py maxgradesurvey.tex
 
 grades.tex: conjunctavg.tex
 grades.tex: disjunctmax.tex
-grades.tex: disjunctmaxsurvey.tex
+grades.tex: maxgradesurvey.tex
 
 
 .PHONY: clean
 clean:
 	${RM} grades.tex
-	${RM} conjunctavg.py conjunctavg.tex
-	${RM} disjunctmax.py disjunctmax.tex
+	${RM} ${MODULES}
 
 
 INCLUDE_MAKEFILES=../../../makefiles
