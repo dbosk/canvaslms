@@ -22,8 +22,10 @@ compile:
 	${MAKE} -C src/canvaslms all
 	poetry build
 
-.PHONY: publish publish-canvaslms publish-docker
-publish: publish-canvaslms doc/canvaslms.pdf publish-docker
+.PHONY: publish publish-github publish-canvaslms publish-docker
+publish: publish-canvaslms doc/canvaslms.pdf publish-docker publish-github
+
+publish-github: doc/canvaslms.pdf
 	git push
 	gh release create -t v${version} v${version} doc/canvaslms.pdf
 
