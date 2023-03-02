@@ -24,6 +24,7 @@ import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.hacks.canvasapi
 import csv
+import operator
 import re
 import sys
 
@@ -154,34 +155,70 @@ def make_user_rows(canvas, args, roles):
     try:
       row = []
       row.append(user.course.course_code)
-      if args.canvas_id:
-        row.append(user.id)
-      row.append(user.login_id)
-      if args.ladok:
-        row.append(user.integration_id)
-      if args.split_name:
-        lastnames, firstnames = user.sortable_name.split(", ")
-        row.append(firstnames.strip())
-        row.append(lastnames.strip())
-      else:
-        row.append(user.name)
-      if args.email:
-        row.append(user.email)
+      <<append user attributes>>
     except AttributeError as err:
       canvaslms.cli.warn(f"skipped {user}: {err}")
       continue
 
     yield row
-@ Note that in most cases, the [[user.login_id]] and [[user.email]] will be the 
+@
+
+Note that in most cases, the [[user.login_id]] and [[user.email]] will be the 
 same.
 However, we need both, because the students can change their email address to a 
 non-KTH address.
 Also note, there are users for whom some attributes don't exist, hence we must 
 first extract them in a try-except construction.
 This happens if they've been removed from the course or never registered.
+<<append user attributes>>=
+if args.canvas_id:
+  row.append(user.id)
+<<append login id>>
+<<append integration id>>
+<<append name>>
+<<append email>>
+@
+
+Now, some of those attributes are optional and we should check [[args]] whether 
+the user specified that an attribute should be included.
+Some of the attributes might not exist, so we need to try-except them.
+(This happens for instance to the [[login_id]] attribute at KTH when the 
+student is no longer a student with us.)
+<<append login id>>=
+try:
+  row.append(user.login_id)
+except AttributeError:
+  row.append(None)
+<<append integration id>>=
+if args.ladok:
+  try:
+    row.append(user.integration_id)
+  except AttributeError:
+    row.append(None)
+<<append email>>=
+if args.email:
+  try:
+    row.append(user.email)
+  except AttributeError:
+    row.append(None)
+@
+
+The name attribute always exists, but we must check if we want first and last 
+names separately or as one string.
+To split them, we can use the [[sortable_name]] attribute and split on the [[, 
+]] following the last name and preceding the first name.
+<<append name>>=
+if args.split_name:
+  lastnames, firstnames = user.sortable_name.split(", ")
+  row.append(firstnames.strip())
+  row.append(lastnames.strip())
+else:
+  row.append(user.name)
+@
 
 If we filter by groups, then we must iterate over the groups to include the 
 group information.
+Other than the group data, we include the user data as before.
 <<functions>>=
 def make_user_rows_w_groups(canvas, args, roles):
   """Takes a list of courses and returns a list of users in those courses,
@@ -203,19 +240,7 @@ def make_user_rows_w_groups(canvas, args, roles):
         except AttributeError:
           pass
         row.append(group.name)
-        if args.canvas_id:
-          row.append(user.id)
-        row.append(user.login_id)
-        if args.ladok:
-          row.append(user.integration_id)
-        if args.split_name:
-          lastnames, firstnames = user.sortable_name.split(", ")
-          row.append(firstnames.strip())
-          row.append(lastnames.strip())
-        else:
-          row.append(user.name)
-        if args.email:
-          row.append(user.email)
+        <<append user attributes>>
       except AttributeError as err:
         canvaslms.cli.warn(f"skipped {user}: {err}")
         continue
@@ -357,35 +382,54 @@ def list_users(courses, roles):
 
 Second, we provide the most general function, [[filter_users]], which takes a 
 list of courses, a list of Canvas roles and a regex as arguments.
+It returns the matching users.
 <<functions>>=
 def filter_users(course_list, regex, roles=[]):
-  """Filter users in courses with roles based on regex
-
-  regex is matched on login ID, Canvas ID and name."""
+  """
+  Filter users in courses with roles based on regex. `regex` is matched on 
+  - Canvas ID (exact match),
+  - name (regex),
+  - login ID (regex),
+  - integration id (exact match),
+  - SIS user ID (exact match).
+  """
   pattern = re.compile(regex or ".*")
 
   for user in list_users(course_list, roles):
-    if pattern.search(user.name):
-      yield user
-      continue
+    <<check if user matches>>
+@
 
-    try:
-      if pattern.search(user.login_id):
-        yield user
-        continue
-    except AttributeError:
-      canvaslms.cli.warn(f"{user} has no login_id")
+Now to check if the user matches, we want to match some things by regular 
+expression, but other things exactly.
+<<check if user matches>>=
+if str(user.id) == regex:
+  yield user
+  continue
 
-    if str(user.id) == regex:
-      yield user
-      continue
+if pattern.search(user.name):
+  yield user
+  continue
 
-    try:
-      if user.integration_id == regex:
-        yield user
-        continue
-    except AttributeError:
-      canvaslms.cli.warn(f"{user} has no integration_id")
+try:
+  if pattern.search(user.login_id):
+    yield user
+    continue
+except AttributeError:
+  canvaslms.cli.warn(f"{user} has no login_id")
+
+try:
+  if user.integration_id == regex:
+    yield user
+    continue
+except AttributeError:
+  canvaslms.cli.warn(f"{user} has no integration_id")
+
+try:
+  if user.sis_user_id == regex:
+    yield user
+    continue
+except AttributeError:
+  canvaslms.cli.warn(f"{user} has no sis_user_id")
 @
 
 Now, we can define the function~[[list_students]] in terms of [[list_users]].
@@ -397,6 +441,49 @@ def list_students(courses):
 def list_teachers(courses):
   """List users in courses with role teacher"""
   return list_users(courses, ["teacher"])
+@
+
+
+\section{Getting a unique identifier}\label{UserUniqueID}
+
+In many cases, we want to get a unique identifier for a user.
+The natural attribute would be [[login_id]].
+However, sometimes the [[login_id]] attribute doesn't exist.
+So we want a function that does the following.
+<<doc unique identifier>>=
+Takes a user object and returns a unique identifier.
+
+Returns one of login_id, integration_id, sis_user_id, id (Canvas ID); in that 
+order of preference.
+@
+
+This yields the following function.
+Try returning the attributes in that order, try the next when failed.
+<<functions>>=
+def get_uid(user):
+  """
+  <<doc unique identifier>>
+  """
+  attributes = ["login_id", "integration_id", "sis_user_id", "id"]
+  for attribute in attributes:
+    try:
+      <<return the uid attribute of user>>
+    except AttributeError:
+      pass
+
+  <<raise error if no attribute existed>>
+@
+
+To return the attribute, we simply fetch it.
+We'll use [[attrgetter]].
+<<return the uid attribute of user>>=
+return operator.attrgetter(attribute)(user)
+@
+
+If no attribute existed (all failed), which should not happen, then we raise an 
+exception.
+<<raise error if no attribute existed>>=
+raise AttributeError(f"no unique user attribute existed, tried: {attributes}")
 @
 
 
