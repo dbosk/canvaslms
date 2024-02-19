@@ -6,6 +6,7 @@ handles an individual submission.
 
 We outline the module:
 <<submissions.py>>=
+import canvasapi.file
 import canvasapi.submission
 
 import canvaslms.cli.assignments as assignments
@@ -16,11 +17,14 @@ import argparse
 import csv
 import json
 import os
+import pathlib
+import subprocess
 import pypandoc
 import re
 import rich.console
 import rich.markdown
 import sys
+import tempfile
 import urllib.request
 
 <<functions>>
@@ -482,28 +486,41 @@ except AttributeError:
 
 \subsection{Attachments}
 
-For the attachment, we want to add it as a Markdown code block.
+For the attachment, we want to add it to the output.
+In the case of Python code we want to have it as a Markdown code block.
+If it's a text file, we want to have it as part of the plain Markdown.
+We will try to convert the attachment to Markdown using [[pypandoc]].
+<<add attachments to output>>=
+try:
+  for attachment in submission.attachments:
+    try:
+      contents = convert_to_md(attachment)
+      formatted_submission += format_section(attachment.filename,
+                                             contents)
+    except Exception as err:
+      <<handle attachments in unsupported file types>>
+except AttributeError:
+  pass
+@
+
+Let's look at the conversion.
+<<functions>>=
+def convert_to_md(attachment: canvasapi.file.File) -> str:
+  """
+  Converts `attachment` to Markdown. Returns the Markdown string.
+  """
+  content_type = getattr(attachment, "content-type")
+  <<if [[content_type]] is text, just decode and use>>
+  <<else convert file using [[pypandoc]]>>
+@
+
+If the content type is text, we can just decode it and use it in a Markdown 
+code block with a suitable (Markdown) content type.
 This means that we can set what type of data the code block contains.
 We compute this text from the content type of the attachment.
 For instance, Python source code is [[text/x-python]].
 We remove the [[text/]] prefix and check if there is any [[x-]] prefix left, in 
 which case we remove that as well.
-<<add attachments to output>>=
-try:
-  for attachment in submission.attachments:
-    content_type = ct_to_md(getattr(attachment, "content-type"))
-    if content_type:
-      contents = attachment.get_contents(binary=True).decode()
-    else:
-      continue
-
-    formatted_submission += format_section(
-      attachment.filename,
-      f"```{content_type}\n{contents}\n```"
-    )
-except AttributeError:
-  pass
-@
 
 Now, we want to change the content type to the format expected by Markdown to 
 do proper syntax highlighting.
@@ -511,15 +528,15 @@ This requires some ugly processing since one [[.py]] file might have content
 type [[text/x-python]] and another [[.py]] file might have 
 [[text/python-script]].
 <<functions>>=
-def ct_to_md(content_type):
+def text_to_md(content_type):
   """
-  Takes a content type, returns Markdown code block type.
-  Returns None if not possible.
+  Takes a text-based content type, returns Markdown code block type.
+  Raises ValueError if not possible.
   """
   if content_type.startswith("text/"):
     content_type = content_type[len("text/"):]
   else:
-    return None
+    raise ValueError(f"Not text-based content type: {content_type}")
 
   if content_type.startswith("x-"):
     content_type = content_type[2:]
@@ -527,6 +544,54 @@ def ct_to_md(content_type):
     content_type = "python"
 
   return content_type
+@
+
+This leaves us with the following.
+<<if [[content_type]] is text, just decode and use>>=
+try:
+  md_type = text_to_md(content_type)
+  contents = attachment.get_contents(binary=True).decode()
+  return f"```{md_type}\n{contents}\n```"
+except ValueError:
+  pass
+@
+
+If the content type is not text, we use [[pypandoc]] to convert it to Markdown.
+Here we'll use Pandoc's ability to infer the file type on its own.
+This means we'll have to download the attachment as a file in a temporary 
+location and let Pandoc convert the file to Markdown.
+<<else convert file using [[pypandoc]]>>=
+with tempfile.TemporaryDirectory() as tmpdir:
+  tmpfile = pathlib.Path(tmpdir) / attachment.filename
+  attachment.download(tmpfile)
+  return pypandoc.convert_file(tmpfile, "markdown")
+@
+
+Now, if that fails, we'll not have anything to add to the output.
+That means that if we're to have anything to show to the user, we'll need to 
+show the native file.
+However, we note this in the output.
+<<handle attachments in unsupported file types>>=
+error_msg = f"""
+Unsupported filetype, showing in external viewer.
+
+Error message from pandoc: {err}
+""".strip()
+formatted_submission += format_section(attachment.filename, error_msg)
+@
+
+Now we want to open download and then open the file.
+We want to make sure the file remains, so we can't use the same temporary 
+directory as before (that was destroyed when we left the [[with]] block).
+We can't use [[tempfile.TemporaryDirectory]] since its [[delete]] parameter is 
+available only from Python 3.12.
+So we'll need to use [[tempfile.mkdtemp]] instead.
+We don't delete anything, but leave it for system cleanup.
+<<handle attachments in unsupported file types>>=
+tmpdir = tempfile.mkdtemp()
+tmpfile = pathlib.Path(tmpdir) / attachment.filename
+attachment.download(tmpfile)
+subprocess.run(["open", tmpfile])
 @
 
 \subsection{Submission history}
