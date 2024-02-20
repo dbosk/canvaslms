@@ -140,14 +140,20 @@ def speedgrader(submission):
 
 Here we provide a subcommand [[submission]] which deals with an individual 
 submission.
+<<submission command description>>=
+Prints data about matching submissions, including submission and grading time, 
+and any text-based attachments.
+
 <<add submission command to subp>>=
 submission_parser = subp.add_parser("submission",
   help="Prints information about a submission",
-  description="Prints data about matching submissions, "
-    "including submission and grading time, any text-based attachments.")
+  description="""
+<<submission command description>>
+""")
 submission_parser.set_defaults(func=submission_command)
 add_submission_options(submission_parser)
 <<add options for printing a submission>>
+<<add submission command options>>
 @ We also need the corresponding function.
 For now, we only print the most relevant data of a submission.
 <<functions>>=
@@ -164,20 +170,37 @@ It also adds syntax highlighting for the source code attachments.
 However, we need to adapt the use of styles to the pager to be used.
 If stdout is not a terminal, we don't use [[rich]], then we simply print the 
 raw markdown.
+
+However, we might want to write all data to the output directory.
+In that case, we don't print anything to stdout.
+
+Finally, if we use a pager, we'll first open the directory with the files, so 
+that the user can explore the files while reading the output (containing the 
+grading and comments).
+That way, the user can try to run the Python code too, if necessary.
 <<get and print the submission data>>=
 console = rich.console.Console()
+<<create [[tmpdir]]>>
 for submission in submission_list:
-  output = format_submission(submission, history=args.history)
+  <<let [[subdir]] be the subdir for [[submission]]'s files>>
+  output = format_submission(submission,
+                             history=args.history,
+                             tmpdir=tmpdir/subdir)
 
-  if sys.stdout.isatty():
+  if args.output_dir:
+    <<write [[output]] to file in [[tmpdir/subdir]]>>
+  elif sys.stdout.isatty():
     <<check if we should use styles>>
+    <<open [[tmpdir/subdir]] for the user>>
     with console.pager(styles=styles):
       console.print(rich.markdown.Markdown(output,
                                            code_theme="manni"))
   else:
     print(output)
-@ Note that we use the theme [[manni]] for the code, as this works in both dark 
-and light terminals.
+@ Note that we use the theme [[manni]] for the code, as this works well in both 
+dark and light terminals.
+
+\subsection{Optional history}
 
 Now, let's turn to that [[args.history]] argument.
 We want to exclude it sometimes, for instance, when we want to get to the 
@@ -188,6 +211,80 @@ history.
 submission_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
 @
+
+\subsection{Specifying an output directory}
+
+Next we have the [[args.output_dir]] argument.
+If we specify the [[output_dir]] we want to write the output to files and not 
+have it printed to stdout.
+<<add options for printing a submission>>=
+submission_parser.add_argument("-o", "--output-dir",
+  required=False, default=None,
+  help="Write output to files in directory the given directory.")
+@
+
+If the user specified an output directory, we will not create a temporary 
+directory, but rather let [[tmpdir]] be the output directory.
+<<create [[tmpdir]]>>=
+if args.output_dir:
+  tmpdir = pathlib.Path(args.output_dir)
+else:
+  tmpdir = pathlib.Path(tempfile.mkdtemp())
+@
+
+Finally, we can then write the output to a file in the output directory.
+We need to structure the files in some way.
+We have a list of submissions for various students.
+The submissions can be submissions for various assignments (in assignment 
+groups) in various courses.
+The two most interesting options are:
+\begin{enumerate}
+\item to group by student, that is the student is the top level directory, 
+[[student/course/assignment]]; or
+\item to group by course, that is we get [[course/assignment/student]].
+\end{enumerate}
+This affects both
+[[<<write [[output]] to file in [[args.output_dir]]>>]]
+and
+[[<<[[tmpdir]] for [[format_submission]]>>]].
+
+We'll introduce an option that lets us choose between these two options.
+<<add submission command options>>=
+submission_parser.add_argument("--sort-order", required=False,
+  choices=["student", "course"], default="student",
+  help="Determines the order in which directories are created "
+       "in `output_dir`. `student` results in `student/course/assignment` "
+       "and `course` results in `course/assignment/student`. "
+       "Default: %(default)s")
+<<let [[subdir]] be the subdir for [[submission]]'s files>>=
+if args.sort_order == "student":
+  subdir = f"{submission.user.login_id}" \
+           f"/{submission.assignment.course.course_code}" \
+           f"/{submission.assignment.name}"
+else:
+  subdir = f"{submission.assignment.course.course_code}" \
+           f"/{submission.assignment.name}" \
+           f"/{submission.user.login_id}"
+
+(tmpdir / subdir).mkdir(parents=True, exist_ok=True)
+<<write [[output]] to file in [[tmpdir/subdir]]>>=
+with open(tmpdir/subdir/"metadata.md", "w") as f:
+  f.write(output)
+@
+
+\subsection{Opening the directory with the files}
+
+We want to open the directory with the files if we use a pager.
+However, we provide this as an option.
+<<add submission command options>>=
+submission_parser.add_argument("--open", required=False, default=False,
+  action="store_true",
+  help="Open the directory with the files in the default file manager.")
+<<open [[tmpdir/subdir]] for the user>>=
+if args.open:
+  subprocess.run(["open", tmpdir/subdir])
+@
+
 
 \subsection{Check if we should use styles}
 
@@ -207,6 +304,10 @@ elif "PAGER" in os.environ:
 styles = False
 if "less" in pager and ("-R" in pager or "-r" in pager):
   styles = True
+<<submission command description>>=
+Uses MANPAGER or PAGER environment variables for the pager to page output. If 
+the `-r` or `-R` flag is passed to `less`, it uses colours in the output.
+
 @
 
 
@@ -362,7 +463,8 @@ IDs, instead, we add these as attributes when fetching the objects.
 So [[submission.assignment]] is the assignment it came from, we don't need to 
 resolve the assignment from the assignmend ID.
 <<functions>>=
-def format_submission(submission, history=False):
+def format_submission(submission, history=False,
+                      <<[[format_submission]] args>>):
   """
   Formats submission for printing to stdout. Returns a string.
 
@@ -492,26 +594,54 @@ If it's a text file, we want to have it as part of the plain Markdown.
 We will try to convert the attachment to Markdown using [[pypandoc]].
 <<add attachments to output>>=
 try:
+  <<attachment iteration variables>>
   for attachment in submission.attachments:
-    try:
-      contents = convert_to_md(attachment)
-      formatted_submission += format_section(attachment.filename,
-                                             contents)
-    except Exception as err:
-      <<handle attachments in unsupported file types>>
+    <<let [[contents]] be the converted [[attachment]]>>
+    formatted_submission += format_section(attachment.filename,
+                                            contents)
 except AttributeError:
   pass
 @
 
 Let's look at the conversion.
+If it's a text-based format, we want to include it as a Markdown code block.
+Otherwise, we'll try to convert it to Markdown using [[pypandoc]].
+If the latter fails, we want to add a pointer to the file in the output, so 
+that the user can open it in an external viewer.
+
+In fact, having a copy of all the files locally is useful.
+We need to download it anyways, so we might just as well put a copy in a local 
+temporary directory too.
+We'll let the caller specify the directory to use, so we can use the same 
+directory for all attachments and potentially all users.
+<<[[format_submission]] args>>=
+tmpdir = None,
+<<attachment iteration variables>>=
+tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
+@
+
+We'll use [[tmpdir]] as the temporary directory to store the files when we try 
+to convert them.
 <<functions>>=
-def convert_to_md(attachment: canvasapi.file.File) -> str:
+def convert_to_md(attachment: canvasapi.file.File,
+                  tmpdir: pathlib.Path) -> str:
   """
   Converts `attachment` to Markdown. Returns the Markdown string.
+
+  Store a file version in `tmpdir`.
   """
+  <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
   content_type = getattr(attachment, "content-type")
-  <<if [[content_type]] is text, just decode and use>>
-  <<else convert file using [[pypandoc]]>>
+  <<if [[content_type]] is text, just use [[outfile]] contents>>
+  <<else convert [[outfile]] using [[pypandoc]]>>
+<<let [[contents]] be the converted [[attachment]]>>=
+contents = convert_to_md(attachment, tmpdir)
+@
+
+The download is simple.
+<<download [[attachment]] to [[outfile]] in [[tmpdir]]>>=
+outfile = tmpdir / attachment.filename
+attachment.download(outfile)
 @
 
 If the content type is text, we can just decode it and use it in a Markdown 
@@ -547,10 +677,13 @@ def text_to_md(content_type):
 @
 
 This leaves us with the following.
-<<if [[content_type]] is text, just decode and use>>=
+The advantage of reading the content from the file is that Python will solve 
+the encoding for us.
+<<if [[content_type]] is text, just use [[outfile]] contents>>=
 try:
   md_type = text_to_md(content_type)
-  contents = attachment.get_contents(binary=True).decode()
+  with open(outfile, "r") as f:
+    contents = f.read()
   return f"```{md_type}\n{contents}\n```"
 except ValueError:
   pass
@@ -560,39 +693,14 @@ If the content type is not text, we use [[pypandoc]] to convert it to Markdown.
 Here we'll use Pandoc's ability to infer the file type on its own.
 This means we'll have to download the attachment as a file in a temporary 
 location and let Pandoc convert the file to Markdown.
-<<else convert file using [[pypandoc]]>>=
-with tempfile.TemporaryDirectory() as tmpdir:
-  tmpfile = pathlib.Path(tmpdir) / attachment.filename
-  attachment.download(tmpfile)
-  return pypandoc.convert_file(tmpfile, "markdown")
+<<else convert [[outfile]] using [[pypandoc]]>>=
+try:
+  return pypandoc.convert_file(outfile, "markdown")
+except Exception as err:
+  return f"Pandoc cannot convert this file. " \
+         f"The file is located at\n\n  {outfile}\n\n"
 @
 
-Now, if that fails, we'll not have anything to add to the output.
-That means that if we're to have anything to show to the user, we'll need to 
-show the native file.
-However, we note this in the output.
-<<handle attachments in unsupported file types>>=
-error_msg = f"""
-Unsupported filetype, showing in external viewer.
-
-Error message from pandoc: {err}
-""".strip()
-formatted_submission += format_section(attachment.filename, error_msg)
-@
-
-Now we want to open download and then open the file.
-We want to make sure the file remains, so we can't use the same temporary 
-directory as before (that was destroyed when we left the [[with]] block).
-We can't use [[tempfile.TemporaryDirectory]] since its [[delete]] parameter is 
-available only from Python 3.12.
-So we'll need to use [[tempfile.mkdtemp]] instead.
-We don't delete anything, but leave it for system cleanup.
-<<handle attachments in unsupported file types>>=
-tmpdir = tempfile.mkdtemp()
-tmpfile = pathlib.Path(tmpdir) / attachment.filename
-attachment.download(tmpfile)
-subprocess.run(["open", tmpfile])
-@
 
 \subsection{Submission history}
 
