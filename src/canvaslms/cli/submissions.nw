@@ -23,6 +23,7 @@ import pypandoc
 import re
 import rich.console
 import rich.markdown
+import rich.json
 import sys
 import tempfile
 import urllib.request
@@ -185,7 +186,8 @@ for submission in submission_list:
   <<let [[subdir]] be the subdir for [[submission]]'s files>>
   output = format_submission(submission,
                              history=args.history,
-                             tmpdir=tmpdir/subdir)
+                             tmpdir=tmpdir/subdir,
+                             json_format=args.json)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -198,8 +200,7 @@ for submission in submission_list:
     if args.open == "open":
       <<open [[tmpdir/subdir]] for the user>>
     with console.pager(styles=styles):
-      console.print(rich.markdown.Markdown(output,
-                                           code_theme="manni"))
+      <<print [[output]] using [[console.print]]>>
   else:
     print(output)
 @ Note that we use the theme [[manni]] for the code, as this works well in both 
@@ -224,8 +225,22 @@ submission_parser.add_argument("--open", required=False,
        "spawn a shell in the directory (`shell`). "
        "With `open`, the pager will be used to display the output as usual. "
        "With `shell`, we just drop into the shell, the output can be "
-       "found in the metadata.md file in the shell's working directory. "
+       "found in the metadata.{json,md} file in the shell's working "
+       "directory. "
        "Default: %(default)s")
+@
+
+Finally, we can add the [[json]] option to the [[submission]] command.
+<<add options for printing a submission>>=
+submission_parser.add_argument("--json", required=False,
+  action="store_true", default=False,
+  help="Print output as JSON, otherwise Markdown.")
+<<print [[output]] using [[console.print]]>>=
+if args.json:
+  console.print(rich.json.JSON(output))
+else:
+  console.print(rich.markdown.Markdown(output,
+                                       code_theme="manni"))
 @
 
 \subsection{Specifying an output directory}
@@ -275,7 +290,12 @@ else:
 
 (tmpdir / subdir).mkdir(parents=True, exist_ok=True)
 <<write [[output]] to file in [[tmpdir/subdir]]>>=
-with open(tmpdir/subdir/"metadata.md", "w") as f:
+if args.json:
+  filename = "metadata.json"
+  output = json.dumps(output, indent=2)
+else:
+  filename = "metadata.md"
+with open(tmpdir/subdir/filename, "w") as f:
   f.write(output)
 @
 
@@ -486,17 +506,34 @@ We no longer need the [[canvas]] object to resolve course, assignment and user
 IDs, instead, we add these as attributes when fetching the objects.
 So [[submission.assignment]] is the assignment it came from, we don't need to 
 resolve the assignment from the assignmend ID.
+
+We have a [[md_title_level]] argument to specify the level of the title in the 
+Markdown version of the output.
+We want this to be able to recursively use [[format_submission]] to format the 
+submission history.
+This must then be passed to the recursive call and the section formatting.
 <<functions>>=
-def format_submission(submission, history=False,
+def format_submission(submission, history=False, json_format=False,
+                      md_title_level="#",
                       <<[[format_submission]] args>>):
   """
   Formats submission for printing to stdout. Returns a string.
 
   If history is True, include all submission versions from history.
+
+  If json_format is True, return a JSON string, otherwise Markdown.
+
+  `md_title_level` is the level of the title in Markdown, by default `#`. This 
+  is used to create a hierarchy of sections in the output.
+
+  <<[[format_submission]] doc>>
   """
   student = submission.assignment.course.get_user(submission.user_id)
 
-  formatted_submission = ""
+  if json_format:
+    formatted_submission = {}
+  else:
+    formatted_submission = ""
 
   <<add metadata to output>>
   <<add rubric assessment to output>>
@@ -514,9 +551,32 @@ def format_submission(submission, history=False,
 \subsection{Some helper functions}
 
 We want to format some sections.
+The section has a title and a body.
+<<[[format_section]] doc>>=
+In the case of Markdown (default), we format the title as a header and the body 
+as a paragraph. If we don't do JSON, but receive a dictionary as the body, we 
+format it as a list of key-value pairs.
+
+`md_title_level` is the level of the title in Markdown, by default `#`.
+We'll use this to create a hierarchy of sections in the output.
+
+In the case of JSON, we return a dictionary with the title as the key and the 
+body as the value.
 <<functions>>=
-def format_section(title, body):
-  return f"\n# {title}\n\n{body}\n\n"
+def format_section(title, body, json_format=False, md_title_level="#"):
+  """
+  <<[[format_section]] doc>>
+  """
+  if json_format:
+    return {title: body}
+
+  if isinstance(body, dict):
+    return "\n".join([
+      f" - {key.capitalize().replace('_', ' ')}: {value}"
+        for key, value in body.items()
+    ])
+
+  return f"\n{md_title_level} {title}\n\n{body}\n\n"
 @
 
 \subsection{Metadata}
@@ -524,18 +584,25 @@ def format_section(title, body):
 To format the metadata section, we simply pass the right strings to the section 
 formatting function.
 <<add metadata to output>>=
-formatted_submission += format_section(
-  "Metadata",
-  f"{submission.assignment.course.course_code} > {submission.assignment.name}"
-  f"\n\n"
-  f" - Student: {student.name} "
-    f"({student.login_id or None}, {submission.user_id})\n"
-  f" - Submission ID: {submission.id}\n"
-  f" - Submitted (graded): {submission.submitted_at} "
-    f"({submission.graded_at})\n"
-  f" - Grade: {submission.grade} ({submission.score})\n"
-  f" - Graded by: {resolve_grader(submission)}\n"
-  f" - SpeedGrader: {speedgrader(submission)}")
+metadata = {
+  "course": submission.assignment.course.course_code,
+  "assignment": submission.assignment.name,
+  "student": str(student),
+  "submission_id": submission.id,
+  "submitted_at": submission.submitted_at,
+  "graded_at": submission.graded_at,
+  "grade": submission.grade,
+  "graded_by": str(resolve_grader(submission)),
+  "speedgrader": speedgrader(submission)
+}
+
+if json_format:
+  formatted_submission.update(format_section("metadata", metadata,
+                                             json_format=True,
+                                             md_title_level=md_title_level))
+else:
+  formatted_submission += format_section("Metadata", metadata,
+                                         md_title_level=md_title_level)
 @
 
 Now to resolve the grader, we need to look up a user ID.
@@ -568,9 +635,15 @@ def resolve_grader(submission):
 <<add rubric assessment to output>>=
 try:
   if submission.rubric_assessment:
-    formatted_submission += format_section(
-      "Rubric assessment",
-      format_rubric(submission))
+    if json_format:
+      formatted_submission.update(format_section(
+        "rubric_assessment",
+        format_rubric(submission, json_format=True)),
+        json_format=True)
+    else:
+      formatted_submission += format_section(
+        "Rubric assessment",
+        format_rubric(submission))
 except AttributeError:
   pass
 @
@@ -580,11 +653,16 @@ except AttributeError:
 <<add comments to output>>=
 try:
   if submission.submission_comments:
-    body = ""
-    for comment in submission.submission_comments:
-      body += f"{comment['author_name']} ({comment['created_at']}):\n\n"
-      body += comment["comment"] + "\n\n"
-    formatted_submission += format_section("Comments", body)
+    if json_format:
+      formatted_submission.update(format_section(
+        "comments", submission.submission_comments,
+        json_format=True))
+    else:
+      body = ""
+      for comment in submission.submission_comments:
+        body += f"{comment['author_name']} ({comment['created_at']}):\n\n"
+        body += comment["comment"] + "\n\n"
+      formatted_submission += format_section("Comments", body)
 except AttributeError:
   pass
 @
@@ -594,7 +672,13 @@ except AttributeError:
 <<add body to output>>=
 try:
   if submission.body:
-    formatted_submission += format_section("Body", submission.body)
+    if json_format:
+      formatted_submission.update(format_section(
+        "body", submission.body, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Body", submission.body,
+                                             md_title_level=md_title_level)
 except AttributeError:
   pass
 @
@@ -604,9 +688,15 @@ except AttributeError:
 <<add quiz answers to output>>=
 try:
   if submission.submission_data:
-    formatted_submission += format_section(
-      "Quiz answers",
-      json.dumps(submission.submission_data, indent=2))
+    if json_format:
+      formatted_submission.update(format_section(
+        "quiz_answers", submission.submission_data,
+        json_format=True, md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section(
+        "Quiz answers",
+        json.dumps(submission.submission_data, indent=2),
+        md_title_level=md_title_level)
 except AttributeError:
   pass
 @
@@ -617,13 +707,33 @@ For the attachment, we want to add it to the output.
 In the case of Python code we want to have it as a Markdown code block.
 If it's a text file, we want to have it as part of the plain Markdown.
 We will try to convert the attachment to Markdown using [[pypandoc]].
+
+Since we want the files to be their own sections, for easy navigation, we must 
+bumps [[md_title_level]] by one to make the files a subsection of the main 
+submission.
+
+In the JSON version, we want to introduce one more level: the attachments 
+should be found under the key [[attachments]].
 <<add attachments to output>>=
 try:
   <<attachment iteration variables>>
+  if json_format:
+    attachments = {}
   for attachment in submission.attachments:
     <<let [[contents]] be the converted [[attachment]]>>
-    formatted_submission += format_section(attachment.filename,
-                                           contents)
+    formatted_attachment = format_section(attachment.filename, contents,
+                                          json_format=json_format,
+                                          md_title_level=md_title_level+"#")
+
+    if json_format:
+      attachments.update(formatted_attachment)
+    else:
+      formatted_submission += formatted_attachment
+
+  if json_format and attachments:
+    formatted_submission.update(format_section("attachments", attachments,
+                                               json_format=True,
+                                               md_title_level=md_title_level))
 except AttributeError:
   pass
 @
@@ -641,6 +751,9 @@ We'll let the caller specify the directory to use, so we can use the same
 directory for all attachments and potentially all users.
 <<[[format_submission]] args>>=
 tmpdir = None,
+<<[[format_submission]] doc>>=
+`tmpdir` is the directory to store all the submission files. Defaults to None, 
+which creates a temporary directory.
 <<attachment iteration variables>>=
 tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
 tmpdir.mkdir(parents=True, exist_ok=True)
@@ -739,28 +852,71 @@ Then we can't be sure which version we're looking at.
 
 To produce the history, we'll modify [[tmpdir]] to create a subdirectory for 
 each version.
-We'll write a [[metadata.md]] file for each version.
-Then we'll return all of those concatenated.
+We'll write a metadata file for each version.
+Then we'll return all of those in one main metadata file too.
 <<add submission history to output>>=
 try:
-  if submission.submission_history:
-    for version, prev_submission in enumerate(submission.submission_history):
-      version = str(version)
-      prev_submission = canvasapi.submission.Submission(
-        submission._requester, prev_submission)
-      prev_submission.assignment = submission.assignment
-
-      version_dir = tmpdir / f"version-{version}"
-
-      prev_metadata = format_submission(prev_submission,
-                                        tmpdir=version_dir)
-
-      with open(version_dir/"metadata.md", "w") as f:
-        f.write(prev_metadata)
-
-      formatted_submission += "\n\n" + prev_metadata
+  submission_history = submission.submission_history
 except AttributeError:
   pass
+else:
+  if submission_history:
+    versions = {}
+    for version, prev_submission in enumerate(submission.submission_history):
+      version = str(version)
+      version_dir = tmpdir / f"version-{version}"
+
+      <<add [[prev_submission]] to [[versions]]>>
+      <<write [[prev_submission]] to file in [[version_dir]]>>
+
+    if json_format:
+      formatted_submission.update(format_section(
+        "submission_history", versions, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_versions = ""
+      for version, prev_metadata in versions.items():
+        formatted_versions += format_section(f"Version {version}",
+                                             prev_metadata,
+                                             md_title_level=md_title_level+"#")
+      formatted_submission += format_section(
+        "Submission history", formatted_versions,
+        md_title_level=md_title_level)
+@
+
+The [[prev_submission]] that we get is in raw JSON format from Canvas.
+We'll turn it into a [[Submission]] object and add the extra assignment 
+attribute to it.
+Now we can reuse the [[format_submission]] function to format this version's 
+submission metadata.
+
+Note that we can't pass on the [[history]] argument to [[format_submission]], 
+we need to let it know that it's formatting a history version in another way to 
+get the sectioning levels right.
+We'll use an argument [[md_title_level]].
+<<add [[prev_submission]] to [[versions]]>>=
+prev_submission = canvasapi.submission.Submission(
+  submission._requester, prev_submission)
+prev_submission.assignment = submission.assignment
+
+prev_metadata = format_submission(prev_submission,
+                                  tmpdir=version_dir,
+                                  json_format=json_format,
+                                  md_title_level=md_title_level+"#")
+
+versions[version] = prev_metadata
+@
+
+When we write the metadata to a file, we'll either just write a string or JSON 
+data.
+We can use [[json.dump]] to write the JSON data to a file.
+<<write [[prev_submission]] to file in [[version_dir]]>>=
+if json_format:
+  with open(version_dir/"metadata.json", "w") as f:
+    json.dump(prev_metadata, f, indent=2)
+else:
+  with open(version_dir/"metadata.md", "w") as f:
+    f.write(prev_metadata)
 @
 
 
@@ -769,21 +925,30 @@ except AttributeError:
 For assignments that use rubrics, we want to format those rubrics so that we 
 can read the results instead of just the cumulated grade.
 <<functions>>=
-def format_rubric(submission):
-  """Format the rubric assessment of the `submission` in readable form."""
+def format_rubric(submission, json_format=False):
+  """
+  Format the rubric assessment of the `submission` in readable form.
 
-  result = ""
+  If `json_format` is True, return a JSON string, otherwise Markdown.
+  """
+
+  if json_format:
+    result = {}
+  else:
+    result = ""
 
   for crit_id, rating_data in submission.rubric_assessment.items():
     criterion = get_criterion(crit_id, submission.assignment.rubric)
     rating = get_rating(rating_data["rating_id"], criterion)
+    try:
+      comments = rating_data["comments"]
+    except KeyError:
+      comments = ""
 
-    <<add [[criterion]] description and [[rating]] to [[result]]>>
+    <<add [[criterion]], [[rating]] and [[comments]] to [[result]]>>
 
-    if rating_data["comments"]:
-      result += f"Comments: {rating_data['comments']}\n"
-
-    result += "\n"
+    if not json_format:
+      result += "\n"
 
   return result.strip()
 @
@@ -791,13 +956,20 @@ def format_rubric(submission):
 Sometimes Canvas is missing some data,
 for instance, an individual rating.
 So we add it only if it exists.
-<<add [[criterion]] description and [[rating]] to [[result]]>>=
-result += f"{criterion['description']}: "
-if rating:
-  result += f"{rating['description']} ({rating['points']})"
+<<add [[criterion]], [[rating]] and [[comments]] to [[result]]>>=
+if json_format:
+  result[criterion["description"]] = {
+    "rating": rating["description"] if rating else None,
+    "points": rating["points"] if rating else None,
+    "comments": comments
+  }
 else:
-  result += "-"
-result += "\n"
+  result += f"{criterion['description']}: "
+  if rating:
+    result += f"{rating['description']} ({rating['points']})"
+  else:
+    result += "-"
+  result += "\n"
 @
 
 We can get the rating of a rubric from the rubric assessment.
