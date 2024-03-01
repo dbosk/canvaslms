@@ -24,11 +24,13 @@ import re
 import rich.console
 import rich.markdown
 import rich.json
+import shlex
 import sys
 import tempfile
 import textwrap
 import urllib.request
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -200,7 +202,7 @@ for submission in submission_list:
   if args.open == "open":
     <<open [[tmpdir/subdir]] for the user>>
 
-  if args.open == "shell":
+  if <<condition that [[args.open]] tells us to spawn a shell>>:
     <<spawn shell in [[tmpdir/subdir]] for the user>>
   elif args.output_dir:
     pass
@@ -226,15 +228,16 @@ submission_parser.add_argument("-o", "--output-dir",
 We also have the open option, that has a choice of two alternatives.
 <<add submission command options>>=
 submission_parser.add_argument("--open", required=False,
-  nargs="?", default=None, const="open", choices=["open", "shell"],
+  nargs="?", default=None, const="open", choices=["open"]+choices_for_shells,
   help="Open the directory containing the files using "
-       "the default file manager (`open`) or "
-       "spawn a shell in the directory (`shell`). "
+       "the default file manager (`open`). "
        "With `open`, the pager will be used to display the output as usual. "
-       "With `shell`, we just drop into the shell, the output can be "
-       "found in the metadata.{json,md} file in the shell's working "
-       "directory. "
-       "Default: %(default)s")
+       <<help strings for open shell options>>
+       "Default: %(const)s")
+<<condition that [[args.open]] tells us to spawn a shell>>=
+args.open in choices_for_shells
+<<constants>>=
+<<define [[choices_for_shells]]>>
 @
 
 Finally, we can add the [[json]] option to the [[submission]] command.
@@ -312,16 +315,111 @@ Sometimes we want to open the directory.
 There are several ways we can do this.
 We can open the directory with the system file explorer, that way the user can 
 open files while reading the stdout output using a pager.
-We can also spawn a shell in the directory so that the user can run the Python 
-code.
+<<open [[tmpdir/subdir]] for the user>>=
+subprocess.run(["open", tmpdir/subdir])
+@
+
+We can also spawn a shell in the directory so that the user can work with the 
+files, for instance run the Python code in the case of a Python lab submission.
+Now, we could spawn a sub-shell of the user's shell,
+we'll let this be the [[shell]] option.
+Another approach would be to run a Docker image and mount the directory in the 
+container.
+This would be the [[docker]] option.
+<<define [[choices_for_shells]]>>=
+choices_for_shells = ["shell", "docker"]
+<<help strings for open shell options>>=
+"With `shell`, we just drop into the shell (as set by $SHELL), "
+"the output can be found in the metadata.{json,md} file in "
+"the shell's working directory. "
+"With `docker`, we run a Docker container with the "
+"directory mounted in the container. "
+"This way we can run the code in the submission in a "
+"controlled environment. "
+"Note that this requires Docker to be installed and running. "
 <<spawn shell in [[tmpdir/subdir]] for the user>>=
-print(f"---> Opening a shell ({os.environ['SHELL']}) in {tmpdir/subdir}")
+if args.open == "shell":
+  <<spawn sub-shell in [[tmpdir/subdir]] for the user>>
+elif args.open == "docker":
+  <<run a Docker container with [[tmpdir/subdir]] mounted in the container>>
+@
+
+In both cases, we want to print some useful info for the user, so that they can 
+more easily orient themselves.
+In the case of the sub-shell, we print a message and then spawn the shell in 
+the directory.
+At exit, we print a message that the shell has terminated and that the files 
+are left in the directory, so the user can go back without executing the 
+command again.
+<<spawn sub-shell in [[tmpdir/subdir]] for the user>>=
+print(f"---> Spawning a shell ({os.environ['SHELL']}) in {tmpdir/subdir}")
+
 subprocess.run([
   "sh", "-c", f"cd '{tmpdir/subdir}' && exec {os.environ['SHELL']}"
 ])
-print(f"<--- canvaslms submission shell terminated.")
-<<open [[tmpdir/subdir]] for the user>>=
-subprocess.run(["open", tmpdir/subdir])
+
+print(f"<--- canvaslms submission shell terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.")
+@
+
+We want to do the same for Docker.
+However, this is a bit more complicated.
+We need to know which image to use and which command to run in the container.
+We also need to know any other options that we might want to pass to Docker.
+<<run a Docker container with [[tmpdir/subdir]] mounted in the container>>=
+print(f"---> Running a Docker container, files mounted in /mnt.")
+
+cmd = [
+  "docker", "run", "-it", "--rm"
+]
+if args.docker_args:
+  cmd += args.docker_args
+cmd += [
+  "-v", f"{tmpdir/subdir}:/mnt",
+  args.docker_image, args.docker_cmd
+]
+
+subprocess.run(cmd)
+
+print(f"<--- canvaslms submission Docker container terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.\n"
+      f"---- To rerun the container, run:\n"
+      f"`{' '.join(map(shlex.quote, cmd))}`")
+@
+
+This requires us to add an option for the Docker image to use and an option for 
+the command to run in the Docker container.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-image", required=False,
+  default="ubuntu",
+  help="The Docker image to use when running a Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+submission_parser.add_argument("--docker-cmd", required=False,
+  default="bash",
+  help="The command to run in the Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+@
+
+For the last argument, [[args.docker_args]], we want to be able to pass any 
+arguments to the Docker command.
+This should be a list of strings, so we can just pass it on to the 
+[[subprocess.run]] function.
+
+Using the [[argparse.REMAINDER]] option, we can pass the rest of the command 
+line to the Docker command.
+This is useful since it saves us a lot of problems with escaping options that 
+we want to pass to Docker, instead of our argparser to parse it.
+Normally, if we want to pass [[-e LADOK_USER]] to Docker, our argparser would 
+pick up that [[-e]] as an option, unless escaped.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-args", required=False,
+  default=[], nargs=argparse.REMAINDER,
+  help="Any additional arguments to pass to the Docker command. "
+       "This is used with the `docker` option for `--open`. "
+       "Note that this must be the last option on the command line, it takes "
+       "the rest of the line as arguments for Docker.")
 @
 
 
