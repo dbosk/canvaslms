@@ -1,4 +1,3 @@
-NOWEAVEFLAGS.tex=	-n -delay -t2
 NOTANGLEFLAGS.py=
 
 

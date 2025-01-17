@@ -33,7 +33,9 @@ import appdirs
 import argcomplete, argparse
 from canvasapi import Canvas
 import canvaslms.cli.login
+import json
 import os
+import pathlib
 import sys
 
 <<modules>>
@@ -86,12 +88,16 @@ The function gets the configuration file as an argument.
 We don't return any error if the file doesn't exist.
 We leave that to the caller to determine what to do if the configuration is 
 empty.
+Likewise, we issue a warning if the configuration file is malformed, \ie it 
+can't be processed as valid JSON.
 <<read configuration file>>=
 try:
   with open(config_file, "r") as file:
     config.update(json.load(file))
 except FileNotFoundError:
   pass
+except json.decoder.JSONDecodeError as err:
+  warn(f"config file is malformed: {err}")
 @
 
 We can read the credentials from the environment, this takes precedence over 
@@ -109,13 +115,24 @@ if "CANVAS_TOKEN" in os.environ:
 
 At times, we might want to update the configuration file.
 When we update the config file, we must ensure that any other part of the 
-configuration file is kept.
-So we write the [[config]] dictionary to the config file.
+configuration file is kept, so we write the [[config]] dictionary to the config 
+file.
+
+If we get a [[FileNotFoundError]], that means the config directory doesn't 
+exist and we must create it.
 <<functions>>=
 def update_config_file(config, config_file):
   """Updates the config file by writing the config dictionary back to it"""
-  with open(config_file, "w") as fd:
-    json.dump(config, fd)
+  try:
+    <<open and write config to config file>>
+  except FileNotFoundError:
+    <<create file's parent directories>>
+    <<open and write config to config file>>
+<<create file's parent directories>>=
+os.makedirs(pathlib.PurePath(config_file).parent)
+<<open and write config to config file>>=
+with open(config_file, "w") as fd:
+  json.dump(config, fd)
 @
 
 
@@ -141,13 +158,6 @@ argcomplete.autocomplete(argp)
 args = argp.parse_args()
 
 config = read_configuration(args.config_file)
-
-hostname, token = canvaslms.cli.login.load_credentials(config)
-
-if not (hostname and token):
-  err("No hostname or token, rum 'canvaslms login'")
-
-canvas = Canvas(hostname, token)
 
 <<run subcommands>>
 @
@@ -182,26 +192,62 @@ argp.add_argument("-d", "--delimiter",
 \subsection{The subcommands}
 
 Each subcommand will have its own module in the package.
-Each such module must have a function [[add_command]] that takes teh 
-[[subp]] parser as an argument and adds its command and options to that.
+Each such module must have a function [[add_command]] that takes the [[subp]] 
+parser as an argument and adds its command and options to that.
+For example, the [[login]] command:
+The \texttt{login} command is located in [[canvaslms.cli.login]].
+<<modules>>=
+import canvaslms.cli.login
+<<add subcommands to subp>>=
+canvaslms.cli.login.add_command(subp)
+@
 
 In short, each [[add_command]] must add a subparser 
 ([[subp.add_parser]]) that will set the [[func]] attribute.
 Then we can execute the correct function and let that function check the 
 remaining arguments.
+
+Each command function must take three arguments:
+\begin{enumerate}
+\item the configuration,
+\item a Canvas object to use for interaction with Canvas,
+\item the processed command-line arguments.
+\end{enumerate}
+This means that we must read the credentials to create the Canvas object.
+One exception is the [[login]] command: this command doesn't need the Canvas 
+object as it will be run before there are credentials.
 <<run subcommands>>=
+if args.func != canvaslms.cli.login.login_command:
+  <<create canvas object>>
+else:
+  canvas = None
+
 if args.func:
   args.func(config, canvas, args)
 @
 
-\paragraph{The \texttt{login} command}
+To create the Canvas object, we must read the credentials using the 
+[[canvaslms.cli.login]] module.
+If there are no credentials, we give an error about running the [[login]] 
+command first.
+Otherwise, we create the Canvas object named [[canvas]].
+<<create canvas object>>=
+hostname, token = canvaslms.cli.login.load_credentials(config)
 
-The \texttt{login} command is located in [[canvaslms.cli.login]].
-<<modules>>=
-import canvaslms.cli.login
+if not (hostname and token):
+  err(1, "No hostname or token, run `canvaslms login`")
+
+<<add https to hostname if needed>>
+
+canvas = Canvas(hostname, token)
 @
-<<add subcommands to subp>>=
-canvaslms.cli.login.add_command(subp)
+
+Now, we must specify a URL to the Canvas server, not actually a hostname.
+If the hostname already contains \enquote{https}, fine; if not, we should add 
+it.
+<<add https to hostname if needed>>=
+if "://" not in hostname:
+  hostname = f"https://{hostname}"
 @
 
 \paragraph{The \texttt{courses} command}
@@ -210,7 +256,6 @@ The \texttt{courses} command resides in [[canvaslms.cli.courses]] and supports
 the protocol above.
 <<modules>>=
 import canvaslms.cli.courses
-@
 <<add subcommands to subp>>=
 canvaslms.cli.courses.add_command(subp)
 @
@@ -220,7 +265,6 @@ canvaslms.cli.courses.add_command(subp)
 The \texttt{users} command resides in [[canvaslms.cli.users]].
 <<modules>>=
 import canvaslms.cli.users
-@
 <<add subcommands to subp>>=
 canvaslms.cli.users.add_command(subp)
 @
@@ -232,7 +276,6 @@ There are two commands related to assignments in the
 Both are added by the same function call.
 <<modules>>=
 import canvaslms.cli.assignments
-@
 <<add subcommands to subp>>=
 canvaslms.cli.assignments.add_command(subp)
 @
@@ -244,7 +287,6 @@ There are two commands related to submissions in the
 Both are added by one function call.
 <<modules>>=
 import canvaslms.cli.submissions
-@
 <<add subcommands to subp>>=
 canvaslms.cli.submissions.add_command(subp)
 @
@@ -254,7 +296,15 @@ canvaslms.cli.submissions.add_command(subp)
 The \texttt{grade} command is located in [[canvaslms.cli.grade]].
 <<modules>>=
 import canvaslms.cli.grade
-@
 <<add subcommands to subp>>=
 canvaslms.cli.grade.add_command(subp)
+@
+
+\paragraph{The \texttt{results} command}
+
+The \texttt{results} command is located in [[canvaslms.cli.results]].
+<<modules>>=
+import canvaslms.cli.results
+<<add subcommands to subp>>=
+canvaslms.cli.results.add_command(subp)
 @

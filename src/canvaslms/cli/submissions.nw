@@ -6,18 +6,33 @@ handles an individual submission.
 
 We outline the module:
 <<submissions.py>>=
+import canvasapi.exceptions
+import canvasapi.file
+import canvasapi.submission
+
+import canvaslms.cli
 import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
 import canvaslms.hacks.canvasapi
 
 import argparse
 import csv
-import pydoc
+import json
+import os
+import pathlib
+import subprocess
 import pypandoc
 import re
+import rich.console
+import rich.markdown
+import rich.json
+import shlex
 import sys
+import tempfile
+import textwrap
 import urllib.request
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -41,10 +56,12 @@ We add the subparser for [[submissions]].
 submissions_parser = subp.add_parser("submissions",
     help="Lists submissions of an assignment",
     description="Lists submissions of assignment(s). Output format: "
-      "<Canvas-user-ID> <grade> <grade date>")
+      "<course code> <assignment name> <user> <grade> "
+      "<submission date> <grade date>")
 submissions_parser.set_defaults(func=submissions_command)
 assignments.add_assignment_option(submissions_parser)
 add_submission_options(submissions_parser)
+<<add options for printing>>
 @ Now, that [[submissions_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
 It must also do the processing for the assignment options using 
@@ -76,7 +93,17 @@ if args.user or args.category or args.group:
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
 
 for submission in submissions:
-  output.writerow(format_submission_short(submission))
+  if args.login_id:
+    output.writerow(format_submission_short_unique(submission))
+  else:
+    output.writerow(format_submission_short(submission))
+@
+
+Now, we must add that option [[args.login_id]].
+<<add options for printing>>=
+submissions_parser.add_argument("-l", "--login-id",
+  help="Print login ID instead of name.",
+  default=False, action="store_true")
 @
 
 
@@ -84,6 +111,8 @@ for submission in submissions:
 
 Sometimes we want to compute the URL for SpeedGrader for a submission.
 The [[Submission]] objects come with an attribute [[preview_url]].
+(However, previous submissions don't have this, so if it doesn't exist, we use 
+[[None]].)
 We want to turn that one into the SpeedGrader URL.
 The [[preview_url]] looks like this:
 \begin{minted}{text}
@@ -99,7 +128,10 @@ We use Python's regex abilities to rewrite the URL.
 <<functions>>=
 def speedgrader(submission):
   """Returns the SpeedGrader URL of the submission"""
-  speedgrader_url = submission.preview_url
+  try:
+    speedgrader_url = submission.preview_url
+  except AttributeError:
+    return None
 
   speedgrader_url = re.sub("assignments/",
     "gradebook/speed_grader?assignment_id=",
@@ -114,17 +146,25 @@ def speedgrader(submission):
   return speedgrader_url
 @
 
+
 \section{The [[submission]] subcommand and its options}
 
 Here we provide a subcommand [[submission]] which deals with an individual 
 submission.
+<<submission command description>>=
+Prints data about matching submissions, including submission and grading time, 
+and any text-based attachments.
+
 <<add submission command to subp>>=
 submission_parser = subp.add_parser("submission",
   help="Prints information about a submission",
-  description="Prints data about matching submissions, "
-    "including submission and grading time, any text-based attachments.")
+  description="""
+<<submission command description>>
+""")
 submission_parser.set_defaults(func=submission_command)
 add_submission_options(submission_parser)
+<<add options for printing a submission>>
+<<add submission command options>>
 @ We also need the corresponding function.
 For now, we only print the most relevant data of a submission.
 <<functions>>=
@@ -133,10 +173,311 @@ def submission_command(config, canvas, args):
   <<get and print the submission data>>
 @
 
-Then we can fetch the submission.
+Then we can fetch the submission, format it to markdown ([[format_submission]]) 
+and then print it.
+We use the [[rich]] package to print it.
+This prints the markdown output of [[format_submission]] nicer in the terminal.
+It also adds syntax highlighting for the source code attachments.
+However, we need to adapt the use of styles to the pager to be used.
+If stdout is not a terminal, we don't use [[rich]], then we simply print the 
+raw markdown.
+
+However, we might want to write all data to the output directory.
+In that case, we don't print anything to stdout.
+
+Finally, we might also want to open the directory of files, either in a shell 
+or in the system file manager.
+We'll open the directory in the file manager so that the user can explore the 
+files while reading the output (containing the grading and comments).
+So we must open this first, then we can proceed.
+
+When we spawn a shell, we don't want to do anything else.
+But open in the file manager we can do no matter what the user wants to do, if 
+they pipe the output or skip the output altogether.
 <<get and print the submission data>>=
+console = rich.console.Console()
+<<create [[tmpdir]]>>
 for submission in submission_list:
-  pydoc.pager(format_submission(submission, canvas))
+  <<let [[subdir]] be the subdir for [[submission]]'s files>>
+  output = format_submission(submission,
+                             history=args.history,
+                             tmpdir=tmpdir/subdir,
+                             json_format=args.json)
+
+  <<write [[output]] to file in [[tmpdir/subdir]]>>
+
+  if args.open == "open":
+    <<open [[tmpdir/subdir]] for the user>>
+  elif args.open == "all":
+    <<open all files in [[tmpdir/subdir]] for the user>>
+
+  if <<condition that [[args.open]] tells us to spawn a shell>>:
+    <<spawn shell in [[tmpdir/subdir]] for the user>>
+  elif args.output_dir:
+    pass
+  elif sys.stdout.isatty():
+    <<check if we should use styles>>
+    with console.pager(styles=styles):
+      <<print [[output]] using [[console.print]]>>
+  else:
+    print(output)
+@ Note that we use the theme [[manni]] for the code, as this works well in both 
+dark and light terminals.
+
+If we specify the [[output_dir]] we want to write the output to files and not 
+have it printed to stdout.
+<<add options for printing a submission>>=
+submission_parser.add_argument("-o", "--output-dir",
+  required=False, default=None,
+  help="Write output to files in directory the given directory. "
+       "If not specified, print to stdout. "
+       "If specified, do not print to stdout.")
+@
+
+We also have the open option, that has a choice of a few alternatives.
+<<add submission command options>>=
+submission_parser.add_argument("--open", required=False,
+  nargs="?", default=None, const="open",
+  choices=["open", "all"]+choices_for_shells,
+  help="Open the directory containing the files using "
+       "the default file manager (`open`). "
+       "With `open`, the pager will be used to display the output as usual. "
+       "With `all`, all files (not the directory containing them) will be "
+       "opened in the default application for the file type. "
+       <<help strings for open shell options>>
+       "Default: %(const)s")
+<<condition that [[args.open]] tells us to spawn a shell>>=
+args.open in choices_for_shells
+<<constants>>=
+<<define [[choices_for_shells]]>>
+@
+
+Finally, we can add the [[json]] option to the [[submission]] command.
+<<add options for printing a submission>>=
+submission_parser.add_argument("--json", required=False,
+  action="store_true", default=False,
+  help="Print output as JSON, otherwise Markdown.")
+<<print [[output]] using [[console.print]]>>=
+if args.json:
+  console.print(rich.json.JSON(output))
+else:
+  console.print(rich.markdown.Markdown(output,
+                                       code_theme="manni"))
+@
+
+\subsection{Specifying an output directory}
+
+If the user specified an output directory, we will not create a temporary 
+directory, but rather let [[tmpdir]] be the output directory.
+<<create [[tmpdir]]>>=
+if args.output_dir:
+  tmpdir = pathlib.Path(args.output_dir)
+else:
+  tmpdir = pathlib.Path(tempfile.mkdtemp())
+@
+
+Finally, we can then write the output to a file in the output directory.
+We need to structure the files in some way.
+We have a list of submissions for various students.
+The submissions can be submissions for various assignments (in assignment 
+groups) in various courses.
+The two most interesting options are:
+\begin{enumerate}
+\item to group by student, that is the student is the top level directory, 
+[[student/course/assignment]]; or
+\item to group by course, that is we get [[course/assignment/student]].
+\end{enumerate}
+This affects both
+[[<<write [[output]] to file in [[args.output_dir]]>>]]
+and
+[[<<[[tmpdir]] for [[format_submission]]>>]].
+
+We'll introduce an option that lets us choose between these two options.
+<<add submission command options>>=
+submission_parser.add_argument("--sort-order", required=False,
+  choices=["student", "course"], default="student",
+  help="Determines the order in which directories are created "
+       "in `output_dir`. `student` results in `student/course/assignment` "
+       "and `course` results in `course/assignment/student`. "
+       "Default: %(default)s")
+<<let [[subdir]] be the subdir for [[submission]]'s files>>=
+if args.sort_order == "student":
+  subdir = f"{submission.user.login_id}" \
+           f"/{submission.assignment.course.course_code}" \
+           f"/{submission.assignment.name}"
+else:
+  subdir = f"{submission.assignment.course.course_code}" \
+           f"/{submission.assignment.name}" \
+           f"/{submission.user.login_id}"
+
+(tmpdir / subdir).mkdir(parents=True, exist_ok=True)
+<<write [[output]] to file in [[tmpdir/subdir]]>>=
+if args.json:
+  filename = "metadata.json"
+  output = json.dumps(output, indent=2)
+else:
+  filename = "metadata.md"
+with open(tmpdir/subdir/filename, "w") as f:
+  f.write(output)
+@
+
+\subsection{Opening the directory containing the files}
+
+Sometimes we want to open the directory.
+There are several ways we can do this.
+We can open the directory with the system file explorer, that way the user can 
+open files while reading the stdout output using a pager.
+<<open [[tmpdir/subdir]] for the user>>=
+subprocess.run(["open", tmpdir/subdir])
+@
+
+If we instead want to open all files contained in the directory, we can need to 
+iterate all the files and open them one by one.
+<<open all files in [[tmpdir/subdir]] for the user>>=
+for file in (tmpdir/subdir).iterdir():
+  subprocess.run(["open", file])
+@
+
+We can also spawn a shell in the directory so that the user can work with the 
+files, for instance run the Python code in the case of a Python lab submission.
+Now, we could spawn a sub-shell of the user's shell,
+we'll let this be the [[shell]] option.
+Another approach would be to run a Docker image and mount the directory in the 
+container.
+This would be the [[docker]] option.
+<<define [[choices_for_shells]]>>=
+choices_for_shells = ["shell", "docker"]
+<<help strings for open shell options>>=
+"With `shell`, we just drop into the shell (as set by $SHELL), "
+"the output can be found in the metadata.{json,md} file in "
+"the shell's working directory. "
+"With `docker`, we run a Docker container with the "
+"directory mounted in the container. "
+"This way we can run the code in the submission in a "
+"controlled environment. "
+"Note that this requires Docker to be installed and running. "
+<<spawn shell in [[tmpdir/subdir]] for the user>>=
+if args.open == "shell":
+  <<spawn sub-shell in [[tmpdir/subdir]] for the user>>
+elif args.open == "docker":
+  <<run a Docker container with [[tmpdir/subdir]] mounted in the container>>
+@
+
+In both cases, we want to print some useful info for the user, so that they can 
+more easily orient themselves.
+In the case of the sub-shell, we print a message and then spawn the shell in 
+the directory.
+At exit, we print a message that the shell has terminated and that the files 
+are left in the directory, so the user can go back without executing the 
+command again.
+<<spawn sub-shell in [[tmpdir/subdir]] for the user>>=
+print(f"---> Spawning a shell ({os.environ['SHELL']}) in {tmpdir/subdir}")
+
+subprocess.run([
+  "sh", "-c", f"cd '{tmpdir/subdir}' && exec {os.environ['SHELL']}"
+])
+
+print(f"<--- canvaslms submission shell terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.")
+@
+
+We want to do the same for Docker.
+However, this is a bit more complicated.
+We need to know which image to use and which command to run in the container.
+We also need to know any other options that we might want to pass to Docker.
+<<run a Docker container with [[tmpdir/subdir]] mounted in the container>>=
+print(f"---> Running a Docker container, files mounted in /mnt.")
+
+cmd = [
+  "docker", "run", "-it", "--rm"
+]
+if args.docker_args:
+  cmd += args.docker_args
+cmd += [
+  "-v", f"{tmpdir/subdir}:/mnt",
+  args.docker_image, args.docker_cmd
+]
+
+subprocess.run(cmd)
+
+print(f"<--- canvaslms submission Docker container terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.\n"
+      f"---- To rerun the container, run:\n"
+      f"`{' '.join(map(shlex.quote, cmd))}`")
+@
+
+This requires us to add an option for the Docker image to use and an option for 
+the command to run in the Docker container.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-image", required=False,
+  default="ubuntu",
+  help="The Docker image to use when running a Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+submission_parser.add_argument("--docker-cmd", required=False,
+  default="bash",
+  help="The command to run in the Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+@
+
+For the last argument, [[args.docker_args]], we want to be able to pass any 
+arguments to the Docker command.
+This should be a list of strings, so we can just pass it on to the 
+[[subprocess.run]] function.
+
+Using the [[argparse.REMAINDER]] option, we can pass the rest of the command 
+line to the Docker command.
+This is useful since it saves us a lot of problems with escaping options that 
+we want to pass to Docker, instead of our argparser to parse it.
+Normally, if we want to pass [[-e LADOK_USER]] to Docker, our argparser would 
+pick up that [[-e]] as an option, unless escaped.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-args", required=False,
+  default=[], nargs=argparse.REMAINDER,
+  help="Any additional arguments to pass to the Docker command. "
+       "This is used with the `docker` option for `--open`. "
+       "Note that this must be the last option on the command line, it takes "
+       "the rest of the line as arguments for Docker.")
+@
+
+
+\subsection{Check if we should use styles}
+
+By default, [[rich.console.Console]] uses the [[pydoc.pager]], which uses the 
+system pager (as determined by environment variables etc.).
+The default usually can't handle colours, so [[rich]] doesn't use colours when 
+paging.
+We want to check if [[less -r]] or [[less -R]] is set as the pager, in that 
+case we can use styles.
+<<check if we should use styles>>=
+pager = ""
+if "MANPAGER" in os.environ:
+  pager = os.environ["MANPAGER"]
+elif "PAGER" in os.environ:
+  pager = os.environ["PAGER"]
+
+styles = False
+if "less" in pager and ("-R" in pager or "-r" in pager):
+  styles = True
+<<submission command description>>=
+Uses MANPAGER or PAGER environment variables for the pager to page output. If 
+the `-r` or `-R` flag is passed to `less`, it uses colours in the output. That 
+is, set `PAGER=less -r` or `PAGER=less -R` to get coloured output from this 
+command.
+
+@
+
+\subsection{Optional history}
+
+Now, let's turn to that [[args.history]] argument.
+We want to exclude it sometimes, for instance, when we want to get to the 
+comments only.
+So we default to off, since it's only occasionally that we want to see the 
+history.
+<<add options for printing a submission>>=
+submission_parser.add_argument("-H", "--history", action="store_true",
+  help="Include submission history.")
 @
 
 
@@ -151,15 +492,24 @@ For this we need
 \item a user or group,
 \item to know if we aim for all or just ungraded submissions.
 \end{itemize}
+We add the [[required]] parameter to specify if we want to have required 
+arguments, \eg for the [[grade]] command.
 <<functions>>=
-def add_submission_options(parser):
+def add_submission_options(parser, required=False):
   try:
-    assignments.add_assignment_option(parser)
+    assignments.add_assignment_option(parser, required=required)
   except argparse.ArgumentError:
     pass
 
   try:
-    users.add_user_or_group_option(parser)
+    users.add_user_or_group_option(parser, required=required)
+  except argparse.ArgumentError:
+    pass
+
+  submissions_parser = parser.add_argument_group("filter submissions")
+  try: # to protect from this option already existing in add_assignment_option
+    submissions_parser.add_argument("-U", "--ungraded", action="store_true",
+      help="Only ungraded submissions.")
   except argparse.ArgumentError:
     pass
 
@@ -172,9 +522,13 @@ def process_submission_options(canvas, args):
   user_list = users.process_user_or_group_option(canvas, args)
 
   if args.ungraded:
-    submissions = list_ungraded_submissions(assignment_list)
+    submissions = list_ungraded_submissions(assignment_list,
+      include=["submission_history", "submission_comments", 
+      "rubric_assessment"])
   else:
-    submissions = list_submissions(assignment_list)
+    submissions = list_submissions(assignment_list,
+      include=["submission_history", "submission_comments", 
+      "rubric_assessment"])
 
   return list(filter_submissions(submissions, user_list))
 @
@@ -236,79 +590,587 @@ def filter_submissions(submission_list, user_list):
 \section{Printing a submission}
 
 We provide two functions to print a submission.
-One to print a short identifier and one to print the submission data.
+One to print a short summary (row in CSV data) and one to print the submission 
+data for rendering.
+The first is to get an overview of all submissions, the latter to look into the 
+details of only one submission.
 
 We'll format the submission in short format.
 The most useful data is the identifier, the grade and the date of grading.
 <<functions>>=
 def format_submission_short(submission):
-  if submission.submitted_at:
-    date = submission.submitted_at
-  else:
-    date = submission.graded_at
-  return [submission.assignment.course.course_code, submission.assignment.name,
-    submission.user_id, submission.user.name, submission.grade, date]
+  return [
+    submission.assignment.course.course_code,
+    submission.assignment.name,
+    submission.user.name,
+    submission.grade, submission.submitted_at, submission.graded_at
+  ]
+@
+
+Sometimes we want the short format to contain a unique identifier (such as 
+[[login_id]]) instead of the name.
+<<functions>>=
+def format_submission_short_unique(submission):
+  <<get uid from submission's user object>>
+
+  return [
+    submission.assignment.course.course_code,
+    submission.assignment.name,
+    uid,
+    submission.grade, submission.submitted_at, submission.graded_at
+  ]
+@
+
+However, we note that sometimes the student doesn't have a [[login_id]] 
+attribute, so we can use their [[integration_id]] or [[sis_user_id]] instead 
+for uniqueness.
+See \cref{UserUniqueID} for details.
+<<get uid from submission's user object>>=
+uid = users.get_uid(submission.user)
 @
 
 We provide the function [[format_submission]] to nicely format a submission.
 It prints metadata, downloads any text attachments to include in the output.
-It also uses the [[canvas]] object to resolve course, assignment and user IDs.
+We also output all the submission history at the end.
+We no longer need the [[canvas]] object to resolve course, assignment and user 
+IDs, instead, we add these as attributes when fetching the objects.
+So [[submission.assignment]] is the assignment it came from, we don't need to 
+resolve the assignment from the assignmend ID.
+
+We have a [[md_title_level]] argument to specify the level of the title in the 
+Markdown version of the output.
+We want this to be able to recursively use [[format_submission]] to format the 
+submission history.
+This must then be passed to the recursive call and the section formatting.
 <<functions>>=
-def format_submission(submission, canvas):
-  """Formats submission for printing to stdout"""
+def format_submission(submission, history=False, json_format=False,
+                      md_title_level="#",
+                      <<[[format_submission]] args>>):
+  """
+  Formats submission for printing to stdout. Returns a string.
+
+  If history is True, include all submission versions from history.
+
+  If json_format is True, return a JSON string, otherwise Markdown.
+
+  `md_title_level` is the level of the title in Markdown, by default `#`. This 
+  is used to create a hierarchy of sections in the output.
+
+  <<[[format_submission]] doc>>
+  """
   student = submission.assignment.course.get_user(submission.user_id)
 
-  formatted_submission = f"""# Metadata
+  if json_format:
+    formatted_submission = {}
+  else:
+    formatted_submission = ""
 
-{submission.assignment.course.course_code} > {submission.assignment.name}
-
-- Student: {student.name} ({student.login_id or None}, {submission.user_id})
-- Submission ID: {submission.id}
-- Submitted (graded): {submission.submitted_at} ({submission.graded_at})
-- Grade: {submission.grade} ({submission.score})
-- SpeedGrader: {speedgrader(submission)}
-"""
-
-  try:
-    if submission.submission_comments:
-      formatted_submission += f"""
-
-# Comments
-"""
-
-    for comment in submission.submission_comments:
-      formatted_submission += f"""
-{comment["author_name"]} ({comment["created_at"]}):
-
-{comment["comment"]}
-"""
-  except AttributeError:
-    pass
-
-  formatted_submission += f"""
-
-# Body
-
-{submission.body}
-"""
-
-  try:
-    for attachment in submission.attachments:
-      if "text/" not in attachment["content-type"]:
-        continue
-
-      contents = urllib.request.urlopen(attachment["url"]).read().decode("utf-8")
-      formatted_submission += f"""
-
-## {attachment["filename"]}
-
-```
-{contents}
-```
-"""
-  except AttributeError:
-    pass
+  <<add metadata to output>>
+  <<add rubric assessment to output>>
+  <<add comments to output>>
+  if history:
+    <<add submission history to output>>
+  else:
+    <<add body to output>>
+    <<add quiz answers to output>>
+    <<add attachments to output>>
 
   return formatted_submission
+@
+
+\subsection{Some helper functions}
+
+We want to format some sections.
+The section has a title and a body.
+<<[[format_section]] doc>>=
+In the case of Markdown (default), we format the title as a header and the body 
+as a paragraph. If we don't do JSON, but receive a dictionary as the body, we 
+format it as a list of key-value pairs.
+
+`md_title_level` is the level of the title in Markdown, by default `#`.
+We'll use this to create a hierarchy of sections in the output.
+
+In the case of JSON, we return a dictionary with the title as the key and the 
+body as the value.
+<<functions>>=
+def format_section(title, body, json_format=False, md_title_level="#"):
+  """
+  <<[[format_section]] doc>>
+  """
+  if json_format:
+    return {title: body}
+
+  if isinstance(body, dict):
+    return "\n".join([
+      f" - {key.capitalize().replace('_', ' ')}: {value}"
+        for key, value in body.items()
+    ])
+
+  return f"\n{md_title_level} {title}\n\n{body}\n\n"
+@
+
+\subsection{Metadata}
+
+To format the metadata section, we simply pass the right strings to the section 
+formatting function.
+<<add metadata to output>>=
+metadata = {
+  "course": submission.assignment.course.course_code,
+  "assignment": submission.assignment.name,
+  "student": str(student),
+  "submission_id": submission.id,
+  "submitted_at": submission.submitted_at,
+  "graded_at": submission.graded_at,
+  "grade": submission.grade,
+  "graded_by": str(resolve_grader(submission)),
+  "speedgrader": speedgrader(submission)
+}
+
+if json_format:
+  formatted_submission.update(format_section("metadata", metadata,
+                                             json_format=True,
+                                             md_title_level=md_title_level))
+else:
+  formatted_submission += format_section("Metadata", metadata,
+                                         md_title_level=md_title_level)
+@
+
+Now to resolve the grader, we need to look up a user ID.
+Fortunately, we can do that through the course that is included as part of the 
+assignment, as part of the submission.
+(We add this manually in [[list_submissions]].)
+The grader ID is negative if it was graded automatically, \eg by a quiz or LTI 
+integration.
+If negative, it's either the quiz ID or LTI tool ID.
+(Negate to get the ID.)
+Finally, we look up the user object from the course.
+In some rare cases, we might not find the user, in which case we return the 
+grader ID as a string.
+<<functions>>=
+def resolve_grader(submission):
+  """
+  Returns a user object if the submission was graded by a human.
+  Otherwise returns None if ungraded or a descriptive string.
+  """
+  try:
+    if submission.grader_id is None:
+      return None
+  except AttributeError:
+    return None
+    
+  if submission.grader_id < 0:
+    return "autograded"
+
+  try:
+    return submission.assignment.course.get_user(submission.grader_id)
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    return f"unknown grader {submission.grader_id}"
+@
+
+\subsection{Rubric data}
+
+<<add rubric assessment to output>>=
+try:
+  if submission.rubric_assessment:
+    if json_format:
+      formatted_submission.update(format_section(
+        "rubric_assessment",
+        format_rubric(submission, json_format=True)),
+        json_format=True)
+    else:
+      formatted_submission += format_section(
+        "Rubric assessment",
+        format_rubric(submission))
+except AttributeError:
+  pass
+@
+
+\subsection{General comments}
+
+<<add comments to output>>=
+try:
+  if submission.submission_comments:
+    if json_format:
+      formatted_submission.update(format_section(
+        "comments", submission.submission_comments,
+        json_format=True))
+    else:
+      body = ""
+      for comment in submission.submission_comments:
+        body += f"{comment['author_name']} ({comment['created_at']}):\n\n"
+        body += comment["comment"] + "\n\n"
+      formatted_submission += format_section("Comments", body)
+except AttributeError:
+  pass
+@
+
+\subsection{Body}
+
+<<add body to output>>=
+try:
+  if submission.body:
+    if json_format:
+      formatted_submission.update(format_section(
+        "body", submission.body, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Body", submission.body,
+                                             md_title_level=md_title_level)
+except AttributeError:
+  pass
+@
+
+\subsection{Quiz answers}
+
+<<add quiz answers to output>>=
+try:
+  if submission.submission_data:
+    if json_format:
+      formatted_submission.update(format_section(
+        "quiz_answers", submission.submission_data,
+        json_format=True, md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section(
+        "Quiz answers",
+        json.dumps(submission.submission_data, indent=2),
+        md_title_level=md_title_level)
+except AttributeError:
+  pass
+@
+
+\subsection{Attachments}
+
+For the attachment, we want to add it to the output.
+In the case of Python code we want to have it as a Markdown code block.
+If it's a text file, we want to have it as part of the plain Markdown.
+We will try to convert the attachment to Markdown using [[pypandoc]].
+
+Since we want the files to be their own sections, for easy navigation, we must 
+bumps [[md_title_level]] by one to make the files a subsection of the main 
+submission.
+
+In the JSON version, we want to introduce one more level: the attachments 
+should be found under the key [[attachments]].
+<<add attachments to output>>=
+try:
+  <<attachment iteration variables>>
+  if json_format:
+    attachments = {}
+  for attachment in submission.attachments:
+    <<let [[contents]] be the converted [[attachment]]>>
+    formatted_attachment = format_section(attachment.filename, contents,
+                                          json_format=json_format,
+                                          md_title_level=md_title_level+"#")
+
+    if json_format:
+      attachments.update(formatted_attachment)
+    else:
+      formatted_submission += formatted_attachment
+
+  if json_format and attachments:
+    formatted_submission.update(format_section("attachments", attachments,
+                                               json_format=True,
+                                               md_title_level=md_title_level))
+except AttributeError:
+  pass
+@
+
+Let's look at the conversion.
+If it's a text-based format, we want to include it as a Markdown code block.
+Otherwise, we'll try to convert it to Markdown using [[pypandoc]].
+If the latter fails, we want to add a pointer to the file in the output, so 
+that the user can open it in an external viewer.
+
+In fact, having a copy of all the files locally is useful.
+We need to download it anyways, so we might just as well put a copy in a local 
+temporary directory too.
+We'll let the caller specify the directory to use, so we can use the same 
+directory for all attachments and potentially all users.
+<<[[format_submission]] args>>=
+tmpdir = None,
+<<[[format_submission]] doc>>=
+`tmpdir` is the directory to store all the submission files. Defaults to None, 
+which creates a temporary directory.
+<<attachment iteration variables>>=
+tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
+tmpdir.mkdir(parents=True, exist_ok=True)
+@
+
+We'll use [[tmpdir]] as the temporary directory to store the files when we try 
+to convert them.
+<<functions>>=
+def convert_to_md(attachment: canvasapi.file.File,
+                  tmpdir: pathlib.Path) -> str:
+  """
+  Converts `attachment` to Markdown. Returns the Markdown string.
+
+  Store a file version in `tmpdir`.
+  """
+  <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
+  content_type = getattr(attachment, "content-type")
+  <<if [[content_type]] is text, just use [[outfile]] contents>>
+  <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>
+  <<else convert [[outfile]] using [[pypandoc]]>>
+<<let [[contents]] be the converted [[attachment]]>>=
+contents = convert_to_md(attachment, tmpdir)
+@
+
+The download is simple.
+<<download [[attachment]] to [[outfile]] in [[tmpdir]]>>=
+outfile = tmpdir / attachment.filename
+attachment.download(outfile)
+@
+
+If the content type is text, we can just decode it and use it in a Markdown 
+code block with a suitable (Markdown) content type.
+This means that we can set what type of data the code block contains.
+We compute this text from the content type of the attachment.
+For instance, Python source code is [[text/x-python]].
+We remove the [[text/]] prefix and check if there is any [[x-]] prefix left, in 
+which case we remove that as well.
+
+Now, we want to change the content type to the format expected by Markdown to 
+do proper syntax highlighting.
+This requires some ugly processing since one [[.py]] file might have content 
+type [[text/x-python]] and another [[.py]] file might have 
+[[text/python-script]].
+<<functions>>=
+def text_to_md(content_type):
+  """
+  Takes a text-based content type, returns Markdown code block type.
+  Raises ValueError if not possible.
+  """
+  if content_type.startswith("text/"):
+    content_type = content_type[len("text/"):]
+  else:
+    raise ValueError(f"Not text-based content type: {content_type}")
+
+  if content_type.startswith("x-"):
+    content_type = content_type[2:]
+  if content_type == "python-script":
+    content_type = "python"
+
+  return content_type
+@
+
+This leaves us with the following.
+The advantage of reading the content from the file is that Python will solve 
+the encoding for us.
+Instead of using an [[if]] statement, we'll go all Python and use a 
+[[try-except]] block.
+<<if [[content_type]] is text, just use [[outfile]] contents>>=
+try:
+  md_type = text_to_md(content_type)
+  with open(outfile, "r") as f:
+    contents = f.read()
+  return f"```{md_type}\n{contents}\n```"
+except ValueError:
+  pass
+@
+
+Now we'll do the same for PDF files.
+We'll use [[pdf2txt]] to convert the PDF to text.
+However, here we'll use an if statement.
+We'll check for the content type to end with [[pdf]], that will capture also 
+[[x-pdf]].
+<<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>=
+if content_type.endswith("pdf"):
+  try:
+    return subprocess.check_output(["pdf2txt", str(outfile)],
+                                    text=True)
+  except subprocess.CalledProcessError:
+    pass
+@
+
+Finally, as a last attempt, we use [[pypandoc]] to try to convert it to 
+Markdown.
+Here we'll use Pandoc's ability to infer the file type on its own.
+This means we'll have to download the attachment as a file in a temporary 
+location and let Pandoc convert the file to Markdown.
+<<else convert [[outfile]] using [[pypandoc]]>>=
+try:
+  return pypandoc.convert_file(outfile, "markdown")
+except Exception as err:
+  return f"Cannot convert this file. " \
+         f"The file is located at\n\n  {outfile}\n\n"
+@
+
+
+\subsection{Submission history}
+
+The history contains all the student's submissions, including the current 
+submission.
+We want to keep track of what belongs to the different versions.
+This becomes important when we rely on the [[tmpdir]] to store the files.
+We don't want the files of one version overwrite the files of another.
+Then we can't be sure which version we're looking at.
+
+To produce the history, we'll modify [[tmpdir]] to create a subdirectory for 
+each version.
+We'll write a metadata file for each version.
+Then we'll return all of those in one main metadata file too.
+<<add submission history to output>>=
+try:
+  submission_history = submission.submission_history
+except AttributeError:
+  pass
+else:
+  if submission_history:
+    versions = {}
+    for version, prev_submission in enumerate(submission.submission_history):
+      version = str(version)
+      version_dir = tmpdir / f"version-{version}"
+
+      <<add [[prev_submission]] to [[versions]]>>
+      <<write [[prev_submission]] to file in [[version_dir]]>>
+
+    if json_format:
+      formatted_submission.update(format_section(
+        "submission_history", versions, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_versions = ""
+      for version, prev_metadata in versions.items():
+        formatted_versions += format_section(f"Version {version}",
+                                             prev_metadata,
+                                             md_title_level=md_title_level+"#")
+      formatted_submission += format_section(
+        "Submission history", formatted_versions,
+        md_title_level=md_title_level)
+@
+
+The [[prev_submission]] that we get is in raw JSON format from Canvas.
+We'll turn it into a [[Submission]] object and add the extra assignment 
+attribute to it.
+Now we can reuse the [[format_submission]] function to format this version's 
+submission metadata.
+
+Note that we can't pass on the [[history]] argument to [[format_submission]], 
+we need to let it know that it's formatting a history version in another way to 
+get the sectioning levels right.
+We'll use an argument [[md_title_level]].
+<<add [[prev_submission]] to [[versions]]>>=
+prev_submission = canvasapi.submission.Submission(
+  submission._requester, prev_submission)
+prev_submission.assignment = submission.assignment
+
+prev_metadata = format_submission(prev_submission,
+                                  tmpdir=version_dir,
+                                  json_format=json_format,
+                                  md_title_level=md_title_level+"#")
+
+versions[version] = prev_metadata
+@
+
+When we write the metadata to a file, we'll either just write a string or JSON 
+data.
+We can use [[json.dump]] to write the JSON data to a file.
+<<write [[prev_submission]] to file in [[version_dir]]>>=
+if json_format:
+  with open(version_dir/"metadata.json", "w") as f:
+    json.dump(prev_metadata, f, indent=2)
+else:
+  with open(version_dir/"metadata.md", "w") as f:
+    f.write(prev_metadata)
+@
+
+
+\section{Formatting rubrics}
+
+For assignments that use rubrics, we want to format those rubrics so that we 
+can read the results instead of just the cumulated grade.
+<<functions>>=
+def format_rubric(submission, json_format=False):
+  """
+  Format the rubric assessment of the `submission` in readable form.
+
+  If `json_format` is True, return a JSON string, otherwise Markdown.
+  """
+
+  if json_format:
+    result = {}
+  else:
+    result = ""
+
+  for crit_id, rating_data in submission.rubric_assessment.items():
+    criterion = get_criterion(crit_id, submission.assignment.rubric)
+    rating = get_rating(rating_data["rating_id"], criterion)
+    try:
+      comments = rating_data["comments"]
+    except KeyError:
+      comments = ""
+
+    <<add [[criterion]], [[rating]] and [[comments]] to [[result]]>>
+
+    if not json_format:
+      result += "\n"
+
+  return result.strip()
+@
+
+Sometimes Canvas is missing some data,
+for instance, an individual rating.
+So we add it only if it exists.
+<<add [[criterion]], [[rating]] and [[comments]] to [[result]]>>=
+if json_format:
+  result[criterion["description"]] = {
+    "rating": rating["description"] if rating else None,
+    "points": rating["points"] if rating else None,
+    "comments": comments
+  }
+else:
+  result += f"- {criterion['description']}: "
+  if rating:
+    result += f"{rating['description']} ({rating['points']})"
+  else:
+    result += "-"
+  result += "\n"
+  if comments:
+    result += textwrap.indent(textwrap.fill(f"- Comment: {comments}"),
+                              "  ")
+    result += "\n"
+@
+
+We can get the rating of a rubric from the rubric assessment.
+We can get this data from [[submission.rubric_assessment]] and it looks like 
+this:
+\begin{minted}{python}
+{'_7957': {'rating_id': '_6397', 'comments': '', 'points': 1.0},
+ '_1100': {'rating_id': '_8950', 'comments': '', 'points': 1.0}}
+\end{minted}
+
+We get the rubric with the assignment.
+So we can get it through [[submission.assignment.rubric]] and it looks like 
+this:
+\begin{minted}{python}
+[{'id': '_7957', 'points': 1.0, 'description': 'Uppfyller kraven i lydelsen', 
+'long_description': '', 'criterion_use_range': False, 'ratings': [{'id': 
+'_6397', 'points': 1.0, 'description': 'OK', 'long_description': ''}, {'id': 
+'_7836', 'points': 0.0, 'description': 'Påpekande', 'long_description': ''}]},
+{'id': '_1100', 'points': 1.0, 'description': 'Kan redogöra för alla detaljer', 
+'long_description': '', 'criterion_use_range': False, 'ratings': [{'id': 
+'_8950', 'points': 1.0, 'description': 'OK', 'long_description': ''}, {'id': 
+'_4428', 'points': 0.0, 'description': 'Påpekande', 'long_description': ''}]}]
+\end{minted}
+It's essentially a list of criterions.
+We want to extract a criterion by ID from the rubric.
+<<functions>>=
+def get_criterion(criterion_id, rubric):
+  """Returns criterion with ID `criterion_id` from rubric `rubric`"""
+  for criterion in rubric:
+    if criterion["id"] == criterion_id:
+      return criterion
+
+  return None
+@ And in exactly the same fashion we want to extract a rating from the 
+criterion.
+<<functions>>=
+def get_rating(rating_id, criterion):
+  """Returns rating with ID `rating_id` from rubric criterion `criterion`"""
+  for rating in criterion["ratings"]:
+    if rating["id"] == rating_id:
+      return rating
+
+  return None
 @
 

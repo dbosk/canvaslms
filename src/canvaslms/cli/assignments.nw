@@ -13,12 +13,16 @@ The [[assignment]] command lists information about a given assignment.
 We outline the module:
 <<assignments.py>>=
 import argparse
+import canvasapi
 import canvaslms.cli.courses as courses
 import canvaslms.hacks.canvasapi
 import csv
-import pydoc
+import json
+import os
 import pypandoc
 import re
+import rich.console
+import rich.markdown
 import sys
 
 <<functions>>
@@ -38,6 +42,99 @@ def add_assignment_command(subp):
 @
 
 
+\section{Selecting assignments on the command line}
+
+We now provide two functions that sets up the options for selecting an 
+assignment on the command line.
+These are used by the [[assignment_command]] and [[assignments_command]] 
+functions, but can also be used by other commands.
+
+When we select assignments, we have the option to only select those assignments 
+with ungraded submissions.
+However, this option is not always relevant, so we provide a way to disable it.
+But to select an assignment, we must first select a course.
+
+If the [[required]] option is set, we want to make all (relevant) options 
+required.
+<<functions>>=
+def add_assignment_option(parser, ungraded=True, required=False):
+  try:
+    courses.add_course_option(parser, required=required)
+  except argparse.ArgumentError:
+    pass
+
+  <<set up options for selecting assignments>>
+
+def process_assignment_option(canvas, args):
+  course_list = courses.process_course_option(canvas, args)
+  <<process options for selecting assignments to assignments list>>
+  return list(assignments_list)
+@
+
+As mentioned above, we want to be able to select only assignments with ungraded 
+submissions.
+Other than that, we want to select assignments in two alternative ways: by 
+assignment name or assignment group that an assignment belongs to.
+In summary, we want the following options:
+\begin{itemize}
+\item [[-U]] will filter assignments that have ungraded submissions.
+\item [[-a]] will take a regex for assignments.
+\item [[-A]] will take a regex for assignment groups.
+  Then we can return all assignments in those assignment groups.
+\end{itemize}
+These regular expressions match either the name or the Canvas identifier.
+This lets us add the following arguments.
+Remember, we add only the ungraded option if that was requested.
+Also, if we want the required version, we want to require either an assignment 
+or an assignment group to be specified.
+<<set up options for selecting assignments>>=
+if ungraded:
+  parser.add_argument("-U", "--ungraded", action="store_true",
+    help="Filter only assignments with ungraded submissions.")
+
+parser = parser.add_mutually_exclusive_group(required=required)
+
+parser.add_argument("-a", "--assignment",
+  required=False, default=".*",
+  help="Regex matching assignment title or Canvas identifier, "
+    "default: '.*'")
+
+parser.add_argument("-A", "--assignment-group",
+  required=False, default="",
+  help="Regex matching assignment group title or Canvas identifier.")
+@
+
+Now we iterate over the [[course_list]] to get to the assignment groups to then 
+filter out the assignments.
+We must get all assignments for a course and all assignment groups.
+Then we can filter out the matching assignments.
+<<process options for selecting assignments to assignments list>>=
+assignments_list = []
+
+for course in course_list:
+  try:
+    ungraded = args.ungraded
+  except AttributeError:
+    ungraded = False
+
+  all_assignments = list(filter_assignments([course],
+    args.assignment,
+    ungraded=ungraded))
+
+  try:
+    assignm_grp_regex = args.assignment_group
+  except AttributeError:
+    print("default to .* for group")
+    assignm_grp_regex = ".*"
+
+  assignment_groups = filter_assignment_groups(course, assignm_grp_regex)
+
+  for assignment_group in assignment_groups:
+    assignments_list += list(filter_assignments_by_group(
+        assignment_group, all_assignments))
+@
+
+
 \section{The [[assignments]] subcommand and its options}
 
 We add the subparser for [[assignments]].
@@ -45,63 +142,37 @@ We add the subparser for [[assignments]].
 assignments_parser = subp.add_parser("assignments",
     help="Lists assignments of a course",
     description="Lists assignments of a course. "
-      "Output, CSV-format: <Canvas ID> <assignment name>")
+      <<assignments help on output format>>)
 assignments_parser.set_defaults(func=assignments_command)
-courses.add_course_option(assignments_parser)
-<<set up positional argument for assignment group regex>>
-<<set up options for selecting type of assignments>>
+add_assignment_option(assignments_parser)
 @ Now, that [[assignments_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
-We use [[process_course_option]] to parse the options that we added with the 
-[[add_course_option]] function above.
+We use [[process_assignment_option]] to parse the options that we added with 
+the [[add_assignment_option]] function above.
 <<functions>>=
 def assignments_command(config, canvas, args):
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
-  course_list = courses.process_course_option(canvas, args)
-
+  assignment_list = process_assignment_option(canvas, args)
   <<write assignments by assignment group to output>>
 @
 
-\subsection{Regex for filtering assignment groups}
-
-We want to be able to list only assignments in particular assignment groups.
-<<set up positional argument for assignment group regex>>=
-assignments_parser.add_argument("regex",
-  default=".*", nargs="?",
-  help="Regex for filtering assignment groups, default: '.*'")
-@
-
-\subsection{Selecting the type of assignments}
-
-We also want to be able to filter out the type of assignments.
-For now, we focus on all or ungraded.
-<<set up options for selecting type of assignments>>=
-assignments_parser.add_argument("-u", "--ungraded", action="store_true",
-  help="Show only ungraded assignments.")
-@ We don't need to do any particular processing for this option.
-
-
-\subsection{Filter and output the list of assignments}
-
-We then simply call the list-assignments function with the [[courses_list]] 
-object as a parameter.
-Then we will print the most useful attributes (identifiers) of an assignment in 
-CSV format.
+We then simply get the filtered list from the processing of the assignment 
+options, stored in [[assignment_list]] above.
+Then we will print the most useful attributes.
+<<assignments help on output format>>=
+"Output, CSV-format: "
+"<course> <assignment group> <assignment name> "
+"<due date> <unlock at> <lock at>"
 <<write assignments by assignment group to output>>=
-for course in course_list:
-  if args.ungraded:
-    all_assignments = list(list_ungraded_assignments([course]))
-  else:
-    all_assignments = list(list_assignments([course]))
-
-  assignment_groups = filter_assignment_groups(course, args.regex)
-
-  for assignment_group in assignment_groups:
-    assignments = filter_assignments_by_group(
-        assignment_group, all_assignments)
-
-    for assignment in assignments:
-      output.writerow([assignment_group.name, assignment.name])
+for assignment in assignment_list:
+  output.writerow([
+    assignment.course.course_code,
+    assignment.assignment_group.name,
+    assignment.name,
+    assignment.due_at,
+    assignment.unlock_at,
+    assignment.lock_at
+  ])
 @
 
 
@@ -122,9 +193,10 @@ assignment group.
 <<functions>>=
 def filter_assignments_by_group(assignment_group, assignments):
   """Returns elements in assignments that are part of assignment_group"""
-  return filter(
-      lambda assignment: assignment.assignment_group_id == assignment_group.id,
-      assignments)
+  for assignment in assignments:
+    if assignment.assignment_group_id == assignment_group.id:
+      assignment.assignment_group = assignment_group
+      yield assignment
 @
 
 
@@ -146,48 +218,40 @@ the options that we added with the [[add_course_option]] and
 [[add_assignment_option]] functions above.
 <<functions>>=
 def assignment_command(config, canvas, args):
+  console = rich.console.Console()
+
   assignment_list = process_assignment_option(canvas, args)
   for assignment in assignment_list:
-    pydoc.pager(format_assignment(assignment))
-@
+    output = format_assignment(assignment)
 
+    if sys.stdout.isatty():
+      <<check if we should use styles>>
+      with console.pager(styles=styles, links=True):
+        console.print(rich.markdown.Markdown(output,
+                                             code_theme="manni"))
+    else:
+      print(output)
+@ Note that we use the theme [[manni]] for the code, as this works in both dark 
+and light terminals.
 
-\section{Selecting assignments on the command line}
+\subsection{Check if we should use styles}
 
-We now provide two functions that sets up the options for selecting an 
-assignment on the command line.
-These are used above by the [[assignment_command]], but can also be used by 
-other commands.
+By default, [[rich.console.Console]] uses the [[pydoc.pager]], which uses the 
+system pager (as determined by environment variables etc.).
+The default usually can't handle colours, so [[rich]] doesn't use colours when 
+paging.
+We want to check if [[less -r]] or [[less -R]] is set as the pager, in that 
+case we can use styles.
+<<check if we should use styles>>=
+pager = ""
+if "MANPAGER" in os.environ:
+  pager = os.environ["MANPAGER"]
+elif "PAGER" in os.environ:
+  pager = os.environ["PAGER"]
 
-To select an assignment, we must first select a course.
-<<functions>>=
-def add_assignment_option(parser):
-  try:
-    courses.add_course_option(parser)
-  except argparse.ArgumentError:
-    pass
-
-  <<set up options for selecting assignments>>
-
-def process_assignment_option(canvas, args):
-  course_list = courses.process_course_option(canvas, args)
-  <<process options for selecting assignments>>
-  return list(assignments_list)
-@
-
-We add one option [[-a]] to select an assignment.
-This is a regular expression which matches the assignment name and identifier.
-<<set up options for selecting assignments>>=
-parser.add_argument("-a", "--assignment",
-  required=False, default=".*",
-  help="Regex matching assignment title or Canvas identifier, "
-    "default: '.*'")
-@
-
-Now we can use the [[course_list]] and [[filter_assignments]] to filter out the 
-desired assignments.
-<<process options for selecting assignments>>=
-assignments_list = filter_assignments(course_list, args.assignment)
+styles = False
+if "less" in pager and ("-R" in pager or "-r" in pager):
+  styles = True
 @
 
 
@@ -199,15 +263,85 @@ The assignment contents given by Canvas is HTML, we want to pipe that through
 <<functions>>=
 def format_assignment(assignment):
   """Returns an assignment formatted for the terminal"""
-  instruction = pypandoc.convert_text(
-    assignment.description, "md", format="html")
+  text = f"""
+<<format assignment metadata>>
 
-  return f"""# {assignment.name}
+"""
 
-{instruction}
+  if assignment.description:
+    instruction = pypandoc.convert_text(
+      assignment.description, "md", format="html")
+    text += f"## Instruction\n\n{instruction}\n\n"
+    <<try to add rubric>>
+  else:
+    <<try to add rubric>>
+    text += f"## Assignment data\n\n```json\n{format_json(assignment)}\n```\n"
 
-URL: {assignment.html_url}
-Submissions: {assignment.submissions_download_url}"""
+  return text
+@
+
+\subsection{Assignment metadata}
+
+Now let's look at the metadata to add.
+<<format assignment metadata>>=
+# {assignment.name}
+
+## Metadata
+
+- Unlocks: {assignment.unlock_at if assignment.unlock_at else None}
+- Due:     {assignment.due_at if assignment.due_at else None}
+- Locks:   {assignment.lock_at if assignment.lock_at else None}
+- Ungraded submissions: {assignment.needs_grading_count}
+- Submission type: {assignment.submission_types}
+- URL: {assignment.html_url}
+- Submissions: {assignment.submissions_download_url}
+@
+
+\subsection{Assignment rubric}
+
+We want to format the rubric as well.
+<<try to add rubric>>=
+try:
+  text += f"## Rubric\n\n{format_rubric(assignment.rubric)}\n\n"
+except AttributeError:
+  pass
+@
+
+We'll do this with [[format_rubric]].
+It should output a markdown representation of the rubric.
+<<functions>>=
+def format_rubric(rubric):
+  """
+  Returns a markdown representation of the rubric
+  """
+  if not rubric:
+    return "No rubric set."
+
+  text = ""
+  for criterion in rubric:
+    text += f"- {criterion['description']}\n"
+    text += f"  - Points: {criterion['points']}\n"
+    text += f"  - Ratings: "
+    text += "; ".join([
+      f"{rating['description'].strip()} ({rating['points']})"
+      for rating in criterion["ratings"]
+    ]) + "\n"
+    text += f"\n```\n{criterion['long_description']}\n```\n\n"
+
+  return text
+@
+
+\subsection{Assignment data as raw JSON}
+
+We also want to format the assignment data as JSON.
+We must extract all attributes from the assignment object.
+<<functions>>=
+def format_json(assignment):
+  """Returns a JSON representation of the assignment"""
+  return json.dumps({
+    key: str(value) for key, value in assignment.__dict__.items()
+      if not key.startswith("_")
+  }, indent=2)
 @
 
 
@@ -224,25 +358,47 @@ We provide the following functions:
 We return the assignments for a list of courses, since we can match several 
 courses with a regular expression (using [[filter_courses]]).
 <<functions>>=
-def list_assignments(courses):
-  for course in courses:
-    for assignment in course.get_assignments():
-      assignment.course = course
+def list_assignments(assignments_containers, ungraded=False):
+  """Lists all assignments in all assignments containers (courses or 
+  assignement groups)"""
+  for container in assignments_containers:
+    if isinstance(container, canvasapi.course.Course):
+      course = container
+    elif isinstance(container, canvasapi.assignment.AssignmentGroup):
+      assignment_group = container
+      course = assignment_group.course
+
+    if ungraded:
+      assignments = container.get_assignments(bucket="ungraded")
+    else:
+      assignments = container.get_assignments()
+
+    for assignment in assignments:
+      try:
+        assignment.course = course
+      except NameError:
+        pass
+
+      try:
+        assignment.assignment_group = assignment_group
+      except NameError:
+        pass
+
       yield assignment
 
-def list_ungraded_assignments(courses):
-  for course in courses:
-    for assignment in course.get_assignments(bucket="ungraded"):
-      assignment.course = course
-      yield assignment
+def list_ungraded_assignments(assignments_containers):
+  return list_assignments(assignments_containers, ungraded=True)
 @
 
 We also want to filter out assignments on the title based on regex.
+We also take an optional default argument to indicate whether we only want 
+ungraded assignments.
 <<functions>>=
-def filter_assignments(courses, regex):
-  """Returns all assignments from courses whose title matches regex"""
+def filter_assignments(assignments_containers, regex, ungraded=False):
+  """Returns all assignments from assignments_container whose
+  title matches regex"""
   p = re.compile(regex)
-  for assignment in list_assignments(courses):
+  for assignment in list_assignments(assignments_containers, ungraded=ungraded):
     if p.search(assignment.name):
       yield assignment
     elif p.search(str(assignment.id)):

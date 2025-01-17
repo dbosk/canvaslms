@@ -1,29 +1,25 @@
-NOWEAVEFLAGS.tex=	-n -delay -t2
 NOTANGLEFLAGS.py=
 
+MODULES+=	__init__.py cli.tex
+MODULES+=	login.py login.tex
+MODULES+=	courses.py courses.tex
+MODULES+=	users.py users.tex
+MODULES+=	assignments.py assignments.tex
+MODULES+=	submissions.py submissions.tex
+MODULES+=	grade.py grade.tex
+MODULES+=	results.py results.tex
 
 .PHONY: all
-all: __init__.py cli.tex
-all: login.py login.tex
-all: courses.py courses.tex
-all: users.py users.tex
-all: assignments.py assignments.tex
-all: submissions.py submissions.tex
-all: grade.py grade.tex
+all: ${MODULES}
 
+.INTERMEDIATE: cli.py
 __init__.py: cli.py
 	mv $< $@
 
 
 .PHONY: clean
 clean:
-	${RM} cli.tex cli.py __init__.py
-	${RM} login.py login.tex
-	${RM} courses.tex courses.py
-	${RM} users.tex users.py
-	${RM} assignments.tex assignments.py
-	${RM} submissions.tex submissions.py
-	${RM} grade.tex grade.py
+	${RM} ${MODULES}
 
 
 INCLUDE_MAKEFILES=../../../makefiles
