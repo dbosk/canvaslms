@@ -5,6 +5,14 @@ is `canvaslms` and it has several subcommands in the same style as Git.
 `canvaslms` provides output in a format useful for POSIX tools, this
 makes automating tasks much easier.
 
+## Getting started
+
+Start by login to your Canvas server
+
+``` {.text}
+canvaslms login
+```
+
 Let's consider how to grade students logging into the student-shell SSH
 server. We store the list of students' Canvas and KTH IDs in a file.
 
