@@ -19,6 +19,7 @@ We outline the module:
 <<users.py>>=
 import argparse
 import canvasapi.course
+import canvasapi.exceptions
 import canvasapi.group
 import canvaslms.cli
 import canvaslms.cli.courses as courses
@@ -260,7 +261,7 @@ def add_groups_command(subp):
   groups_parser = subp.add_parser("groups",
     help="Lists groups of a course",
     description="Lists groups of a course(s). Output, CSV-format: "
-      "<Canvas ID> <group category> <group name> <#members>")
+      "<course code> <group category> <group name> <#members>")
   groups_parser.set_defaults(func=groups_command)
   courses.add_course_option(groups_parser)
   <<add groups specific options>>
@@ -298,7 +299,10 @@ else:
 
 for category in categories:
   for group in filter_groups([category], args.regex):
-    row = [group.id, category.name, group.name, group.members_count]
+    row = [
+      category.course.course_code, category.name,
+      group.name, group.members_count
+    ]
     output.writerow(row)
 @
 
@@ -313,8 +317,10 @@ we can filter out groups; or filter out groups directly from courses.
 We want to filter out the group categories from a list of courses.
 <<functions>>=
 def filter_group_categories(course_list, regex):
-  """Filters out the group categories whose names match regex
-  in the courses in course_list"""
+  """
+  Filters out the group categories whose names match regex
+  in the courses in course_list
+  """
 
   name = re.compile(regex or ".*")
 
@@ -334,9 +340,11 @@ method [[.get_groups()]], so thanks to Python's duck typing we can write short
 code.
 <<functions>>=
 def filter_groups(items, regex):
-  """Items is a list of either courses or group categories,
+  """
+  Items is a list of either courses or group categories,
   regex is a regular expression.
-  Returns all groups whose name match regex."""
+  Returns all groups whose name match regex.
+  """
 
   name = re.compile(regex or ".*")
 
@@ -366,13 +374,23 @@ We provide the following functions:
 
 First, we provide [[list_users]], which takes a list of courses and a list of 
 Canvas roles as arguments.
+Here we must be careful.
+For some courses we can't list the users, because of lacking permissions.
+Whenever we're searching for a particular user, we might look in all courses, 
+and then we must skip those where we can't list the users.
+This way we can search through all other courses instead of stopping at the 
+first error.
 <<functions>>=
 def list_users(courses, roles):
   """List users in courses with roles"""
   users = list()
 
   for course in courses:
-    course_users = list(course.get_users(enrollment_type=roles))
+    try:
+      course_users = list(course.get_users(enrollment_type=roles))
+    except canvasapi.exceptions.CanvasException as err:
+      canvaslms.cli.warn(f"skipped {course}: {err}")
+      continue
     for user in course_users:
       user.course = course
     users.extend(course_users)
@@ -383,6 +401,11 @@ def list_users(courses, roles):
 Second, we provide the most general function, [[filter_users]], which takes a 
 list of courses, a list of Canvas roles and a regex as arguments.
 It returns the matching users.
+
+We compile the regex to a pattern.
+This is because it's slightly faster, since we reuse the regex for several 
+searches.
+We'll ignore case.
 <<functions>>=
 def filter_users(course_list, regex, roles=[]):
   """
@@ -393,15 +416,23 @@ def filter_users(course_list, regex, roles=[]):
   - integration id (exact match),
   - SIS user ID (exact match).
   """
-  pattern = re.compile(regex or ".*")
+  pattern = re.compile(regex or ".*", re.IGNORECASE)
 
   for user in list_users(course_list, roles):
-    <<check if user matches>>
+    <<yield [[user]] if match>>
 @
 
 Now to check if the user matches, we want to match some things by regular 
 expression, but other things exactly.
-<<check if user matches>>=
+The reasoning is this:
+If we use the name, we might match on parts of it; if the user has a unique 
+enough name.
+But if we give the integration ID, we wouldn't try to give part of it; it's not 
+predicable how much of it will give a unique match, and it doesn't make sense 
+to look for students with a common prefix of their integration IDs.
+Also, some attributes might not exist, so we must try-except them and issue a warning 
+if they don't exist.
+<<yield [[user]] if match>>=
 if str(user.id) == regex:
   yield user
   continue

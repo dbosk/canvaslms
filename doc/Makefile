@@ -11,6 +11,7 @@ all: canvaslms.pdf
 canvaslms.pdf: canvaslms.bib
 canvaslms.pdf: abstract.tex
 canvaslms.pdf: canvaslms.tex 
+canvaslms.pdf: didactic.sty
 
 canvaslms.pdf: ${SRC_DIR}/hacks/canvasapi.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cli.tex
@@ -41,3 +42,5 @@ INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
 
+INCLUDE_DIDACTIC=./didactic
+include ${INCLUDE_DIDACTIC}/didactic.mk

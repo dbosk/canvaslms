@@ -6,9 +6,11 @@ handles an individual submission.
 
 We outline the module:
 <<submissions.py>>=
+import canvasapi.exceptions
 import canvasapi.file
 import canvasapi.submission
 
+import canvaslms.cli
 import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
 import canvaslms.hacks.canvasapi
@@ -24,10 +26,13 @@ import re
 import rich.console
 import rich.markdown
 import rich.json
+import shlex
 import sys
 import tempfile
+import textwrap
 import urllib.request
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -56,6 +61,7 @@ submissions_parser = subp.add_parser("submissions",
 submissions_parser.set_defaults(func=submissions_command)
 assignments.add_assignment_option(submissions_parser)
 add_submission_options(submissions_parser)
+<<add options for history>>
 <<add options for printing>>
 @ Now, that [[submissions_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
@@ -71,20 +77,60 @@ def submissions_command(config, canvas, args):
 
 We then simply call the appropriate list-submissions function with the 
 [[assignments_list]] object as a parameter.
+However, since we optionally want to include the submission history, we must 
+pass that as an argument to the list-submissions function.
+<<get submissions and print them>>=
+to_include=[]
+if args.history:
+  to_include += ["submission_history"]
+
+if args.ungraded:
+  submissions = list_ungraded_submissions(assignment_list, include=to_include)
+else:
+  submissions = list_submissions(assignment_list, include=to_include)
+<<add options for history>>=
+submissions_parser.add_argument("-H", "--history", action="store_true",
+  help="Include submission history.")
+@
+
 If any of the group options are set, we filter out the submissions to only 
 include submissions by the users in the groups.
-Then we will print the most useful attributes of a submission, which the 
-[[format_submission_short]] will return preformatted for us.
 <<get submissions and print them>>=
-if args.ungraded:
-  submissions = list_ungraded_submissions(assignment_list)
-else:
-  submissions = list_submissions(assignment_list)
-
 if args.user or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
   submissions = filter_submissions(submissions, user_list)
+@
 
+Now the list [[submissions]] contains all the submissions we want to print.
+However, only the most recent.
+If we want to include the history, we must fetch all the versions of the 
+submissions from each submission object.
+
+The submission history ([[.submission_history]] attribute) contains all 
+versions, including the latest.
+So we turn them into proper submission objects, add them to a list.
+Then we can use this list instead of the original [[submissions]] list.
+This way, we also maintain the ordering.
+<<get submissions and print them>>=
+if args.history:
+  submissions = list(submissions)
+  historical_submissions = []
+  for submission in submissions:
+    for prev_submission in submission.submission_history:
+      prev_submission = canvasapi.submission.Submission(submission._requester,
+                                                        prev_submission)
+      prev_submission.assignment = submission.assignment
+      prev_submission.user = submission.user
+      historical_submissions.append(prev_submission)
+
+  submissions = historical_submissions
+@
+
+Then we will print the most useful attributes of each submission, which the 
+[[format_submission_short]] and
+[[format_submission_short_unique]] functions
+will return preformatted for us.
+<<get submissions and print them>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
 
 for submission in submissions:
@@ -92,9 +138,7 @@ for submission in submissions:
     output.writerow(format_submission_short_unique(submission))
   else:
     output.writerow(format_submission_short(submission))
-@
-
-Now, we must add that option [[args.login_id]].
+@ Now, we must add that option [[args.login_id]].
 <<add options for printing>>=
 submissions_parser.add_argument("-l", "--login-id",
   help="Print login ID instead of name.",
@@ -106,6 +150,8 @@ submissions_parser.add_argument("-l", "--login-id",
 
 Sometimes we want to compute the URL for SpeedGrader for a submission.
 The [[Submission]] objects come with an attribute [[preview_url]].
+(However, previous submissions don't have this, so if it doesn't exist, we use 
+[[None]].)
 We want to turn that one into the SpeedGrader URL.
 The [[preview_url]] looks like this:
 \begin{minted}{text}
@@ -121,7 +167,10 @@ We use Python's regex abilities to rewrite the URL.
 <<functions>>=
 def speedgrader(submission):
   """Returns the SpeedGrader URL of the submission"""
-  speedgrader_url = submission.preview_url
+  try:
+    speedgrader_url = submission.preview_url
+  except AttributeError:
+    return None
 
   speedgrader_url = re.sub("assignments/",
     "gradebook/speed_grader?assignment_id=",
@@ -175,10 +224,15 @@ raw markdown.
 However, we might want to write all data to the output directory.
 In that case, we don't print anything to stdout.
 
-Finally, if we use a pager, we'll first open the directory with the files, so 
-that the user can explore the files while reading the output (containing the 
-grading and comments).
-That way, the user can try to run the Python code too, if necessary.
+Finally, we might also want to open the directory of files, either in a shell 
+or in the system file manager.
+We'll open the directory in the file manager so that the user can explore the 
+files while reading the output (containing the grading and comments).
+So we must open this first, then we can proceed.
+
+When we spawn a shell, we don't want to do anything else.
+But open in the file manager we can do no matter what the user wants to do, if 
+they pipe the output or skip the output altogether.
 <<get and print the submission data>>=
 console = rich.console.Console()
 <<create [[tmpdir]]>>
@@ -191,14 +245,17 @@ for submission in submission_list:
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
-  if args.output_dir:
-    pass
-  elif args.open == "shell":
+  if args.open == "open":
+    <<open [[tmpdir/subdir]] for the user>>
+  elif args.open == "all":
+    <<open all files in [[tmpdir/subdir]] for the user>>
+
+  if <<condition that [[args.open]] tells us to spawn a shell>>:
     <<spawn shell in [[tmpdir/subdir]] for the user>>
+  elif args.output_dir:
+    pass
   elif sys.stdout.isatty():
     <<check if we should use styles>>
-    if args.open == "open":
-      <<open [[tmpdir/subdir]] for the user>>
     with console.pager(styles=styles):
       <<print [[output]] using [[console.print]]>>
   else:
@@ -216,18 +273,22 @@ submission_parser.add_argument("-o", "--output-dir",
        "If specified, do not print to stdout.")
 @
 
-We also have the open option, that has a choice of two alternatives.
+We also have the open option, that has a choice of a few alternatives.
 <<add submission command options>>=
 submission_parser.add_argument("--open", required=False,
-  nargs="?", default=None, const="open", choices=["open", "shell"],
+  nargs="?", default=None, const="open",
+  choices=["open", "all"]+choices_for_shells,
   help="Open the directory containing the files using "
-       "the default file manager (`open`) or "
-       "spawn a shell in the directory (`shell`). "
+       "the default file manager (`open`). "
        "With `open`, the pager will be used to display the output as usual. "
-       "With `shell`, we just drop into the shell, the output can be "
-       "found in the metadata.{json,md} file in the shell's working "
-       "directory. "
-       "Default: %(default)s")
+       "With `all`, all files (not the directory containing them) will be "
+       "opened in the default application for the file type. "
+       <<help strings for open shell options>>
+       "Default: %(const)s")
+<<condition that [[args.open]] tells us to spawn a shell>>=
+args.open in choices_for_shells
+<<constants>>=
+<<define [[choices_for_shells]]>>
 @
 
 Finally, we can add the [[json]] option to the [[submission]] command.
@@ -305,16 +366,118 @@ Sometimes we want to open the directory.
 There are several ways we can do this.
 We can open the directory with the system file explorer, that way the user can 
 open files while reading the stdout output using a pager.
-We can also spawn a shell in the directory so that the user can run the Python 
-code.
+<<open [[tmpdir/subdir]] for the user>>=
+subprocess.run(["open", tmpdir/subdir])
+@
+
+If we instead want to open all files contained in the directory, we can need to 
+iterate all the files and open them one by one.
+<<open all files in [[tmpdir/subdir]] for the user>>=
+for file in (tmpdir/subdir).iterdir():
+  subprocess.run(["open", file])
+@
+
+We can also spawn a shell in the directory so that the user can work with the 
+files, for instance run the Python code in the case of a Python lab submission.
+Now, we could spawn a sub-shell of the user's shell,
+we'll let this be the [[shell]] option.
+Another approach would be to run a Docker image and mount the directory in the 
+container.
+This would be the [[docker]] option.
+<<define [[choices_for_shells]]>>=
+choices_for_shells = ["shell", "docker"]
+<<help strings for open shell options>>=
+"With `shell`, we just drop into the shell (as set by $SHELL), "
+"the output can be found in the metadata.{json,md} file in "
+"the shell's working directory. "
+"With `docker`, we run a Docker container with the "
+"directory mounted in the container. "
+"This way we can run the code in the submission in a "
+"controlled environment. "
+"Note that this requires Docker to be installed and running. "
 <<spawn shell in [[tmpdir/subdir]] for the user>>=
-print(f"---> Opening a shell ({os.environ['SHELL']}) in {tmpdir/subdir}")
+if args.open == "shell":
+  <<spawn sub-shell in [[tmpdir/subdir]] for the user>>
+elif args.open == "docker":
+  <<run a Docker container with [[tmpdir/subdir]] mounted in the container>>
+@
+
+In both cases, we want to print some useful info for the user, so that they can 
+more easily orient themselves.
+In the case of the sub-shell, we print a message and then spawn the shell in 
+the directory.
+At exit, we print a message that the shell has terminated and that the files 
+are left in the directory, so the user can go back without executing the 
+command again.
+<<spawn sub-shell in [[tmpdir/subdir]] for the user>>=
+print(f"---> Spawning a shell ({os.environ['SHELL']}) in {tmpdir/subdir}")
+
 subprocess.run([
   "sh", "-c", f"cd '{tmpdir/subdir}' && exec {os.environ['SHELL']}"
 ])
-print(f"<--- canvaslms submission shell terminated.")
-<<open [[tmpdir/subdir]] for the user>>=
-subprocess.run(["open", tmpdir/subdir])
+
+print(f"<--- canvaslms submission shell terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.")
+@
+
+We want to do the same for Docker.
+However, this is a bit more complicated.
+We need to know which image to use and which command to run in the container.
+We also need to know any other options that we might want to pass to Docker.
+<<run a Docker container with [[tmpdir/subdir]] mounted in the container>>=
+print(f"---> Running a Docker container, files mounted in /mnt.")
+
+cmd = [
+  "docker", "run", "-it", "--rm"
+]
+if args.docker_args:
+  cmd += args.docker_args
+cmd += [
+  "-v", f"{tmpdir/subdir}:/mnt",
+  args.docker_image, args.docker_cmd
+]
+
+subprocess.run(cmd)
+
+print(f"<--- canvaslms submission Docker container terminated.\n"
+      f"---- Files left in {tmpdir/subdir}.\n"
+      f"---- To rerun the container, run:\n"
+      f"`{' '.join(map(shlex.quote, cmd))}`")
+@
+
+This requires us to add an option for the Docker image to use and an option for 
+the command to run in the Docker container.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-image", required=False,
+  default="ubuntu",
+  help="The Docker image to use when running a Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+submission_parser.add_argument("--docker-cmd", required=False,
+  default="bash",
+  help="The command to run in the Docker container. "
+       "This is used with the `docker` option for `--open`. "
+       "Default: %(default)s")
+@
+
+For the last argument, [[args.docker_args]], we want to be able to pass any 
+arguments to the Docker command.
+This should be a list of strings, so we can just pass it on to the 
+[[subprocess.run]] function.
+
+Using the [[argparse.REMAINDER]] option, we can pass the rest of the command 
+line to the Docker command.
+This is useful since it saves us a lot of problems with escaping options that 
+we want to pass to Docker, instead of our argparser to parse it.
+Normally, if we want to pass [[-e LADOK_USER]] to Docker, our argparser would 
+pick up that [[-e]] as an option, unless escaped.
+<<add submission command options>>=
+submission_parser.add_argument("--docker-args", required=False,
+  default=[], nargs=argparse.REMAINDER,
+  help="Any additional arguments to pass to the Docker command. "
+       "This is used with the `docker` option for `--open`. "
+       "Note that this must be the last option on the command line, it takes "
+       "the rest of the line as arguments for Docker.")
 @
 
 
@@ -338,7 +501,9 @@ if "less" in pager and ("-R" in pager or "-r" in pager):
   styles = True
 <<submission command description>>=
 Uses MANPAGER or PAGER environment variables for the pager to page output. If 
-the `-r` or `-R` flag is passed to `less`, it uses colours in the output.
+the `-r` or `-R` flag is passed to `less`, it uses colours in the output. That 
+is, set `PAGER=less -r` or `PAGER=less -R` to get coloured output from this 
+command.
 
 @
 
@@ -613,6 +778,9 @@ The grader ID is negative if it was graded automatically, \eg by a quiz or LTI
 integration.
 If negative, it's either the quiz ID or LTI tool ID.
 (Negate to get the ID.)
+Finally, we look up the user object from the course.
+In some rare cases, we might not find the user, in which case we return the 
+grader ID as a string.
 <<functions>>=
 def resolve_grader(submission):
   """
@@ -627,7 +795,11 @@ def resolve_grader(submission):
     
   if submission.grader_id < 0:
     return "autograded"
-  return submission.assignment.course.get_user(submission.grader_id)
+
+  try:
+    return submission.assignment.course.get_user(submission.grader_id)
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    return f"unknown grader {submission.grader_id}"
 @
 
 \subsection{Rubric data}
@@ -772,6 +944,7 @@ def convert_to_md(attachment: canvasapi.file.File,
   <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
   content_type = getattr(attachment, "content-type")
   <<if [[content_type]] is text, just use [[outfile]] contents>>
+  <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>
   <<else convert [[outfile]] using [[pypandoc]]>>
 <<let [[contents]] be the converted [[attachment]]>>=
 contents = convert_to_md(attachment, tmpdir)
@@ -818,6 +991,8 @@ def text_to_md(content_type):
 This leaves us with the following.
 The advantage of reading the content from the file is that Python will solve 
 the encoding for us.
+Instead of using an [[if]] statement, we'll go all Python and use a 
+[[try-except]] block.
 <<if [[content_type]] is text, just use [[outfile]] contents>>=
 try:
   md_type = text_to_md(content_type)
@@ -828,7 +1003,22 @@ except ValueError:
   pass
 @
 
-If the content type is not text, we use [[pypandoc]] to convert it to Markdown.
+Now we'll do the same for PDF files.
+We'll use [[pdf2txt]] to convert the PDF to text.
+However, here we'll use an if statement.
+We'll check for the content type to end with [[pdf]], that will capture also 
+[[x-pdf]].
+<<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>=
+if content_type.endswith("pdf"):
+  try:
+    return subprocess.check_output(["pdf2txt", str(outfile)],
+                                    text=True)
+  except subprocess.CalledProcessError:
+    pass
+@
+
+Finally, as a last attempt, we use [[pypandoc]] to try to convert it to 
+Markdown.
 Here we'll use Pandoc's ability to infer the file type on its own.
 This means we'll have to download the attachment as a file in a temporary 
 location and let Pandoc convert the file to Markdown.
@@ -836,7 +1026,7 @@ location and let Pandoc convert the file to Markdown.
 try:
   return pypandoc.convert_file(outfile, "markdown")
 except Exception as err:
-  return f"Pandoc cannot convert this file. " \
+  return f"Cannot convert this file. " \
          f"The file is located at\n\n  {outfile}\n\n"
 @
 
@@ -964,12 +1154,16 @@ if json_format:
     "comments": comments
   }
 else:
-  result += f"{criterion['description']}: "
+  result += f"- {criterion['description']}: "
   if rating:
     result += f"{rating['description']} ({rating['points']})"
   else:
     result += "-"
   result += "\n"
+  if comments:
+    result += textwrap.indent(textwrap.fill(f"- Comment: {comments}"),
+                              "  ")
+    result += "\n"
 @
 
 We can get the rating of a rubric from the rubric assessment.
