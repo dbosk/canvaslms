@@ -9,6 +9,11 @@ MODULES+=	submissions.py submissions.tex
 MODULES+=	grade.py grade.tex
 MODULES+=	results.py results.tex
 
+MODULES+=	utils.tex
+MODULES+=	afstats pfstats
+MODULES+=	lsgroup
+MODULES+=	OLIstats
+
 .PHONY: all
 all: ${MODULES}
 
