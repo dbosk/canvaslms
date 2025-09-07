@@ -55,3 +55,17 @@ Some subcommands use `pandoc`, so you will likely have to [install
 pandoc][pandoc] on your system manually.
 
 [pandoc]: https://pandoc.org/installing.html
+
+## Development
+
+This project uses literate programming with [noweb](https://www.cs.tufts.edu/~nr/noweb/). 
+The source code is written in `.nw` files which combine documentation and code.
+
+### GitHub Copilot Setup
+
+This repository includes GitHub Copilot configuration files:
+- `.github/copilot-instructions.md`: Project context and coding guidelines
+- `.copilotignore`: Files to exclude from Copilot context
+
+The configuration helps Copilot understand the literate programming approach, 
+Canvas LMS domain, and project-specific patterns.
