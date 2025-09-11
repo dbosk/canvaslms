@@ -53,21 +53,20 @@ def add_command(subp):
     # Add arguments
     parser.set_defaults(func=command_function)
 
-def command_function(args):
+def command_function(config, canvas, args):
     """Implementation of the command"""
     # Command logic here
 ```
 
 #### Canvas API Usage
 ```python
-import canvasapi
 import canvaslms.cli.courses as courses
 
-def get_canvas_and_course(args):
-    """Standard pattern for getting Canvas instance and course"""
-    canvas = Canvas(args.canvas_url, args.canvas_token)
-    course = courses.get_course(canvas, args.course)
-    return canvas, course
+def example_command(config, canvas, args):
+    """Standard pattern for Canvas API usage"""
+    # Canvas object is already instantiated and passed to the function
+    course_list = courses.process_course_option(canvas, args)
+    # Use the course_list for further processing
 ```
 
 #### Output Formatting
@@ -97,13 +96,13 @@ def get_canvas_and_course(args):
 1. **Follow existing patterns**: Look at existing subcommands for structure
 2. **POSIX compatibility**: Ensure output works well with Unix tools
 3. **Error handling**: Provide clear error messages for common failures
-4. **Documentation**: Include docstrings and inline comments for complex logic
+4. **Documentation**: Include docstrings and inline comments for complex logic and summarize the ideas behind complex logic in the TeX part of the literate source code
 5. **Testing**: Consider edge cases like missing courses, invalid IDs, etc.
 
 ### Naming Conventions
 - Use snake_case for Python functions and variables
 - CLI commands use lowercase with hyphens (e.g., `canvas-lms`)
-- Module names match their primary command
+- Module names match their primary command (though usually a module has a set of subcommands)
 
 ### Canvas API Best Practices
 - Always validate course and assignment IDs
@@ -114,7 +113,7 @@ def get_canvas_and_course(args):
 ## Build System
 
 The project uses a Make-based build system:
-- `make compile`: Generate Python files from .nw sources
+- `make all`: Generate Python files from .nw sources
 - `make install`: Install the package locally
 - `poetry build`: Create distribution packages
 
@@ -127,6 +126,9 @@ Generated Python files should not be edited directly - modify the .nw sources in
 2. Implement the `add_command(subp)` function
 3. Add the module import to cli.nw
 4. Follow existing patterns for argument parsing and Canvas API usage
+
+### Module Utility Functions
+Each module often provides utility functions to add options to other commands. For example, the course module provides a function to add all options to match courses (`add_course_option`), then it provides a function to generate a list of courses, given the args (`process_course_option`). These patterns allow for consistent option handling across subcommands.
 
 ### Canvas Data Retrieval
 - Use course.get_assignments() for assignment lists
