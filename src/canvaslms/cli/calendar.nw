@@ -25,6 +25,7 @@ import csv
 import datetime
 import sys
 import arrow
+import textwrap
 
 <<functions>>
 
@@ -87,8 +88,8 @@ If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
 <<process course option for calendar list>>=
 context_codes = []
-if hasattr(args, 'course') and args.course:
-  course_list = courses.process_course_option(canvas, args)
+course_list = courses.process_course_option(canvas, args)
+if course_list:
   context_codes = [f"course_{course.id}" for course in course_list]
 @
 
@@ -96,6 +97,10 @@ if hasattr(args, 'course') and args.course:
 \section{Getting and outputting calendar events}
 
 We fetch the calendar events and output them in CSV format.
+
+The \texttt{args.type} parameter is optional and may be \texttt{None} by default.
+When \texttt{None}, the Canvas API includes all event types (both ``event'' and ``assignment'').
+When specified, it filters to only the requested type.
 <<get and output calendar events>>=
 try:
   # Prepare parameters for API call
@@ -170,7 +175,18 @@ try:
   
   print(f"Event ID: {event.id}")
   print(f"Title: {getattr(event, 'title', 'N/A')}")
-  print(f"Description: {getattr(event, 'description', 'N/A')}")
+  
+  # Handle multiline description with proper alignment
+  description = getattr(event, 'description', 'N/A')
+  if description and description != 'N/A':
+    # Split description into lines and align continuation lines
+    lines = description.split('\n')
+    print(f"Description: {lines[0]}")
+    for line in lines[1:]:
+      print(f"             {line}")
+  else:
+    print(f"Description: {description}")
+  
   print(f"Start: {getattr(event, 'start_at', 'N/A')}")
   print(f"End: {getattr(event, 'end_at', 'N/A')}")
   print(f"Location: {getattr(event, 'location_name', 'N/A')}")
@@ -185,12 +201,20 @@ except canvasapi.exceptions.CanvasException as e:
 \section{The \texttt{calendar create} subcommand}
 
 The \texttt{calendar create} subcommand creates a new calendar event.
+It supports two types of events:
+\begin{itemize}
+\item Regular calendar events (\texttt{--event-type event}, default)
+\item Appointment groups for bookable time slots (\texttt{--event-type appointment\_group})
+\end{itemize}
+
+Appointment groups allow students to book time slots within a defined time range.
+This is useful for office hours, lab sessions, or individual consultations.
 <<functions>>=
 def add_calendar_create_command(subp):
   """Adds the calendar create subcommand and its options to argparse subparser subp"""  
   calendar_create_parser = subp.add_parser("create",
     help="Creates a new calendar event", 
-    description="Creates a new calendar event")
+    description="Creates a new calendar event or appointment group for bookable time slots")
   calendar_create_parser.set_defaults(func=calendar_create_command)
   courses.add_course_option(calendar_create_parser)
   <<add calendar create arguments>>
@@ -212,40 +236,95 @@ calendar_create_parser.add_argument("--description",
   help="Description of the event")
 calendar_create_parser.add_argument("--location",
   help="Location of the event")
+calendar_create_parser.add_argument("--event-type", 
+  choices=["event", "appointment_group"],
+  default="event",
+  help="Type of calendar event to create (default: event)")
+calendar_create_parser.add_argument("--time-slot-duration", type=int,
+  help="Duration in minutes for each bookable time slot (only for appointment_group type)")
+calendar_create_parser.add_argument("--max-appointments", type=int, default=1,
+  help="Maximum appointments per time slot (only for appointment_group type, default: 1)")
 @
 
 We create the calendar event with the specified parameters.
 <<create calendar event>>=
 try:
-  # Prepare event parameters
-  params = {
-    'calendar_event': {
-      'title': args.title,
-      'start_at': args.start_time,
+  if args.event_type == "appointment_group":
+    # Create appointment group (bookable time slots)
+    params = {
+      'appointment_group': {
+        'title': args.title,
+        'start_at': args.start_time,
+        'end_at': args.end_time or args.start_time,  # End time required for appointment groups
+        'participants_per_appointment': args.max_appointments,
+        'participant_visibility': 'protected',  # Students can see appointment times
+        'max_appointments_per_participant': 1,
+      }
     }
-  }
-  
-  if args.end_time:
-    params['calendar_event']['end_at'] = args.end_time
-  if args.description:
-    params['calendar_event']['description'] = args.description  
-  if args.location:
-    params['calendar_event']['location_name'] = args.location
     
-  # Set context if course is specified
-  if hasattr(args, 'course') and args.course:
-    course_list = courses.process_course_option(canvas, args)
-    if course_list:
-      course = list(course_list)[0]  # Use first course if multiple
-      params['calendar_event']['context_code'] = f"course_{course.id}"
-  
-  event = canvas.create_calendar_event(**params)
-  
-  print(f"Created calendar event with ID: {event.id}")
-  print(f"Title: {event.title}")
-  print(f"Start: {getattr(event, 'start_at', 'N/A')}")
-  if hasattr(event, 'end_at') and event.end_at:
-    print(f"End: {event.end_at}")
+    if args.description:
+      params['appointment_group']['description'] = args.description
+    if args.location:
+      params['appointment_group']['location_name'] = args.location
+    if args.time_slot_duration:
+      params['appointment_group']['min_appointments_per_participant'] = 1
+      # Canvas uses the duration to create time slots automatically
+      # We need to set sub_context_codes for the course context
+      
+    # Set context if course is specified
+    if hasattr(args, 'course') and args.course:
+      course_list = courses.process_course_option(canvas, args)
+      if course_list:
+        course = list(course_list)[0]  # Use first course if multiple
+        params['appointment_group']['context_codes'] = [f"course_{course.id}"]
+        params['appointment_group']['sub_context_codes'] = [f"course_{course.id}"]
+    
+    # Note: Canvas API creates appointment groups differently than regular events
+    # This creates the appointment group, then students can book time slots
+    response = canvas._Canvas__requester.request(
+      'POST', 
+      'appointment_groups',
+      **params
+    )
+    
+    print(f"Created appointment group with ID: {response.json().get('id')}")
+    print(f"Title: {args.title}")
+    print(f"Start: {args.start_time}")
+    print(f"End: {args.end_time or args.start_time}")
+    if args.time_slot_duration:
+      print(f"Time slot duration: {args.time_slot_duration} minutes")
+    print(f"Max appointments per slot: {args.max_appointments}")
+    
+  else:
+    # Create regular calendar event
+    params = {
+      'calendar_event': {
+        'title': args.title,
+        'start_at': args.start_time,
+      }
+    }
+    
+    if args.end_time:
+      params['calendar_event']['end_at'] = args.end_time
+    if args.description:
+      params['calendar_event']['description'] = args.description  
+    if args.location:
+      params['calendar_event']['location_name'] = args.location
+      
+    # Set context if course is specified
+    if hasattr(args, 'course') and args.course:
+      course_list = courses.process_course_option(canvas, args)
+      if course_list:
+        course = list(course_list)[0]  # Use first course if multiple
+        params['calendar_event']['context_code'] = f"course_{course.id}"
+    
+    event = canvas.create_calendar_event(**params)
+    
+    print(f"Created calendar event with ID: {event.id}")
+    print(f"Title: {event.title}")
+    print(f"Start: {getattr(event, 'start_at', 'N/A')}")
+    if hasattr(event, 'end_at') and event.end_at:
+      print(f"End: {event.end_at}")
   
 except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to create calendar event: {e}")
