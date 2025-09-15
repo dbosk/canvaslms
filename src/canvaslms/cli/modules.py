@@ -44,7 +44,7 @@ def add_module_option(parser, required=False):
         pass
 
     parser.add_argument(
-        "-z",
+        "-M",
         "--module",
         required=required,
         default="" if not required else None,
