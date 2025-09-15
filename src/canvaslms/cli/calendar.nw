@@ -53,6 +53,67 @@ def add_command(subp):
 @
 
 
+\section{Some helper functions}
+
+We need some helper functions.
+Particularly, we want to format ISO timestamps in local time for better 
+readability.
+We also want to parse ISO timestamps given by the user as local time in the 
+system timezone.
+
+Parse the ISO timestamps with [[arrow]], convert them to the system’s local 
+timezone via to('local'), and format as a readable string.
+If a timestamp is missing or unparsable, fall back to “N/A” or the original 
+string.
+<<functions>>=
+def format_local_time(iso_ts):
+  """
+  Formats an ISO timestamp string in local time (YYYY-MM-DD HH:MM).
+  """
+  if not iso_ts:
+    return "N/A"
+  try:
+    return arrow.get(iso_ts).to('local').format('YYYY-MM-DD HH:MM')
+  except Exception:
+    return iso_ts
+@
+
+Next, we need a function to parse user-provided ISO timestamps as local time in 
+the system timezone and convert them to UTC ISO format for the API.
+Additionally, the API requires the UTC timestamp to end with a "Z" instead of 
+"+00:00".
+<<functions>>=
+def format_canvas_time(iso_ts):
+  """
+  Parses an ISO timestamp string as local time and converts to UTC ISO format.
+  """
+  if not iso_ts:
+    return None
+  try:
+    if isinstance(iso_ts, datetime.datetime):
+      # Already a datetime object
+      dt = iso_ts
+      if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=arrow.now().tzinfo)
+      return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00",
+                                                                      "Z")
+    elif isinstance(iso_ts, datetime.date):
+      # Date only, interpret as start of day in local timezone
+      dt = datetime.datetime.combine(iso_ts, datetime.time(0, 0))
+      dt = dt.replace(tzinfo=arrow.now().tzinfo)
+      return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00",
+                                                                      "Z")
+    elif isinstance(iso_ts, arrow.Arrow):
+      return iso_ts.to('utc').isoformat().replace("+00:00", "Z")
+    elif isinstance(iso_ts, str):
+      return arrow.get(iso_ts,
+                       tzinfo='local').to('utc').isoformat().replace("+00:00",
+                                                                     "Z")
+  except Exception as e:
+    raise ValueError(f"Invalid date/time format: {e}")
+@
+
+
 \section{The \texttt{calendar list} subcommand}
 
 The \texttt{calendar list} subcommand lists calendar events, optionally filtered by course.
@@ -75,17 +136,81 @@ def calendar_list_command(config, canvas, args):
   <<get and output calendar events>>
 @
 
-We add options to filter events by date range.
+We add an option to choose the CSV delimiter (default: tab).
 <<add calendar list arguments>>=
-calendar_list_parser.add_argument("--start-date",
-  default=arrow.now().format('YYYY-MM-DD'),
-  help="Start date for event filter (YYYY-MM-DD format, defaults to today)")
-calendar_list_parser.add_argument("--end-date", 
-  default=arrow.now().shift(weeks=1).format('YYYY-MM-DD'),
-  help="End date for event filter (YYYY-MM-DD format, defaults to one week from today)")
+calendar_list_parser.add_argument("--delimiter", "-D",
+  default="\t",
+  help="Delimiter for CSV output (default: tab)")
+@
+
+We add options to filter events.
+<<add calendar list arguments>>=
 calendar_list_parser.add_argument("--type",
   choices=["event", "assignment"],
   help="Filter by event type")
+@
+
+When we add time filtering arguments, we allow either a single date/time 
+([[--on]]) or a start/end date range ([[--start-time]] and [[--end-time]]).
+Both with accept a date and an optional time.
+<<functions>>=
+def add_time_filtering_arguments(parser):
+  """Adds time filtering arguments to the given argparse parser"""
+  parser.add_argument("--on",
+    help="Single date (YYYY-MM-DD) or time (YYYY-MM-DD HH:mm ) "
+         "to search on (overrides start/end times)")
+  parser.add_argument("--start-time",
+    default=arrow.now().format('YYYY-MM-DD HH:mm'),
+    help="Start date for search (YYYY-MM-DD [HH:mm], default: now)")
+  parser.add_argument("--end-time",
+    default=arrow.now().shift(weeks=1).format('YYYY-MM-DD HH:mm'),
+    help="End date for search (YYYY-MM-DD [HH:mm], "
+         "default: one week from now.)")
+<<add calendar list arguments>>=
+add_time_filtering_arguments(calendar_list_parser)
+@
+
+When we process these, we want the [[--on]] option to override the start/end 
+options.
+When we use [[--on]], we use the start and end to be the same.
+This works with Canvas, which includes events that start or end within the 
+given range---that is, a minimal window, as expected.
+<<determine [[start_time]] and [[end_time]] from [[args]]>>=
+if args.on:
+  try:
+    start_time = arrow.get(args.on, 'YYYY-MM-DD HH:mm').to('utc')
+    end_time = start_time
+  except Exception:
+    try:
+      start_time = arrow.get(args.on, 'YYYY-MM-DD').to('utc')
+      end_time = start_time.shift(days=1)
+    except Exception as e:
+      canvaslms.cli.err(1, f"Invalid date format for --on: {e}")
+
+  start_time = start_time.format()
+  end_time = end_time.format()
+else:
+  try:
+    start_time = arrow.get(args.start_time,
+                          'YYYY-MM-DD HH:mm').to('utc').format()
+  except:
+    try:
+      start_time = arrow.get(args.start_time,
+                            'YYYY-MM-DD').to('utc').format()
+    except Exception as e:
+      canvaslms.cli.err(1, f"Invalid date format for --start-time: {e}")
+  try:
+    end_time = arrow.get(args.end_time,
+                        'YYYY-MM-DD HH:mm').to('utc').format()
+  except:
+    try:
+      end_time = arrow.get(args.end_time,
+                          'YYYY-MM-DD').to('utc').format()
+    except Exception as e:
+      canvaslms.cli.err(1, f"Invalid date format for --end-time: {e}")
+
+start_time = format_canvas_time(start_time)
+end_time = format_canvas_time(end_time)
 @
 
 
@@ -94,10 +219,7 @@ calendar_list_parser.add_argument("--type",
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
 <<process course option for calendar list>>=
-context_codes = []
 course_list = courses.process_course_option(canvas, args)
-if course_list:
-  context_codes = [f"course_{course.id}" for course in course_list]
 @
 
 
@@ -109,20 +231,35 @@ The \texttt{args.type} parameter is optional and may be \texttt{None} by default
 When \texttt{None}, the Canvas API includes all event types (both 
 \enquote{event} and \enquote{assignment}).
 When specified, it filters to only the requested type.
-<<get and output calendar events>>=
-try:
-  # Prepare parameters for API call
+<<functions>>=
+def get_calendar_events(canvas, course_list=None,
+                        start_time=None, end_time=None, event_type=None):
+  """Fetches calendar events from Canvas with optional filters"""
   params = {}
+  if course_list:
+    context_codes = [f"course_{course.id}" for course in course_list]
+  else:
+    context_codes = None
   if context_codes:
     params['context_codes'] = context_codes
-  if args.start_date:
-    params['start_date'] = args.start_date
-  if args.end_date:
-    params['end_date'] = args.end_date
-  if args.type:
-    params['type'] = args.type
+  if start_time:
+    params['start_date'] = start_time
+  if end_time:
+    params['end_date'] = end_time
+  if event_type:
+    params['type'] = event_type
     
-  events = canvas.get_calendar_events(**params)
+  return canvas.get_calendar_events(**params)
+<<get and output calendar events>>=
+<<determine [[start_time]] and [[end_time]] from [[args]]>>
+try:
+  events = get_calendar_events(
+    canvas,
+    course_list=course_list,
+    start_time=start_time,
+    end_time=end_time,
+    event_type=args.type
+  )
   
   for event in events:
     <<output calendar event data>>
@@ -132,12 +269,21 @@ except canvasapi.exceptions.CanvasException as e:
 @
 
 We output the calendar event data in a structured format.
-<<output calendar event data>>=
-# Get context information
-context_type = getattr(event, 'context_type', '')
-context_name = getattr(event, 'context_name', '')
+There are two ways to output the data:
+\begin{enumerate}
+\item Just the events.
+\item For each event, we output one line per booked student.
+  And one line for any free slots.
+\end{enumerate}
+We'll add an option to choose between these two modes.
+<<add calendar list arguments>>=
+calendar_list_parser.add_argument("--bookings", "-b",
+  action="store_true", default=False,
+  help="Output one line per booked student and one line for free slots "
+       "(only for appointment group events)")
+@
 
-# Format dates, change to local time if possible
+<<output calendar event data>>=
 start_at = format_local_time(getattr(event, 'start_at', None))
 end_at = format_local_time(getattr(event, 'end_at', None))
 
@@ -147,14 +293,36 @@ try:
 except AttributeError:
   participants = ''
 
-row = [
-  getattr(event, 'id', ''),
-  getattr(event, 'title', ''),
-  start_at,
-  end_at,
-  participants,
-]
-output.writerow(row)
+if args.bookings:
+  try:
+    slots = event.child_events
+  except AttributeError:
+    pass
+  else:
+    if event.available_slots:
+      output.writerow([
+        event.title,
+        start_at,
+        end_at,
+        f"{event.available_slots} free slots"
+      ])
+    if slots:
+      for slot in slots:
+        user_name = slot["user"]["name"]
+        user_uname = slot["user"]["login_id"]
+        output.writerow([
+          slot["title"],
+          format_local_time(slot["start_at"]),
+          format_local_time(slot["end_at"]),
+          f"{user_name} ({user_uname})"
+        ])
+else:
+  output.writerow([
+    event.title,
+    start_at,
+    end_at,
+    participants,
+  ])
 @
 
 
@@ -192,15 +360,7 @@ calendar_show_parser.add_argument("--ignore-case", "-i",
   action="store_true",
   help="Make the regex case-insensitive")
 
-# Date range filters
-calendar_show_parser.add_argument("--on",
-  help="Single date (YYYY-MM-DD) to search on (overrides start/end date)")
-calendar_show_parser.add_argument("--start-date",
-  default=arrow.now().format('YYYY-MM-DD'),
-  help="Start date for search (YYYY-MM-DD, default: today)")
-calendar_show_parser.add_argument("--end-date",
-  default=arrow.now().shift(weeks=1).format('YYYY-MM-DD'),
-  help="End date for search (YYYY-MM-DD, default: one week from today)")
+add_time_filtering_arguments(calendar_show_parser)
 
 # How many events to print
 calendar_show_parser.add_argument("--count", "-n", type=int, default=1,
@@ -210,7 +370,7 @@ calendar_show_parser.add_argument("--count", "-n", type=int, default=1,
 
 We fetch events in the requested date window, filter them by regex (if provided), sort by start time, and print up to the requested count.
 <<get and display calendar event details>>=
-<<determine date window>>
+<<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
 
 # Prepare parameters for API call
@@ -224,10 +384,10 @@ if course_list:
 if context_codes:
   params['context_codes'] = context_codes
 
-if start_date:
-  params['start_date'] = start_date
-if end_date:
-  params['end_date'] = end_date
+if start_time:
+  params['start_date'] = start_time
+if end_time:
+  params['end_date'] = end_time
 
 try:
   events = canvas.get_calendar_events(**params)
@@ -296,17 +456,6 @@ def print_event_details(event):
     pass # Not an appointment group event
   
   print(f"URL:      {getattr(event, 'html_url', 'N/A')}")
-@
-
-We use either a single date ([[--on]]) or a start/end date range to filter 
-events.
-<<determine date window>>=
-if args.on:
-  start_date = args.on
-  end_date = args.on
-else:
-  start_date = args.start_date
-  end_date = args.end_date
 @
 
 We compile the regex patterns once, handling any errors.
@@ -398,21 +547,6 @@ We want to format the times in local timezone for better readability.
 <<format start and end times>>=
 print(f"Start:    {format_local_time(getattr(event, 'start_at', None))}")
 print(f"End:      {format_local_time(getattr(event, 'end_at', None))}")
-@ Parse the ISO timestamps with [[arrow]], convert them to the system’s local 
-timezone via to('local'), and format as a readable string.
-If a timestamp is missing or unparsable, fall back to “N/A” or the original 
-string.
-<<functions>>=
-def format_local_time(iso_ts):
-  """
-  Formats an ISO timestamp string in local time (YYYY-MM-DD HH:mm).
-  """
-  if not iso_ts:
-    return "N/A"
-  try:
-    return arrow.get(iso_ts).to('local').format('YYYY-MM-DD HH:mm')
-  except Exception:
-    return iso_ts
 @
 
 \section{The \texttt{calendar create} subcommand}
@@ -468,8 +602,8 @@ We interpret the start and end times ([[args.start_time]] and
 [[args.end_time]]) as local time in the system timezone.
 <<create calendar event>>=
 try:
-  start_time = arrow.get(args.start_time).to('utc').format()
-  end_time = arrow.get(args.end_time).to('utc').format()
+  start_time = format_canvas_time(arrow.get(args.start_time, tzinfo='local'))
+  end_time = format_canvas_time(arrow.get(args.end_time, tzinfo='local'))
 except Exception as e:
   canvaslms.cli.err(1, f"Invalid date/time format: {e}")
 
@@ -557,14 +691,15 @@ if not args.time_slot_duration:
 params["appointment_group"]["new_appointments"] = {}
 
 slot_duration = datetime.timedelta(minutes=args.time_slot_duration)
-current_start = arrow.get(start_time, tzinfo='local')
-end = arrow.get(end_time, tzinfo='local')
+current_start = arrow.get(start_time)
+end = arrow.get(end_time)
+import pdb; pdb.set_trace()
 
 slot_num = 0
 while current_start + slot_duration <= end:
   slot = [
-    current_start.to("utc").isoformat().replace("+00:00", "Z"),
-    (current_start + slot_duration).to("utc").isoformat().replace("+00:00", "Z")
+    format_canvas_time(current_start),
+    format_canvas_time(current_start + slot_duration)
   ]
   params["appointment_group"]["new_appointments"][str(slot_num)] = slot
   current_start += slot_duration
