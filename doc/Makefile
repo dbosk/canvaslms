@@ -24,6 +24,12 @@ canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
 canvaslms.pdf: ${SRC_DIR}/cli/results.tex
 canvaslms.pdf: ${SRC_DIR}/grades/grades.tex
 
+canvaslms.pdf: src
+
+.PHONY: src
+src:
+	${MAKE} -C ${SRC_DIR} all
+
 ${SRC_DIR}/%.tex: ${SRC_DIR}/%.nw
 	${MAKE} -C $(dir $@) $(notdir $@)
 
