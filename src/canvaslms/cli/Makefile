@@ -9,6 +9,8 @@ MODULES+=	submissions.py submissions.tex
 MODULES+=	grade.py grade.tex
 MODULES+=	results.py results.tex
 MODULES+=	calendar.py calendar.tex
+MODULES+=	discussions.py discussions.tex
+MODULES+= 	utils.py utils.tex
 
 .PHONY: all
 all: ${MODULES}
