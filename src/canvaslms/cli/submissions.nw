@@ -57,12 +57,13 @@ submissions_parser = subp.add_parser("submissions",
     help="Lists submissions of an assignment",
     description="Lists submissions of assignment(s). Output format: "
       "<course code> <assignment name> <user> <grade> "
-      "<submission date> <grade date>")
+      "<submission date> <grade date> [<peer reviews received> <peer reviews given>]")
 submissions_parser.set_defaults(func=submissions_command)
 assignments.add_assignment_option(submissions_parser)
 add_submission_options(submissions_parser)
 <<add options for history>>
 <<add options for printing>>
+<<add options for peer reviews>>
 @ Now, that [[submissions_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
 It must also do the processing for the assignment options using 
@@ -138,6 +139,11 @@ submissions = list(submissions)
 if not submissions:
   raise canvaslms.cli.EmptyListError("No submissions found matching the criteria")
 
+# Set peer review inclusion flag based on args
+include_peer_reviews = not args.no_peer_reviews
+format_submission_short._include_peer_reviews = include_peer_reviews
+format_submission_short_unique._include_peer_reviews = include_peer_reviews
+
 for submission in submissions:
   if args.login_id:
     output.writerow(format_submission_short_unique(submission))
@@ -148,6 +154,12 @@ for submission in submissions:
 submissions_parser.add_argument("-l", "--login-id",
   help="Print login ID instead of name.",
   default=False, action="store_true")
+@
+
+We also provide options to control peer review output:
+<<add options for peer reviews>>=
+submissions_parser.add_argument("--no-peer-reviews", action="store_true",
+  help="Exclude peer review columns from CSV output.")
 @
 
 
@@ -197,7 +209,7 @@ Here we provide a subcommand [[submission]] which deals with an individual
 submission.
 <<submission command description>>=
 Prints data about matching submissions, including submission and grading time, 
-and any text-based attachments.
+peer review information, and any text-based attachments.
 
 <<add submission command to subp>>=
 submission_parser = subp.add_parser("submission",
@@ -246,7 +258,8 @@ for submission in submission_list:
   output = format_submission(submission,
                              history=args.history,
                              tmpdir=tmpdir/subdir,
-                             json_format=args.json)
+                             json_format=args.json,
+                             include_peer_reviews=not args.no_peer_reviews)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -522,6 +535,8 @@ history.
 <<add options for printing a submission>>=
 submission_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
+submission_parser.add_argument("--no-peer-reviews", action="store_true",
+  help="Exclude peer review information from detailed output.")
 @
 
 
@@ -642,12 +657,19 @@ We'll format the submission in short format.
 The most useful data is the identifier, the grade and the date of grading.
 <<functions>>=
 def format_submission_short(submission):
-  return [
+  received_count, given_count = format_peer_reviews_short(submission)
+  base_row = [
     submission.assignment.course.course_code,
     submission.assignment.name,
     submission.user.name,
     submission.grade, submission.submitted_at, submission.graded_at
   ]
+  
+  # Check if peer reviews should be excluded (this will be set by the calling function)
+  if hasattr(format_submission_short, '_include_peer_reviews') and format_submission_short._include_peer_reviews:
+    return base_row + [received_count, given_count]
+  else:
+    return base_row
 @
 
 Sometimes we want the short format to contain a unique identifier (such as 
@@ -655,13 +677,20 @@ Sometimes we want the short format to contain a unique identifier (such as
 <<functions>>=
 def format_submission_short_unique(submission):
   <<get uid from submission's user object>>
+  received_count, given_count = format_peer_reviews_short(submission)
 
-  return [
+  base_row = [
     submission.assignment.course.course_code,
     submission.assignment.name,
     uid,
     submission.grade, submission.submitted_at, submission.graded_at
   ]
+  
+  # Check if peer reviews should be excluded (this will be set by the calling function)
+  if hasattr(format_submission_short_unique, '_include_peer_reviews') and format_submission_short_unique._include_peer_reviews:
+    return base_row + [received_count, given_count]
+  else:
+    return base_row
 @
 
 However, we note that sometimes the student doesn't have a [[login_id]] 
@@ -711,6 +740,7 @@ def format_submission(submission, history=False, json_format=False,
   <<add metadata to output>>
   <<add rubric assessment to output>>
   <<add comments to output>>
+  <<add peer reviews to output>>
   if history:
     <<add submission history to output>>
   else:
@@ -847,6 +877,33 @@ except AttributeError:
   pass
 @
 
+\subsection{Peer Reviews}
+
+<<add peer reviews to output>>=
+if include_peer_reviews:
+  try:
+    peer_review_data = format_peer_reviews_detailed(submission, json_format=json_format)
+    if json_format:
+      if peer_review_data["received_reviews"] or peer_review_data["given_reviews"]:
+        formatted_submission.update(format_section(
+          "peer_reviews", peer_review_data, json_format=True,
+          md_title_level=md_title_level))
+    else:
+      # Always include peer review section, even if empty
+      formatted_submission += format_section("Peer Reviews", peer_review_data,
+                                             md_title_level=md_title_level)
+  except Exception:
+    # Handle gracefully if peer review data is not available
+    if json_format:
+      formatted_submission.update(format_section(
+        "peer_reviews", {"received_reviews": [], "given_reviews": []}, 
+        json_format=True, md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Peer Reviews", 
+                                             "Peer review data not available.",
+                                             md_title_level=md_title_level)
+@
+
 \subsection{Body}
 
 <<add body to output>>=
@@ -930,10 +987,13 @@ temporary directory too.
 We'll let the caller specify the directory to use, so we can use the same 
 directory for all attachments and potentially all users.
 <<[[format_submission]] args>>=
-tmpdir = None,
+tmpdir = None, include_peer_reviews=True,
 <<[[format_submission]] doc>>=
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
+
+`include_peer_reviews` controls whether to include peer review information in the output. 
+Defaults to True.
 <<attachment iteration variables>>=
 tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
 tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1215,5 +1275,116 @@ def get_rating(rating_id, criterion):
       return rating
 
   return None
+
+def get_submission_peer_reviews(submission):
+  """
+  Get peer reviews for a submission.
+  
+  Returns a tuple of (received_reviews, given_reviews):
+  - received_reviews: list of peer reviews OF this submission (by others)
+  - given_reviews: list of peer reviews BY this student (of other submissions)
+  """
+  try:
+    # Get reviews OF this submission (received by the student)
+    received_reviews = list(submission.get_submission_peer_reviews())
+  except Exception:
+    received_reviews = []
+  
+  try:
+    # Get all peer reviews for the assignment to find reviews BY this student
+    all_peer_reviews = list(submission.assignment.get_peer_reviews())
+    # Filter to find reviews written BY this student
+    given_reviews = [pr for pr in all_peer_reviews 
+                    if pr.assessor_id == submission.user_id]
+  except Exception:
+    given_reviews = []
+  
+  return received_reviews, given_reviews
+
+def format_peer_reviews_short(submission):
+  """
+  Format peer review information for short output (CSV format).
+  
+  Returns a tuple of (received_count, given_count) for CSV columns.
+  """
+  received_reviews, given_reviews = get_submission_peer_reviews(submission)
+  return len(received_reviews), len(given_reviews)
+
+def format_peer_reviews_detailed(submission, json_format=False):
+  """
+  Format peer review information for detailed output.
+  
+  Returns formatted peer review data for inclusion in submission details.
+  """
+  received_reviews, given_reviews = get_submission_peer_reviews(submission)
+  
+  if json_format:
+    return {
+      "received_reviews": [format_peer_review_json(pr) for pr in received_reviews],
+      "given_reviews": [format_peer_review_json(pr) for pr in given_reviews]
+    }
+  else:
+    result = ""
+    
+    if received_reviews:
+      result += f"**Received {len(received_reviews)} peer review(s):**\n\n"
+      for i, review in enumerate(received_reviews, 1):
+        result += format_peer_review_markdown(review, i)
+        result += "\n"
+    else:
+      result += "**No peer reviews received.**\n\n"
+    
+    if given_reviews:
+      result += f"**Given {len(given_reviews)} peer review(s):**\n\n"
+      for i, review in enumerate(given_reviews, 1):
+        result += format_peer_review_markdown(review, i)
+        result += "\n"
+    else:
+      result += "**No peer reviews given.**\n\n"
+    
+    return result.strip()
+
+def format_peer_review_json(peer_review):
+  """Format a single peer review for JSON output"""
+  try:
+    return {
+      "id": peer_review.id,
+      "assessor_id": peer_review.assessor_id,
+      "user_id": peer_review.user_id,
+      "workflow_state": peer_review.workflow_state,
+      "assessor_name": getattr(peer_review, 'assessor', {}).get('name', 'Unknown'),
+      "user_name": getattr(peer_review, 'user', {}).get('name', 'Unknown'),
+      "comment": getattr(peer_review, 'submission_comment', {}).get('comment', ''),
+      "created_at": getattr(peer_review, 'submission_comment', {}).get('created_at', '')
+    }
+  except AttributeError:
+    # Handle missing attributes gracefully
+    return {
+      "id": getattr(peer_review, 'id', 'unknown'),
+      "workflow_state": getattr(peer_review, 'workflow_state', 'unknown'),
+      "comment": "Data not available"
+    }
+
+def format_peer_review_markdown(peer_review, review_number):
+  """Format a single peer review for Markdown output"""
+  try:
+    assessor_name = getattr(peer_review, 'assessor', {}).get('name', 'Unknown Reviewer')
+    user_name = getattr(peer_review, 'user', {}).get('name', 'Unknown Student')
+    state = getattr(peer_review, 'workflow_state', 'unknown')
+    
+    result = f"{review_number}. **{assessor_name}** → **{user_name}** ({state})\n"
+    
+    # Add comment if available
+    comment_data = getattr(peer_review, 'submission_comment', {})
+    if comment_data and comment_data.get('comment'):
+      comment = comment_data['comment']
+      created_at = comment_data.get('created_at', '')
+      result += f"   *Comment ({created_at})*: {comment}\n"
+    else:
+      result += f"   *No written comment*\n"
+    
+    return result
+  except Exception:
+    return f"{review_number}. Peer review data not available\n"
 @
 
