@@ -17,6 +17,7 @@ import canvaslms.hacks.canvasapi
 
 import argparse
 import csv
+import difflib
 import json
 import os
 import pathlib
@@ -213,6 +214,10 @@ add_submission_options(submission_parser)
 For now, we only print the most relevant data of a submission.
 <<functions>>=
 def submission_command(config, canvas, args):
+  # Validate that --diff is only used with --history
+  if args.diff and not args.history:
+    raise ValueError("--diff option requires --history to be specified")
+  
   submission_list = process_submission_options(canvas, args)
   <<get and print the submission data>>
 @
@@ -246,7 +251,8 @@ for submission in submission_list:
   output = format_submission(submission,
                              history=args.history,
                              tmpdir=tmpdir/subdir,
-                             json_format=args.json)
+                             json_format=args.json,
+                             diff=args.diff)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -522,6 +528,8 @@ history.
 <<add options for printing a submission>>=
 submission_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
+submission_parser.add_argument("--diff", action="store_true",
+  help="Show diffs between submission versions. Only works with --history.")
 @
 
 
@@ -712,7 +720,10 @@ def format_submission(submission, history=False, json_format=False,
   <<add rubric assessment to output>>
   <<add comments to output>>
   if history:
-    <<add submission history to output>>
+    if diff:
+      <<add submission history diffs to output>>
+    else:
+      <<add submission history to output>>
   else:
     <<add body to output>>
     <<add quiz answers to output>>
@@ -931,9 +942,13 @@ We'll let the caller specify the directory to use, so we can use the same
 directory for all attachments and potentially all users.
 <<[[format_submission]] args>>=
 tmpdir = None,
+diff=False,
 <<[[format_submission]] doc>>=
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
+
+`diff` is a boolean indicating whether to show diffs between submission versions
+instead of showing each version in full. Only works when `history` is True.
 <<attachment iteration variables>>=
 tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
 tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1100,7 +1115,8 @@ prev_submission.assignment = submission.assignment
 prev_metadata = format_submission(prev_submission,
                                   tmpdir=version_dir,
                                   json_format=json_format,
-                                  md_title_level=md_title_level+"#")
+                                  md_title_level=md_title_level+"#",
+                                  diff=False)
 
 versions[version] = prev_metadata
 @
@@ -1115,6 +1131,52 @@ if json_format:
 else:
   with open(version_dir/"metadata.md", "w") as f:
     f.write(prev_metadata)
+@
+
+\subsection{Submission history with diffs}
+
+When the user wants to see diffs between submission versions, we need to extract
+the text content from each version and compare them.
+We'll show diffs between consecutive submission versions.
+<<add submission history diffs to output>>=
+try:
+  submission_history = submission.submission_history
+except AttributeError:
+  pass
+else:
+  if submission_history:
+    if json_format:
+      formatted_submission.update(format_section(
+        "submission_diffs", "Diffs not supported in JSON format",
+        json_format=True, md_title_level=md_title_level))
+    else:
+      diff_output = ""
+      prev_content = None
+      
+      for version, curr_submission_data in enumerate(submission.submission_history):
+        curr_submission = canvasapi.submission.Submission(
+          submission._requester, curr_submission_data)
+        curr_submission.assignment = submission.assignment
+        
+        curr_content = extract_submission_text(curr_submission, tmpdir / f"version-{version}")
+        
+        if prev_content is not None:
+          # Generate diff between previous and current version
+          version_diff = generate_diff(prev_content, curr_content, 
+                                     f"Version {version-1}", f"Version {version}")
+          if version_diff:
+            diff_output += format_section(f"Changes from Version {version-1} to Version {version}",
+                                        version_diff, md_title_level=md_title_level+"#")
+        
+        prev_content = curr_content
+      
+      if diff_output:
+        formatted_submission += format_section("Submission Diffs", diff_output,
+                                              md_title_level=md_title_level)
+      else:
+        formatted_submission += format_section("Submission Diffs", 
+                                              "No textual differences found between versions.",
+                                              md_title_level=md_title_level)
 @
 
 
@@ -1214,6 +1276,105 @@ def get_rating(rating_id, criterion):
     if rating["id"] == rating_id:
       return rating
 
+  return None
+
+def extract_submission_text(submission, tmpdir):
+  """
+  Extracts text content from a submission for diff comparison.
+  Returns a dictionary with keys for different content types.
+  """
+  content = {}
+  
+  # Extract body text
+  try:
+    if submission.body:
+      content['body'] = submission.body
+  except AttributeError:
+    pass
+  
+  # Extract quiz answers if any
+  try:
+    if submission.submission_data:
+      content['quiz_answers'] = json.dumps(submission.submission_data, indent=2, sort_keys=True)
+  except AttributeError:
+    pass
+  
+  # Extract text from attachments
+  try:
+    if submission.attachments:
+      tmpdir = pathlib.Path(tmpdir)
+      tmpdir.mkdir(parents=True, exist_ok=True)
+      attachment_texts = {}
+      
+      for attachment in submission.attachments:
+        try:
+          attachment_content = convert_to_md(attachment, tmpdir)
+          # Remove markdown code block markers for cleaner diff
+          if attachment_content.startswith('```') and attachment_content.endswith('```'):
+            lines = attachment_content.split('\n')
+            if len(lines) > 2:
+              attachment_content = '\n'.join(lines[1:-1])
+          attachment_texts[attachment.filename] = attachment_content
+        except Exception:
+          # If we can't convert the attachment, skip it for diff purposes
+          pass
+      
+      if attachment_texts:
+        content['attachments'] = attachment_texts
+  except AttributeError:
+    pass
+  
+  return content
+
+def generate_diff(prev_content, curr_content, prev_label, curr_label):
+  """
+  Generates a unified diff between two content dictionaries.
+  Returns a string with the diff output, or None if no differences.
+  """
+  diff_lines = []
+  all_keys = set(prev_content.keys()) | set(curr_content.keys())
+  
+  for key in sorted(all_keys):
+    prev_text = prev_content.get(key, "")
+    curr_text = curr_content.get(key, "")
+    
+    if key == 'attachments':
+      # Handle attachments specially since they're nested dictionaries
+      prev_attachments = prev_text if isinstance(prev_text, dict) else {}
+      curr_attachments = curr_text if isinstance(curr_text, dict) else {}
+      all_files = set(prev_attachments.keys()) | set(curr_attachments.keys())
+      
+      for filename in sorted(all_files):
+        prev_file_content = prev_attachments.get(filename, "")
+        curr_file_content = curr_attachments.get(filename, "")
+        
+        if prev_file_content != curr_file_content:
+          file_diff = list(difflib.unified_diff(
+            prev_file_content.splitlines(keepends=True),
+            curr_file_content.splitlines(keepends=True),
+            fromfile=f"{prev_label}/{filename}",
+            tofile=f"{curr_label}/{filename}",
+            lineterm=""
+          ))
+          if file_diff:
+            diff_lines.extend(file_diff)
+            diff_lines.append("\n")
+    else:
+      # Handle other content types (body, quiz_answers)
+      if prev_text != curr_text:
+        content_diff = list(difflib.unified_diff(
+          prev_text.splitlines(keepends=True) if prev_text else [],
+          curr_text.splitlines(keepends=True) if curr_text else [],
+          fromfile=f"{prev_label}/{key}",
+          tofile=f"{curr_label}/{key}",
+          lineterm=""
+        ))
+        if content_diff:
+          diff_lines.extend(content_diff)
+          diff_lines.append("\n")
+  
+  if diff_lines:
+    return "```diff\n" + "".join(diff_lines) + "```"
   return None
 @
 
