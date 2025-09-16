@@ -11,6 +11,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import pypandoc
+import rich.console
+import rich.markdown
 import canvaslms.cli.courses
 
 <<functions>>
@@ -28,6 +31,7 @@ def add_command(subp):
   
   add_announce_command(discussions_subp)
   add_list_command(discussions_subp)
+  add_show_command(discussions_subp)
 
 def add_announce_command(subp):
   """Adds the announce subcommand"""
@@ -45,6 +49,14 @@ def add_list_command(subp):
     description="List discussions or announcements from courses.")
   list_parser.set_defaults(func=list_command)
   <<add list arguments>>
+
+def add_show_command(subp):
+  """Adds the show subcommand"""
+  show_parser = subp.add_parser("show",
+    help="Show details of discussions and announcements",
+    description="Show detailed view of discussions or announcements from courses with rich formatting.")
+  show_parser.set_defaults(func=show_command)
+  <<add show arguments>>
 @
 
 
@@ -72,6 +84,28 @@ list_parser.add_argument("type",
   help="Type of content to list")
 list_parser.add_argument("-c", "--course", required=True,
   help="Regex matching courses on title, course code or Canvas ID")
+@
+
+\section{Show command arguments}
+
+The show command displays detailed information about discussions or announcements.
+<<add show arguments>>=
+show_parser.add_argument("type",
+  choices=["announcements", "discussions"],
+  help="Type of content to show")
+show_parser.add_argument("-c", "--course", required=True,
+  help="Regex matching courses on title, course code or Canvas ID")
+show_parser.add_argument("--match",
+  help="Regular expression to match against discussion/announcement title and message")
+show_parser.add_argument("--title", "-t",
+  help="Regular expression to match against discussion/announcement title")
+show_parser.add_argument("--message", "-m",
+  help="Regular expression to match against discussion/announcement message")
+show_parser.add_argument("--ignore-case", "-i",
+  action="store_true",
+  help="Make the regex case-insensitive")
+show_parser.add_argument("--count", "-n", type=int, default=1,
+  help="Number of matching items to show (default: 1), set to 0 to show all matches")
 @
 
 
@@ -157,6 +191,71 @@ def list_command(config, canvas, args):
       sys.exit(1)
 @
 
+\section{The show command function}
+
+The main function that processes the show command.
+<<functions>>=
+def show_command(config, canvas, args):
+  """Shows detailed view of discussions or announcements from matching courses"""
+  
+  # Get list of matching courses
+  course_list = list(canvaslms.cli.courses.filter_courses(canvas, args.course))
+  
+  if not course_list:
+    print(f"No courses found matching pattern: {args.course}", file=sys.stderr)
+    sys.exit(1)
+  
+  <<compile regex patterns for show>>
+  
+  # Collect all discussions/announcements from matching courses
+  all_items = []
+  for course in course_list:
+    try:
+      if args.type == "announcements":
+        items = course.get_discussion_topics(only_announcements=True)
+      else:  # discussions
+        items = course.get_discussion_topics()
+        # Filter out announcements when listing discussions
+        items = [item for item in items if not getattr(item, 'is_announcement', False)]
+      
+      # Add course info to each item for display
+      for item in items:
+        item._course = course
+        all_items.append(item)
+        
+    except Exception as e:
+      print(f"Error accessing {course.course_code}: {str(e)}", file=sys.stderr)
+      sys.exit(1)
+  
+  # Filter by regex if provided
+  filtered_items = []
+  for item in all_items:
+    if matches_regex_patterns(item, args):
+      filtered_items.append(item)
+  
+  # Sort by creation date (newest first)
+  filtered_items.sort(key=lambda x: getattr(x, 'created_at', ''), reverse=True)
+  
+  # Take the requested count
+  if args.count == 0:
+    count = len(filtered_items)  # Show all matches
+  else:
+    count = max(1, args.count)
+  
+  selected_items = filtered_items[:count]
+  
+  if not selected_items:
+    print(f"No matching {args.type} found", file=sys.stderr)
+    sys.exit(1)
+  
+  # Display items using Rich
+  console = rich.console.Console()
+  for idx, item in enumerate(selected_items):
+    <<print discussion details with rich>>
+    if idx != len(selected_items) - 1:
+      print()  # Add blank line between items
+@
+
 
 \section{Interactive message editing}
 
@@ -186,7 +285,19 @@ def get_message_from_editor():
       if not line.strip().startswith('#'):
         lines.append(line)
     
-    return '\n'.join(lines).strip()
+    markdown_content = '\n'.join(lines).strip()
+    
+    # Convert markdown to HTML using pandoc
+    if markdown_content:
+      try:
+        html_content = pypandoc.convert_text(markdown_content, 'html', format='md')
+        return html_content
+      except Exception as e:
+        print(f"Warning: Failed to convert markdown to HTML: {e}", file=sys.stderr)
+        print("Using raw markdown content instead.", file=sys.stderr)
+        return markdown_content
+    else:
+      return markdown_content
     
   finally:
     # Clean up temporary file
@@ -226,4 +337,107 @@ for discussion in discussions:
   if not getattr(discussion, 'is_announcement', False):
     # Output in tab-delimited format for UNIX tools
     print(f"{course.course_code}\t{discussion.id}\t{discussion.title}\t{discussion.created_at}")
+@
+
+\section{Helper functions for show command}
+
+Functions to support the show command functionality.
+<<compile regex patterns for show>>=
+pattern = None
+if args.match:
+  try:
+    flags = re.IGNORECASE if args.ignore_case else 0
+    pattern = re.compile(args.match, flags)
+  except re.error as e:
+    print(f"Invalid regex for --match: {e}", file=sys.stderr)
+    sys.exit(1)
+
+title_pattern = None
+if args.title:
+  try:
+    flags = re.IGNORECASE if args.ignore_case else 0
+    title_pattern = re.compile(args.title, flags)
+  except re.error as e:
+    print(f"Invalid regex for --title: {e}", file=sys.stderr)
+    sys.exit(1)
+
+message_pattern = None
+if args.message:
+  try:
+    flags = re.IGNORECASE if args.ignore_case else 0
+    message_pattern = re.compile(args.message, flags)
+  except re.error as e:
+    print(f"Invalid regex for --message: {e}", file=sys.stderr)
+    sys.exit(1)
+@
+
+<<functions>>=
+def matches_regex_patterns(item, args):
+  """Check if discussion/announcement matches the regex patterns"""
+  if not (args.match or args.title or args.message):
+    return True
+  
+  title = getattr(item, 'title', '') or ''
+  message = getattr(item, 'message', '') or ''
+  text = f"{title}\n{message}"
+  
+  # Compile patterns dynamically (could be optimized by moving to show_command)
+  flags = re.IGNORECASE if args.ignore_case else 0
+  
+  if args.title:
+    try:
+      title_pattern = re.compile(args.title, flags)
+      if title_pattern.search(title):
+        return True
+    except re.error:
+      pass
+  
+  if args.message:
+    try:
+      message_pattern = re.compile(args.message, flags)  
+      if message_pattern.search(message):
+        return True
+    except re.error:
+      pass
+      
+  if args.match:
+    try:
+      pattern = re.compile(args.match, flags)
+      if pattern.search(text):
+        return True
+    except re.error:
+      pass
+  
+  return False
+@
+
+<<print discussion details with rich>>=
+# Print header with course and type info
+item_type = "Announcement" if getattr(item, 'is_announcement', False) else "Discussion"
+course = getattr(item, '_course', None)
+course_info = f" [{course.course_code}]" if course else ""
+
+console.print(f"[bold cyan]{item_type}{course_info}[/bold cyan]")
+console.print(f"[bold]Title:[/bold] {getattr(item, 'title', 'N/A')}")
+console.print(f"[bold]Created:[/bold] {getattr(item, 'created_at', 'N/A')}")
+console.print(f"[bold]Author:[/bold] {getattr(item, 'author', {}).get('display_name', 'N/A')}")
+
+# Show URL if available
+url = getattr(item, 'html_url', None)
+if url:
+  console.print(f"[bold]URL:[/bold] {url}")
+
+# Show message content if available
+message = getattr(item, 'message', None)
+if message and message.strip():
+  console.print(f"[bold]Message:[/bold]")
+  # Convert HTML message back to markdown for nice display
+  try:
+    markdown_content = pypandoc.convert_text(message, 'md', format='html')
+    console.print(rich.markdown.Markdown(markdown_content))
+  except Exception:
+    # Fallback: just print the HTML content
+    console.print(message)
+else:
+  console.print(f"[bold]Message:[/bold] [dim]No content[/dim]")
 @
