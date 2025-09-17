@@ -5,6 +5,11 @@ NOTANGLEFLAGS.py=
 all: __init__.py
 all: canvasapi_patch.py canvasapi_patch.tex
 
+canvasapi_patch.py: canvasapi-patch.py
+	${MV} $< $@
+
+canvasapi-patch.py: canvasapi_patch.nw
+	${NOTANGLE.py}
 
 .PHONY: clean
 clean:
