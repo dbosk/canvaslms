@@ -13,11 +13,12 @@ canvaslms.pdf: abstract.tex
 canvaslms.pdf: canvaslms.tex 
 canvaslms.pdf: didactic.sty
 
-canvaslms.pdf: ${SRC_DIR}/hacks/canvasapi.tex
+canvaslms.pdf: ${SRC_DIR}/hacks/canvasapi_patch.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cli.tex
 canvaslms.pdf: ${SRC_DIR}/cli/login.tex
 canvaslms.pdf: ${SRC_DIR}/cli/courses.tex
 canvaslms.pdf: ${SRC_DIR}/cli/users.tex
+canvaslms.pdf: ${SRC_DIR}/cli/utils.tex
 canvaslms.pdf: ${SRC_DIR}/cli/assignments.tex
 canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
