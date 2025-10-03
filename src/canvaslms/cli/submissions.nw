@@ -13,6 +13,7 @@ import canvasapi.submission
 import canvaslms.cli
 import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
+import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 
 import argparse
@@ -61,6 +62,7 @@ submissions_parser = subp.add_parser("submissions",
 submissions_parser.set_defaults(func=submissions_command)
 assignments.add_assignment_option(submissions_parser)
 add_submission_options(submissions_parser)
+<<add options for history>>
 <<add options for printing>>
 @ Now, that [[submissions_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
@@ -76,30 +78,73 @@ def submissions_command(config, canvas, args):
 
 We then simply call the appropriate list-submissions function with the 
 [[assignments_list]] object as a parameter.
+However, since we optionally want to include the submission history, we must 
+pass that as an argument to the list-submissions function.
+<<get submissions and print them>>=
+to_include=[]
+if args.history:
+  to_include += ["submission_history"]
+
+if args.ungraded:
+  submissions = list_ungraded_submissions(assignment_list, include=to_include)
+else:
+  submissions = list_submissions(assignment_list, include=to_include)
+<<add options for history>>=
+submissions_parser.add_argument("-H", "--history", action="store_true",
+  help="Include submission history.")
+@
+
 If any of the group options are set, we filter out the submissions to only 
 include submissions by the users in the groups.
-Then we will print the most useful attributes of a submission, which the 
-[[format_submission_short]] will return preformatted for us.
 <<get submissions and print them>>=
-if args.ungraded:
-  submissions = list_ungraded_submissions(assignment_list)
-else:
-  submissions = list_submissions(assignment_list)
-
 if args.user or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
   submissions = filter_submissions(submissions, user_list)
+@
 
+Now the list [[submissions]] contains all the submissions we want to print.
+However, only the most recent.
+If we want to include the history, we must fetch all the versions of the 
+submissions from each submission object.
+
+The submission history ([[.submission_history]] attribute) contains all 
+versions, including the latest.
+So we turn them into proper submission objects, add them to a list.
+Then we can use this list instead of the original [[submissions]] list.
+This way, we also maintain the ordering.
+<<get submissions and print them>>=
+if args.history:
+  submissions = list(submissions)
+  historical_submissions = []
+  for submission in submissions:
+    for prev_submission in submission.submission_history:
+      prev_submission = canvasapi.submission.Submission(submission._requester,
+                                                        prev_submission)
+      prev_submission.assignment = submission.assignment
+      prev_submission.user = submission.user
+      historical_submissions.append(prev_submission)
+
+  submissions = historical_submissions
+@
+
+Then we will print the most useful attributes of each submission, which the 
+[[format_submission_short]] and
+[[format_submission_short_unique]] functions
+will return preformatted for us.
+<<get submissions and print them>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
+
+# Convert to list and check if empty
+submissions = list(submissions)
+if not submissions:
+  raise canvaslms.cli.EmptyListError("No submissions found matching the criteria")
 
 for submission in submissions:
   if args.login_id:
     output.writerow(format_submission_short_unique(submission))
   else:
     output.writerow(format_submission_short(submission))
-@
-
-Now, we must add that option [[args.login_id]].
+@ Now, we must add that option [[args.login_id]].
 <<add options for printing>>=
 submissions_parser.add_argument("-l", "--login-id",
   help="Print login ID instead of name.",
@@ -111,6 +156,8 @@ submissions_parser.add_argument("-l", "--login-id",
 
 Sometimes we want to compute the URL for SpeedGrader for a submission.
 The [[Submission]] objects come with an attribute [[preview_url]].
+(However, previous submissions don't have this, so if it doesn't exist, we use 
+[[None]].)
 We want to turn that one into the SpeedGrader URL.
 The [[preview_url]] looks like this:
 \begin{minted}{text}
@@ -126,7 +173,10 @@ We use Python's regex abilities to rewrite the URL.
 <<functions>>=
 def speedgrader(submission):
   """Returns the SpeedGrader URL of the submission"""
-  speedgrader_url = submission.preview_url
+  try:
+    speedgrader_url = submission.preview_url
+  except AttributeError:
+    return None
 
   speedgrader_url = re.sub("assignments/",
     "gradebook/speed_grader?assignment_id=",
@@ -521,7 +571,10 @@ def process_submission_options(canvas, args):
       include=["submission_history", "submission_comments", 
       "rubric_assessment"])
 
-  return list(filter_submissions(submissions, user_list))
+  submission_list = list(filter_submissions(submissions, user_list))
+  if not submission_list:
+    raise canvaslms.cli.EmptyListError("No submissions found matching the criteria")
+  return submission_list
 @
 
 
@@ -594,7 +647,7 @@ def format_submission_short(submission):
     submission.assignment.course.course_code,
     submission.assignment.name,
     submission.user.name,
-    submission.grade, submission.submitted_at, submission.graded_at
+    submission.grade, canvaslms.cli.utils.format_local_time(submission.submitted_at), canvaslms.cli.utils.format_local_time(submission.graded_at)
   ]
 @
 
@@ -608,7 +661,7 @@ def format_submission_short_unique(submission):
     submission.assignment.course.course_code,
     submission.assignment.name,
     uid,
-    submission.grade, submission.submitted_at, submission.graded_at
+    submission.grade, canvaslms.cli.utils.format_local_time(submission.submitted_at), canvaslms.cli.utils.format_local_time(submission.graded_at)
   ]
 @
 
@@ -710,8 +763,8 @@ metadata = {
   "assignment": submission.assignment.name,
   "student": str(student),
   "submission_id": submission.id,
-  "submitted_at": submission.submitted_at,
-  "graded_at": submission.graded_at,
+  "submitted_at": canvaslms.cli.utils.format_local_time(submission.submitted_at),
+  "graded_at": canvaslms.cli.utils.format_local_time(submission.graded_at),
   "grade": submission.grade,
   "graded_by": str(resolve_grader(submission)),
   "speedgrader": speedgrader(submission)
@@ -755,8 +808,6 @@ def resolve_grader(submission):
   try:
     <<resolve the grader's user ID from Canvas>>
   except canvasapi.exceptions.ResourceDoesNotExist:
-    canvaslms.cli.warn(f"unknown grader {submission.grader_id} "
-                       f"for submission {submission}.")
     return f"unknown grader {submission.grader_id}"
 @
 
@@ -806,7 +857,7 @@ try:
     else:
       body = ""
       for comment in submission.submission_comments:
-        body += f"{comment['author_name']} ({comment['created_at']}):\n\n"
+        body += f"{comment['author_name']} ({canvaslms.cli.utils.format_local_time(comment['created_at'])}):\n\n"
         body += comment["comment"] + "\n\n"
       formatted_submission += format_section("Comments", body)
 except AttributeError:
@@ -918,6 +969,7 @@ def convert_to_md(attachment: canvasapi.file.File,
   <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
   content_type = getattr(attachment, "content-type")
   <<if [[content_type]] is text, just use [[outfile]] contents>>
+  <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>
   <<else convert [[outfile]] using [[pypandoc]]>>
 <<let [[contents]] be the converted [[attachment]]>>=
 contents = convert_to_md(attachment, tmpdir)
@@ -964,6 +1016,8 @@ def text_to_md(content_type):
 This leaves us with the following.
 The advantage of reading the content from the file is that Python will solve 
 the encoding for us.
+Instead of using an [[if]] statement, we'll go all Python and use a 
+[[try-except]] block.
 <<if [[content_type]] is text, just use [[outfile]] contents>>=
 try:
   md_type = text_to_md(content_type)
@@ -974,7 +1028,22 @@ except ValueError:
   pass
 @
 
-If the content type is not text, we use [[pypandoc]] to convert it to Markdown.
+Now we'll do the same for PDF files.
+We'll use [[pdf2txt]] to convert the PDF to text.
+However, here we'll use an if statement.
+We'll check for the content type to end with [[pdf]], that will capture also 
+[[x-pdf]].
+<<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>=
+if content_type.endswith("pdf"):
+  try:
+    return subprocess.check_output(["pdf2txt", str(outfile)],
+                                    text=True)
+  except subprocess.CalledProcessError:
+    pass
+@
+
+Finally, as a last attempt, we use [[pypandoc]] to try to convert it to 
+Markdown.
 Here we'll use Pandoc's ability to infer the file type on its own.
 This means we'll have to download the attachment as a file in a temporary 
 location and let Pandoc convert the file to Markdown.
@@ -982,7 +1051,7 @@ location and let Pandoc convert the file to Markdown.
 try:
   return pypandoc.convert_file(outfile, "markdown")
 except Exception as err:
-  return f"Pandoc cannot convert this file. " \
+  return f"Cannot convert this file. " \
          f"The file is located at\n\n  {outfile}\n\n"
 @
 
