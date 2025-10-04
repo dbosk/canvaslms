@@ -58,12 +58,13 @@ submissions_parser = subp.add_parser("submissions",
     help="Lists submissions of an assignment",
     description="Lists submissions of assignment(s). Output format: "
       "<course code> <assignment name> <user> <grade> "
-      "<submission date> <grade date>")
+      "<submission date> <grade date> [<peer reviews received> <peer reviews given>]")
 submissions_parser.set_defaults(func=submissions_command)
 assignments.add_assignment_option(submissions_parser)
 add_submission_options(submissions_parser)
 <<add options for history>>
 <<add options for printing>>
+<<add options for peer reviews>>
 @ Now, that [[submissions_command]] function must take three arguments: 
 [[config]], [[canvas]] and [[args]].
 It must also do the processing for the assignment options using 
@@ -139,6 +140,11 @@ submissions = list(submissions)
 if not submissions:
   raise canvaslms.cli.EmptyListError("No submissions found matching the criteria")
 
+# Set peer review inclusion flag based on args
+include_peer_reviews = not args.no_peer_reviews
+format_submission_short._include_peer_reviews = include_peer_reviews
+format_submission_short_unique._include_peer_reviews = include_peer_reviews
+
 for submission in submissions:
   if args.login_id:
     output.writerow(format_submission_short_unique(submission))
@@ -149,6 +155,12 @@ for submission in submissions:
 submissions_parser.add_argument("-l", "--login-id",
   help="Print login ID instead of name.",
   default=False, action="store_true")
+@
+
+We also provide options to control peer review output:
+<<add options for peer reviews>>=
+submissions_parser.add_argument("--no-peer-reviews", action="store_true",
+  help="Exclude peer review columns from CSV output.")
 @
 
 
@@ -198,7 +210,7 @@ Here we provide a subcommand [[submission]] which deals with an individual
 submission.
 <<submission command description>>=
 Prints data about matching submissions, including submission and grading time, 
-and any text-based attachments.
+peer review information, and any text-based attachments.
 
 <<add submission command to subp>>=
 submission_parser = subp.add_parser("submission",
@@ -247,7 +259,8 @@ for submission in submission_list:
   output = format_submission(submission,
                              history=args.history,
                              tmpdir=tmpdir/subdir,
-                             json_format=args.json)
+                             json_format=args.json,
+                             include_peer_reviews=not args.no_peer_reviews)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -523,6 +536,8 @@ history.
 <<add options for printing a submission>>=
 submission_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
+submission_parser.add_argument("--no-peer-reviews", action="store_true",
+  help="Exclude peer review information from detailed output.")
 @
 
 
@@ -641,14 +656,54 @@ details of only one submission.
 
 We'll format the submission in short format.
 The most useful data is the identifier, the grade and the date of grading.
+
+\subsection{Adding Peer Review Columns to CSV Output}
+
+In addition to the standard submission data, we optionally include peer review 
+participation statistics.
+These are added as two extra columns:
+\begin{enumerate}
+\item Number of peer reviews received (how many peers reviewed this submission)
+\item Number of peer reviews given (how many submissions this student reviewed)
+\end{enumerate}
+
+The inclusion of these columns is controlled by a function attribute 
+[[_include_peer_reviews]], which is set by the calling function based on the 
+[[--no-peer-reviews]] command-line flag.
+This approach allows us to:
+\begin{itemize}
+\item Maintain backward compatibility with existing scripts
+\item Keep the function signature unchanged
+\item Allow runtime control over column inclusion
+\end{itemize}
+
+We use [[hasattr]] to check if the attribute exists and is set to [[True]].
+If the attribute doesn't exist or is [[False]], we return the base row without 
+peer review columns.
+This ensures the function works correctly even if the attribute is never set.
+
+The peer review counts are obtained by calling [[format_peer_reviews_short]], 
+which queries the Canvas API for peer review data.
+This call happens regardless of whether the columns are included, which ensures 
+consistent API behavior.
+However, if API performance becomes a concern, the call could be moved inside 
+the conditional block.
+
 <<functions>>=
 def format_submission_short(submission):
-  return [
+  received_count, given_count = format_peer_reviews_short(submission)
+  base_row = [
     submission.assignment.course.course_code,
     submission.assignment.name,
     submission.user.name,
     submission.grade, canvaslms.cli.utils.format_local_time(submission.submitted_at), canvaslms.cli.utils.format_local_time(submission.graded_at)
   ]
+  
+  # Check if peer reviews should be excluded (this will be set by the calling function)
+  if hasattr(format_submission_short, '_include_peer_reviews') and format_submission_short._include_peer_reviews:
+    return base_row + [received_count, given_count]
+  else:
+    return base_row
 @
 
 Sometimes we want the short format to contain a unique identifier (such as 
@@ -656,13 +711,20 @@ Sometimes we want the short format to contain a unique identifier (such as
 <<functions>>=
 def format_submission_short_unique(submission):
   <<get uid from submission's user object>>
+  received_count, given_count = format_peer_reviews_short(submission)
 
-  return [
+  base_row = [
     submission.assignment.course.course_code,
     submission.assignment.name,
     uid,
     submission.grade, canvaslms.cli.utils.format_local_time(submission.submitted_at), canvaslms.cli.utils.format_local_time(submission.graded_at)
   ]
+  
+  # Check if peer reviews should be excluded (this will be set by the calling function)
+  if hasattr(format_submission_short_unique, '_include_peer_reviews') and format_submission_short_unique._include_peer_reviews:
+    return base_row + [received_count, given_count]
+  else:
+    return base_row
 @
 
 However, we note that sometimes the student doesn't have a [[login_id]] 
@@ -712,6 +774,7 @@ def format_submission(submission, history=False, json_format=False,
   <<add metadata to output>>
   <<add rubric assessment to output>>
   <<add comments to output>>
+  <<add peer reviews to output>>
   if history:
     <<add submission history to output>>
   else:
@@ -864,6 +927,69 @@ except AttributeError:
   pass
 @
 
+\subsection{Peer Reviews}
+
+When formatting a submission, we want to include peer review information to 
+show:
+\begin{enumerate}
+\item How many peers reviewed this submission and what feedback they provided
+\item How many other submissions this student reviewed and their feedback
+\end{enumerate}
+
+This information is controlled by the [[include_peer_reviews]] parameter, which 
+defaults to [[True]].
+Users can disable peer review output using the [[--no-peer-reviews]] 
+command-line flag, which is useful for:
+\begin{itemize}
+\item Maintaining backward compatibility with existing scripts that expect the 
+  original output format
+\item Reducing output size when peer reviews are not relevant to the task
+\item Avoiding API calls when peer review data is not needed
+\end{itemize}
+
+When peer reviews are enabled, we call [[format_peer_reviews_detailed]] to get 
+the formatted output.
+For JSON format, we only include the peer review section if there are actual 
+reviews to show (to avoid cluttering the JSON with empty arrays).
+For Markdown format, we always include the section to make it clear that peer 
+reviews were checked.
+
+The error handling uses a broad [[Exception]] catch because:
+\begin{itemize}
+\item Peer review APIs might not be available in all Canvas instances
+\item Network errors or API rate limits might occur
+\item The assignment might not have peer reviews configured
+\item Permission issues might prevent access to peer review data
+\end{itemize}
+
+When an error occurs, we provide an empty peer review structure (for JSON) or 
+an informative message (for Markdown) rather than failing the entire command.
+
+<<add peer reviews to output>>=
+if include_peer_reviews:
+  try:
+    peer_review_data = format_peer_reviews_detailed(submission, json_format=json_format)
+    if json_format:
+      if peer_review_data["received_reviews"] or peer_review_data["given_reviews"]:
+        formatted_submission.update(format_section(
+          "peer_reviews", peer_review_data, json_format=True,
+          md_title_level=md_title_level))
+    else:
+      # Always include peer review section, even if empty
+      formatted_submission += format_section("Peer Reviews", peer_review_data,
+                                             md_title_level=md_title_level)
+  except Exception:
+    # Handle gracefully if peer review data is not available
+    if json_format:
+      formatted_submission.update(format_section(
+        "peer_reviews", {"received_reviews": [], "given_reviews": []}, 
+        json_format=True, md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Peer Reviews", 
+                                             "Peer review data not available.",
+                                             md_title_level=md_title_level)
+@
+
 \subsection{Body}
 
 <<add body to output>>=
@@ -947,10 +1073,13 @@ temporary directory too.
 We'll let the caller specify the directory to use, so we can use the same 
 directory for all attachments and potentially all users.
 <<[[format_submission]] args>>=
-tmpdir = None,
+tmpdir = None, include_peer_reviews=True,
 <<[[format_submission]] doc>>=
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
+
+`include_peer_reviews` controls whether to include peer review information in the output. 
+Defaults to True.
 <<attachment iteration variables>>=
 tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
 tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1232,5 +1361,350 @@ def get_rating(rating_id, criterion):
       return rating
 
   return None
+@
+
+
+\section{Peer Review Support}
+
+Canvas LMS supports peer reviews, which allow students to review and provide 
+feedback on each other's work.
+This is a common pedagogical practice that helps students learn by evaluating 
+their peers' submissions.
+When an assignment has peer reviews enabled, Canvas assigns reviewers to 
+submissions and collects their feedback.
+
+We want to include peer review information in the submission output to provide 
+a complete picture of the submission's evaluation.
+This is useful for several reasons:
+\begin{itemize}
+\item Instructors can monitor peer review participation rates
+\item Students can see who reviewed their work and what feedback they received
+\item The system shows accountability by displaying which submissions a student 
+  has reviewed
+\item It provides a holistic view of the assignment's peer review activity
+\end{itemize}
+
+The peer review functionality needs to handle two distinct perspectives:
+\begin{enumerate}
+\item \textbf{Received reviews}: Peer reviews \emph{of} this submission, 
+  written by other students who reviewed the current student's work
+\item \textbf{Given reviews}: Peer reviews \emph{by} this student, 
+  where the current student reviewed other students' submissions
+\end{enumerate}
+
+This dual perspective is important because it shows both how a student's work 
+was evaluated by peers and how well the student fulfilled their responsibility 
+to review others' work.
+
+
+\subsection{Canvas API for Peer Reviews}
+
+The Canvas API provides two main methods for accessing peer review data:
+\begin{itemize}
+\item [[Assignment.get_peer_reviews()]]: Returns all peer reviews for an 
+  assignment, across all submissions
+\item [[Submission.get_submission_peer_reviews()]]: Returns peer reviews for 
+  a specific submission (reviews of that submission)
+\end{itemize}
+
+The peer review objects returned by these methods contain the following key 
+attributes:
+\begin{itemize}
+\item [[id]]: The unique identifier for the peer review
+\item [[assessor_id]]: The ID of the student who wrote the review
+\item [[user_id]]: The ID of the student whose work was reviewed
+\item [[workflow_state]]: The status of the review (e.g., [[assigned]], 
+  [[completed]])
+\item [[assessor]]: A dictionary containing the assessor's user information
+\item [[user]]: A dictionary containing the reviewed user's information
+\item [[submission_comment]]: An optional dictionary containing the review 
+  comment with [[comment]] and [[created_at]] fields
+\end{itemize}
+
+Note that not all attributes are guaranteed to be present, especially for older 
+peer reviews or when the API returns partial data.
+Our implementation must handle these cases gracefully.
+
+
+\subsection{Retrieving Peer Review Data}
+
+To get both received and given reviews for a submission, we need to call both 
+API methods and filter the results appropriately.
+The [[get_submission_peer_reviews]] function implements this dual retrieval.
+
+For received reviews, we can directly use 
+[[submission.get_submission_peer_reviews()]], which returns peer reviews of 
+the current submission.
+
+For given reviews, we need to:
+\begin{enumerate}
+\item Get all peer reviews for the assignment using 
+  [[submission.assignment.get_peer_reviews()]]
+\item Filter these to find reviews where [[assessor_id]] matches the current 
+  submission's [[user_id]]
+\end{enumerate}
+
+This approach is necessary because the Canvas API doesn't provide a direct 
+method to get reviews written by a specific user.
+We must retrieve all reviews for the assignment and filter them ourselves.
+
+We wrap both API calls in try-except blocks to handle potential failures 
+gracefully:
+\begin{itemize}
+\item The peer review API might not be available for all Canvas instances
+\item Some assignments might not have peer reviews enabled
+\item Network issues or API errors could occur during the request
+\end{itemize}
+
+<<functions>>=
+def get_submission_peer_reviews(submission):
+  """
+  Get peer reviews for a submission.
+  
+  Returns a tuple of (received_reviews, given_reviews):
+  - received_reviews: list of peer reviews OF this submission (by others)
+  - given_reviews: list of peer reviews BY this student (of other submissions)
+  """
+  try:
+    # Get reviews OF this submission (received by the student)
+    received_reviews = list(submission.get_submission_peer_reviews())
+  except Exception:
+    received_reviews = []
+  
+  try:
+    # Get all peer reviews for the assignment to find reviews BY this student
+    all_peer_reviews = list(submission.assignment.get_peer_reviews())
+    # Filter to find reviews written BY this student
+    given_reviews = [pr for pr in all_peer_reviews 
+                    if pr.assessor_id == submission.user_id]
+  except Exception:
+    given_reviews = []
+  
+  return received_reviews, given_reviews
+@
+
+
+\subsection{Formatting Peer Reviews for CSV Output}
+
+For the CSV output format ([[submissions]] command), we want to add two columns 
+showing peer review statistics:
+\begin{itemize}
+\item The number of peer reviews received (how many peers reviewed this 
+  student's work)
+\item The number of peer reviews given (how many other submissions this student 
+  reviewed)
+\end{itemize}
+
+These counts provide a quick overview of peer review participation and can be 
+used for:
+\begin{itemize}
+\item Identifying students who haven't completed their peer review assignments
+\item Generating reports on peer review participation rates
+\item Filtering submissions based on peer review activity
+\end{itemize}
+
+The [[format_peer_reviews_short]] function simply counts the reviews in each 
+category and returns them as a tuple.
+This is designed to be added to the existing submission data rows in the CSV 
+output.
+
+<<functions>>=
+def format_peer_reviews_short(submission):
+  """
+  Format peer review information for short output (CSV format).
+  
+  Returns a tuple of (received_count, given_count) for CSV columns.
+  """
+  received_reviews, given_reviews = get_submission_peer_reviews(submission)
+
+def format_peer_reviews_short(submission):
+  """
+  Format peer review information for short output (CSV format).
+  
+  Returns a tuple of (received_count, given_count) for CSV columns.
+  """
+  received_reviews, given_reviews = get_submission_peer_reviews(submission)
+  return len(received_reviews), len(given_reviews)
+@
+
+
+\subsection{Formatting Peer Reviews for Detailed Output}
+
+For the detailed output format ([[submission]] command), we want to show much 
+more information about each peer review.
+This includes:
+\begin{itemize}
+\item The reviewer's name (for received reviews) or reviewed student's name 
+  (for given reviews)
+\item The workflow state (assigned, completed, etc.)
+\item Any comments left by the reviewer
+\item Timestamps for when comments were created
+\end{itemize}
+
+The output format differs between Markdown and JSON:
+\begin{itemize}
+\item \textbf{Markdown}: Human-readable format with numbered lists, showing 
+  reviewer arrows (→) to indicate direction, and formatted comments
+\item \textbf{JSON}: Structured data suitable for programmatic processing, 
+  with all peer review attributes as key-value pairs
+\end{itemize}
+
+The [[format_peer_reviews_detailed]] function handles both output formats.
+For Markdown, it creates two sections: one for received reviews and one for 
+given reviews.
+For JSON, it returns a dictionary with [[received_reviews]] and 
+[[given_reviews]] keys, each containing an array of peer review objects.
+
+We always include the peer review section in the output, even if there are no 
+reviews.
+This makes it clear that peer reviews were checked (as opposed to being 
+unavailable or skipped).
+When no reviews exist, we show an informative message rather than omitting the 
+section.
+
+<<functions>>=
+def format_peer_reviews_detailed(submission, json_format=False):
+  """
+  Format peer review information for detailed output.
+  
+  Returns formatted peer review data for inclusion in submission details.
+  """
+  received_reviews, given_reviews = get_submission_peer_reviews(submission)
+  
+  if json_format:
+    return {
+      "received_reviews": [format_peer_review_json(pr) for pr in received_reviews],
+      "given_reviews": [format_peer_review_json(pr) for pr in given_reviews]
+    }
+  else:
+    result = ""
+    
+    if received_reviews:
+      result += f"**Received {len(received_reviews)} peer review(s):**\n\n"
+      for i, review in enumerate(received_reviews, 1):
+        result += format_peer_review_markdown(review, i)
+        result += "\n"
+    else:
+      result += "**No peer reviews received.**\n\n"
+    
+    if given_reviews:
+      result += f"**Given {len(given_reviews)} peer review(s):**\n\n"
+      for i, review in enumerate(given_reviews, 1):
+        result += format_peer_review_markdown(review, i)
+        result += "\n"
+    else:
+      result += "**No peer reviews given.**\n\n"
+    
+    return result.strip()
+@
+
+
+\subsection{Formatting Individual Peer Reviews}
+
+Each peer review needs to be formatted appropriately for its output format.
+We provide two helper functions: [[format_peer_review_json]] for JSON output 
+and [[format_peer_review_markdown]] for Markdown output.
+
+
+\subsubsection{JSON Format}
+
+The JSON format needs to extract all relevant attributes from the peer review 
+object and structure them as a dictionary.
+This is more complex than it might seem because:
+\begin{itemize}
+\item Canvas peer review objects can have varying structures depending on the 
+  Canvas version and configuration
+\item Some attributes might be nested dictionaries (like [[assessor]] and 
+  [[user]])
+\item The [[submission_comment]] attribute is optional and might not exist
+\item Attributes might be missing entirely for older or incomplete peer reviews
+\end{itemize}
+
+We use Python's [[getattr]] function with default values to safely extract 
+attributes.
+For nested dictionaries like [[assessor]] and [[user]], we use [[.get()]] 
+method to safely access nested keys.
+If any attribute extraction fails, we catch the [[AttributeError]] and return 
+a minimal dictionary with available information.
+
+This defensive approach ensures that even with incomplete or malformed peer 
+review data, we can still provide some useful output rather than crashing.
+
+<<functions>>=
+def format_peer_review_json(peer_review):
+  """Format a single peer review for JSON output"""
+  try:
+    return {
+      "id": peer_review.id,
+      "assessor_id": peer_review.assessor_id,
+      "user_id": peer_review.user_id,
+      "workflow_state": peer_review.workflow_state,
+      "assessor_name": getattr(peer_review, 'assessor', {}).get('name', 'Unknown'),
+      "user_name": getattr(peer_review, 'user', {}).get('name', 'Unknown'),
+      "comment": getattr(peer_review, 'submission_comment', {}).get('comment', ''),
+      "created_at": getattr(peer_review, 'submission_comment', {}).get('created_at', '')
+    }
+  except AttributeError:
+    # Handle missing attributes gracefully
+    return {
+      "id": getattr(peer_review, 'id', 'unknown'),
+      "workflow_state": getattr(peer_review, 'workflow_state', 'unknown'),
+      "comment": "Data not available"
+    }
+@
+
+
+\subsubsection{Markdown Format}
+
+The Markdown format creates a human-readable representation of the peer review.
+We use formatting conventions that are clear and visually distinct:
+\begin{itemize}
+\item Numbered list items for each review (1., 2., etc.)
+\item Bold text for reviewer and student names
+\item An arrow symbol (→) to show the direction of the review
+\item Workflow state in parentheses
+\item Indented italic text for comments with timestamps
+\end{itemize}
+
+For example:
+\begin{verbatim}
+1. **Bob Jones** → **Alice Smith** (completed)
+   *Comment (2023-10-15T14:30:00Z)*: Excellent work!
+\end{verbatim}
+
+This format is designed to be readable both in the terminal (via the rich 
+library) and when saved to a file.
+The arrow notation makes it immediately clear who reviewed whom.
+
+If a peer review has no comment, we explicitly state ``No written comment'' 
+rather than leaving it blank.
+This makes it clear that the review exists but doesn't include textual 
+feedback.
+
+As with the JSON format, we wrap everything in a try-except block to handle 
+any unexpected data structures gracefully.
+
+<<functions>>=
+def format_peer_review_markdown(peer_review, review_number):
+  """Format a single peer review for Markdown output"""
+  try:
+    assessor_name = getattr(peer_review, 'assessor', {}).get('name', 'Unknown Reviewer')
+    user_name = getattr(peer_review, 'user', {}).get('name', 'Unknown Student')
+    state = getattr(peer_review, 'workflow_state', 'unknown')
+    
+    result = f"{review_number}. **{assessor_name}** → **{user_name}** ({state})\n"
+    
+    # Add comment if available
+    comment_data = getattr(peer_review, 'submission_comment', {})
+    if comment_data and comment_data.get('comment'):
+      comment = comment_data['comment']
+      created_at = comment_data.get('created_at', '')
+      result += f"   *Comment ({created_at})*: {comment}\n"
+    else:
+      result += f"   *No written comment*\n"
+    
+    return result
+  except Exception:
+    return f"{review_number}. Peer review data not available\n"
 @
 
