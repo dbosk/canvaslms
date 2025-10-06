@@ -45,6 +45,27 @@ regular expression `(Preparing the terminal|The terminal)`.
 done
 ```
 
+### Analyzing Quiz/Survey Results
+
+The `quizzes` command helps you analyze Canvas quiz or survey evaluation data. 
+Download the Student Analysis Report CSV from Canvas and run:
+
+```bash
+canvaslms quizzes --csv survey_results.csv
+```
+
+This will provide:
+- Statistical summaries for quantitative questions (ratings, multiple choice)
+- All individual responses for qualitative questions (free text)
+- AI-generated summaries of qualitative responses (requires `llm` configuration)
+
+To set up AI summaries:
+```bash
+# Install and configure llm
+pip install llm
+llm keys set openai  # or another provider
+```
+
 ## Installation
 
 Just install the PyPI package:
