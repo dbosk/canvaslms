@@ -51,11 +51,16 @@ The `quizzes` command helps you analyze Canvas quiz or survey evaluation data.
 Download the Student Analysis Report CSV from Canvas and run:
 
 ```bash
+# Markdown output (default, rendered with rich)
 canvaslms quizzes --csv survey_results.csv
+
+# LaTeX output (for PDF compilation)
+canvaslms quizzes --csv survey_results.csv --format latex > report.tex
 ```
 
 This will provide:
 - Statistical summaries for quantitative questions (ratings, multiple choice)
+- Proper handling of multi-select questions (comma-separated options)
 - All individual responses for qualitative questions (free text)
 - AI-generated summaries of qualitative responses (requires `llm` configuration)
 
