@@ -1,0 +1,370 @@
+\chapter{The \texttt{quizzes} command}
+\label{quizzes-command}
+
+This chapter provides the subcommand [[quizzes]], which summarizes Canvas quiz 
+or survey evaluation data.
+
+The command supports two modes of operation:
+\begin{enumerate}
+\item Fetch quiz/survey data directly from Canvas by specifying the quiz.
+\item Read and analyze a CSV file downloaded from Canvas.
+\end{enumerate}
+
+The command provides:
+\begin{itemize}
+\item Statistical summaries for quantitative (multiple choice, rating) data
+\item Individual responses for qualitative (free text) data
+\item AI-generated summaries of qualitative data using the [[llm]] package
+\end{itemize}
+
+
+\section{Module outline}
+
+We outline the module:
+<<quizzes.py>>=
+import argparse
+import csv
+import json
+import os
+import re
+import statistics
+import sys
+from collections import defaultdict
+from typing import Dict, List, Any
+
+import canvaslms.cli
+import canvaslms.cli.courses as courses
+import canvaslms.cli.assignments as assignments
+
+<<helper functions>>
+
+def add_command(subp):
+  """Adds the quizzes command to argparse parser subp"""
+  <<add quizzes command to subp>>
+
+def quizzes_command(config, canvas, args):
+  """Main command handler for quizzes"""
+  <<process quizzes command>>
+@
+
+
+\section{The [[quizzes]] subcommand and its options}
+
+We add the subparser for [[quizzes]].
+The command can either work with a CSV file or fetch data from Canvas.
+<<add quizzes command to subp>>=
+quizzes_parser = subp.add_parser("quizzes",
+    help="Summarize quiz/survey evaluation data",
+    description="""Summarizes Canvas quiz or survey evaluation data.
+    
+Can either fetch quiz data from Canvas or analyze a downloaded CSV file.
+Provides statistical summaries for quantitative data and AI-generated 
+summaries for qualitative (free text) responses.""")
+
+quizzes_parser.set_defaults(func=quizzes_command)
+
+<<add quizzes options>>
+@
+
+We need options for:
+\begin{itemize}
+\item CSV file input
+\item Course selection (for Canvas API mode)
+\item Assignment/quiz selection (for Canvas API mode)
+\end{itemize}
+<<add quizzes options>>=
+quizzes_parser.add_argument("--csv", "-f",
+    help="Path to CSV file downloaded from Canvas",
+    type=str)
+
+try:
+  courses.add_course_option(quizzes_parser, required=False)
+except argparse.ArgumentError:
+  pass
+
+try:
+  assignments.add_assignment_option(quizzes_parser, 
+      ungraded=False, required=False)
+except argparse.ArgumentError:
+  pass
+@
+
+
+\section{Processing the command}
+
+The main command processing determines whether to use CSV file or Canvas API.
+<<process quizzes command>>=
+if args.csv:
+  <<process CSV file>>
+else:
+  <<fetch from Canvas and process>>
+@
+
+
+\section{CSV file processing}
+
+When processing a CSV file, we need to:
+\begin{enumerate}
+\item Parse the CSV structure
+\item Identify question columns
+\item Separate quantitative and qualitative questions
+\item Generate summaries
+\end{enumerate}
+<<process CSV file>>=
+if not os.path.exists(args.csv):
+  canvaslms.cli.err(1, f"CSV file not found: {args.csv}")
+
+try:
+  with open(args.csv, 'r', encoding='utf-8') as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+    
+    if not rows:
+      canvaslms.cli.err(1, "CSV file is empty")
+    
+    <<parse and summarize CSV data>>
+except Exception as e:
+  canvaslms.cli.err(1, f"Error processing CSV: {e}")
+@
+
+
+\section{Parsing and summarizing CSV data}
+
+The Canvas CSV format has a complex structure where questions appear as column 
+headers with their IDs.
+We need to identify which columns are questions and which are metadata.
+<<parse and summarize CSV data>>=
+# Get all column names
+columns = list(rows[0].keys())
+
+# Identify question columns (they contain question IDs like "588913:")
+question_columns = []
+for col in columns:
+  if re.match(r'^\d+:', col):
+    question_columns.append(col)
+
+if not question_columns:
+  canvaslms.cli.err(1, "No question columns found in CSV")
+
+# Categorize questions
+quantitative_questions = []
+qualitative_questions = []
+
+for qcol in question_columns:
+  # Check if the column contains mostly numeric/categorical responses
+  sample_responses = [row[qcol] for row in rows if row[qcol]]
+  
+  if is_quantitative(sample_responses):
+    quantitative_questions.append(qcol)
+  else:
+    qualitative_questions.append(qcol)
+
+<<summarize quantitative data>>
+<<summarize qualitative data>>
+@
+
+
+\section{Helper functions}
+
+\subsection{Determining question type}
+
+We need to determine if a question is quantitative or qualitative based on the 
+responses.
+<<helper functions>>=
+def is_quantitative(responses: List[str]) -> bool:
+  """Determine if responses are quantitative (numbers/categories) or qualitative (free text)"""
+  if not responses:
+    return False
+  
+  # If responses are very short or repetitive, likely quantitative
+  # Check for common patterns
+  unique_responses = set(responses)
+  
+  # If there are very few unique responses relative to total, it's likely quantitative
+  if len(unique_responses) <= 10 and len(responses) > 3:
+    return True
+  
+  # Check if responses are numeric
+  numeric_count = 0
+  for resp in responses:
+    try:
+      float(resp)
+      numeric_count += 1
+    except (ValueError, TypeError):
+      pass
+  
+  if numeric_count > len(responses) * 0.5:
+    return True
+  
+  # Check average response length - short responses suggest quantitative
+  avg_length = sum(len(str(r)) for r in responses) / len(responses)
+  if avg_length < 30:
+    return True
+  
+  return False
+@
+
+
+\subsection{Summarizing quantitative data}
+
+For quantitative data, we compute statistics.
+<<summarize quantitative data>>=
+if quantitative_questions:
+  print("\n" + "="*80)
+  print("QUANTITATIVE SUMMARY")
+  print("="*80)
+  
+  for qcol in quantitative_questions:
+    print(f"\n{qcol}")
+    print("-" * 80)
+    
+    responses = [row[qcol] for row in rows if row[qcol] and row[qcol].strip()]
+    
+    if not responses:
+      print("No responses")
+      continue
+    
+    <<compute and print statistics>>
+@
+
+We compute different statistics depending on the type of data.
+<<compute and print statistics>>=
+# Try to parse as numbers first
+numeric_values = []
+for resp in responses:
+  try:
+    numeric_values.append(float(resp))
+  except (ValueError, TypeError):
+    pass
+
+if numeric_values and len(numeric_values) >= len(responses) * 0.5:
+  # Numeric data
+  print(f"  Total responses: {len(numeric_values)}")
+  print(f"  Mean: {statistics.mean(numeric_values):.2f}")
+  print(f"  Median: {statistics.median(numeric_values):.2f}")
+  if len(numeric_values) > 1:
+    print(f"  Std Dev: {statistics.stdev(numeric_values):.2f}")
+  print(f"  Min: {min(numeric_values):.2f}")
+  print(f"  Max: {max(numeric_values):.2f}")
+else:
+  # Categorical data - show frequency distribution
+  from collections import Counter
+  freq = Counter(responses)
+  print(f"  Total responses: {len(responses)}")
+  print(f"  Response distribution:")
+  for value, count in freq.most_common():
+    percentage = (count / len(responses)) * 100
+    # Handle multi-line values
+    value_display = value.replace('\n', ' ')[:70]
+    print(f"    {value_display}: {count} ({percentage:.1f}%)")
+@
+
+
+\subsection{Summarizing qualitative data}
+
+For qualitative data, we show all responses and generate an AI summary.
+<<summarize qualitative data>>=
+if qualitative_questions:
+  print("\n" + "="*80)
+  print("QUALITATIVE SUMMARY")
+  print("="*80)
+  
+  for qcol in qualitative_questions:
+    print(f"\n{qcol}")
+    print("-" * 80)
+    
+    responses = [row[qcol] for row in rows 
+                 if row[qcol] and row[qcol].strip()]
+    
+    if not responses:
+      print("No responses")
+      continue
+    
+    print(f"\nIndividual Responses ({len(responses)} total):")
+    print("-" * 80)
+    for i, resp in enumerate(responses, 1):
+      print(f"\n[Response {i}]")
+      print(resp)
+    
+    <<generate AI summary>>
+@
+
+
+\section{AI summary generation}
+
+We use the [[llm]] package to generate summaries of qualitative responses.
+<<generate AI summary>>=
+print("\n" + "-" * 80)
+print("AI-GENERATED SUMMARY:")
+print("-" * 80)
+
+try:
+  import llm
+  
+  # Prepare the prompt
+  prompt = f"""Please analyze the following survey responses and provide a concise summary of the main themes, concerns, and suggestions mentioned by respondents.
+
+Question: {qcol}
+
+Responses:
+"""
+  for i, resp in enumerate(responses, 1):
+    prompt += f"\n{i}. {resp}"
+  
+  prompt += "\n\nProvide a summary highlighting:\n1. Main themes\n2. Common concerns or issues\n3. Suggestions for improvement\n4. Overall sentiment"
+  
+  # Get default model and generate summary
+  model = llm.get_model()
+  response = model.prompt(prompt)
+  print(response.text())
+  
+except ImportError:
+  print("The 'llm' package is not installed. Install it with: pip install llm")
+  print("Then configure it with your API keys.")
+except Exception as e:
+  print(f"Error generating AI summary: {e}")
+  print("Make sure llm is configured with: llm keys set <provider>")
+@
+
+
+\section{Fetching from Canvas}
+
+For Canvas API mode, we need to fetch quiz data and process it similarly.
+<<fetch from Canvas and process>>=
+# Ensure we have course and assignment specified
+if not hasattr(args, 'course') or not args.course:
+  canvaslms.cli.err(1, "Course must be specified when not using CSV file")
+
+try:
+  # Get the quiz/assignment
+  assignment_list = assignments.process_assignment_option(canvas, args)
+  
+  if not assignment_list:
+    canvaslms.cli.err(1, "No quiz/survey found matching criteria")
+  
+  if len(assignment_list) > 1:
+    canvaslms.cli.warn("Multiple assignments found, using first one")
+  
+  quiz = assignment_list[0]
+  
+  <<fetch quiz submissions from Canvas>>
+  <<process Canvas quiz data>>
+  
+except canvaslms.cli.EmptyListError as e:
+  canvaslms.cli.err(1, str(e))
+except Exception as e:
+  canvaslms.cli.err(1, f"Error fetching from Canvas: {e}")
+@
+
+For now, we'll implement a basic version that suggests using CSV export.
+<<fetch quiz submissions from Canvas>>=
+print(f"Note: Canvas API quiz data processing is limited.")
+print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
+print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
+print(f"Download the CSV and run: canvaslms quizzes --csv <file.csv>")
+sys.exit(0)
+@
+
+<<process Canvas quiz data>>=
+# This section intentionally left empty for future implementation
+@
