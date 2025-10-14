@@ -114,6 +114,7 @@ from typing import Dict, List, Any
 import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
+import canvaslms.cli.utils
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -250,19 +251,18 @@ course = course_list[0]
 \subsection{Listing all quizzes}
 
 We need to list both new quizzes (from assignments) and classic quizzes.
-The output is in CSV format: ID, Title, Type, Published status.
+The output format follows the same pattern as [[assignments list]]: 
+course code, title, type, published status, due date.
 
 <<list all quizzes in course>>=
-# Print CSV header
-print("id\ttitle\ttype\tpublished")
-
 # List classic quizzes (including surveys)
 try:
   quizzes = course.get_quizzes()
   for quiz in quizzes:
     quiz_type = getattr(quiz, 'quiz_type', 'quiz')
-    published = getattr(quiz, 'published', False)
-    print(f"{quiz.id}\t{quiz.title}\t{quiz_type}\t{published}")
+    published = "Published" if getattr(quiz, 'published', False) else "Unpublished"
+    due_date = canvaslms.cli.utils.format_local_time(getattr(quiz, 'due_at', None))
+    print(f"{course.course_code}\t{quiz.title}\t{quiz_type}\t{published}\t{due_date}")
 except Exception as e:
   canvaslms.cli.warn(f"Could not fetch classic quizzes: {e}")
 
@@ -272,8 +272,9 @@ try:
   for assignment in assignments_list:
     # Check if it's a quiz assignment
     if hasattr(assignment, 'is_quiz_assignment') and assignment.is_quiz_assignment:
-      published = getattr(assignment, 'published', False)
-      print(f"{assignment.id}\t{assignment.name}\tnew_quiz\t{published}")
+      published = "Published" if getattr(assignment, 'published', False) else "Unpublished"
+      due_date = canvaslms.cli.utils.format_local_time(getattr(assignment, 'due_at', None))
+      print(f"{course.course_code}\t{assignment.name}\tnew_quiz\t{published}\t{due_date}")
 except Exception as e:
   canvaslms.cli.warn(f"Could not fetch new quizzes: {e}")
 @
@@ -323,6 +324,14 @@ The Canvas CSV format has a complex structure where questions appear as column
 headers with their IDs.
 We need to identify which columns are questions and which are metadata.
 <<parse and summarize CSV data>>=
+<<categorize and summarize quiz data>>
+@
+
+\subsection{Categorize and summarize quiz data}
+
+This chunk processes quiz data rows and generates summaries.
+It's used both for CSV file processing and Canvas API data.
+<<categorize and summarize quiz data>>=
 # Initialize output buffer
 output_buffer = []
 
@@ -740,13 +749,66 @@ if hasattr(args, 'assignment') and args.assignment:
       break
 @
 
-For now, we'll implement a basic version that suggests using CSV export.
+We need to fetch quiz submissions and extract the data to analyze.
+For classic quizzes, we can use [[get\_quiz\_report]] to get the student analysis report.
 <<fetch quiz submissions from Canvas>>=
-print(f"Note: Canvas API quiz data processing is limited.")
-print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
-print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
-print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
-sys.exit(0)
+# For classic quizzes, try to get the quiz statistics report
+if hasattr(quiz, 'get_quiz_report'):
+  try:
+    # Request a quiz statistics report
+    report = quiz.create_report(report_type='student_analysis', includes_all_versions=True)
+    
+    # Poll until the report is ready
+    import time
+    max_attempts = 30
+    for attempt in range(max_attempts):
+      report = quiz.get_quiz_report(report.id)
+      if report.progress and report.progress.workflow_state == 'completed':
+        break
+      if attempt < max_attempts - 1:
+        time.sleep(2)
+    
+    if report.progress and report.progress.workflow_state == 'completed':
+      # Download the report file
+      import requests
+      if hasattr(report, 'file') and hasattr(report.file, 'url'):
+        response = requests.get(report.file.url)
+        response.raise_for_status()
+        
+        # Parse the CSV data
+        import io
+        csv_data = response.text
+        reader = csv.DictReader(io.StringIO(csv_data))
+        
+        # Process the CSV data
+        <<process quiz CSV data from API>>
+      else:
+        canvaslms.cli.err(1, "Report file URL not available")
+    else:
+      canvaslms.cli.err(1, "Report generation timed out or failed")
+  except Exception as e:
+    canvaslms.cli.warn(f"Could not fetch quiz report via API: {e}")
+    print(f"\nNote: For best results, export the Student Analysis Report as CSV manually.")
+    print(f"To export: Go to Quiz -> ... menu -> Student Analysis")
+    print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
+    sys.exit(1)
+else:
+  # For new quizzes or other types, fall back to manual export
+  print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
+  print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
+  print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
+  print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
+  sys.exit(0)
+@
+
+<<process quiz CSV data from API>>=
+# Convert the CSV reader data into the same format as our file processing
+rows = list(reader)
+if not rows:
+  canvaslms.cli.err(1, "No data in quiz report")
+
+# Process it the same way as CSV file processing
+<<categorize and summarize quiz data>>
 @
 
 <<process Canvas quiz data>>=
