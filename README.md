@@ -62,21 +62,30 @@ This will provide:
 - Statistical summaries for quantitative questions (ratings, multiple choice)
 - Proper handling of multi-select questions (comma-separated options)
 - All individual responses for qualitative questions (free text)
-- AI-generated summaries of qualitative responses (requires `llm` configuration)
+- AI-generated summaries of qualitative responses (requires `llm`, install with `canvaslms[llm]`)
 
-To set up AI summaries:
+If you installed with the `[llm]` extra, configure your API keys:
 ```bash
-# Install and configure llm
-pip install llm
 llm keys set openai  # or another provider
 ```
 
 ## Installation
 
-Just install the PyPI package:
+Install the PyPI package using pip or pipx:
+```bash
+# Basic installation (Python 3.8+)
+pip install canvaslms
+# or
+pipx install canvaslms
+
+# With optional LLM support for AI summaries (Python 3.9+)
+pip install canvaslms[llm]
+# or
+pipx install canvaslms[llm]
 ```
-python3 -m pip install canvaslms
-```
+
+The `[llm]` extra includes the `llm` package and various LLM provider plugins (OpenAI, Anthropic, Gemini, Azure) for AI-powered features like quiz analysis summaries.
+
 Some subcommands use `pandoc`, so you will likely have to [install 
 pandoc][pandoc] on your system manually.
 
