@@ -392,7 +392,21 @@ def show_command(config, canvas, args):
 
 \section{Interactive message editing}
 
-Function to open an editor for writing the announcement message with YAML front matter.
+The interactive editing system uses YAML front matter to allow users to set
+announcement attributes alongside the message content. This design was chosen
+because it's familiar to users of Jekyll and GitHub Pages, keeps all 
+announcement data in one place, and remains plain text and editor-agnostic.
+
+We implement this through three main functions: [[parse_yaml_front_matter]] 
+extracts YAML metadata from content, [[format_yaml_front_matter]] formats 
+content with a YAML header, and [[get_announcement_from_editor]] orchestrates 
+the editing process.
+
+\subsection{Parsing YAML front matter}
+
+The parser looks for content delimited by [[---]] markers at the start of the
+file. If found, it attempts to parse the section as YAML and returns both the
+attributes dictionary and the remaining content.
 <<functions>>=
 def parse_yaml_front_matter(content):
   """Parse YAML front matter from content
@@ -437,7 +451,15 @@ def format_yaml_front_matter(attributes, message_content):
   
   yaml_str = yaml.dump(attributes, default_flow_style=False, sort_keys=False)
   return f"---\n{yaml_str}---\n{message_content}"
+@
 
+\subsection{Opening the editor with YAML template}
+
+The [[get_announcement_from_editor]] function creates a temporary file with
+YAML front matter template showing all available attributes. After the user
+edits and saves, we parse the result and return the attributes and content
+separately.
+<<functions>>=
 def get_announcement_from_editor(initial_title=None, initial_attributes=None, initial_content=""):
   """Opens the user's preferred editor to write the announcement with YAML front matter
   
@@ -515,6 +537,11 @@ def get_announcement_from_editor(initial_title=None, initial_attributes=None, in
     except OSError:
       pass
 
+@
+
+Note that [[get_message_from_editor]] is retained for backward compatibility,
+though it now uses the YAML-aware editor internally.
+<<functions>>=
 def get_message_from_editor(initial_content=""):
   """Opens the user's preferred editor to write the announcement message
   
@@ -629,70 +656,89 @@ def interactive_confirm_and_edit(title, message, attributes):
 
 \section{Posting announcements}
 
-Function to post an announcement to a specific course, using attributes from YAML front matter.
+Function to post an announcement to a specific course, using attributes from 
+YAML front matter. We build the kwargs dictionary from the attributes, 
+converting date strings to Canvas-compatible format using the calendar module's
+[[format_canvas_time]] function.
+
+\subsection{Date attribute parsing}
+
+Both [[delayed_post_at]] and [[lock_at]] need the same date parsing logic.
+We extract this to a helper function to avoid repetition.
+<<functions>>=
+def parse_date_attribute(attributes, attr_name):
+  """Parse a date attribute using calendar module's format_canvas_time
+  
+  Args:
+    attributes: Dictionary of announcement attributes
+    attr_name: Name of the date attribute to parse
+  
+  Returns:
+    Canvas-formatted date string, or None if not present or invalid
+  """
+  if attr_name not in attributes:
+    return None
+  
+  date_value = attributes[attr_name]
+  if date_value and date_value != 'null':
+    try:
+      return canvaslms.cli.calendar.format_canvas_time(date_value)
+    except Exception as e:
+      print(f"Warning: Failed to parse {attr_name} '{date_value}': {e}", 
+            file=sys.stderr)
+      return None
+  return None
+@
+
+\subsection{Building the announcement parameters}
+
+We now build the parameters for [[create_discussion_topic]], starting with
+required fields and adding optional attributes if present.
 <<post announcement to course>>=
-# Build kwargs from attributes
 kwargs = {
   'title': title,
   'message': html_message,
   'is_announcement': True,
 }
 
-# Add optional attributes if present
 if 'published' in attributes:
   kwargs['published'] = attributes['published']
 else:
   kwargs['published'] = True
 
-if 'delayed_post_at' in attributes:
-  # Parse date string using calendar module's format_canvas_time
-  # Supports YYYY-MM-DD HH:mm and YYYY-MM-DD formats
-  delayed_post = attributes['delayed_post_at']
-  if delayed_post and delayed_post != 'null':
-    try:
-      kwargs['delayed_post_at'] = canvaslms.cli.calendar.format_canvas_time(delayed_post)
-    except Exception as e:
-      print(f"Warning: Failed to parse delayed_post_at '{delayed_post}': {e}", file=sys.stderr)
-
-if 'lock_at' in attributes:
-  # Parse date string using calendar module's format_canvas_time
-  # Supports YYYY-MM-DD HH:mm and YYYY-MM-DD formats
-  lock_at = attributes['lock_at']
-  if lock_at and lock_at != 'null':
-    try:
-      kwargs['lock_at'] = canvaslms.cli.calendar.format_canvas_time(lock_at)
-    except Exception as e:
-      print(f"Warning: Failed to parse lock_at '{lock_at}': {e}", file=sys.stderr)
-
-if 'require_initial_post' in attributes:
-  kwargs['require_initial_post'] = attributes['require_initial_post']
-
-if 'allow_rating' in attributes:
-  kwargs['allow_rating'] = attributes['allow_rating']
-
-if 'only_graders_can_rate' in attributes:
-  kwargs['only_graders_can_rate'] = attributes['only_graders_can_rate']
-
-if 'sort_by_rating' in attributes:
-  kwargs['sort_by_rating'] = attributes['sort_by_rating']
+<<add date attributes to kwargs>>
+<<add boolean attributes to kwargs>>
 
 discussion_topic = course.create_discussion_topic(**kwargs)
+@
+
+We simply add date attributes by parsing them with our helper function.
+<<add date attributes to kwargs>>=
+for attr in ['delayed_post_at', 'lock_at']:
+  parsed = parse_date_attribute(attributes, attr)
+  if parsed:
+    kwargs[attr] = parsed
+<<add boolean attributes to kwargs>>=
+for attr in ['require_initial_post', 'allow_rating', 
+             'only_graders_can_rate', 'sort_by_rating']:
+  if attr in attributes:
+    kwargs[attr] = attributes[attr]
 @
 
 \section{Listing announcements and discussions}
 
 Functions to list announcements and discussions from courses.
 The output uses CSV format for compatibility with POSIX tools.
-For announcements, the delayed posting date is used if available (for scheduled posts),
-otherwise the creation date is shown.
+
+For announcements, we prefer showing the scheduled posting date
+([[delayed_post_at]]) over the creation date, since scheduled announcements
+are more relevant when they'll actually appear to students.
 <<list announcements for course>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
 announcements = course.get_discussion_topics(only_announcements=True)
 for announcement in announcements:
-  # Use delayed_post_at if available, otherwise created_at
   date_to_show = (getattr(announcement, 'delayed_post_at', None) or 
                   getattr(announcement, 'created_at', None))
-  # Output: course_code, title, date (delayed_post_at or created_at)
   output.writerow([
     course.course_code,
     announcement.title,
@@ -700,13 +746,13 @@ for announcement in announcements:
   ])
 @
 
+For discussions, we filter out announcements (which are technically a special
+type of discussion in Canvas) and show only the creation date.
 <<list discussions for course>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
 discussions = course.get_discussion_topics()
 for discussion in discussions:
-  # Skip announcements when listing discussions
   if not getattr(discussion, 'is_announcement', False):
-    # Output: course_code, title, created_at
     output.writerow([
       course.course_code,
       discussion.title,
