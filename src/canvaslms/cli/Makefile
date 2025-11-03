@@ -12,6 +12,7 @@ MODULES+=	calendar.py calendar.tex
 MODULES+=	discussions.py discussions.tex
 MODULES+= 	utils.py utils.tex
 MODULES+=	quizzes.py quizzes.tex
+MODULES+=	fbf.py fbf.tex
 
 .PHONY: all
 all: ${MODULES}
