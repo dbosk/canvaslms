@@ -26,9 +26,6 @@ make all           # Runs compile + generates doc/canvaslms.pdf
 # Generate Python from .nw sources only
 make compile       # Tangles .nw files and runs poetry build
 
-# Install locally for development
-make install       # Installs with pip -e and sets up bash completion
-
 # Clean generated files
 make distclean     # Removes build/, dist/, *.egg-info
 ```
@@ -193,7 +190,7 @@ def example_command(config, canvas, args):
 ### Development Workflow
 
 - No pytest framework currently in place
-- Use `make install` for local development with editable install (requires sudo for bash completion)
+- Use `poetry run` or `poetry shell` for running the local development version.
 - Poetry manages dependencies and builds
 - Use `pdbpp` for debugging (included in dev dependencies)
 
