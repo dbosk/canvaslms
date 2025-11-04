@@ -184,8 +184,16 @@ def example_command(config, canvas, args):
 
 ## Testing and Development
 
+### Running Commands for Testing
+
+- Use `poetry run canvaslms <subcommand>` to test commands in the Poetry environment
+- This ensures you're testing against the current development version with all dependencies
+- Example: `poetry run canvaslms quizzes analyse -c <course> -a <assignment>`
+
+### Development Workflow
+
 - No pytest framework currently in place
-- Use `make install` for local development with editable install
+- Use `make install` for local development with editable install (requires sudo for bash completion)
 - Poetry manages dependencies and builds
 - Use `pdbpp` for debugging (included in dev dependencies)
 
