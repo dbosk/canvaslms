@@ -5,18 +5,19 @@
   It has been minimally reviewed and revised by Daniel Bosk.%
 }
 
-This chapter provides the subcommand [[quizzes]], which provides access to 
+This chapter provides the subcommand [[quizzes]], which provides access to
 Canvas quiz and survey data.
 
 The [[quizzes]] command has two subcommands:
 \begin{itemize}
-\item [[list]] lists all quizzes (including classic quizzes and surveys) in a course
+\item [[list]] lists all quizzes (including Classic Quizzes, New Quizzes, and surveys) in a course
 \item [[analyse]] summarizes quiz or survey evaluation data
 \end{itemize}
 
 The [[analyse]] subcommand supports two modes of operation:
 \begin{enumerate}
 \item Fetch quiz/survey data directly from Canvas by specifying the quiz.
+  This works for both Classic Quizzes and New Quizzes (Quizzes.Next).
 \item Read and analyze a CSV file downloaded from Canvas.
 \end{enumerate}
 
@@ -192,11 +193,11 @@ analyse_parser.set_defaults(func=analyse_command)
 \section{The [[quizzes list]] subcommand and its options}
 
 We add the subparser for [[quizzes list]].
-This command lists all quizzes (both new quizzes and classic quizzes) in a course.
+This command lists all quizzes (both Classic Quizzes and New Quizzes) in a course.
 <<add quizzes list command to subp>>=
 list_parser = subp.add_parser("list",
     help="List all quizzes in a course",
-    description="""Lists all quizzes (including classic quizzes and surveys) 
+    description="""Lists all quizzes (including Classic Quizzes, New Quizzes, and surveys)
 in a course. Output in CSV format with quiz ID, title, type, and whether it's published.""")
 
 list_parser.set_defaults(func=list_command)
@@ -286,8 +287,8 @@ for course in course_list:
 
 \subsection{Listing all quizzes}
 
-We need to list both new quizzes (from assignments) and classic quizzes.
-The output format follows the same pattern as [[assignments list]]: 
+We need to list both New Quizzes (from assignments) and Classic Quizzes.
+The output format follows the same pattern as [[assignments list]]:
 course code, title, type, published status, due date.
 
 <<list all quizzes in course>>=
@@ -409,6 +410,129 @@ for qcol in question_columns:
 
 
 \section{Helper functions}
+
+\subsection{Detecting New Quizzes}
+
+New Quizzes (also known as Quizzes.Next) appear as assignments with a special
+attribute [[is\_quiz\_assignment]] set to [[True]].
+<<functions>>=
+def is_new_quiz(assignment):
+  """Determine if an assignment is a New Quiz (Quizzes.Next)"""
+  return hasattr(assignment, 'is_quiz_assignment') and assignment.is_quiz_assignment
+@
+
+
+\subsection{Progress polling}
+
+Both Classic Quizzes and New Quizzes return Progress objects when generating
+reports. This helper function polls a progress object until completion.
+<<functions>>=
+def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
+  """
+  Poll a progress object until it completes.
+
+  Args:
+    progress_obj: A Progress object or report object with progress attribute
+    max_attempts: Maximum number of polling attempts
+    sleep_interval: Seconds to wait between polls
+
+  Returns:
+    The final progress/report object, or None if max attempts reached
+  """
+  import time
+
+  for attempt in range(max_attempts):
+    # Check different ways the progress might indicate completion
+    is_completed = False
+
+    if hasattr(progress_obj, 'query'):
+      # It's a Progress object - refresh it
+      progress_obj.query()
+      if hasattr(progress_obj, 'workflow_state'):
+        is_completed = progress_obj.workflow_state == 'completed'
+
+    # For quiz reports with embedded progress
+    if hasattr(progress_obj, 'progress'):
+      if hasattr(progress_obj.progress, 'workflow_state'):
+        is_completed = progress_obj.progress.workflow_state == 'completed'
+      elif isinstance(progress_obj.progress, dict):
+        is_completed = progress_obj.progress.get('workflow_state') == 'completed'
+    elif hasattr(progress_obj, 'workflow_state'):
+      is_completed = progress_obj.workflow_state == 'completed'
+
+    if is_completed:
+      return progress_obj
+
+    if attempt < max_attempts - 1:
+      time.sleep(sleep_interval)
+
+  return None
+@
+
+
+\subsection{CSV report downloading}
+
+Both Classic and New Quizzes provide CSV reports via a file URL. This helper
+downloads and decodes the CSV with proper UTF-8 encoding.
+<<functions>>=
+def download_csv_report(file_url):
+  """
+  Download a CSV report from Canvas and return a CSV reader.
+
+  Args:
+    file_url: URL to the CSV file
+
+  Returns:
+    csv.DictReader object with the CSV data
+  """
+  import requests
+  import io
+
+  response = requests.get(file_url)
+  response.raise_for_status()
+
+  # Explicitly decode as UTF-8 to handle international characters
+  csv_data = response.content.decode('utf-8')
+  return csv.DictReader(io.StringIO(csv_data))
+@
+
+
+\subsection{Creating New Quiz reports}
+
+New Quizzes use a different API endpoint for report generation. We need to
+make a direct API call using the Canvas [[\_requester]] object.
+<<functions>>=
+def create_new_quiz_report(course, assignment_id, requester):
+  """
+  Create a student analysis report for a New Quiz.
+
+  Args:
+    course: Course object
+    assignment_id: The assignment ID of the New Quiz
+    requester: Canvas _requester object for making API calls
+
+  Returns:
+    Progress object for polling
+  """
+  import canvasapi.progress
+
+  # Build the API endpoint
+  endpoint = f"courses/{course.id}/quizzes/{assignment_id}/reports"
+
+  # Make the POST request
+  response = requester.request(
+    'POST',
+    f'/api/quiz/v1/{endpoint}',
+    _kwargs={
+      'quiz_report[report_type]': 'student_analysis',
+      'quiz_report[format]': 'csv'
+    }
+  )
+
+  # The response is a Progress object
+  return canvasapi.progress.Progress(requester, response.json())
+@
+
 
 \subsection{Determining question type}
 
@@ -772,9 +896,12 @@ Responses:
 For Canvas API mode, we need to fetch quiz data and process it similarly.
 We need to search for quizzes in two places:
 \begin{enumerate}
-\item Assignments (new quizzes, which are assignments)
+\item Assignments with [[is\_quiz\_assignment]] attribute (New Quizzes/Quizzes.Next)
 \item Classic quizzes (accessed via [[get\_quizzes()]])
 \end{enumerate}
+
+Both quiz types are handled by generating a student analysis report, polling
+until complete, and downloading the resulting CSV for processing.
 <<fetch from Canvas and process>>=
 # Ensure we have course and assignment specified
 if not hasattr(args, 'course') or not args.course:
@@ -788,7 +915,7 @@ try:
     canvaslms.cli.err(1, "No course found matching criteria")
   
   for course in course_list:
-    # Try to find the quiz/survey in assignments first (new quizzes)
+    # Try to find the quiz/survey in assignments first (includes New Quizzes)
     quiz = None
     try:
       assignment_list = assignments.process_assignment_option(canvas, args)
@@ -799,14 +926,14 @@ try:
           quiz = course_assignments[0]
           if len(course_assignments) > 1:
             canvaslms.cli.warn(f"Multiple assignments found in {course.course_code}, using first one")
-          # Check if this assignment supports create_report (classic quiz/survey)
-          # If not, we need to search in classic quizzes instead
-          if not hasattr(quiz, 'create_report'):
+          # If it's a New Quiz (is_quiz_assignment), we can handle it
+          # If it's not a New Quiz but is an assignment, search classic quizzes instead
+          if not is_new_quiz(quiz):
             quiz = None
     except canvaslms.cli.EmptyListError:
       pass
-    
-    # If not found in assignments or assignment doesn't support reports, try classic quizzes
+
+    # If not found as New Quiz in assignments, try classic quizzes
     if quiz is None:
       <<search for classic quiz>>
     
@@ -845,67 +972,12 @@ if hasattr(args, 'assignment') and args.assignment:
 We need to fetch quiz submissions and extract the data to analyze.
 For classic quizzes, we can use [[get\_quiz\_report]] to get the student analysis report.
 <<fetch quiz submissions from Canvas>>=
-# For classic quizzes, try to get the quiz statistics report
-# Try to create report - works for all quiz types retrieved via get_quizzes()
+# Check if this is a Classic Quiz or New Quiz and handle accordingly
 try:
-  # Try to create a student analysis report (works for surveys, graded_surveys, etc.)
-  # Don't check with hasattr as it doesn't always detect methods correctly
-  try:
-    report = quiz.create_report(report_type='student_analysis', includes_all_versions=True)
-  except AttributeError:
-    # Quiz doesn't support create_report, fall back to manual export
-    print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
-    print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
-    print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
-    print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
-    sys.exit(0)
-  
-  # Poll until the report is ready
-  import time
-  max_attempts = 30
-  for attempt in range(max_attempts):
-    report = quiz.get_quiz_report(report.id)
-    
-    # Check different ways the report might indicate completion
-    is_completed = False
-    if hasattr(report, 'progress'):
-      if hasattr(report.progress, 'workflow_state'):
-        is_completed = report.progress.workflow_state == 'completed'
-      elif isinstance(report.progress, dict):
-        is_completed = report.progress.get('workflow_state') == 'completed'
-    elif hasattr(report, 'workflow_state'):
-      is_completed = report.workflow_state == 'completed'
-    
-    if is_completed:
-      break
-    
-    if attempt < max_attempts - 1:
-      time.sleep(2)
-  
-  # Check if we have the file URL
-  file_url = None
-  if hasattr(report, 'file'):
-    if hasattr(report.file, 'url'):
-      file_url = report.file.url
-    elif isinstance(report.file, dict):
-      file_url = report.file.get('url')
-  
-  if file_url:
-    # Download the report file
-    import requests
-    response = requests.get(file_url)
-    response.raise_for_status()
-    
-    # Parse the CSV data with proper UTF-8 encoding
-    import io
-    # Explicitly decode as UTF-8 to handle Swedish characters correctly
-    csv_data = response.content.decode('utf-8')
-    reader = csv.DictReader(io.StringIO(csv_data))
-    
-    # Process the CSV data
-    <<process quiz CSV data from API>>
+  if is_new_quiz(quiz):
+    <<fetch New Quiz report>>
   else:
-    canvaslms.cli.err(1, "Report file URL not available")
+    <<fetch Classic Quiz report>>
 except AttributeError:
   # Quiz doesn't support the report API
   print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
@@ -919,6 +991,77 @@ except Exception as e:
   print(f"To export: Go to Quiz -> ... menu -> Student Analysis")
   print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
   sys.exit(1)
+@
+
+\subsection{Fetching Classic Quiz reports}
+
+Classic quizzes use the [[create\_report()]] method which returns a report
+object. We poll until complete, then download the CSV.
+<<fetch Classic Quiz report>>=
+# Try to create a student analysis report (works for surveys, graded_surveys, etc.)
+try:
+  report = quiz.create_report(report_type='student_analysis', includes_all_versions=True)
+except AttributeError:
+  # Quiz doesn't support create_report, fall back to manual export
+  print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
+  print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
+  print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
+  print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
+  sys.exit(0)
+
+# Poll until the report is ready
+# We need to refresh the report object to check progress
+for attempt in range(30):
+  report = quiz.get_quiz_report(report.id)
+  final_report = poll_progress(report, max_attempts=1)
+  if final_report:
+    report = final_report
+    break
+
+# Check if we have the file URL
+file_url = None
+if hasattr(report, 'file'):
+  if hasattr(report.file, 'url'):
+    file_url = report.file.url
+  elif isinstance(report.file, dict):
+    file_url = report.file.get('url')
+
+if file_url:
+  # Download and parse the CSV data
+  reader = download_csv_report(file_url)
+  # Process the CSV data
+  <<process quiz CSV data from API>>
+else:
+  canvaslms.cli.err(1, "Report file URL not available")
+@
+
+\subsection{Fetching New Quiz reports}
+
+New Quizzes use a different API endpoint. We call the helper to create the
+report, which returns a Progress object directly.
+<<fetch New Quiz report>>=
+# Create the report using the New Quiz API
+progress = create_new_quiz_report(course, quiz.id, canvas._requester)
+
+# Poll until the report is ready
+progress = poll_progress(progress)
+
+if not progress:
+  canvaslms.cli.err(1, "Report generation timed out")
+
+# Extract the file URL from the progress results
+file_url = None
+if hasattr(progress, 'results'):
+  if isinstance(progress.results, dict):
+    file_url = progress.results.get('url')
+
+if not file_url:
+  canvaslms.cli.err(1, "Report file URL not available from New Quiz report")
+
+# Download and parse the CSV data
+reader = download_csv_report(file_url)
+# Process the CSV data
+<<process quiz CSV data from API>>
 @
 
 <<process quiz CSV data from API>>=
