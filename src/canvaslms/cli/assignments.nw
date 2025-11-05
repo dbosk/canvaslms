@@ -81,23 +81,49 @@ As mentioned above, we want to be able to select only assignments with ungraded
 submissions.
 Other than that, we want to select assignments by assignment name, assignment
 group that an assignment belongs to, or module that contains the assignment.
-These filters can be combined using AND logic to narrow down results.
+
+\subsection{Design: Combinable filters vs.\ mutually exclusive filters}
+
+We provide three ways to filter assignments: by name ([[-a]]), by assignment
+group ([[-A]]), and by module ([[-M]]).
+An earlier design made these mutually exclusive---you could use only one at a
+time.
+However, this prevented useful queries like ``all lab assignments in Module 3''
+or ``all quizzes in the graded assignment group.''
+
+We now allow these filters to be \emph{combined} using AND logic.
+This provides more expressive filtering while maintaining backward
+compatibility.
+For example:
+\begin{itemize}
+\item [[-a "Lab" -M "Module 1"]] returns assignments matching ``Lab'' that are
+  \emph{also} in modules matching ``Module 1''
+\item [[-a "Quiz" -A "Graded"]] returns quizzes that are \emph{also} in the
+  ``Graded'' assignment group
+\item [[-M "Week 1" -A "Homework"]] returns assignments in Week 1 modules that
+  are \emph{also} in the Homework group
+\end{itemize}
+
+Since [[-a]] defaults to [[.*]] (match all assignment names), using [[-M]]
+alone still works as before: it returns all assignments in the matching modules,
+regardless of name.
+
+However, when filters are \emph{required} (some commands need at least one
+filter), we maintain mutual exclusion to avoid confusing users with too many
+options.
+This is a pragmatic choice: required filters are typically used in simpler
+contexts where combination isn't needed.
+
 In summary, we want the following options:
 \begin{itemize}
 \item [[-U]] will filter assignments that have ungraded submissions.
-\item [[-a]] will take a regex for assignments.
+\item [[-a]] will take a regex for assignment names.
 \item [[-A]] will take a regex for assignment groups.
   Then we can return all assignments in those assignment groups.
 \item [[-M]] will take a regex for modules.
   Then we can return all assignments in those modules.
 \end{itemize}
 These regular expressions match either the name or the Canvas identifier.
-
-When multiple filters are specified, they are combined with AND logic.
-For example, [[-a "Lab" -M "Module 1"]] returns only assignments matching
-"Lab" that are also in modules matching "Module 1".
-The [[-a]] option defaults to [[.*]] (match all), so using [[-M]] alone
-returns all assignments in the matching modules.
 This lets us add the following arguments.
 Remember, we add only the ungraded option if that was requested.
 Also, if we want the required version, we want to require either an assignment,
@@ -107,8 +133,15 @@ if ungraded:
   parser.add_argument("-U", "--ungraded", action="store_true",
     help="Filter only assignments with ungraded submissions.")
 
+<<add filter options: required or combinable>>
+@
+
+When filters are required, we maintain the mutually exclusive group to keep the
+interface simple.
+When filters are optional, we allow combination by adding them directly to the
+parser (not to a mutually exclusive group).
+<<add filter options: required or combinable>>=
 if required:
-  # If required, create a group that requires at least one of the filters
   filter_group = parser.add_mutually_exclusive_group(required=True)
   filter_group.add_argument("-a", "--assignment",
     help="Regex matching assignment title or Canvas identifier")
@@ -117,66 +150,111 @@ if required:
   filter_group.add_argument("-M", "--module",
     help="Regex matching module title or Canvas identifier")
 else:
-  # If not required, allow all filters to be combined with AND logic
   parser.add_argument("-a", "--assignment",
     required=False, default=".*",
     help="Regex matching assignment title or Canvas identifier, "
       "default: '.*'. Can be combined with -A and -M for AND filtering.")
-
   parser.add_argument("-A", "--assignment-group",
     required=False, default="",
     help="Regex matching assignment group title or Canvas identifier. "
       "Can be combined with -a and -M for AND filtering.")
-
   parser.add_argument("-M", "--module",
     required=False, default="",
     help="Regex matching module title or Canvas identifier. "
       "Can be combined with -a and -A for AND filtering.")
 @
 
-Now we iterate over the [[course_list]] to get to the assignment groups to then 
+Now we iterate over the [[course_list]] to get to the assignment groups to then
 filter out the assignments.
-We must get all assignments for a course and all assignment groups.
-Then we can filter out the matching assignments.
+
+\subsection{Sequential filter application for AND logic}
+
+To support combinable filters with AND logic, we apply filters \emph{sequentially}
+rather than using mutually exclusive branches.
+The algorithm is:
+\begin{enumerate}
+\item Start with all assignments matching the [[-a]] regex (defaults to [[.*]],
+  so all assignments by name)
+\item If [[-A]] is specified, filter the result to keep only assignments in
+  matching assignment groups
+\item If [[-M]] is specified, filter the result to keep only assignments in
+  matching modules
+\item Return the final filtered list
+\end{enumerate}
+
+This contrasts with the earlier mutually exclusive design, which used
+[[if]]/[[elif]]/[[else]] to choose \emph{one} filtering path.
+Now we chain filters, progressively narrowing the result set.
+
+Each filter that takes a list of groups or modules (rather than a single group
+or module) allows us to match assignments in \emph{any} of the matching groups
+or modules.
+For example, if [[-M "Module [12]"]] matches both Module 1 and Module 2, we
+return assignments from either module---but they must still match the other
+filters (assignment name and assignment group, if specified).
+
 <<process options for selecting assignments to assignments list>>=
 assignments_list = []
 
 for course in course_list:
-  try:
-    ungraded = args.ungraded
-  except AttributeError:
-    ungraded = False
-
-  # Start with all assignments matching the -a regex (defaults to ".*")
-  filtered_assignments = list(filter_assignments([course],
-    args.assignment,
-    ungraded=ungraded))
-
-  # Get filtering options
-  try:
-    assignm_grp_regex = args.assignment_group
-  except AttributeError:
-    assignm_grp_regex = ""
-
-  try:
-    module_regex = args.module
-  except AttributeError:
-    module_regex = ""
-
-  # Apply assignment group filter (AND logic with previous filters)
-  if assignm_grp_regex:
-    assignment_groups = filter_assignment_groups(course, assignm_grp_regex)
-    filtered_assignments = list(filter_assignments_by_group_list(
-        assignment_groups, filtered_assignments))
-
-  # Apply module filter (AND logic with previous filters)
-  if module_regex:
-    course_modules = modules.filter_modules(course, module_regex)
-    filtered_assignments = list(filter_assignments_by_module_list(
-        course_modules, filtered_assignments))
-
-  # Add the filtered assignments to the final list
+  <<get ungraded flag>>
+  <<apply sequential filters to get filtered assignments>>
   assignments_list += filtered_assignments
+@
+
+We check if the [[ungraded]] flag is set, defaulting to [[False]] if the
+attribute doesn't exist (some commands don't provide this option).
+<<get ungraded flag>>=
+try:
+  ungraded = args.ungraded
+except AttributeError:
+  ungraded = False
+@
+
+We start by filtering assignments by name using the [[-a]] option.
+Then, if assignment group or module filters are specified, we apply them
+sequentially to progressively narrow the results.
+<<apply sequential filters to get filtered assignments>>=
+filtered_assignments = list(filter_assignments([course],
+  args.assignment,
+  ungraded=ungraded))
+
+<<get filter options from args>>
+<<apply assignment group filter if specified>>
+<<apply module filter if specified>>
+@
+
+We extract the filter options from [[args]], defaulting to empty strings if the
+attributes don't exist.
+<<get filter options from args>>=
+try:
+  assignm_grp_regex = args.assignment_group
+except AttributeError:
+  assignm_grp_regex = ""
+
+try:
+  module_regex = args.module
+except AttributeError:
+  module_regex = ""
+@
+
+If an assignment group filter is specified, we filter the assignments to keep
+only those in matching groups.
+Note that we use [[filter_assignments_by_group_list]] which takes a list of
+groups and returns assignments in \emph{any} of them.
+<<apply assignment group filter if specified>>=
+if assignm_grp_regex:
+  assignment_groups = filter_assignment_groups(course, assignm_grp_regex)
+  filtered_assignments = list(filter_assignments_by_group_list(
+      assignment_groups, filtered_assignments))
+@
+
+Similarly, if a module filter is specified, we further filter the assignments.
+<<apply module filter if specified>>=
+if module_regex:
+  course_modules = modules.filter_modules(course, module_regex)
+  filtered_assignments = list(filter_assignments_by_module_list(
+      course_modules, filtered_assignments))
 @
 
 
@@ -256,16 +334,28 @@ def filter_assignments_by_group(assignment_group, assignments):
     if assignment.assignment_group_id == assignment_group.id:
       assignment.assignment_group = assignment_group
       yield assignment
+@
 
+We need a variant that filters by a \emph{list} of assignment groups.
+This is used for AND filtering: when [[-A]] matches multiple groups (via regex),
+we want assignments in \emph{any} of those groups, as long as they also match
+the other filters.
+
+For example, if [[-A "Graded|Homework"]] matches both ``Graded'' and ``Homework''
+groups, we return assignments from either group.
+But if we also specify [[-a "Lab"]], we only return Lab assignments from those
+groups.
+
+The key difference from [[filter_assignments_by_group]] is that this function
+takes a list of groups and builds a set of group IDs for efficient membership
+testing.
+<<functions>>=
 def filter_assignments_by_group_list(assignment_groups, assignments):
-  """Returns elements in assignments that belong to any of the assignment_groups.
-  Used for AND filtering with other criteria."""
-  # Get all group IDs
+  """Returns elements in assignments that belong to any of the assignment_groups"""
   group_ids = {group.id for group in assignment_groups}
 
   for assignment in assignments:
     if assignment.assignment_group_id in group_ids:
-      # Set the assignment_group attribute for matching assignments
       for group in assignment_groups:
         if assignment.assignment_group_id == group.id:
           assignment.assignment_group = group

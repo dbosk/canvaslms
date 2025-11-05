@@ -154,9 +154,7 @@ def filter_assignments_by_module(module, assignments):
 
 
 def filter_assignments_by_module_list(modules, assignments):
-    """Returns elements in assignments that belong to any of the modules.
-    Used for AND filtering with other criteria."""
-    # Collect all assignment IDs from all modules
+    """Returns elements in assignments that belong to any of the modules"""
     all_assignment_ids = set()
     for module in modules:
         try:
