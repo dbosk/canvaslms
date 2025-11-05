@@ -20,7 +20,6 @@ def modules_list_command(config, canvas, args):
             except:
                 item_count = 0
 
-            # Format sequential progress requirement more descriptively
             sequential = (
                 module.require_sequential_progress
                 if hasattr(module, "require_sequential_progress")
@@ -57,7 +56,6 @@ def modules_show_command(config, canvas, args):
                     output.writerow(row)
                 else:
                     for item in items:
-                        # Get completion requirement info
                         completion_req = ""
                         if (
                             hasattr(item, "completion_requirement")
@@ -70,8 +68,6 @@ def modules_show_command(config, canvas, args):
                                     completion_req += (
                                         f" (min score: {req['min_score']})"
                                     )
-
-                        # Build output row, conditionally including ID
                         row = [
                             course.course_code,
                             module.name,
