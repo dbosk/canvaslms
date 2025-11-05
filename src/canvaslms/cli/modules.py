@@ -153,6 +153,24 @@ def filter_assignments_by_module(module, assignments):
             yield assignment
 
 
+def filter_assignments_by_module_list(modules, assignments):
+    """Returns elements in assignments that belong to any of the modules.
+    Used for AND filtering with other criteria."""
+    # Collect all assignment IDs from all modules
+    all_assignment_ids = set()
+    for module in modules:
+        try:
+            for item in module.get_module_items():
+                if hasattr(item, "type") and item.type == "Assignment":
+                    all_assignment_ids.add(item.content_id)
+        except AttributeError:
+            pass
+
+    for assignment in assignments:
+        if assignment.id in all_assignment_ids:
+            yield assignment
+
+
 def add_command(subp):
     """Adds the subcommand and its options to argparse subparser subp"""
     modules_parser = subp.add_parser("modules", help="Work with Canvas modules")
