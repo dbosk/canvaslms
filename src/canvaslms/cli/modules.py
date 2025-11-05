@@ -50,9 +50,11 @@ def modules_show_command(config, canvas, args):
                 items = list(module.get_module_items())
                 if not items:
                     # Show module even if it has no items
-                    output.writerow(
-                        [course.course_code, module.name, "No items", "", "", ""]
-                    )
+                    row = [course.course_code, module.name, "No items", ""]
+                    if args.show_id:
+                        row.append("")
+                    row.append("")
+                    output.writerow(row)
                 else:
                     for item in items:
                         # Get completion requirement info
@@ -69,25 +71,30 @@ def modules_show_command(config, canvas, args):
                                         f" (min score: {req['min_score']})"
                                     )
 
-                        output.writerow(
-                            [
-                                course.course_code,
-                                module.name,
-                                item.type if hasattr(item, "type") else "Unknown",
-                                item.title if hasattr(item, "title") else "No title",
-                                (
-                                    item.content_id
-                                    if hasattr(item, "content_id")
-                                    else item.id if hasattr(item, "id") else ""
-                                ),
-                                completion_req,
-                            ]
-                        )
+                        # Build output row, conditionally including ID
+                        row = [
+                            course.course_code,
+                            module.name,
+                            item.type if hasattr(item, "type") else "Unknown",
+                            item.title if hasattr(item, "title") else "No title",
+                        ]
+
+                        if args.show_id:
+                            row.append(
+                                item.content_id
+                                if hasattr(item, "content_id")
+                                else item.id if hasattr(item, "id") else ""
+                            )
+
+                        row.append(completion_req)
+                        output.writerow(row)
             except:
                 # If we can't get items, show the module with error
-                output.writerow(
-                    [course.course_code, module.name, "Error loading items", "", "", ""]
-                )
+                row = [course.course_code, module.name, "Error loading items", ""]
+                if args.show_id:
+                    row.append("")
+                row.append("")
+                output.writerow(row)
 
 
 def add_module_option(parser, required=False):
@@ -176,7 +183,7 @@ def add_command(subp):
     show_parser = modules_subp.add_parser(
         "show",
         help="Shows modules and their contents",
-        description="Shows modules and their contents. Output: course, module name, item type, item name, item id, completion requirement",
+        description="Shows modules and their contents. Output: course, module name, item type, item name, [item id], completion requirement",
     )
     show_parser.set_defaults(func=modules_show_command)
     show_parser.add_argument(
@@ -186,3 +193,6 @@ def add_command(subp):
         help="Regex for filtering modules, default: '.*'",
     )
     courses.add_course_option(show_parser, required=True)
+    show_parser.add_argument(
+        "--show-id", action="store_true", help="Include Canvas IDs in output"
+    )
