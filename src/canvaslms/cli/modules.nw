@@ -1,0 +1,424 @@
+\chapter{The \texttt{modules} subcommand}
+\chapterprecis{Written by Copilot and Claude under supervision of Daniel Bosk.}
+
+\section*{What are Canvas modules?}
+
+In Canvas LMS, modules are organizational units that group course content
+(assignments, pages, files, etc.) into structured learning sequences.
+Modules can have prerequisites, unlock dates, and completion requirements,
+making them essential for understanding course structure and student progress.
+
+Why do we need a separate [[modules]] subcommand when we already have
+[[assignments]], [[users]], and other subcommands?
+Because modules represent the \emph{pedagogical structure} of a course, while
+assignments represent \emph{individual work items}.
+An instructor might want to see all content from \enquote{Week 3} without
+knowing which specific assignments that includes, or check if all modules are
+properly configured before a course begins.
+
+\section*{Chapter overview}
+
+This chapter serves two purposes:
+First, it provides the [[modules]] subcommand with two sub-commands:
+\begin{itemize}
+\item [[modules list]] --- lists modules with their metadata (unlock dates,
+  progress requirements, item counts)
+\item [[modules show]] --- displays module contents including all items and
+  their completion requirements
+\end{itemize}
+
+Second, it provides utility functions ([[add_module_option]],
+[[process_module_option]], [[filter_modules]]) that other subcommands can use
+to filter operations by module membership.
+
+We outline the module structure:
+<<modules.py>>=
+import argparse
+import canvasapi
+import canvaslms.cli.courses as courses
+import csv
+import re
+import sys
+
+<<functions>>
+
+def add_command(subp):
+  """Adds the subcommand and its options to argparse subparser subp"""
+  modules_parser = subp.add_parser("modules",
+    help="Work with Canvas modules")
+  modules_subp = modules_parser.add_subparsers(dest="modules_command", 
+    help="Available module commands")
+  
+  # Add 'list' subcommand
+  list_parser = modules_subp.add_parser("list",
+    help="Lists modules of a course",
+    description="Lists modules of a course. Output: course, module name, "
+                "unlock at, require sequential progress, item count")
+  list_parser.set_defaults(func=modules_list_command)
+  <<add list arguments>>
+  
+  # Add 'show' subcommand
+  show_parser = modules_subp.add_parser("show",
+    help="Shows modules and their contents",
+    description="Shows modules and their contents. Output: course, "
+                "module name, item type, item name, [item id], "
+                "completion requirement")
+  show_parser.set_defaults(func=modules_show_command)
+  <<add show arguments>>
+@
+
+Both subcommands accept a regular expression for filtering modules by name
+or Canvas ID.
+This allows users to work with specific modules or groups of related modules.
+Additionally, the [[show]] subcommand supports an optional [[--show-id]] flag
+to include Canvas item IDs in the output.
+These IDs are useful for automation and scripting, but omitted by default for
+cleaner, more readable output.
+
+<<add list arguments>>=
+list_parser.add_argument("regex",
+  default=".*", nargs="?",
+  help="Regex for filtering modules, default: '.*'")
+courses.add_course_option(list_parser, required=True)
+
+<<add show arguments>>=
+show_parser.add_argument("regex",
+  default=".*", nargs="?",
+  help="Regex for filtering modules, default: '.*'")
+courses.add_course_option(show_parser, required=True)
+show_parser.add_argument("--show-id", action="store_true",
+  help="Include Canvas IDs in output")
+@
+
+
+\section{Producing a list of modules, [[modules_list_command]]}
+
+The [[modules list]] subcommand provides a high-level overview of all modules
+in a course.
+For each module, we output metadata that helps users understand course
+structure: when modules unlock, whether students must complete items in order,
+and how many items each module contains.
+
+The function~[[modules_list_command]] processes the command-line arguments and
+outputs one row per module in CSV format.
+<<functions>>=
+def modules_list_command(config, canvas, args):
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  course_list = courses.process_course_option(canvas, args)
+  
+  for course in course_list:
+    modules = filter_modules(course, args.regex)
+    for module in modules:
+      <<write module information to output>>
+@
+
+\section{Showing modules and their contents, [[modules_show_command]]}
+
+The [[modules show]] subcommand provides detailed information about module
+contents.
+Unlike [[modules list]] which shows module-level metadata, [[modules show]]
+enumerates every item within matching modules, including their type (Assignment,
+Page, File, etc.), title, and completion requirements.
+
+We must handle several edge cases:
+modules with no items, API errors when fetching items, and optional inclusion
+of Canvas IDs based on the [[--show-id]] flag.
+<<functions>>=
+def modules_show_command(config, canvas, args):
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  course_list = courses.process_course_option(canvas, args)
+  
+  for course in course_list:
+    modules = filter_modules(course, args.regex)
+    for module in modules:
+      <<process module items with error handling>>
+@
+
+Canvas modules can be in various states:
+some may contain no items (empty modules used as headers), while others may
+have permissions or API issues preventing item access.
+We handle these cases gracefully to ensure users see all matching modules, even
+if we cannot retrieve their contents.
+
+For empty modules, we output a row indicating \enquote{No items}.
+For modules where item retrieval fails (due to API errors, permissions, or
+network issues), we output an \enquote{Error loading items} message.
+This approach ensures the user knows which modules exist and that we attempted
+to process them, even when complete information is unavailable.
+
+The bare [[except]] clause catches all exceptions because the Canvas API can
+raise various exception types (network errors, permission errors, malformed
+responses), and we want robust output rather than a failed command.
+
+<<process module items with error handling>>=
+try:
+  items = list(module.get_module_items())
+  if not items:
+    # Show module even if it has no items
+    row = [course.course_code, module.name, "No items", ""]
+    if args.show_id:
+      row.append("")
+    row.append("")
+    output.writerow(row)
+  else:
+    for item in items:
+      <<write module item information to output>>
+except:
+  # If we can't get items, show the module with error
+  row = [course.course_code, module.name, "Error loading items", ""]
+  if args.show_id:
+    row.append("")
+  row.append("")
+  output.writerow(row)
+@
+
+\subsection{Module metadata output format}
+
+For the [[modules list]] command, we output five pieces of information per
+module:
+\begin{enumerate}
+\item Course code
+\item Module name
+\item Unlock date (when the module becomes available to students)
+\item Progress mode (explained below)
+\item Item count (number of items in the module)
+\end{enumerate}
+
+<<write module information to output>>=
+# Get module items count
+try:
+  items = list(module.get_module_items())
+  item_count = len(items)
+except:
+  item_count = 0
+
+<<format progress mode descriptively>>
+
+output.writerow([
+  course.course_code,
+  module.name,
+  module.unlock_at if hasattr(module, 'unlock_at') else None,
+  progress_mode,
+  item_count
+])
+@
+
+The Canvas API provides a boolean [[require_sequential_progress]] field
+indicating whether students must complete module items in order.
+However, outputting [[True]]/[[False]] values would require users to consult
+documentation to understand their meaning.
+Instead, we output self-explanatory strings: ``sequential'' when items must be
+completed in order, and ``any-order'' when students can complete items in any
+sequence.
+This follows the Unix philosophy of making output immediately understandable.
+
+<<format progress mode descriptively>>=
+sequential = (module.require_sequential_progress
+              if hasattr(module, 'require_sequential_progress')
+              else False)
+progress_mode = "sequential" if sequential else "any-order"
+@
+
+\subsection{Module item output format}
+
+For the [[modules show]] command, we output information about each item within
+matching modules.
+The output includes: course code, module name, item type, item title,
+optionally the Canvas ID (when [[--show-id]] is specified), and any
+completion requirements.
+
+Completion requirements specify what students must do to mark an item complete:
+they might need to view the item, submit an assignment, or achieve a minimum
+score.
+We format these requirements in a human-readable way, including threshold scores
+when applicable.
+
+Canvas item IDs are useful for automation (e.g., constructing URLs or making
+API calls) but add visual clutter for humans reading the output.
+Therefore, we make ID output optional via the [[--show-id]] flag, defaulting to
+cleaner output without IDs.
+
+<<write module item information to output>>=
+<<extract completion requirement>>
+<<build item output row conditionally>>
+@
+
+<<extract completion requirement>>=
+completion_req = ""
+if hasattr(item, 'completion_requirement') and item.completion_requirement:
+  req = item.completion_requirement
+  if 'type' in req:
+    completion_req = req['type']
+    if 'min_score' in req:
+      completion_req += f" (min score: {req['min_score']})"
+@
+
+We build the output row incrementally.
+The base row always includes course, module, item type, and item title.
+If the user requested IDs via [[--show-id]], we insert the Canvas ID
+before the completion requirement.
+This approach maintains consistent column ordering while allowing optional
+fields.
+
+<<build item output row conditionally>>=
+row = [
+  course.course_code,
+  module.name,
+  item.type if hasattr(item, 'type') else "Unknown",
+  item.title if hasattr(item, 'title') else "No title"
+]
+
+if args.show_id:
+  if hasattr(item, 'content_id'):
+    row.append(item.content_id)
+  elif hasattr(item, 'id'):
+    row.append(item.id)
+  else:
+    row.append("")
+
+row.append(completion_req)
+output.writerow(row)
+@
+
+
+\section{Module selection options for other commands}
+
+Many Canvas operations can be filtered by module membership.
+For example, when grading assignments, an instructor might want to grade only
+assignments from a specific module, or when listing submissions, they might
+want to filter by module.
+
+To support these use cases, we provide two utility functions that other
+subcommands can use:
+[[add_module_option]] adds a [[-M, --module]] option to an argument parser,
+and [[process_module_option]] processes this option to return a filtered list
+of modules.
+
+These functions follow the same pattern as [[courses.add_course_option]] and
+[[courses.process_course_option]], providing a consistent interface across
+subcommands.
+
+When selecting modules, we must first select a course (since modules belong to
+courses).
+The [[add_module_option]] function attempts to add the course option, but
+catches [[ArgumentError]] if the course option was already added by other code.
+If the [[required]] parameter is [[True]], we make the module option required.
+<<functions>>=
+def add_module_option(parser, required=False):
+  """Adds module selection option to parser"""
+  try:
+    courses.add_course_option(parser, required=required)
+  except argparse.ArgumentError:
+    pass
+
+  parser.add_argument("-M", "--module",
+    required=required, default="" if not required else None,
+    help="Regex matching module title or Canvas identifier.")
+
+def process_module_option(canvas, args):
+  """Processes module selection from command line args"""
+  course_list = courses.process_course_option(canvas, args)
+  modules_list = []
+  
+  for course in course_list:
+    try:
+      module_regex = args.module
+    except AttributeError:
+      module_regex = ".*"
+    
+    if module_regex:
+      modules = filter_modules(course, module_regex)
+      modules_list.extend(modules)
+  
+  return modules_list
+@
+
+
+\section{Filtering modules by pattern}
+
+The [[filter_modules]] function filters a course's modules by a regular
+expression pattern.
+We match the pattern against both the module name (e.g.,
+\enquote{Week 1: Introduction}) and the Canvas numeric ID, giving users
+flexibility in how they specify modules.
+
+This dual-matching approach is useful because:
+\begin{itemize}
+\item Module names are human-readable but may be long or contain special
+  characters
+\item Canvas IDs are concise and stable (they never change), making them ideal
+  for scripts
+\item Users can choose the most convenient method for their use case
+\end{itemize}
+<<functions>>=
+def filter_modules(course, regex):
+  """Returns all modules of course whose name matches regex"""
+  name = re.compile(regex)
+  return filter(
+    lambda module: name.search(module.name) or name.search(str(module.id)),
+    course.get_modules())
+@
+
+
+\section{Filtering assignments by module membership}
+
+Assignments in Canvas can be organized into modules, but they also exist
+independently in the course's assignment list.
+When users want to work with assignments from a specific module, we need to
+cross-reference module items with the assignment list.
+
+The [[filter_assignments_by_module]] function takes a module and a list of
+assignments, yielding only those assignments that appear as items in the module.
+We build a set of assignment IDs from the module's items, then filter the
+assignment list to include only matching assignments.
+
+This is a generator function (using [[yield]]) to avoid building intermediate
+lists when processing large numbers of assignments.
+<<functions>>=
+def filter_assignments_by_module(module, assignments):
+  """Returns elements in assignments that are part of module"""
+  # Get all module items that are assignments
+  assignment_ids = set()
+  try:
+    for item in module.get_module_items():
+      if hasattr(item, 'type') and item.type == "Assignment":
+        assignment_ids.add(item.content_id)
+  except AttributeError:
+    # Handle cases where module items don't have expected attributes
+    pass
+
+  for assignment in assignments:
+    if assignment.id in assignment_ids:
+      yield assignment
+@
+
+We also need a variant that filters by a \emph{list} of modules rather than a
+single module.
+This supports AND filtering in the assignments command: when [[-M]] matches
+multiple modules (via regex), we want assignments in \emph{any} of those
+modules, as long as they also match the other filters (assignment name and
+assignment group, if specified).
+
+For example, if [[-M "Module [12]"]] matches both Module 1 and Module 2, we
+return assignments from either module.
+But if we also specify [[-a "Quiz"]], we only return Quiz assignments from
+those modules.
+
+The implementation collects assignment IDs from all matching modules into a
+single set, then yields assignments whose IDs appear in that set.
+<<functions>>=
+def filter_assignments_by_module_list(modules, assignments):
+  """Returns elements in assignments that belong to any of the modules"""
+  all_assignment_ids = set()
+  for module in modules:
+    try:
+      for item in module.get_module_items():
+        if hasattr(item, 'type') and item.type == "Assignment":
+          all_assignment_ids.add(item.content_id)
+    except AttributeError:
+      pass
+
+  for assignment in assignments:
+    if assignment.id in all_assignment_ids:
+      yield assignment
+@

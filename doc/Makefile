@@ -20,9 +20,13 @@ canvaslms.pdf: ${SRC_DIR}/cli/courses.tex
 canvaslms.pdf: ${SRC_DIR}/cli/users.tex
 canvaslms.pdf: ${SRC_DIR}/cli/assignments.tex
 canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
+canvaslms.pdf: ${SRC_DIR}/cli/modules.tex
 canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
 canvaslms.pdf: ${SRC_DIR}/cli/results.tex
 canvaslms.pdf: ${SRC_DIR}/grades/grades.tex
+canvaslms.pdf: ${SRC_DIR}/cli/calendar.tex
+canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
+canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex
 
 canvaslms.pdf: src
 
