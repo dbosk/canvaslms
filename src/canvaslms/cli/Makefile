@@ -11,6 +11,7 @@ MODULES+=	results.py results.tex
 MODULES+=	calendar.py calendar.tex
 MODULES+=	discussions.py discussions.tex
 MODULES+= 	utils.py utils.tex
+MODULES+=	quizzes.py quizzes.tex
 
 .PHONY: all
 all: ${MODULES}
