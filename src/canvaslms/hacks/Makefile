@@ -3,17 +3,14 @@ NOTANGLEFLAGS.py=
 
 .PHONY: all
 all: __init__.py
-all: canvasapi_patch.py canvasapi_patch.tex
+all: canvasapi.py canvasapi.tex
 
-canvasapi_patch.py: canvasapi-patch.py
-	${MV} $< $@
-
-canvasapi-patch.py: canvasapi_patch.nw
+canvasapi.py: canvasapi.nw
 	${NOTANGLE.py}
 
 .PHONY: clean
 clean:
-	${RM} canvasapi_patch.py canvasapi_patch.tex
+	${RM} canvasapi.py canvasapi.tex
 
 
 INCLUDE_MAKEFILES=../../../makefiles
