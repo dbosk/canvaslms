@@ -76,11 +76,12 @@ def modules_show_command(config, canvas, args):
                         ]
 
                         if args.show_id:
-                            row.append(
-                                item.content_id
-                                if hasattr(item, "content_id")
-                                else item.id if hasattr(item, "id") else ""
-                            )
+                            if hasattr(item, "content_id"):
+                                row.append(item.content_id)
+                            elif hasattr(item, "id"):
+                                row.append(item.id)
+                            else:
+                                row.append("")
 
                         row.append(completion_req)
                         output.writerow(row)
@@ -180,7 +181,8 @@ def add_command(subp):
     list_parser = modules_subp.add_parser(
         "list",
         help="Lists modules of a course",
-        description="Lists modules of a course. Output: course, module name, unlock at, require sequential progress, item count",
+        description="Lists modules of a course. Output: course, module name, "
+        "unlock at, require sequential progress, item count",
     )
     list_parser.set_defaults(func=modules_list_command)
     list_parser.add_argument(
@@ -195,7 +197,9 @@ def add_command(subp):
     show_parser = modules_subp.add_parser(
         "show",
         help="Shows modules and their contents",
-        description="Shows modules and their contents. Output: course, module name, item type, item name, [item id], completion requirement",
+        description="Shows modules and their contents. Output: course, "
+        "module name, item type, item name, [item id], "
+        "completion requirement",
     )
     show_parser.set_defaults(func=modules_show_command)
     show_parser.add_argument(
