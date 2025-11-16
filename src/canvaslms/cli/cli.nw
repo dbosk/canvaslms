@@ -279,14 +279,83 @@ if "://" not in hostname:
   hostname = f"https://{hostname}"
 @
 
-To make the Canvas API client more resilient to transient failures, we
-configure a retry policy with exponential backoff.
-This handles rate limiting (HTTP 429) and server errors (HTTP 500--504).
-The retry strategy uses exponential backoff with a factor of 2, starting at 2
-seconds and capping at 256 seconds.
-We allow up to 10 retry attempts and add jitter to prevent thundering herd
-problems.
-The Canvas API may send a [[Retry-After]] header, which we respect.
+
+\subsection{Configuring retry policy with exponential backoff}
+
+The Canvas API, like most web services, can experience transient failures due to
+network issues, temporary server overload, or rate limiting.
+Without retry logic, these transient failures would cause the CLI to fail
+immediately, forcing users to manually re-run commands.
+To make [[canvaslms]] more robust and user-friendly, we configure automatic
+retry handling with exponential backoff.
+
+The [[canvasapi]] library uses the [[requests]] library internally, which in
+turn uses [[urllib3]] for HTTP connections.
+The [[urllib3.util.retry.Retry]] class provides sophisticated retry logic with
+exponential backoff.
+We configure it to handle:
+\begin{itemize}
+\item HTTP 429 (Too Many Requests): The standard rate-limiting response code.
+\item HTTP 500 (Internal Server Error): Temporary server-side errors.
+\item HTTP 502 (Bad Gateway): Upstream server errors, often transient.
+\item HTTP 503 (Service Unavailable): Server temporarily unable to handle requests.
+\item HTTP 504 (Gateway Timeout): Upstream server timeout, may succeed on retry.
+\end{itemize}
+
+\paragraph{Exponential backoff strategy}
+
+Exponential backoff means that the delay between retries grows exponentially
+rather than linearly.
+With a backoff factor of 2, the delays follow the sequence: 2, 4, 8, 16, 32, 64,
+128, 256 seconds.
+We cap the maximum delay at 256 seconds to prevent excessively long waits while
+still allowing the server time to recover.
+With 10 total retry attempts, the total maximum time spent retrying is
+approximately $2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 256 + 256 = 1022$ seconds
+(about 17 minutes).
+
+This strategy is beneficial because:
+\begin{itemize}
+\item Early retries happen quickly for transient glitches (2--4 seconds).
+\item Later retries give the server more time to recover from sustained issues.
+\item It prevents overwhelming a struggling server with rapid retry attempts.
+\end{itemize}
+
+\paragraph{Jitter to prevent thundering herd}
+
+We add jitter (random variation) of 0.3 to the backoff delays.
+This means each delay is multiplied by a random factor between 0.7 and 1.3.
+Jitter is important when many clients experience the same failure simultaneously
+(for example, if the Canvas server goes down briefly and then recovers).
+Without jitter, all clients would retry at exactly the same moments, potentially
+overwhelming the server again.
+Jitter spreads the retry attempts over time, allowing the server to recover
+smoothly.
+
+\paragraph{Respecting the Retry-After header}
+
+When a server is rate-limiting or overloaded, it may include a [[Retry-After]]
+header in the response to tell clients how long to wait before retrying.
+By setting [[respect_retry_after_header=True]], we honor this guidance from the
+Canvas API, which may specify shorter or longer delays than our exponential
+backoff would calculate.
+
+\paragraph{Implementation via session adapter monkey-patching}
+
+The [[canvasapi]] library doesn't expose a way to pass custom retry configuration
+through its [[Canvas]] constructor.
+However, it internally creates a [[requests.Session]] object for connection pooling.
+We can configure retry behavior by creating an [[HTTPAdapter]] with our retry
+strategy and mounting it to the session for both [[https://]] and [[http://]]
+protocols.
+
+We access the internal session through [[canvas._Canvas__requester._session]].
+This uses Python's name mangling for private attributes (the [[__requester]]
+attribute becomes [[_Canvas__requester]]).
+While this is somewhat fragile (it depends on [[canvasapi]]'s internal structure),
+it's currently the only way to configure retries without modifying the library
+itself.
+
 <<configure retry policy for canvas>>=
 retry_strategy = Retry(
   total=10,
