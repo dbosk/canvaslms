@@ -29,6 +29,7 @@ import canvaslms.hacks.canvasapi
 
 import argparse
 import csv
+import difflib
 import json
 import os
 import pathlib
@@ -276,7 +277,10 @@ We also need the corresponding function.
 For now, we only print the most relevant data of a submission.
 <<functions>>=
 def submissions_view_command(config, canvas, args):
+  <<enable history when diff is requested>>
+  
   submission_list = process_submission_options(canvas, args)
+
   <<get and print the submission data>>
 @
 
@@ -309,7 +313,8 @@ for submission in submission_list:
   output = format_submission(submission,
                              history=args.history,
                              tmpdir=tmpdir/subdir,
-                             json_format=args.json)
+                             json_format=args.json,
+                             diff=args.diff)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -585,6 +590,18 @@ history.
 <<add options for printing a submission>>=
 view_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
+submission_parser.add_argument("--diff", action="store_true",
+  help="Show diffs between submission versions. Automatically enables --history.")
+@
+
+When the user requests diffs between submission versions, we need access to the 
+submission history. Without history, there's only one version available and no 
+comparison can be made. Therefore, we automatically enable history mode when 
+diff is requested to provide better user experience - users don't need to 
+remember to specify both flags.
+<<enable history when diff is requested>>=
+if args.diff:
+  args.history = True
 @
 
 
@@ -780,7 +797,10 @@ def format_submission(submission, history=False, json_format=False,
   <<add rubric assessment to output>>
   <<add comments to output>>
   if history:
-    <<add submission history to output>>
+    if diff:
+      <<add submission history diffs to output>>
+    else:
+      <<add submission history to output>>
   else:
     <<add body to output>>
     <<add quiz answers to output>>
@@ -1022,6 +1042,7 @@ tmpdir = None,
 <<[[format_submission]] doc>>=
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
+
 <<attachment iteration variables>>=
 tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
 tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1188,7 +1209,8 @@ prev_submission.assignment = submission.assignment
 prev_metadata = format_submission(prev_submission,
                                   tmpdir=version_dir,
                                   json_format=json_format,
-                                  md_title_level=md_title_level+"#")
+                                  md_title_level=md_title_level+"#",
+                                  diff=False)
 
 versions[version] = prev_metadata
 @
@@ -1203,6 +1225,585 @@ if json_format:
 else:
   with open(version_dir/"metadata.md", "w") as f:
     f.write(prev_metadata)
+@
+
+
+\section{Diff functionality for submission versions}\label{SubmissionDiff}
+\marginpar{%
+  \footnotesize
+  \cref{SubmissionDiff} was written by GitHub Copilot.
+  It was reviewed and revised by Daniel Bosk.
+}%
+When grading student submissions, instructors often need to understand how
+students' work evolved over multiple attempts.
+A common pattern in student work is progressive refinement, where each
+submission builds on the previous one.
+Simply viewing each version in isolation makes it difficult to identify what
+actually changed between attempts, forcing the instructor to mentally compare
+versions or manually switch between different views.
+
+This section implements diff functionality that addresses this pedagogical need.
+The approach shows Version~0 in its entirety (providing complete context)
+followed by unified diffs for subsequent versions.
+This design balances readability with information density: the instructor reads
+the complete first submission to understand the student's initial approach, then
+sees only what changed in each subsequent attempt.
+This makes it easy to track the student's problem-solving process and identify
+patterns in their revisions.
+
+The implementation handles parameter handling, content extraction from various
+submission types (text, quiz answers, file attachments), and unified diff
+generation.
+
+\subsection{Adding diff parameter to [[format_submission]]}
+
+The diff functionality requires an additional parameter to the format\_submission
+function to control whether we show diffs or full content for each version.
+<<[[format_submission]] args>>=
+diff=False,
+@
+
+We also need to document this parameter for users of the function.
+<<[[format_submission]] doc>>=
+`diff` is a boolean indicating whether to show diffs between submission versions
+instead of showing each version in full. Only works when `history` is True.
+@
+
+\subsection{Design decisions}
+
+Several design choices shape the diff functionality's implementation and output
+format.
+
+We chose unified diff format (as produced by [[difflib.unified_diff]]) because:
+\begin{itemize}
+\item It's familiar to anyone who has used version control systems like Git,
+      reducing the learning curve for instructors.
+\item It's compact and works well in terminal pagers, which is the primary
+      viewing environment for this tool.
+\item It clearly shows context around changes, making it easy to understand
+      what was modified without losing sight of the surrounding code.
+\item The [[+]]/[[-]] notation makes additions and deletions immediately
+      apparent at a glance.
+\end{itemize}
+
+We wrap diffs in Markdown code blocks with the [[diff]] syntax highlighting
+marker.
+This provides visual distinction between added lines, removed lines, and
+unchanged context when the output is viewed with a capable pager (such as
+[[less -R]]) or rendered in a Markdown viewer.
+
+JSON format is explicitly not supported for diffs.
+Unified diff is fundamentally a textual representation optimized for human
+reading, and it doesn't translate meaningfully to structured data.
+Instructors using [[--json]] mode will see a message indicating that diffs are
+not available in that format.
+
+\subsection{Example output}
+
+To illustrate the diff functionality, consider a student who submits a Python
+solution twice.
+The first version contains a basic implementation:
+\begin{minted}{python}
+def calculate_average(numbers):
+    return sum(numbers) / len(numbers)
+\end{minted}
+
+The student then revises the submission to add error handling:
+\begin{minted}{python}
+def calculate_average(numbers):
+    if not numbers:
+        return 0
+    return sum(numbers) / len(numbers)
+\end{minted}
+
+The diff output will show Version~0 in full, then display the changes for
+Version~1:
+\begin{minted}{diff}
+--- Version 0/solution.py
++++ Version 1/solution.py
+@@ -1,2 +1,4 @@
+ def calculate_average(numbers):
++    if not numbers:
++        return 0
+     return sum(numbers) / len(numbers)
+\end{minted}
+
+This makes it immediately clear that the student added input validation between
+submissions.
+The [[@@]] line shows that we're looking at lines starting from line~1 in the
+original, and that the new version has 4 lines instead of 2.
+The unchanged lines provide context, while the [[+]] prefix clearly marks the
+new additions.
+
+If the student had renamed the file between submissions (\eg from
+[[solution.py]] to [[solution_final.py]]), the diff headers would show both
+names to make the rename detection visible to the instructor.
+
+\subsection{Submission history with diffs}
+
+When the user wants to see diffs between submission versions, we need to extract
+the text content from each version and compare them. The strategy is to show
+Version 0 in full (providing complete context), then show subsequent versions 
+as diffs from the previous version.
+
+First, we check if submission history is available.
+<<add submission history diffs to output>>=
+try:
+  submission_history = submission.submission_history
+except AttributeError:
+  pass
+else:
+  if submission_history:
+    if json_format:
+      <<handle json format for diffs>>
+    else:
+      <<process versions for diff display>>
+@
+
+For JSON format, we don't support diffs as they're not meaningful in that context.
+<<handle json format for diffs>>=
+formatted_submission.update(format_section(
+  "submission_diffs", "Diffs not supported in JSON format",
+  json_format=True, md_title_level=md_title_level))
+@
+
+For markdown format, we process each version and build the diff output.
+<<process versions for diff display>>=
+diff_output = ""
+prev_content = None
+
+<<iterate through submission versions>>
+
+if diff_output:
+  formatted_submission += format_section("Submission History with Diffs",
+                                         diff_output,
+                                         md_title_level=md_title_level)
+else:
+  formatted_submission += format_section("Submission History with Diffs",
+                                         "No submission history found.",
+                                         md_title_level=md_title_level)
+@
+
+We iterate through each version filling [[diff_output]], treating Version 0 
+specially (showing full content) and subsequent versions as diffs.
+<<iterate through submission versions>>=
+for version, curr_submission_data in enumerate(submission.submission_history):
+  curr_submission = canvasapi.submission.Submission(submission._requester,
+                                                    curr_submission_data)
+  curr_submission.assignment = submission.assignment
+  
+  curr_content = extract_submission_text(curr_submission, tmpdir / f"version-{version}")
+  
+  <<handle version 0 full content>>
+  <<handle subsequent versions as diffs>>
+  
+  prev_content = curr_content
+@
+
+Version 0 is shown in full to provide complete context for understanding 
+subsequent changes.
+We use a dedicated directory for this version to avoid file collisions
+between different submission revisions during extraction.
+<<handle version 0 full content>>=
+if version == 0:
+  version_dir = tmpdir / f"version-{version}"
+  version_0_formatted = format_submission(curr_submission,
+                                          tmpdir=version_dir,
+                                          json_format=json_format,
+                                          md_title_level=md_title_level+"##",
+                                          diff=False)
+  diff_output += format_section(f"Version {version} (Full Content)",
+                                version_0_formatted,
+                                md_title_level=md_title_level+"#")
+@
+
+Subsequent versions are shown as diffs from the previous version.
+<<handle subsequent versions as diffs>>=
+else:
+  version_diff = generate_diff(prev_content,
+                               curr_content,
+                               f"Version {version-1}",
+                               f"Version {version}")
+  if version_diff:
+    diff_output += format_section(f"Version {version} "
+                                    f"(Changes from Version {version-1})",
+                                  version_diff,
+                                  md_title_level=md_title_level+"#")
+  else:
+    diff_output += format_section(f"Version {version} "
+                                    f"(Changes from Version {version-1})",
+                                  "No textual differences found from "
+                                    "previous version.",
+                                  md_title_level=md_title_level+"#")
+@
+
+\subsection{Text extraction for diff comparison}
+
+To generate meaningful diffs, we need to extract text content from submissions
+in a consistent format. This function handles different types of content including
+body text, quiz answers, and file attachments.
+<<functions>>=
+def extract_submission_text(submission, tmpdir):
+  """
+  Extracts text content from a submission for diff comparison.
+  Returns a dictionary with keys for different content types.
+  """
+  content = {}
+  
+  <<extract body text>>
+  <<extract quiz answers>>
+  <<extract attachment text>>
+  
+  return content
+@
+
+Body text is the main textual content of the submission.
+<<extract body text>>=
+try:
+  if submission.body:
+    content['body'] = submission.body
+except AttributeError:
+  pass
+@
+
+Quiz answers are stored as JSON data that we format consistently for comparison.
+<<extract quiz answers>>=
+try:
+  if submission.submission_data:
+    content['quiz_answers'] = json.dumps(submission.submission_data,
+                                         indent=2, sort_keys=True)
+except AttributeError:
+  pass
+@
+
+File attachments require special handling to convert various formats to text.
+<<extract attachment text>>=
+try:
+  if submission.attachments:
+    tmpdir = pathlib.Path(tmpdir)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    attachment_texts = {}
+    
+    <<process each attachment>>
+    
+    if attachment_texts:
+      content['attachments'] = attachment_texts
+except AttributeError:
+  pass
+@
+
+Each attachment is processed to extract its text content, with error handling
+for files that cannot be converted.
+When [[convert_to_md]] processes text files, it wraps the content in Markdown
+code blocks ([[```python\n...\n```]]) for nice display.
+However, for diff comparison, we want the raw content without these markers,
+since the diff itself will be wrapped in a code block later.
+Removing the markers prevents nested code blocks and ensures clean line-by-line
+comparison.
+<<process each attachment>>=
+for attachment in submission.attachments:
+  try:
+    attachment_content = convert_to_md(attachment, tmpdir)
+    # Remove markdown code block markers for cleaner diff
+    lines = attachment_content.split('\n')
+    if len(lines) > 2  and lines[0].startswith('```') \
+                       and lines[-1].endswith('```'):
+      attachment_content = '\n'.join(lines[1:-1])
+    attachment_texts[attachment.filename] = attachment_content
+  except Exception:
+    attachment_texts[attachment.filename] = \
+                                    "[Could not convert attachment to text]"
+@
+
+\subsection{Generating unified diffs}
+
+This function generates unified diffs between two content dictionaries, handling
+different content types appropriately.
+<<functions>>=
+def generate_diff(prev_content, curr_content, prev_label, curr_label):
+  """
+  Generates a unified diff between two content dictionaries. Each key 
+  represents a part of the submission (body, quiz_answers, attachments).
+  The attachments key contains itself a dictionary of filename to content.
+
+  Returns a string with the diff output, or None if no differences.
+  """
+  diff_lines = []
+
+  <<process all content keys for diff>>
+  
+  <<format final diff output>>
+@
+
+We process each content type, handling attachments specially since they're nested.
+We split this into two separate concerns: non-attachment content (body text,
+quiz answers) and attachment content (files).
+<<process all content keys for diff>>=
+<<process non-attachment content for diff>>
+<<process attachment content for diff>>
+@
+
+First, we handle non-attachment content types like body text and quiz answers.
+These are all stored as strings directly in the content dictionary.
+<<process non-attachment content for diff>>=
+all_keys = (set(prev_content.keys()) | set(curr_content.keys())) \
+              - {'attachments'}
+
+for key in sorted(all_keys):
+  prev_text = prev_content.get(key, "")
+  curr_text = curr_content.get(key, "")
+
+  <<handle other content diffs>>
+@
+
+Then we handle attachments, which require special processing.
+<<process attachment content for diff>>=
+<<handle attachment diffs>>
+@
+
+Other than attachments content types (body text, quiz answers) are handled with
+standard diff logic.
+We call [[splitlines(keepends=True)]] to retain the original line terminators
+so that [[difflib.unified_diff]] can faithfully represent changes, including
+newline-only edits.
+We also pass [[lineterm=""]] to [[unified_diff]] to prevent it from adding
+extra newlines (since our input lines already have them preserved by
+[[keepends=True]]).
+<<handle other content diffs>>=
+if prev_text != curr_text:
+  content_diff = list(difflib.unified_diff(
+    prev_text.splitlines(keepends=True) if prev_text else [],
+    curr_text.splitlines(keepends=True) if curr_text else [],
+    fromfile=f"{prev_label}/{key}",
+    tofile=f"{curr_label}/{key}",
+    lineterm=""
+  ))
+  if content_diff:
+    diff_lines.extend(content_diff)
+    diff_lines.append("\n")
+@
+
+Attachments require special handling since they're nested dictionaries of files.
+However, when there's only one file in each version, we try to match them even 
+if names differ.
+<<handle attachment diffs>>=
+prev_attachments = prev_content.get('attachments', {})
+curr_attachments = curr_content.get('attachments', {})
+
+# Dictionary to track original filenames for matched files
+# Maps current filename -> original filename in previous version
+filename_mapping = {}
+
+<<match single files with different names>>
+
+all_files = set(prev_attachments.keys()) | set(curr_attachments.keys())
+
+<<diff each attachment file>>
+@
+
+\subsubsection{Smart file matching for renamed submissions}
+
+A common student behavior is to rename files between submissions, often adding
+qualifiers like ``final'', ``revised'', or ``v2''.
+For example:
+\begin{itemize}
+\item [[solution.py]] → [[solution_final.py]]
+\item [[assignment.py]] → [[final_assignment.py]]
+\item [[lab1.java]] → [[lab1_revised.java]]
+\end{itemize}
+
+When there is exactly one file in each of two consecutive versions, we apply
+heuristics to determine if they should be treated as the same file (and thus
+diffed) rather than as separate add/delete operations.
+
+The matching criteria are:
+\begin{enumerate}
+\item Both files must have the same extension ([[.py]], [[.java]], etc.).
+      Different extensions suggest different file types, which shouldn't be
+      compared.
+\item The filenames (without extension) must share either:
+  \begin{itemize}
+  \item A common prefix of at least 3 characters, or
+  \item A common suffix of at least 3 characters, or
+  \item One name contains the other as a substring.
+  \end{itemize}
+\end{enumerate}
+
+When files are matched this way, the diff header shows both original names
+([[--- Version 0/solution.py]] and [[+++ Version 1/solution_final.py]]) to
+make the matching transparent to the grader.
+This allows instructors to verify that the heuristic made the correct match.
+
+This heuristic intentionally only applies when there's a single file in each
+version.
+With multiple files, we fall back to exact name matching to avoid incorrect
+pairings (\eg matching [[test.py]] with [[test_data.py]] when both versions
+contain multiple files).
+<<match single files with different names>>=
+if (len(prev_attachments) == 1 and len(curr_attachments) == 1
+    and list(prev_attachments.keys())[0] != list(curr_attachments.keys())[0]):
+  prev_filename = list(prev_attachments.keys())[0]
+  curr_filename = list(curr_attachments.keys())[0]
+  
+  <<check if files should be matched>>
+@
+
+We check if two files with different names should be treated as the same file
+by looking for common prefixes, suffixes, or file extensions.
+<<check if files should be matched>>=
+should_match = False
+
+# Check for common file extension
+prev_ext = get_file_extension(prev_filename)
+curr_ext = get_file_extension(curr_filename)
+
+if prev_ext and curr_ext and prev_ext == curr_ext:
+  # Same extension - check for common prefix or suffix
+  prev_base = get_file_base(prev_filename)
+  curr_base = get_file_base(curr_filename)
+  
+  <<set [[should_match]] if common prefix or suffix>>
+
+if should_match:
+  # Store the mapping for diff generation
+  # Use the current version's name as the canonical name
+  filename_mapping[curr_filename] = prev_filename
+  prev_attachments[curr_filename] = prev_attachments.pop(prev_filename)
+@
+
+Check if filenames share a common prefix or suffix pattern.
+A prefix or suffix of at least 3 characters is considered sufficient.
+Or that one filename is a substring of the other.
+<<set [[should_match]] if common prefix or suffix>>=
+common_prefix_len = 0
+for i, (c1, c2) in enumerate(zip(prev_base, curr_base)):
+  if c1 == c2:
+    common_prefix_len = i + 1
+  else:
+    break
+
+common_suffix_len = 0
+for i, (c1, c2) in enumerate(zip(reversed(prev_base), reversed(curr_base))):
+  if c1 == c2:
+    common_suffix_len = i + 1
+  else:
+    break
+
+should_match = (common_prefix_len >= 3 or common_suffix_len >= 3
+                or prev_base in curr_base or curr_base in prev_base)
+@
+
+Each attachment file is compared individually.
+When a file has been matched despite having different names, we use the original
+filename in the diff header to make it clear that a rename was detected.
+<<diff each attachment file>>=
+for filename in sorted(all_files):
+  prev_file_content = prev_attachments.get(filename, "")
+  curr_file_content = curr_attachments.get(filename, "")
+  
+  if prev_file_content != curr_file_content:
+    # Use original filename if this file was matched despite name difference
+    prev_filename_for_diff = filename_mapping.get(filename, filename)
+    
+    file_diff = list(difflib.unified_diff(
+      prev_file_content.splitlines(keepends=True),
+      curr_file_content.splitlines(keepends=True),
+      fromfile=f"{prev_label}/{prev_filename_for_diff}",
+      tofile=f"{curr_label}/{filename}",
+      lineterm=""
+    ))
+    if file_diff:
+      diff_lines.extend(file_diff)
+      diff_lines.append("\n")
+@
+
+Finally, we format the diff output with markdown code blocks for readability.
+Each diff line should be properly terminated to ensure correct rendering.
+<<format final diff output>>=
+if diff_lines:
+  # Ensure each line ends with a newline for proper rendering
+  formatted_lines = []
+  for line in diff_lines:
+    if line == "\n":
+      formatted_lines.append(line)
+    elif not line.endswith('\n'):
+      formatted_lines.append(line + '\n')
+    else:
+      formatted_lines.append(line)
+  return "```diff\n" + "".join(formatted_lines) + "```"
+return None
+@
+
+\subsection{Limitations and edge cases}
+
+The diff functionality handles most common submission scenarios, but has some
+limitations instructors should be aware of:
+
+\begin{description}
+\item[Binary files and unconvertible content]
+  Files that cannot be converted to text (such as images, compiled binaries, or
+  proprietary formats) will show [[{[}Could not convert attachment to text{]}]]
+  in the output rather than a meaningful diff.
+  The file is still downloaded to [[tmpdir]] for manual inspection.
+
+\item[Very large files]
+  No pagination or summarization is performed on large diffs.
+  A student submission with a very large file (\eg a data file or generated
+  code) may produce unwieldy output.
+  The pager helps navigate this, but instructors may prefer to use
+  [[--output-dir]] to save files for inspection in an editor.
+
+\item[Multiple file handling]
+  When multiple files exist in a version, file matching uses exact names only.
+  If a student renames one of several files between submissions, that file will
+  appear as separate delete/add operations rather than a diff.
+  This is intentional to avoid incorrect pairings, but means the instructor
+  must manually correlate the old and new versions.
+
+\item[File matching heuristic accuracy]
+  The smart file matching heuristic (§\ref{SubmissionDiff}) may occasionally
+  match unrelated files if they happen to share common naming patterns.
+  For example, [[intro.py]] and [[intro_to_python.py]] might be matched despite
+  being different programs.
+  The visible filenames in diff headers ([[--- Version 0/intro.py]] and
+  [[+++ Version 1/intro_to_python.py]]) help detect such cases, allowing the
+  instructor to mentally discount the diff.
+
+\item[Line ending differences]
+  Different operating systems use different line endings (LF vs CRLF).
+  If a student switches systems between submissions, the diff may show every
+  line as changed even if only line endings differ.
+  The [[splitlines(keepends=True)]] approach preserves line endings, so genuine
+  content changes remain visible, but the output can be noisy.
+
+\item[Whitespace-only changes]
+  The diff shows all whitespace changes (indentation, trailing spaces).
+  For languages like Python where indentation is significant, this is important.
+  However, for other languages, reformatting code may produce large diffs that
+  obscure semantic changes.
+\end{description}
+
+Despite these limitations, the diff functionality significantly improves the
+efficiency of reviewing student submission revisions in the common case.
+
+Helper functions for file name processing used by the diff functionality.
+<<functions>>=
+def get_file_extension(filename):
+  """
+  Extract file extension from filename.
+  Returns extension including the dot (e.g., '.py') or empty string if none.
+  """
+  if '.' in filename:
+    return '.' + filename.rsplit('.', 1)[1]
+  return ''
+
+def get_file_base(filename):
+  """
+  Extract base filename without extension.
+  """
+  if '.' in filename:
+    return filename.rsplit('.', 1)[0]
+  return filename
 @
 
 
