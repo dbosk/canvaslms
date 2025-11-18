@@ -255,6 +255,19 @@ def outdated(obj):
     return False
 
 
+def make_canvas_courses_cacheable():
+    import canvasapi.canvas
+
+    canvasapi.canvas.Canvas = CacheGetMethods("course")(canvasapi.canvas.Canvas)
+
+
+def make_course_contents_cacheable():
+    import canvasapi.course
+
+    canvasapi.course.Course = CacheGetMethods("assignment")(canvasapi.course.Course)
+    canvasapi.course.Course = CacheGetMethods("user")(canvasapi.course.Course)
+
+
 def make_assignment_submissions_cacheable():
     def cache_submissions(cls):
         """Class decorator for cacheable get_submission, get_submissions methods"""
