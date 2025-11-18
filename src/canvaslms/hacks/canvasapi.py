@@ -349,6 +349,7 @@ def make_assignment_submissions_cacheable():
 # Loads all hacks
 this_module = sys.modules[__name__]
 
-# automatically execute all functions in this module
-for _, function in inspect.getmembers(this_module, inspect.isfunction):
-    function()
+# automatically execute all make_* functions to apply decorators
+for name, function in inspect.getmembers(this_module, inspect.isfunction):
+    if name.startswith("make_"):
+        function()
