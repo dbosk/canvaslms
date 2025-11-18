@@ -3,6 +3,7 @@ NOTANGLEFLAGS.py=
 MODULES+=	__init__.py cli.tex
 MODULES+=	login.py login.tex
 MODULES+=	courses.py courses.tex
+MODULES+=	modules.py modules.tex
 MODULES+=	users.py users.tex
 MODULES+=	assignments.py assignments.tex
 MODULES+=	submissions.py submissions.tex
