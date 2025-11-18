@@ -1,0 +1,237 @@
+\chapter{Cache persistence}
+
+We want to persist the Canvas object between runs to avoid redundant API calls.
+The Canvas object contains cached data for courses, assignments, users, and
+submissions.
+By saving this object to disk, we can reuse it on subsequent runs until the
+cache expires or is explicitly cleared.
+
+However, the Canvas object contains sensitive data (course information, student
+data, etc.), so we must encrypt it before storing to disk.
+We use authenticated encryption to ensure both confidentiality and integrity.
+
+\section{Design overview}
+
+The cache persistence mechanism works as follows:
+\begin{enumerate}
+\item When creating a Canvas object, we first check if a cached version exists.
+\item If it does, we decrypt and unpickle it using the Canvas token as the key.
+\item If not, we create a new Canvas object from the API.
+\item After each command completes, we save the Canvas object to the cache.
+\item The cache is stored in the user's cache directory (from [[appdirs]]).
+\item We provide a [[cache clear]] subcommand to explicitly remove the cache.
+\end{enumerate}
+
+The key derivation works as follows:
+We use the Canvas access token as the password for key derivation.
+This means that if the user changes their token, the old cache becomes
+inaccessible (which is correct behavior, as it's tied to a specific account).
+
+\section{Implementation}
+
+<<cache.py>>=
+"""Cache persistence with authenticated encryption"""
+
+import appdirs
+import base64
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.fernet import Fernet, InvalidToken
+import hashlib
+import os
+import pickle
+import pathlib
+
+dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
+
+<<functions>>
+@
+
+
+\subsection{Key derivation from token}
+
+We derive an encryption key from the Canvas token using PBKDF2.
+This is a key derivation function that makes brute-force attacks harder.
+
+The salt is derived from the hostname to ensure different keys for different
+Canvas instances.
+This prevents someone from reusing a decryption key across different Canvas
+servers.
+<<functions>>=
+def derive_key(token, hostname):
+  """Derives a Fernet key from the Canvas token and hostname"""
+  # Use hostname as salt (hashed to get consistent 16 bytes)
+  salt = hashlib.sha256(hostname.encode()).digest()[:16]
+
+  # Derive key using PBKDF2
+  kdf = PBKDF2(
+    algorithm=hashes.SHA256(),
+    length=32,
+    salt=salt,
+    iterations=100000,
+  )
+  key = base64.urlsafe_b64encode(kdf.derive(token.encode()))
+  return key
+@
+
+
+\subsection{Cache file path}
+
+The cache is stored in the user's cache directory with a filename based on the
+Canvas hostname.
+This allows us to maintain separate caches for different Canvas instances
+(e.g., production vs. test servers).
+<<functions>>=
+def get_cache_path(hostname):
+  """Returns the path to the cache file for a given hostname"""
+  # Create a safe filename from the hostname
+  safe_hostname = hostname.replace("://", "_").replace("/", "_")
+  cache_file = f"canvas_cache_{safe_hostname}.enc"
+  return os.path.join(dirs.user_cache_dir, cache_file)
+@
+
+
+\subsection{Saving the Canvas object}
+
+To save the Canvas object, we:
+\begin{enumerate}
+\item Pickle the object to bytes.
+\item Encrypt the bytes using Fernet (authenticated encryption).
+\item Write the encrypted bytes to the cache file.
+\end{enumerate}
+
+If the cache directory doesn't exist, we create it first.
+<<functions>>=
+def save_canvas_cache(canvas, token, hostname):
+  """Saves the Canvas object to encrypted cache"""
+  try:
+    # Derive encryption key
+    key = derive_key(token, hostname)
+    fernet = Fernet(key)
+
+    # Pickle and encrypt
+    pickled = pickle.dumps(canvas)
+    encrypted = fernet.encrypt(pickled)
+
+    # Write to cache file
+    cache_path = get_cache_path(hostname)
+    <<create cache directory if needed>>
+    with open(cache_path, "wb") as f:
+      f.write(encrypted)
+  except Exception:
+    # If saving fails, silently continue
+    # (cache is optional, don't break the command)
+    pass
+@
+
+If the cache directory doesn't exist, we must create it.
+<<create cache directory if needed>>=
+os.makedirs(pathlib.PurePath(cache_path).parent, exist_ok=True)
+@
+
+
+\subsection{Loading the Canvas object}
+
+To load the Canvas object, we:
+\begin{enumerate}
+\item Read the encrypted bytes from the cache file.
+\item Decrypt using the key derived from the token.
+\item Unpickle to reconstruct the Canvas object.
+\end{enumerate}
+
+If any step fails (file not found, decryption fails, unpickling fails), we
+return [[None]] to indicate that a new Canvas object should be created.
+
+The decryption can fail for several reasons:
+\begin{itemize}
+\item The cache file is corrupted.
+\item The token has changed (different key).
+\item The cache was created with a different version of the code.
+\end{itemize}
+In all these cases, the correct behavior is to create a fresh Canvas object.
+<<functions>>=
+def load_canvas_cache(token, hostname):
+  """Loads the Canvas object from encrypted cache, returns None if unavailable"""
+  try:
+    # Derive encryption key
+    key = derive_key(token, hostname)
+    fernet = Fernet(key)
+
+    # Read and decrypt
+    cache_path = get_cache_path(hostname)
+    with open(cache_path, "rb") as f:
+      encrypted = f.read()
+
+    pickled = fernet.decrypt(encrypted)
+    canvas = pickle.loads(pickled)
+
+    return canvas
+  except (FileNotFoundError, InvalidToken, pickle.UnpicklingError, Exception):
+    # Cache doesn't exist or is invalid, return None
+    return None
+@
+
+
+\subsection{Clearing the cache}
+
+To clear the cache, we simply remove the cache file for the given hostname.
+<<functions>>=
+def clear_cache(hostname):
+  """Clears the cache for the given hostname"""
+  cache_path = get_cache_path(hostname)
+  try:
+    os.remove(cache_path)
+    return True
+  except FileNotFoundError:
+    return False
+@
+
+
+\subsection{The cache command}
+
+The [[cache]] subcommand provides control over the cache.
+Currently, it only supports [[clear]], but we could add other operations in the
+future (e.g., [[cache status]] to show cache size and age).
+<<functions>>=
+def add_command(subp):
+  """Adds the cache command to argparse parser"""
+  cache_parser = subp.add_parser(
+    "cache",
+    help="Manage the Canvas object cache",
+    description="""
+Manages the persistent cache of Canvas data. The cache stores previously
+fetched courses, assignments, users, and submissions to speed up subsequent
+commands. The cache is encrypted using your Canvas token.
+"""
+  )
+
+  cache_subp = cache_parser.add_subparsers(
+    title="cache commands",
+    dest="cache_command",
+    required=True
+  )
+
+  # cache clear command
+  clear_parser = cache_subp.add_parser(
+    "clear",
+    help="Clear the cached Canvas data"
+  )
+  clear_parser.set_defaults(func=clear_command)
+
+def clear_command(config, canvas, args):
+  """Clears the Canvas cache"""
+  import canvaslms.cli.login
+  hostname, token = canvaslms.cli.login.load_credentials(config)
+
+  if not hostname:
+    import canvaslms.cli
+    canvaslms.cli.err(1, "No hostname configured, run `canvaslms login`")
+
+  if "://" not in hostname:
+    hostname = f"https://{hostname}"
+
+  if clear_cache(hostname):
+    print(f"Cache cleared for {hostname}")
+  else:
+    print(f"No cache found for {hostname}")
+@
