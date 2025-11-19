@@ -25,6 +25,7 @@ canvaslms.pdf: ${SRC_DIR}/cli/modules.tex
 canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
 canvaslms.pdf: ${SRC_DIR}/cli/results.tex
 canvaslms.pdf: ${SRC_DIR}/grades/grades.tex
+canvaslms.pdf: ${SRC_DIR}/cli/scripts.tex
 canvaslms.pdf: ${SRC_DIR}/cli/calendar.tex
 canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex

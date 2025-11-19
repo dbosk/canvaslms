@@ -14,6 +14,11 @@ MODULES+=	discussions.py discussions.tex
 MODULES+= 	utils.py utils.tex
 MODULES+=	quizzes.py quizzes.tex
 
+MODULES+=	scripts.tex
+MODULES+=	afstats pfstats
+MODULES+=	lsgroup
+MODULES+=	OLIstats
+
 .PHONY: all
 all: ${MODULES}
 
@@ -21,6 +26,8 @@ all: ${MODULES}
 __init__.py: cli.py
 	mv $< $@
 
+afstats pfstats lsgroup OLIstats: scripts.nw
+	${NOTANGLE.sh}
 
 .PHONY: clean
 clean:
