@@ -239,11 +239,11 @@ class CacheGetMethods:
                     attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
                     for obj, _ in attr_cache.values():
                         yield obj
-
-                for obj, obj_kwargs in attr_cache.values():
-                    if outdated(obj):
-                        obj = get_attr(self, obj.id, **obj_kwargs)
-                    yield obj
+                else:
+                    for obj, obj_kwargs in attr_cache.values():
+                        if outdated(obj):
+                            obj = get_attr(self, obj.id, **obj_kwargs)
+                        yield obj
 
             setattr(cls, plural_name, new_get_attrs)
         return cls
