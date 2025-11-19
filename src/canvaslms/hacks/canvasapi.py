@@ -109,8 +109,15 @@ def merge_kwargs(kwargs_list, ignore_keys=["sort", "order", "order_by"]):
         for key, value in kwargs.items():
             if key not in new_kwargs:
                 new_kwargs[key] = value
-            elif isinstance(kwargs[key], list):
-                new_kwargs[key] = list(set(value) | set(new_kwargs[key]))
+            elif isinstance(value, list) or isinstance(new_kwargs[key], list):
+                # Convert both to lists if either is a list, then union
+                prev_val = (
+                    new_kwargs[key]
+                    if isinstance(new_kwargs[key], list)
+                    else [new_kwargs[key]]
+                )
+                curr_val = value if isinstance(value, list) else [value]
+                new_kwargs[key] = list(set(prev_val) | set(curr_val))
             else:
                 if key in ignore_keys:
                     new_kwargs[key] = value
@@ -139,15 +146,15 @@ class CacheGetMethods:
     def __call__(self, cls):
         """Applies the decorator to the class cls"""
         init = cls.__init__
-        cache = self.__cache
         attr_name = self.__attribute_name
 
         @functools.wraps(init)
         def new_init(*args, **kwargs):
             self = args[0]
-            self.attr_name = attr_name
-            setattr(self, f"{self.attr_name}_cache", cache)
-            setattr(self, f"{self.attr_name}_all_fetched", None)
+            if not hasattr(self, f"{attr_name}_cache"):
+                setattr(self, f"{attr_name}_cache", {})
+            if not hasattr(self, f"{attr_name}_all_fetched"):
+                setattr(self, f"{attr_name}_all_fetched", None)
             init(*args, **kwargs)
 
         cls.__init__ = new_init
@@ -157,7 +164,7 @@ class CacheGetMethods:
 
         @functools.wraps(get_attr)
         def new_get_attr(self, *args, **kwargs):
-            attr_cache = getattr(self, f"{self.attr_name}_cache")
+            attr_cache = getattr(self, f"{attr_name}_cache")
 
             try:
                 obj = args[0]
@@ -199,8 +206,8 @@ class CacheGetMethods:
 
             @functools.wraps(get_attrs)
             def new_get_attrs(self, *args, **kwargs):
-                attr_cache = getattr(self, f"{self.attr_name}_cache")
-                attr_all_fetched = getattr(self, f"{self.attr_name}_all_fetched")
+                attr_cache = getattr(self, f"{attr_name}_cache")
+                attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
 
                 if attr_all_fetched:
                     for _, prev_kwargs in attr_cache.values():
@@ -215,15 +222,19 @@ class CacheGetMethods:
 
                     for obj in get_attrs(self, *args, **union_kwargs):
                         old_obj = attr_cache.get(obj.id, None)
-                        for attr_name in dir(old_obj):
-                            if attr_name.endswith("_cache") or attr_name.endswith(
-                                "_all_fetched"
-                            ):
-                                setattr(obj, attr_name, getattr(old_obj, attr_name))
+                        for cache_attr_name in dir(old_obj):
+                            if cache_attr_name.endswith(
+                                "_cache"
+                            ) or cache_attr_name.endswith("_all_fetched"):
+                                setattr(
+                                    obj,
+                                    cache_attr_name,
+                                    getattr(old_obj, cache_attr_name),
+                                )
                         attr_cache[obj.id] = (obj, union_kwargs)
 
-                    setattr(self, f"{self.attr_name}_all_fetched", datetime.now())
-                    attr_all_fetched = getattr(self, f"{self.attr_name}_all_fetched")
+                    setattr(self, f"{attr_name}_all_fetched", datetime.now())
+                    attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
                     for obj, _ in attr_cache.values():
                         yield obj
 
@@ -245,7 +256,9 @@ def outdated(obj):
         pass
     for attr_name in dir(obj):
         if attr_name == "user_all_fetched":
-            if datetime.now() - getattr(obj, attr_name) > timedelta(days=2):
+            if not getattr(obj, attr_name):
+                continue
+            elif datetime.now() - getattr(obj, attr_name) > timedelta(days=2):
                 setattr(obj, attr_name, None)
         elif attr_name.endswith("_all_fetched"):
             if not getattr(obj, attr_name):
