@@ -36,6 +36,8 @@ def make_classes_comparable():
         "assignment": ["Assignment", "AssignmentGroup"],
         "submission": ["Submission"],
         "user": ["User"],
+        "group": ["GroupCategory", "Group"],
+        "module": ["Module"],
     }
     canvasapi_modules = {}
 
@@ -265,6 +267,11 @@ def outdated(obj):
             if not getattr(obj, attr_name):
                 continue
             elif datetime.now() - getattr(obj, attr_name) > timedelta(days=2):
+                setattr(obj, attr_name, None)
+        elif attr_name in ["group_all_fetched", "group_category_all_fetched"]:
+            if not getattr(obj, attr_name):
+                continue
+            elif datetime.now() - getattr(obj, attr_name) > timedelta(days=5):
                 setattr(obj, attr_name, None)
         elif attr_name.endswith("_all_fetched"):
             if not getattr(obj, attr_name):
