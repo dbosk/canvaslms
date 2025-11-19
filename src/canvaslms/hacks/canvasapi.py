@@ -194,6 +194,7 @@ class CacheGetMethods:
 
             if not obj:
                 obj = get_attr(self, *args, **kwargs)
+                obj._fetched_at = datetime.now()
                 attr_cache[obj.id] = (obj, kwargs)
 
             return obj
@@ -231,6 +232,7 @@ class CacheGetMethods:
                                     cache_attr_name,
                                     getattr(old_obj, cache_attr_name),
                                 )
+                        obj._fetched_at = datetime.now()
                         attr_cache[obj.id] = (obj, union_kwargs)
 
                     setattr(self, f"{attr_name}_all_fetched", datetime.now())
@@ -251,7 +253,11 @@ def outdated(obj):
     """Returns True if the object obj is outdated"""
     try:
         if obj.grade not in NOREFRESH_GRADES:
-            return True
+            try:
+                if datetime.now() - obj._fetched_at > timedelta(minutes=5):
+                    return True
+            except AttributeError:
+                return True
     except AttributeError:
         pass
     for attr_name in dir(obj):
