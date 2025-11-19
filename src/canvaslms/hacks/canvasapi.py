@@ -137,12 +137,30 @@ class CacheGetMethods:
 
     We assume that the first positional argument is the ID of the object to fetch.
     This must be the same as the `.id` attribute of an object (`obj.id`).
+
+    Parameters:
+      attribute_name: The attribute name to cache (e.g., "assignment", "user").
+      cache: Optional initial cache dictionary (default: {}).
+      include_plural: Whether to cache the plural method get_*s (default: True).
+      include_singular: Whether to cache the singular method get_* (default: True).
+      plural_name: Custom plural name for irregular plurals (default: None, uses
+                   attribute_name + "s"). For example, "group_categories" instead
+                   of "group_categorys".
     """
 
-    def __init__(self, attribute_name, cache=None, include_plural=True):
+    def __init__(
+        self,
+        attribute_name,
+        cache=None,
+        include_plural=True,
+        include_singular=True,
+        plural_name=None,
+    ):
         """No parameters required"""
         self.__attribute_name = attribute_name
         self.__include_plural = include_plural
+        self.__include_singular = include_singular
+        self.__plural_name = plural_name
         self.__cache = cache if cache else {}
 
     def __call__(self, cls):
@@ -161,50 +179,54 @@ class CacheGetMethods:
 
         cls.__init__ = new_init
 
-        singular_name = f"get_{self.__attribute_name}"
-        get_attr = getattr(cls, singular_name)
+        if self.__include_singular:
+            singular_name = f"get_{self.__attribute_name}"
+            get_attr = getattr(cls, singular_name)
 
-        @functools.wraps(get_attr)
-        def new_get_attr(self, *args, **kwargs):
-            attr_cache = getattr(self, f"{attr_name}_cache")
+            @functools.wraps(get_attr)
+            def new_get_attr(self, *args, **kwargs):
+                attr_cache = getattr(self, f"{attr_name}_cache")
 
-            try:
-                obj = args[0]
-                id = obj.id
-            except IndexError:
-                raise TypeError(
-                    f"{singular_name}() missing 1 required positional "
-                    f"argument: 'id'"
-                )
-            except AttributeError:
-                if isinstance(obj, int):
-                    id = obj
-                else:
+                try:
+                    obj = args[0]
+                    id = obj.id
+                except IndexError:
                     raise TypeError(
-                        f"{singular_name}() argument 1 must be int or "
-                        f"Canvas object, not {type(obj)}"
+                        f"{singular_name}() missing 1 required positional "
+                        f"argument: 'id'"
                     )
+                except AttributeError:
+                    if isinstance(obj, int):
+                        id = obj
+                    else:
+                        raise TypeError(
+                            f"{singular_name}() argument 1 must be int or "
+                            f"Canvas object, not {type(obj)}"
+                        )
 
-            try:
-                obj, prev_kwargs = attr_cache[id]
-            except KeyError:
-                obj = None
-                prev_kwargs = {}
+                try:
+                    obj, prev_kwargs = attr_cache[id]
+                except KeyError:
+                    obj = None
+                    prev_kwargs = {}
 
-            if obj and (must_update(prev_kwargs, kwargs) or outdated(obj)):
-                obj = None
+                if obj and (must_update(prev_kwargs, kwargs) or outdated(obj)):
+                    obj = None
 
-            if not obj:
-                obj = get_attr(self, *args, **kwargs)
-                obj._fetched_at = datetime.now()
-                attr_cache[obj.id] = (obj, kwargs)
+                if not obj:
+                    obj = get_attr(self, *args, **kwargs)
+                    obj._fetched_at = datetime.now()
+                    attr_cache[obj.id] = (obj, kwargs)
 
-            return obj
+                return obj
 
-        setattr(cls, singular_name, new_get_attr)
+            setattr(cls, singular_name, new_get_attr)
 
         if self.__include_plural:
-            plural_name = f"get_{self.__attribute_name}s"
+            if self.__plural_name:
+                plural_name = f"get_{self.__plural_name}"
+            else:
+                plural_name = f"get_{self.__attribute_name}s"
             get_attrs = getattr(cls, plural_name)
 
             @functools.wraps(get_attrs)
@@ -292,6 +314,37 @@ def make_course_contents_cacheable():
 
     canvasapi.course.Course = CacheGetMethods("assignment")(canvasapi.course.Course)
     canvasapi.course.Course = CacheGetMethods("user")(canvasapi.course.Course)
+
+
+def make_course_assignment_groups_cacheable():
+    import canvasapi.course
+
+    canvasapi.course.Course = CacheGetMethods(
+        "assignment_group", include_singular=False
+    )(canvasapi.course.Course)
+
+
+def make_course_modules_cacheable():
+    import canvasapi.course
+
+    canvasapi.course.Course = CacheGetMethods("module", include_singular=False)(
+        canvasapi.course.Course
+    )
+
+
+def make_course_groups_cacheable():
+    import canvasapi.course
+    import canvasapi.group
+
+    canvasapi.course.Course = CacheGetMethods(
+        "group_category", include_singular=False, plural_name="group_categories"
+    )(canvasapi.course.Course)
+    canvasapi.course.Course = CacheGetMethods("group", include_singular=False)(
+        canvasapi.course.Course
+    )
+    canvasapi.group.GroupCategory = CacheGetMethods("group", include_singular=False)(
+        canvasapi.group.GroupCategory
+    )
 
 
 def make_assignment_submissions_cacheable():
