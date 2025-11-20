@@ -1188,6 +1188,266 @@ except AttributeError:
                     f"Canvas object, not {type(obj)}")
 @
 
+Now let's verify the singular method caching works correctly.
+
+\subsubsection{Verifying singular method caching}
+
+The decorated [[get_*]] method should cache results and avoid redundant API calls.
+
+<<test singular method caching>>=
+class TestSingularMethodCaching:
+    """Test get_* singular method caching logic"""
+
+    def test_first_call_fetches_from_api(self):
+        """First call should fetch from API and cache result"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                call_count["count"] += 1
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        result = instance.get_item(1)
+
+        assert call_count["count"] == 1
+        assert result.id == 1
+        assert 1 in instance.item_cache
+
+    def test_second_call_returns_cached(self):
+        """Second call with same ID should return cached object"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                call_count["count"] += 1
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        result1 = instance.get_item(1)
+        result2 = instance.get_item(1)
+
+        assert call_count["count"] == 1
+        assert result1 is result2
+
+    def test_cache_stores_object_kwargs_tuple(self):
+        """Cache should store (object, kwargs) tuple"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id, **kwargs):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        instance.get_item(1, include=["user"])
+
+        cached_obj, cached_kwargs = instance.item_cache[1]
+        assert cached_obj.id == 1
+        assert cached_kwargs == {"include": ["user"]}
+
+    def test_must_update_triggers_refetch(self):
+        """Changed kwargs should trigger refetch via must_update"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id, **kwargs):
+                call_count["count"] += 1
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        instance.get_item(1, include=["user"])
+        instance.get_item(1, include=["user", "email"])
+
+        assert call_count["count"] == 2
+
+    def test_outdated_triggers_refetch(self):
+        """Stale object should trigger refetch via outdated()"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_submission(self, sub_id):
+                call_count["count"] += 1
+                obj = MagicMock()
+                obj.id = sub_id
+                obj.grade = "B"  # Non-passing grade
+                return obj
+            def get_submissions(self):
+                return []
+
+        CacheGetMethods("submission")(TestClass)
+        instance = TestClass()
+
+        # First call
+        result1 = instance.get_submission(1)
+        # Make it outdated (> 5 minutes old)
+        result1._fetched_at = datetime.now() - timedelta(minutes=6)
+        instance.submission_cache[1] = (result1, {})
+
+        # Second call should refetch
+        result2 = instance.get_submission(1)
+
+        assert call_count["count"] == 2
+
+    def test_accepts_integer_id(self):
+        """Should accept integer ID as argument"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        result = instance.get_item(42)
+
+        assert result.id == 42
+
+    def test_accepts_canvas_object_with_id(self):
+        """Should accept Canvas object and extract .id"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                if hasattr(item_id, 'id'):
+                    obj.id = item_id.id
+                else:
+                    obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        canvas_obj = MagicMock()
+        canvas_obj.id = 99
+        result = instance.get_item(canvas_obj)
+
+        assert result.id == 99
+
+    def test_sets_fetched_at_timestamp(self):
+        """Should set _fetched_at timestamp on fetched objects"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        before = datetime.now()
+        result = instance.get_item(1)
+        after = datetime.now()
+
+        assert hasattr(result, '_fetched_at')
+        assert before <= result._fetched_at <= after
+
+    def test_raises_typeerror_missing_argument(self):
+        """Should raise TypeError if no argument provided"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        with pytest.raises(TypeError, match="missing 1 required positional"):
+            instance.get_item()
+
+    def test_raises_typeerror_invalid_argument_type(self):
+        """Should raise TypeError for invalid argument types"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        with pytest.raises(TypeError, match="must be int or Canvas object"):
+            instance.get_item("invalid_string")
+
+    def test_cache_key_is_object_id(self):
+        """Cache key should be object.id not argument value"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id if isinstance(item_id, int) else item_id.id
+                return obj
+            def get_items(self):
+                return []
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Pass Canvas object
+        canvas_obj = MagicMock()
+        canvas_obj.id = 123
+        instance.get_item(canvas_obj)
+
+        # Cache key should be the ID, not the object
+        assert 123 in instance.item_cache
+@
+
+<<test hacks.py>>=
+<<test singular method caching>>
+@
+
 Now, let's turn to the plural method.
 We have the obvious case that we must fetch all if we haven't fetched all 
 before.
