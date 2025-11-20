@@ -1,12 +1,12 @@
 \chapter{Hackish improvements to the \texttt{canvasapi} module}
 
-In this module we provide some decorators for the classes in the 
+In this module we provide some decorators for the classes in the
 \texttt{canvasapi} package.
 We automatically apply all decorators upon import, so
 \begin{minted}{python}
 import canvaslms.hacks.canvasapi
 \end{minted}
-would apply all decorators defined herein to the already defined classes in the 
+would apply all decorators defined herein to the already defined classes in the
 \texttt{canvasapi} package.
 
 We do this as follows:
@@ -26,6 +26,295 @@ this_module = sys.modules[__name__]
 for _, function in inspect.getmembers(this_module, inspect.isfunction):
   function()
 @
+
+\section{Testing Canvas API monkey-patches}
+\label{sec:hacks:testing}
+
+Before examining the implementation, let's understand through tests what problem these monkey-patches solve and how they improve the [[canvasapi]] library.
+
+\subsection{The problem: Canvas objects lack equality and hashability}
+
+By default, the [[canvasapi]] library's classes don't define [[__eq__]] or [[__hash__]] methods.
+This creates practical problems:
+\begin{enumerate}
+\item Two [[User]] objects representing the same Canvas user (same ID) are not equal
+\item Canvas objects cannot be added to sets
+\item Canvas objects cannot be used as dictionary keys
+\item The [[User.__str__]] method uses Canvas ID instead of login ID
+\end{enumerate}
+
+Our monkey-patches fix these issues by adding proper equality, hashing, and string representation.
+
+\subsection{Variation theory in testing monkey-patches}
+
+When testing monkey-patches, we must verify:
+\begin{description}
+\item[Invariant] The patch is applied once, affects all instances of the class
+\item[Variant] Different classes (User, Assignment, Submission), different IDs, different instances
+\end{description}
+
+The tests also demonstrate a critical principle: \emph{semantic equality}.
+Two objects with the same Canvas ID represent the same entity, even if they are different Python objects.
+
+\subsubsection{Test structure}
+
+<<test hacks.py>>=
+"""
+Tests for canvaslms.hacks.canvasapi monkey-patches.
+
+These tests verify that our decorators correctly add __eq__, __hash__,
+and improved __str__ methods to canvasapi classes.
+
+IMPORTANT: These tests import canvaslms.hacks.canvasapi, which applies
+monkey-patches to canvasapi classes. The patches are applied at import
+time and affect all future instances.
+"""
+import pytest
+from unittest.mock import MagicMock
+
+# This import applies the monkey-patches
+import canvaslms.hacks.canvasapi
+
+# Import canvasapi classes to test
+from canvasapi.user import User
+from canvasapi.assignment import Assignment, AssignmentGroup
+from canvasapi.submission import Submission
+
+<<test equality>>
+<<test hashability>>
+<<test user string representation>>
+@
+
+\subsubsection{Testing equality (\_\_eq\_\_)}
+
+The [[__eq__]] method should compare Canvas objects by their type and Canvas ID.
+Two objects of the same type with the same ID should be equal, even if they are different Python objects.
+
+This is \emph{semantic equality}---objects represent the same real-world entity.
+
+<<test equality>>=
+class TestEqualityMonkeyPatch:
+    """Test that Canvas objects can be compared by ID"""
+
+    def test_users_with_same_id_are_equal(self):
+        """Two User objects with same ID should be equal"""
+        # Create two separate User objects with same ID
+        user1 = MagicMock(spec=User)
+        user1.id = 12345
+        User.__eq__(user1, user1)  # Ensure patch is applied
+
+        user2 = MagicMock(spec=User)
+        user2.id = 12345
+
+        # Different Python objects, same Canvas ID
+        assert user1 is not user2  # Different objects
+        assert User.__eq__(user1, user2)  # But equal by Canvas ID
+
+    def test_users_with_different_ids_not_equal(self):
+        """Users with different IDs should not be equal"""
+        user1 = MagicMock(spec=User)
+        user1.id = 12345
+
+        user2 = MagicMock(spec=User)
+        user2.id = 67890
+
+        assert not User.__eq__(user1, user2)
+
+    def test_different_types_not_equal(self):
+        """Objects of different types should not be equal, even with same ID"""
+        user = MagicMock(spec=User)
+        user.id = 12345
+
+        assignment = MagicMock(spec=Assignment)
+        assignment.id = 12345
+
+        # Same ID but different types
+        assert not User.__eq__(user, assignment)
+
+    def test_assignments_with_same_id_are_equal(self):
+        """Assignment objects should also have equality"""
+        assign1 = MagicMock(spec=Assignment)
+        assign1.id = 5001
+
+        assign2 = MagicMock(spec=Assignment)
+        assign2.id = 5001
+
+        assert Assignment.__eq__(assign1, assign2)
+
+    def test_submissions_with_same_id_are_equal(self):
+        """Submission objects should also have equality"""
+        sub1 = MagicMock(spec=Submission)
+        sub1.id = 6001
+
+        sub2 = MagicMock(spec=Submission)
+        sub2.id = 6001
+
+        assert Submission.__eq__(sub1, sub2)
+
+    def test_assignment_groups_with_same_id_are_equal(self):
+        """AssignmentGroup objects should also have equality"""
+        group1 = MagicMock(spec=AssignmentGroup)
+        group1.id = 2001
+
+        group2 = MagicMock(spec=AssignmentGroup)
+        group2.id = 2001
+
+        assert AssignmentGroup.__eq__(group1, group2)
+@
+
+Notice how semantic equality transforms our ability to work with Canvas objects.
+Before the patch, comparing objects was meaningless.
+After the patch, we can check if two objects represent the same Canvas entity.
+
+\subsubsection{Testing hashability (\_\_hash\_\_)}
+
+The [[__hash__]] method makes Canvas objects usable in sets and as dictionary keys.
+This is crucial for deduplication and fast lookup operations.
+
+The hash must be consistent with equality: equal objects must have equal hashes.
+
+<<test hashability>>=
+class TestHashabilityMonkeyPatch:
+    """Test that Canvas objects can be hashed and used in sets/dicts"""
+
+    def test_users_with_same_id_have_same_hash(self):
+        """Equal users should have equal hashes"""
+        user1 = MagicMock(spec=User)
+        user1.id = 12345
+
+        user2 = MagicMock(spec=User)
+        user2.id = 12345
+
+        # Equal objects must have equal hashes
+        assert User.__hash__(user1) == User.__hash__(user2)
+
+    def test_users_with_different_ids_have_different_hashes(self):
+        """Different users should (usually) have different hashes"""
+        user1 = MagicMock(spec=User)
+        user1.id = 12345
+
+        user2 = MagicMock(spec=User)
+        user2.id = 67890
+
+        # Different IDs should produce different hashes
+        # (hash collisions possible but unlikely)
+        assert User.__hash__(user1) != User.__hash__(user2)
+
+    def test_can_add_users_to_set(self):
+        """Users should be usable in sets for deduplication"""
+        user1 = MagicMock(spec=User)
+        user1.id = 12345
+        user1.__eq__ = User.__eq__.__get__(user1, User)
+        user1.__hash__ = User.__hash__.__get__(user1, User)
+
+        user2 = MagicMock(spec=User)
+        user2.id = 12345
+        user2.__eq__ = User.__eq__.__get__(user2, User)
+        user2.__hash__ = User.__hash__.__get__(user2, User)
+
+        user3 = MagicMock(spec=User)
+        user3.id = 67890
+        user3.__eq__ = User.__eq__.__get__(user3, User)
+        user3.__hash__ = User.__hash__.__get__(user3, User)
+
+        # Create set with duplicate user (same ID)
+        user_set = {user1, user2, user3}
+
+        # Set should deduplicate user1 and user2
+        assert len(user_set) == 2
+
+    def test_can_use_assignments_as_dict_keys(self):
+        """Assignments should be usable as dictionary keys"""
+        assign1 = MagicMock(spec=Assignment)
+        assign1.id = 5001
+        assign1.__eq__ = Assignment.__eq__.__get__(assign1, Assignment)
+        assign1.__hash__ = Assignment.__hash__.__get__(assign1, Assignment)
+
+        assign2 = MagicMock(spec=Assignment)
+        assign2.id = 5002
+        assign2.__eq__ = Assignment.__eq__.__get__(assign2, Assignment)
+        assign2.__hash__ = Assignment.__hash__.__get__(assign2, Assignment)
+
+        # Use assignments as dict keys
+        grades = {
+            assign1: 95.0,
+            assign2: 87.5
+        }
+
+        assert grades[assign1] == 95.0
+        assert grades[assign2] == 87.5
+        assert len(grades) == 2
+@
+
+These tests demonstrate the power of hashability: we can now use sets for deduplication and dictionaries for fast lookups.
+Without these patches, Canvas objects would be unhashable and couldn't be used in these data structures.
+
+\subsubsection{Testing improved User string representation}
+
+The original [[User.__str__]] method returns something like \enquote{User 12345}.
+Our improvement returns \enquote{Alice Anderson <alice>}---much more useful for debugging and logging.
+
+<<test user string representation>>=
+class TestUserStringRepresentation:
+    """Test improved User.__str__ method"""
+
+    def test_user_str_with_name_and_login(self):
+        """User string should show name and login ID"""
+        user = MagicMock(spec=User)
+        user.name = "Alice Anderson"
+        user.login_id = "alice"
+
+        result = User.__str__(user)
+
+        assert result == "Alice Anderson <alice>"
+
+    def test_user_str_without_login_id(self):
+        """If login_id is missing, show empty brackets"""
+        user = MagicMock(spec=User)
+        user.name = "Bob Brown"
+        # Simulate missing login_id attribute
+        del user.login_id
+
+        result = User.__str__(user)
+
+        assert result == "Bob Brown <>"
+
+    def test_user_str_useful_for_debugging(self):
+        """String representation should be human-readable"""
+        user = MagicMock(spec=User)
+        user.name = "Charlie Chen"
+        user.login_id = "cchen"
+
+        # Should not contain Canvas ID or object address
+        result = User.__str__(user)
+
+        assert "Charlie Chen" in result
+        assert "cchen" in result
+        assert "0x" not in result  # No memory address
+@
+
+This improved string representation makes debugging much easier.
+When you print a list of users or log user actions, you see meaningful names instead of numeric IDs.
+
+\subsection{Why monkey-patching is necessary here}
+
+These tests demonstrate why we can't just use wrapper classes:
+\begin{enumerate}
+\item The [[canvasapi]] library returns its own class instances
+\item We don't control object creation
+\item Monkey-patching affects all instances automatically
+\item No wrapper conversion needed throughout the codebase
+\end{enumerate}
+
+The tests verify that our patches:
+\begin{itemize}
+\item Apply correctly at import time
+\item Work for all specified classes (User, Assignment, Submission, AssignmentGroup)
+\item Enable practical operations (sets, dict keys, equality checks)
+\item Improve developer experience (better [[__str__]])
+\end{itemize}
+
+By testing \emph{before} implementing, we clearly specify the improvement contract: what capabilities we're adding and how they should behave.
 
 
 \section{Make classes comparable and hashable}
