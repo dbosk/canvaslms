@@ -1533,6 +1533,267 @@ functions.
 <<general class decorator for caching get methods>>
 @
 
+Now let's verify the plural method caching works correctly.
+
+\subsubsection{Verifying plural method caching}
+
+The decorated [[get_*s]] method should efficiently handle bulk fetches and cached
+retrievals with individual staleness checks.
+
+<<test plural method caching>>=
+class TestPluralMethodCaching:
+    """Test get_*s plural method caching logic"""
+
+    def test_first_call_performs_bulk_fetch(self):
+        """First call should perform bulk fetch"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                call_count["count"] += 1
+                return [MagicMock(id=1), MagicMock(id=2), MagicMock(id=3)]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        list(instance.get_items())
+
+        assert call_count["count"] == 1
+
+    def test_bulk_fetch_populates_cache(self):
+        """Bulk fetch should populate cache with all objects"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                return [MagicMock(id=i) for i in [10, 20, 30]]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        list(instance.get_items())
+
+        assert 10 in instance.item_cache
+        assert 20 in instance.item_cache
+        assert 30 in instance.item_cache
+
+    def test_bulk_fetch_sets_all_fetched_timestamp(self):
+        """Bulk fetch should set {attr}_all_fetched timestamp"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                return [MagicMock(id=1)]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        before = datetime.now()
+        list(instance.get_items())
+        after = datetime.now()
+
+        assert instance.item_all_fetched is not None
+        assert before <= instance.item_all_fetched <= after
+
+    def test_second_call_yields_from_cache(self):
+        """Second call should yield from cache without API call"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                call_count["count"] += 1
+                return [MagicMock(id=i) for i in [1, 2, 3]]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        list(instance.get_items())
+        list(instance.get_items())
+
+        assert call_count["count"] == 1
+
+    def test_returns_generator_not_list(self):
+        """Should return generator not list"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                return [MagicMock(id=1)]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        result = instance.get_items()
+
+        from types import GeneratorType
+        assert isinstance(result, GeneratorType)
+
+    def test_cache_path_checks_outdated(self):
+        """Cached path should check each object with outdated()"""
+        refetch_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_submission(self, sub_id):
+                refetch_count["count"] += 1
+                obj = MagicMock()
+                obj.id = sub_id
+                obj.grade = "A"  # Won't be outdated
+                return obj
+            def get_submissions(self):
+                return [MagicMock(id=i, grade="A") for i in [1, 2]]
+
+        CacheGetMethods("submission")(TestClass)
+        instance = TestClass()
+
+        # First call - bulk fetch
+        list(instance.get_submissions())
+        # Second call - should check outdated but not refetch (grade=A)
+        list(instance.get_submissions())
+
+        # No refetches because all have passing grades
+        assert refetch_count["count"] == 0
+
+    def test_stale_objects_refetched(self):
+        """Stale individual objects should be refetched"""
+        refetch_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_submission(self, sub_id):
+                refetch_count["count"] += 1
+                obj = MagicMock()
+                obj.id = sub_id
+                obj.grade = "B"  # Non-passing grade
+                return obj
+            def get_submissions(self):
+                return [MagicMock(id=1, grade="B")]
+
+        CacheGetMethods("submission")(TestClass)
+        instance = TestClass()
+
+        # First call - bulk fetch
+        list(instance.get_submissions())
+
+        # Make it outdated
+        obj, kwargs = instance.submission_cache[1]
+        obj._fetched_at = datetime.now() - timedelta(minutes=6)
+        instance.submission_cache[1] = (obj, kwargs)
+
+        # Second call should refetch the outdated object
+        list(instance.get_submissions())
+
+        assert refetch_count["count"] == 1
+
+    def test_bulk_fetch_merges_kwargs(self):
+        """Bulk fetch should merge all previous kwargs"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id, **kwargs):
+                return MagicMock(id=item_id)
+            def get_items(self, **kwargs):
+                # Return objects with merged kwargs visible
+                return [MagicMock(id=1)]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Fetch with one include
+        instance.get_item(1, include=["user"])
+        # Clear all_fetched to force bulk refetch
+        instance.item_all_fetched = None
+        # Bulk fetch with additional include
+        list(instance.get_items(include=["email"]))
+
+        # Cache should have merged kwargs
+        _, cached_kwargs = instance.item_cache[1]
+        assert "user" in cached_kwargs.get("include", [])
+        assert "email" in cached_kwargs.get("include", [])
+
+    def test_irregular_plural_name(self):
+        """plural_name parameter should work correctly"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_group_category(self, cat_id):
+                return MagicMock(id=cat_id)
+            def get_group_categories(self):
+                return [MagicMock(id=1)]
+
+        CacheGetMethods("group_category",
+                        plural_name="group_categories")(TestClass)
+        instance = TestClass()
+
+        result = list(instance.get_group_categories())
+
+        assert len(result) == 1
+        assert result[0].id == 1
+
+    def test_empty_cache_after_reset_triggers_bulk_fetch(self):
+        """Setting all_fetched=None should trigger bulk refetch"""
+        call_count = {"count": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                call_count["count"] += 1
+                return [MagicMock(id=1)]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        list(instance.get_items())
+        instance.item_all_fetched = None
+        list(instance.get_items())
+
+        assert call_count["count"] == 2
+
+    def test_no_double_yield_after_bulk_fetch(self):
+        """Should not yield objects twice after bulk fetch"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                return MagicMock(id=item_id)
+            def get_items(self):
+                obj1 = MagicMock()
+                obj1.id = 1
+                obj1.grade = "B"  # Non-passing (would be checked if double-yield)
+                return [obj1]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        results = list(instance.get_items())
+
+        # Should only yield once, not twice
+        assert len(results) == 1
+@
+
+<<test hacks.py>>=
+<<test plural method caching>>
+@
+
 \subsection{Copy cache to new object}
 
 When we update all objects, we want to keep the caches of every old object.
