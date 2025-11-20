@@ -38,8 +38,12 @@ unit/test_hacks.py: ../src/canvaslms/hacks/canvasapi.nw
 
 # Target to run tests after tangling
 .PHONY: test
-test: all
+test: all compile
 	poetry run pytest -v --cov=canvaslms --cov-report=term-missing
+
+.PHONY: compile
+compile:
+	${MAKE} -C ../src/canvaslms all
 
 # Clean generated test files
 .PHONY: clean
