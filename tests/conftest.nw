@@ -1,0 +1,484 @@
+\chapter{Testing strategy and shared fixtures}
+
+Testing a command-line interface to an external API presents unique challenges.
+We cannot make real API calls during tests---they would be slow, unreliable, and
+might modify production data.
+Instead, we must create a comprehensive mocking strategy that simulates the
+Canvas API's behavior while allowing us to test our code's logic in isolation.
+
+This chapter explains our testing philosophy and provides shared fixtures that
+all tests can reuse.
+By understanding these foundations first, you'll better appreciate the test
+examples embedded in subsequent chapters.
+
+\section{The testing challenge: mocking an external API}
+
+The [[canvaslms]] tool interacts extensively with the Canvas LMS API through
+the [[canvasapi]] Python library.
+Every command---listing courses, filtering assignments, fetching
+submissions---makes API calls that return Canvas objects.
+
+\subsection{What we need to test}
+
+We want to verify that our code correctly:
+\begin{enumerate}
+\item Filters and processes Canvas objects based on command-line arguments
+\item Handles edge cases like empty results, regex matching, and missing data
+\item Raises appropriate errors (like [[EmptyListError]]) when expected
+\item Formats output correctly for Unix pipelines
+\end{enumerate}
+
+What we \emph{don't} need to test:
+\begin{enumerate}
+\item Whether the Canvas API returns correct data (that's Canvas's job)
+\item Whether [[canvasapi]] library works (that's their test suite's job)
+\item Network reliability, authentication, rate limiting (external concerns)
+\end{enumerate}
+
+\subsection{Why we mock at the API boundary}
+
+We mock Canvas API objects rather than our own functions because:
+\begin{description}
+\item[Isolation:] Tests verify our logic without depending on external services
+\item[Speed:] Mock objects are instantaneous; API calls take seconds
+\item[Repeatability:] Tests produce identical results every run
+\item[Control:] We can simulate edge cases that are hard to create in production
+\end{description}
+
+\subsection{Variation theory perspective: what varies, what stays constant}
+
+When designing our mocks, we apply variation theory:
+\begin{description}
+\item[Invariant (stays constant):] The Canvas API interface---methods like
+[[get_courses()]], [[get_assignments()]], object attributes like [[id]],
+[[name]], [[due_at]]
+\item[Variant (what we change):] The data returned---course names, assignment
+counts, submission states, timestamps
+\end{description}
+
+By keeping the interface constant while varying the data, our tests focus on
+how our code handles different scenarios rather than implementation details.
+
+\section{Pytest and fixtures}
+
+We use [[pytest]] as our testing framework.
+Pytest provides \emph{fixtures}---reusable test components that can be injected
+into test functions.
+
+\subsection{What is a fixture?}
+
+A fixture is a function that creates and returns a test resource.
+For example:
+\begin{verbatim}
+@pytest.fixture
+def mock_course():
+    """Returns a fake Canvas Course object"""
+    course = MagicMock()
+    course.id = 12345
+    course.name = "Introduction to Testing"
+    return course
+
+def test_course_filtering(mock_course):
+    # pytest automatically calls mock_course() and passes result
+    assert mock_course.name == "Introduction to Testing"
+\end{verbatim}
+
+Fixtures promote \emph{separation of concerns}:
+\begin{itemize}
+\item Test setup lives in fixtures
+\item Test logic lives in test functions
+\item Tests stay focused and readable
+\end{itemize}
+
+\subsection{Our fixture strategy}
+
+We provide fixtures at multiple levels of abstraction:
+\begin{description}
+\item[Canvas instance:] [[mock_canvas()]]---the root API client
+\item[Course objects:] [[mock_course()]], [[mock_courses()]]---single and
+multiple courses
+\item[Assignment objects:] [[mock_assignment()]],
+[[mock_assignment_group()]]---assignments and groups
+\item[User objects:] [[mock_user()]], [[mock_group()]]---users and groups
+\item[Submission objects:] [[mock_submission()]]---student submissions
+\end{description}
+
+Each fixture represents a Canvas API object with realistic attributes.
+Tests can customize these attributes as needed.
+
+\section{Implementation: the conftest.py fixture file}
+
+Pytest automatically loads fixtures from [[conftest.py]] files.
+We'll create fixtures for each major Canvas API object type, using Python's
+[[unittest.mock.MagicMock]] to create flexible mock objects.
+
+<<conftest.py>>=
+"""
+Shared pytest fixtures for testing canvaslms.
+
+This file provides mock Canvas API objects that tests can use
+instead of making real API calls. Each fixture returns a MagicMock
+configured to behave like the corresponding Canvas API object.
+"""
+import pytest
+from unittest.mock import MagicMock, Mock
+from datetime import datetime, timezone
+import arrow
+
+<<mock canvas api fixture>>
+<<mock course fixtures>>
+<<mock assignment fixtures>>
+<<mock user and group fixtures>>
+<<mock submission fixtures>>
+<<mock configuration fixture>>
+@
+
+\subsection{The mock Canvas API instance}
+
+Every command receives a [[canvas]] parameter---an instance of the Canvas API
+client.
+We mock this as the root of our API object hierarchy.
+
+<<mock canvas api fixture>>=
+@pytest.fixture
+def mock_canvas():
+    """
+    Mock Canvas API instance.
+
+    Provides get_courses() method that returns a list of mock courses.
+    Tests can customize the return value to simulate different scenarios.
+    """
+    canvas = MagicMock()
+    canvas.get_courses.return_value = []
+    return canvas
+@
+
+\subsection{Mock course objects}
+
+Courses are central to Canvas---almost every operation starts by selecting a
+course.
+We provide both single-course and multi-course fixtures.
+
+\subsubsection{Design decision: realistic vs. minimal mocks}
+
+We face a choice: should our mock courses have every attribute a real Canvas
+course has (100+ attributes), or just the ones our code uses?
+
+We choose \emph{minimal but realistic} mocks:
+\begin{itemize}
+\item Include attributes our code actually accesses ([[id]], [[name]],
+[[course_code]])
+\item Provide methods our code calls ([[get_assignments()]], [[get_users()]])
+\item Omit rarely-used attributes to keep tests readable
+\item Allow tests to add custom attributes when needed (MagicMock permits this)
+\end{itemize}
+
+This gives us the best of both worlds: tests are clear about what they're
+testing, but flexible enough for edge cases.
+
+<<mock course fixtures>>=
+@pytest.fixture
+def mock_course():
+    """
+    Mock Canvas Course object with realistic attributes.
+
+    Attributes:
+        id: Course ID (12345)
+        name: Course name ("Test Course")
+        course_code: Short code ("TEST101")
+        term: Dict with term info
+
+    Methods:
+        get_assignments(): Returns empty list (override in tests)
+        get_users(): Returns empty list (override in tests)
+    """
+    course = MagicMock()
+    course.id = 12345
+    course.name = "Test Course"
+    course.course_code = "TEST101"
+    course.term = {"name": "Fall 2023"}
+
+    # Mock methods that return lists
+    course.get_assignments.return_value = []
+    course.get_users.return_value = []
+
+    return course
+
+
+@pytest.fixture
+def mock_courses():
+    """
+    Returns a list of three mock courses with different names.
+
+    Useful for testing filtering and selection logic.
+    Uses variation theory: three courses with same structure,
+    different data (names, codes, IDs).
+    """
+    course1 = MagicMock()
+    course1.id = 1001
+    course1.name = "Introduction to Programming"
+    course1.course_code = "CS101"
+    course1.term = {"name": "Fall 2023"}
+    course1.get_assignments.return_value = []
+    course1.get_users.return_value = []
+
+    course2 = MagicMock()
+    course2.id = 1002
+    course2.name = "Advanced Algorithms"
+    course2.course_code = "CS201"
+    course2.term = {"name": "Fall 2023"}
+    course2.get_assignments.return_value = []
+    course2.get_users.return_value = []
+
+    course3 = MagicMock()
+    course3.id = 1003
+    course3.name = "Data Structures"
+    course3.course_code = "CS102"
+    course3.term = {"name": "Spring 2024"}
+    course3.get_assignments.return_value = []
+    course3.get_users.return_value = []
+
+    return [course1, course2, course3]
+@
+
+\subsection{Mock assignment objects}
+
+Assignments represent tasks that students submit.
+Our mock assignments include common attributes like due dates, point values,
+and submission types.
+
+<<mock assignment fixtures>>=
+@pytest.fixture
+def mock_assignment():
+    """
+    Mock Canvas Assignment object.
+
+    Attributes:
+        id: Assignment ID
+        name: Assignment name
+        due_at: ISO 8601 due date string (or None)
+        points_possible: Maximum points
+        published: Whether assignment is published
+        assignment_group_id: ID of assignment group
+        submission_types: List of allowed submission types
+
+    Methods:
+        get_submissions(): Returns empty list (override in tests)
+    """
+    assignment = MagicMock()
+    assignment.id = 5001
+    assignment.name = "Homework 1"
+    assignment.due_at = "2023-12-15T23:59:00Z"
+    assignment.points_possible = 100.0
+    assignment.published = True
+    assignment.assignment_group_id = 2001
+    assignment.submission_types = ["online_text_entry", "online_upload"]
+    assignment.get_submissions.return_value = []
+
+    return assignment
+
+
+@pytest.fixture
+def mock_assignment_group():
+    """
+    Mock Canvas AssignmentGroup object.
+
+    Assignment groups categorize assignments (e.g., "Homeworks", "Exams").
+
+    Attributes:
+        id: Group ID
+        name: Group name
+        position: Sort order
+        group_weight: Percentage of final grade
+    """
+    group = MagicMock()
+    group.id = 2001
+    group.name = "Homeworks"
+    group.position = 1
+    group.group_weight = 40.0
+
+    return group
+@
+
+\subsection{Mock user and group objects}
+
+Users are students, teachers, and TAs.
+Groups are collections of students for group assignments.
+
+<<mock user and group fixtures>>=
+@pytest.fixture
+def mock_user():
+    """
+    Mock Canvas User object.
+
+    Attributes:
+        id: User ID
+        name: Full name
+        sortable_name: "Last, First" format
+        login_id: Username
+        email: Email address (may be None due to privacy settings)
+    """
+    user = MagicMock()
+    user.id = 3001
+    user.name = "Alice Anderson"
+    user.sortable_name = "Anderson, Alice"
+    user.login_id = "alice"
+    user.email = "alice@example.edu"
+
+    return user
+
+
+@pytest.fixture
+def mock_group():
+    """
+    Mock Canvas Group object.
+
+    Groups are collections of users for collaborative assignments.
+
+    Attributes:
+        id: Group ID
+        name: Group name
+        members_count: Number of members
+
+    Methods:
+        get_users(): Returns list of mock users
+    """
+    group = MagicMock()
+    group.id = 4001
+    group.name = "Project Team Alpha"
+    group.members_count = 3
+    group.get_users.return_value = []
+
+    return group
+@
+
+\subsection{Mock submission objects}
+
+Submissions represent student work on assignments.
+They have workflow states (submitted, graded, etc.) and may include scores,
+comments, and file attachments.
+
+<<mock submission fixtures>>=
+@pytest.fixture
+def mock_submission():
+    """
+    Mock Canvas Submission object.
+
+    Submissions represent student work. They have states (submitted, graded,
+    unsubmitted) and may include scores, comments, and timestamps.
+
+    Attributes:
+        id: Submission ID
+        user_id: ID of student who submitted
+        assignment_id: ID of assignment
+        workflow_state: State (submitted, graded, unsubmitted, pending_review)
+        grade: Current grade (may be None)
+        score: Numeric score (may be None)
+        submitted_at: ISO 8601 submission time (or None)
+        graded_at: ISO 8601 grading time (or None)
+        late: Whether submission was late
+        missing: Whether submission is missing
+        excused: Whether student is excused
+    """
+    submission = MagicMock()
+    submission.id = 6001
+    submission.user_id = 3001
+    submission.assignment_id = 5001
+    submission.workflow_state = "submitted"
+    submission.grade = "A"
+    submission.score = 95.0
+    submission.submitted_at = "2023-12-14T18:30:00Z"
+    submission.graded_at = "2023-12-16T10:00:00Z"
+    submission.late = False
+    submission.missing = False
+    submission.excused = False
+
+    return submission
+@
+
+\subsection{Mock configuration}
+
+Many functions need the configuration dictionary that's normally loaded from
+[[~/.config/canvaslms/config.json]].
+We provide a fixture with sensible defaults.
+
+<<mock configuration fixture>>=
+@pytest.fixture
+def mock_config():
+    """
+    Mock configuration dictionary.
+
+    Provides minimal configuration needed for most commands.
+    Tests can override values as needed.
+
+    Keys:
+        canvas_server: Canvas instance URL
+        course_id: Default course ID (optional)
+        assignment: Default assignment filter (optional)
+    """
+    return {
+        "canvas_server": "https://canvas.example.edu",
+        "course_id": None,
+        "assignment": None,
+    }
+@
+
+\section{Using these fixtures in tests}
+
+With these fixtures in place, writing tests becomes straightforward.
+Here's a preview of how they'll be used:
+
+\begin{verbatim}
+def test_filter_courses_by_name(mock_canvas, mock_courses):
+    """Test that regex filtering works on course names"""
+    mock_canvas.get_courses.return_value = mock_courses
+
+    # Test the actual filtering function
+    result = filter_courses(mock_canvas, "Programming")
+
+    assert len(result) == 1
+    assert result[0].name == "Introduction to Programming"
+\end{verbatim}
+
+Notice:
+\begin{itemize}
+\item We declare which fixtures we need as function parameters
+\item Pytest automatically provides them
+\item We customize the mock behavior ([[get_courses.return_value]])
+\item We test our actual function against realistic mock data
+\item The test is clear, focused, and fast
+\end{itemize}
+
+\section{Benefits of this approach}
+
+This fixture-based testing strategy provides several advantages:
+
+\begin{description}
+\item[Reusability:] Every test can use these fixtures without duplication
+\item[Consistency:] All tests use the same realistic mock objects
+\item[Maintainability:] If Canvas API changes, we update fixtures in one place
+\item[Readability:] Tests focus on behavior, not mock setup
+\item[Pedagogical value:] Fixtures serve as documentation of Canvas API
+structure
+\end{description}
+
+As you read the test examples in subsequent chapters, you'll see these fixtures
+in action.
+They make tests clear and concise while providing enough realism to catch bugs.
+
+\section{Next steps}
+
+In the following chapters, we'll see these fixtures used to test:
+\begin{itemize}
+\item Time formatting utilities (with [[freezegun]] for deterministic time
+tests)
+\item Course filtering with regex patterns
+\item Assignment and user filtering
+\item Submission processing and state management
+\item Canvas API extensions (equality, hashing)
+\end{itemize}
+
+Each test chapter will show the \emph{expected behavior} through test examples
+before diving into the implementation details.
+This "tests as examples" approach follows variation theory: we show what the
+code \emph{should do} before explaining how it \emph{does} it.
