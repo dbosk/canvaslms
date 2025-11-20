@@ -1502,8 +1502,10 @@ union_kwargs = merge_kwargs(
   [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
 
 for obj in get_attrs(self, *args, **union_kwargs):
-  old_obj = attr_cache.get(obj.id, None)
-  <<update [[obj]] with cache from [[old_obj]]>>
+  old_entry = attr_cache.get(obj.id, None)
+  if old_entry:
+    old_obj, _ = old_entry
+    <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, union_kwargs)
 
@@ -1817,6 +1819,253 @@ lines~494--495).
 for cache_attr_name in dir(old_obj):
   if cache_attr_name.endswith("_cache") or cache_attr_name.endswith("_all_fetched"):
     setattr(obj, cache_attr_name, getattr(old_obj, cache_attr_name))
+@
+
+Now let's verify cache synchronization preserves hierarchical caches.
+
+\subsubsection{Verifying cache synchronization}
+
+When bulk fetching objects, we must preserve their sub-object caches to avoid
+losing cached data down the hierarchy.
+
+<<test cache synchronization>>=
+class TestCacheSynchronization:
+    """Test cache preservation during bulk updates"""
+
+    def test_preserves_sub_object_caches(self):
+        """Bulk fetch should preserve sub-object caches"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_course(self, course_id):
+                obj = MagicMock()
+                obj.id = course_id
+                return obj
+            def get_courses(self):
+                obj = MagicMock()
+                obj.id = 1
+                return [obj]
+
+        CacheGetMethods("course")(TestClass)
+        instance = TestClass()
+
+        # Initial bulk fetch
+        courses = list(instance.get_courses())
+        course = courses[0]
+
+        # Add sub-cache (simulate assignment cache on course)
+        course.assignment_cache = {10: ("assignment_obj", {})}
+        course.assignment_all_fetched = datetime.now()
+        instance.course_cache[1] = (course, {})
+
+        # Force refetch by clearing all_fetched
+        instance.course_all_fetched = None
+
+        # Bulk fetch again
+        new_courses = list(instance.get_courses())
+        new_course = new_courses[0]
+
+        # Sub-cache should be preserved
+        assert hasattr(new_course, "assignment_cache")
+        assert 10 in new_course.assignment_cache
+
+    def test_copies_cache_attributes(self):
+        """Should copy {attr}_cache attributes"""
+        counter = {"val": 0}
+
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                counter["val"] += 1
+                # Return object with consistent ID
+                obj = MagicMock()
+                obj.id = 1
+                return [obj]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Initial fetch
+        items1 = list(instance.get_items())
+        item1 = items1[0]
+        item1.sub_cache = {"key": "value"}
+        # Update cache with modified object
+        instance.item_cache[1] = (item1, {})
+
+        # Refetch - should copy sub_cache from old object
+        instance.item_all_fetched = None
+        items2 = list(instance.get_items())
+        item2 = items2[0]
+
+        assert hasattr(item2, "sub_cache")
+        assert item2.sub_cache == {"key": "value"}
+
+    def test_copies_all_fetched_attributes(self):
+        """Should copy {attr}_all_fetched attributes"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                obj = MagicMock()
+                obj.id = 1
+                return [obj]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Initial fetch
+        items1 = list(instance.get_items())
+        item1 = items1[0]
+        timestamp = datetime.now() - timedelta(hours=1)
+        item1.sub_all_fetched = timestamp
+        instance.item_cache[1] = (item1, {})
+
+        # Refetch - should copy sub_all_fetched from old object
+        instance.item_all_fetched = None
+        items2 = list(instance.get_items())
+        item2 = items2[0]
+
+        assert hasattr(item2, "sub_all_fetched")
+        assert item2.sub_all_fetched == timestamp
+
+    def test_preserves_multiple_cache_types(self):
+        """Should preserve all cache attributes (multiple types)"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_course(self, course_id):
+                obj = MagicMock()
+                obj.id = course_id
+                return obj
+            def get_courses(self):
+                obj = MagicMock()
+                obj.id = 1
+                return [obj]
+
+        CacheGetMethods("course")(TestClass)
+        instance = TestClass()
+
+        # Initial fetch
+        courses = list(instance.get_courses())
+        course = courses[0]
+
+        # Add multiple sub-caches
+        course.assignment_cache = {10: ("asgn", {})}
+        course.assignment_all_fetched = datetime.now()
+        course.user_cache = {20: ("user", {})}
+        course.user_all_fetched = datetime.now()
+        instance.course_cache[1] = (course, {})
+
+        # Refetch
+        instance.course_all_fetched = None
+        new_courses = list(instance.get_courses())
+        new_course = new_courses[0]
+
+        # All caches should be preserved
+        assert hasattr(new_course, "assignment_cache")
+        assert hasattr(new_course, "assignment_all_fetched")
+        assert hasattr(new_course, "user_cache")
+        assert hasattr(new_course, "user_all_fetched")
+
+    def test_pattern_matching_works_for_any_cache(self):
+        """Pattern matching should work for any {name}_cache"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                obj = MagicMock()
+                obj.id = 1
+                return [obj]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Initial fetch
+        items1 = list(instance.get_items())
+        item1 = items1[0]
+        item1.custom_thing_cache = {"data": "value"}
+        instance.item_cache[1] = (item1, {})
+
+        # Refetch - should copy custom cache from old object
+        instance.item_all_fetched = None
+        items2 = list(instance.get_items())
+        item2 = items2[0]
+
+        # Custom cache should be preserved
+        assert hasattr(item2, "custom_thing_cache")
+        assert item2.custom_thing_cache == {"data": "value"}
+
+    def test_fresh_objects_without_old_cache_work(self):
+        """Fresh objects without old cache should get empty cache"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                return obj
+            def get_items(self):
+                # Return new object not in cache
+                obj = MagicMock()
+                obj.id = 99
+                return [obj]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Fetch
+        items = list(instance.get_items())
+
+        # Should complete without error
+        assert len(items) == 1
+        assert items[0].id == 99
+
+    def test_cache_copying_doesnt_interfere_with_new_data(self):
+        """Cache copying shouldn't interfere with new API data"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_item(self, item_id):
+                obj = MagicMock()
+                obj.id = item_id
+                obj.name = f"Item {item_id}"
+                return obj
+            def get_items(self):
+                obj = MagicMock()
+                obj.id = 1
+                obj.name = "Updated Item 1"
+                return [obj]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+
+        # Initial fetch
+        items = list(instance.get_items())
+        assert items[0].name == "Updated Item 1"
+
+        # Refetch
+        instance.item_all_fetched = None
+        new_items = list(instance.get_items())
+
+        # New data should be visible
+        assert new_items[0].name == "Updated Item 1"
+@
+
+<<test hacks.py>>=
+<<test cache synchronization>>
 @
 
 \subsection{Testing outdated objects}
