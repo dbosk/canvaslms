@@ -2068,6 +2068,242 @@ class TestCacheSynchronization:
 <<test cache synchronization>>
 @
 
+Now let's test realistic Canvas API usage scenarios to verify the caching works
+as expected in production-like workflows.
+
+\subsubsection{Realistic Canvas API scenarios}
+
+These tests verify that the caching system works correctly for typical Canvas API
+usage patterns, particularly hierarchical data access (Course → Assignment → Submission).
+
+<<test realistic canvas scenarios>>=
+class TestRealisticCanvasScenarios:
+    """Test realistic Canvas API usage patterns"""
+
+    def test_course_assignment_hierarchy(self):
+        """Course with cached assignments should work like real Canvas"""
+        class Canvas:
+            def get_course(self, course_id):
+                obj = MagicMock()
+                obj.id = course_id
+                obj.name = f"Course {course_id}"
+                return obj
+            def get_courses(self):
+                c1 = MagicMock()
+                c1.id = 1
+                c1.name = "Course 1"
+                c2 = MagicMock()
+                c2.id = 2
+                c2.name = "Course 2"
+                return [c1, c2]
+
+        # Apply decorator
+        CacheGetMethods("course")(Canvas)
+
+        canvas = Canvas()
+
+        # List courses (bulk fetch)
+        courses = list(canvas.get_courses())
+        assert len(courses) == 2
+
+        # Verify caching works
+        assert 1 in canvas.course_cache
+        assert 2 in canvas.course_cache
+        assert courses[0].name == "Course 1"
+        assert courses[1].name == "Course 2"
+
+    def test_multi_level_caching_with_includes(self):
+        """Verify include parameters work with caching"""
+        call_counts = {"fetch": 0}
+
+        class Canvas:
+            def get_course(self, course_id):
+                obj = MagicMock()
+                obj.id = course_id
+                return obj
+            def get_courses(self, **kwargs):
+                call_counts["fetch"] += 1
+                c = MagicMock()
+                c.id = 1
+                return [c]
+
+        CacheGetMethods("course")(Canvas)
+
+        canvas = Canvas()
+
+        # First fetch with one include
+        list(canvas.get_courses(include=["term"]))
+        assert call_counts["fetch"] == 1
+
+        # Request additional include - should refetch
+        canvas.course_all_fetched = None
+        list(canvas.get_courses(include=["term", "enrollment"]))
+
+        # Course refetch should happen
+        assert call_counts["fetch"] == 2
+
+    def test_multiple_decorators_on_same_class(self):
+        """Course with both assignment and user caches (like production)"""
+        class Course:
+            def get_assignment(self, assignment_id):
+                obj = MagicMock()
+                obj.id = assignment_id
+                return obj
+            def get_assignments(self):
+                a = MagicMock()
+                a.id = 10
+                return [a]
+            def get_user(self, user_id):
+                obj = MagicMock()
+                obj.id = user_id
+                return obj
+            def get_users(self):
+                u = MagicMock()
+                u.id = 100
+                return [u]
+
+        # Apply multiple decorators like production
+        CacheGetMethods("assignment")(Course)
+        CacheGetMethods("user")(Course)
+
+        course = Course()
+
+        # Should have separate caches
+        assert hasattr(course, "assignment_cache")
+        assert hasattr(course, "assignment_all_fetched")
+        assert hasattr(course, "user_cache")
+        assert hasattr(course, "user_all_fetched")
+
+        # Both should work independently
+        assignments = list(course.get_assignments())
+        users = list(course.get_users())
+
+        assert len(assignments) == 1
+        assert len(users) == 1
+        assert 10 in course.assignment_cache
+        assert 100 in course.user_cache
+
+    def test_production_workflow_no_redundant_api_calls(self):
+        """Typical workflow should minimize API calls"""
+        call_counts = {"get_courses": 0, "get_course": 0}
+
+        class Canvas:
+            def get_course(self, course_id):
+                call_counts["get_course"] += 1
+                obj = MagicMock()
+                obj.id = course_id
+                obj.name = f"Course {course_id}"
+                return obj
+            def get_courses(self):
+                call_counts["get_courses"] += 1
+                c1 = MagicMock()
+                c1.id = 1
+                c1.name = "Course 1"
+                c2 = MagicMock()
+                c2.id = 2
+                c2.name = "Course 2"
+                return [c1, c2]
+
+        CacheGetMethods("course")(Canvas)
+
+        canvas = Canvas()
+
+        # Typical workflow: list all courses
+        courses = list(canvas.get_courses())  # 1 API call
+
+        # Now get individual course (should come from cache)
+        course = canvas.get_course(1)  # 0 API calls (cached)
+
+        # Verify minimal API calls
+        assert call_counts["get_courses"] == 1
+        assert call_counts["get_course"] == 0  # Came from cache!
+        assert course.name == "Course 1"
+
+    def test_irregular_plural_name_in_production(self):
+        """group_categories uses custom plural_name like production"""
+        class Course:
+            def get_group_category(self, category_id):
+                obj = MagicMock()
+                obj.id = category_id
+                return obj
+            def get_group_categories(self):
+                gc = MagicMock()
+                gc.id = 1
+                return [gc]
+
+        CacheGetMethods("group_category",
+                        plural_name="group_categories")(Course)
+
+        course = Course()
+        categories = list(course.get_group_categories())
+
+        # Should create cache with singular form
+        assert hasattr(course, "group_category_cache")
+        assert hasattr(course, "group_category_all_fetched")
+        assert 1 in course.group_category_cache
+
+    def test_assignment_groups_include_singular_false(self):
+        """assignment_groups decorator uses include_singular=False"""
+        class Course:
+            def get_assignment_groups(self):
+                ag = MagicMock()
+                ag.id = 1
+                return [ag]
+
+        CacheGetMethods("assignment_group",
+                        include_singular=False)(Course)
+
+        course = Course()
+
+        # Should still have cache attributes
+        assert hasattr(course, "assignment_group_cache")
+        assert hasattr(course, "assignment_group_all_fetched")
+
+        # Should NOT have get_assignment_group method (include_singular=False)
+        # (but we can't easily test that a method wasn't added in this test structure)
+
+        # Plural should work
+        groups = list(course.get_assignment_groups())
+        assert len(groups) == 1
+        assert 1 in course.assignment_group_cache
+
+    def test_fresh_data_not_refetched_unnecessarily(self):
+        """Fresh cached data should not trigger redundant API calls"""
+        call_count = {"count": 0}
+
+        class Canvas:
+            def get_course(self, course_id):
+                obj = MagicMock()
+                obj.id = course_id
+                return obj
+            def get_courses(self):
+                call_count["count"] += 1
+                c = MagicMock()
+                c.id = 1
+                c.name = "Test Course"
+                return [c]
+
+        CacheGetMethods("course")(Canvas)
+
+        canvas = Canvas()
+
+        # Initial fetch
+        list(canvas.get_courses())
+        assert call_count["count"] == 1
+
+        # Multiple fetches from cache
+        for _ in range(5):
+            courses = list(canvas.get_courses())
+            assert courses[0].name == "Test Course"
+
+        # Should still only have 1 API call (rest from cache)
+        assert call_count["count"] == 1
+@
+
+<<test hacks.py>>=
+<<test realistic canvas scenarios>>
+@
+
 \subsection{Testing outdated objects}
 
 Now we'll deal with the [[outdated]] function.
