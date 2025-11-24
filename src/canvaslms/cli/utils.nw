@@ -10,6 +10,268 @@ import datetime
 <<functions>>
 @
 
+\section{Testing the utility functions}
+\label{sec:utils:testing}
+
+Before diving into implementation details, let's understand what these utility functions should do by examining test examples.
+This follows the principle of demonstrating \emph{behavior} before explaining \emph{implementation}.
+
+The utilities handle time formatting and date parsing---operations that must work correctly across timezones and handle various input formats gracefully.
+Testing time-dependent code is tricky: tests must produce consistent results regardless of when they run.
+We use [[freezegun]] to freeze time at a known point, making our tests deterministic.
+
+\subsection{Testing philosophy: variation theory and edge cases}
+
+When testing time utilities, we apply variation theory:
+\begin{description}
+\item[Invariant] The conversion logic and timezone handling
+\item[Variant] Input types (None, string, datetime, arrow), timezones, formats
+\end{description}
+
+By varying inputs while keeping the logic constant, we verify that our functions handle all scenarios correctly.
+
+\subsection{Test structure}
+
+Our tests verify three core functions:
+\begin{enumerate}
+\item [[format_local_time()]]: Converts ISO timestamps to human-readable local time
+\item [[format_canvas_time()]]: Converts various inputs to Canvas UTC format (ending with 'Z')
+\item [[parse_date()]]: Parses human-readable dates to Canvas format
+\end{enumerate}
+
+Let's see how they should behave through concrete test examples.
+
+\subsubsection{Testing format\_local\_time}
+
+This function takes an ISO timestamp and displays it in local time.
+It should handle None values gracefully (returning "N/A") and format valid timestamps consistently.
+
+<<test utils.py>>=
+"""
+Tests for canvaslms.cli.utils time formatting functions.
+
+These tests demonstrate expected behavior using variation theory:
+we vary inputs (None, different formats, timezones) while the
+conversion logic stays constant.
+"""
+import pytest
+from datetime import datetime, timezone
+from freezegun import freeze_time
+import arrow
+
+from canvaslms.cli.utils import (
+    format_local_time,
+    format_canvas_time,
+    parse_date
+)
+
+<<test format local time>>
+<<test format canvas time>>
+<<test parse date>>
+@
+
+The [[format_local_time()]] function is used to display timestamps to users.
+Let's verify it handles edge cases and formats correctly:
+
+<<test format local time>>=
+class TestFormatLocalTime:
+    """Test format_local_time() with various inputs"""
+
+    def test_none_returns_na(self):
+        """None input should return 'N/A' for display"""
+        assert format_local_time(None) == "N/A"
+
+    def test_empty_string_returns_na(self):
+        """Empty string should return 'N/A'"""
+        assert format_local_time("") == "N/A"
+
+    @freeze_time("2023-12-15 14:30:00")
+    def test_formats_utc_to_local(self):
+        """
+        Should convert UTC timestamp to local time.
+
+        Frozen at 2023-12-15 14:30 CET (UTC+1, Europe/Stockholm winter time).
+        Input: 2023-12-15 13:30:00 UTC
+        Expected output in local time (CET): 2023-12-15 14:30
+        """
+        utc_time = "2023-12-15T13:30:00Z"
+        result = format_local_time(utc_time)
+        assert result == "2023-12-15 14:30"
+
+    def test_invalid_format_returns_original(self):
+        """If parsing fails, return the original string"""
+        invalid = "not-a-timestamp"
+        result = format_local_time(invalid)
+        assert result == invalid
+@
+
+Notice how we use [[freeze_time]] to create a deterministic test environment.
+This is \emph{crucial} for time-dependent tests: without freezing time, tests would pass or fail depending on the system timezone and current time.
+
+\subsubsection{Testing format\_canvas\_time}
+
+The [[format_canvas_time()]] function is more complex: it accepts multiple input types (datetime objects, arrow objects, date objects, strings) and converts them all to Canvas's expected UTC format ending with 'Z'.
+
+This is a perfect example of variation theory in action---we test the same conversion logic with many different input types:
+
+<<test format canvas time>>=
+class TestFormatCanvasTime:
+    """Test format_canvas_time() with various input types"""
+
+    def test_none_returns_none(self):
+        """None input should return None"""
+        assert format_canvas_time(None) == None
+
+    def test_empty_string_returns_none(self):
+        """Empty string should return None"""
+        assert format_canvas_time("") == None
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_datetime_with_timezone(self):
+        """
+        Should convert timezone-aware datetime to Canvas UTC format.
+
+        Input: datetime with timezone
+        Output: UTC ISO string ending with 'Z'
+        """
+        dt = datetime(2023, 12, 15, 10, 0, 0, tzinfo=timezone.utc)
+        result = format_canvas_time(dt)
+        assert result.endswith("Z")
+        assert "2023-12-15" in result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_datetime_without_timezone_assumes_local(self):
+        """
+        Naive datetime (no timezone) should be interpreted as local time.
+
+        Frozen at 2023-12-15 10:00 CET (UTC+1, Europe/Stockholm winter time).
+        Input: naive datetime 2023-12-15 10:00
+        Output: Should interpret as local (CET) and convert to UTC
+        """
+        dt = datetime(2023, 12, 15, 10, 0, 0)
+        result = format_canvas_time(dt)
+        # Should be converted from CET to UTC (subtract 1 hour)
+        assert result.endswith("Z")
+        assert "2023-12-15T09:00:00Z" == result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_date_object_start_of_day(self):
+        """
+        Date (not datetime) should be interpreted as start of day in local time.
+
+        Frozen at 2023-12-15 10:00 CET (UTC+1, Europe/Stockholm winter time).
+        Input: date(2023, 12, 15)
+        Output: 2023-12-15 00:00 local → converted to UTC
+        """
+        from datetime import date
+        d = date(2023, 12, 15)
+        result = format_canvas_time(d)
+        assert result.endswith("Z")
+        # Start of day in CET (00:00) = 23:00 UTC previous day
+        assert "2023-12-14T23:00:00Z" == result
+
+    def test_arrow_object(self):
+        """Arrow objects should be converted to Canvas format"""
+        arr = arrow.get("2023-12-15T10:00:00Z")
+        result = format_canvas_time(arr)
+        assert result == "2023-12-15T10:00:00Z"
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_string_iso_format(self):
+        """ISO string should be parsed as local time and converted to UTC"""
+        iso_str = "2023-12-15T10:00:00"
+        result = format_canvas_time(iso_str)
+        assert result.endswith("Z")
+        # 10:00 local (CET) = 09:00 UTC
+        assert "2023-12-15T09:00:00Z" == result
+
+    def test_invalid_string_raises_error(self):
+        """Invalid date string should raise ValueError"""
+        with pytest.raises(ValueError, match="Invalid date/time format"):
+            format_canvas_time("not a date")
+@
+
+These tests demonstrate how [[format_canvas_time()]] handles the variation across input types while maintaining the invariant: always produce Canvas-compatible UTC timestamps ending with 'Z'.
+
+\subsubsection{Testing parse\_date}
+
+The [[parse_date()]] function accepts human-readable date strings in many formats and converts them to Canvas format.
+This function is particularly important because it processes user input from the command line.
+
+We test multiple formats to ensure flexibility:
+
+<<test parse date>>=
+class TestParseDate:
+    """Test parse_date() with various date formats"""
+
+    def test_none_returns_none(self):
+        """None should return None"""
+        assert parse_date(None) == None
+
+    def test_none_string_returns_none(self):
+        """String 'none' should return None"""
+        assert parse_date("none") == None
+        assert parse_date("None") == None
+
+    def test_clear_returns_none(self):
+        """String 'clear' should return None (for clearing dates)"""
+        assert parse_date("clear") == None
+
+    def test_empty_string_returns_none(self):
+        """Empty string should return None"""
+        assert parse_date("") == None
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_iso_format(self):
+        """ISO format: YYYY-MM-DD"""
+        result = parse_date("2023-12-15")
+        assert result.endswith("Z")
+        # Date interpreted as start of day local time
+        assert "2023-12-15" in result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_iso_with_time(self):
+        """ISO format with time: YYYY-MM-DD HH:mm"""
+        result = parse_date("2023-12-15 14:30")
+        assert result.endswith("Z")
+        # parse_date uses arrow which interprets as UTC by default
+        assert "2023-12-15T14:30:00Z" == result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_slash_format(self):
+        """US format: MM/DD/YYYY"""
+        result = parse_date("12/15/2023")
+        assert result.endswith("Z")
+        assert "2023-12-15" in result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_month_name_format(self):
+        """Month name format: Dec 15 2023"""
+        result = parse_date("Dec 15 2023")
+        assert result.endswith("Z")
+        assert "2023-12-15" in result
+
+    def test_invalid_format_raises_error(self):
+        """Completely invalid string should raise ValueError"""
+        with pytest.raises(ValueError, match="Could not parse date"):
+            parse_date("not-a-valid-date-xyz123")
+@
+
+These tests show how [[parse_date()]] provides a flexible interface for users: they can input dates in many common formats, and the function will convert them all to the standard Canvas format.
+
+\subsection{Benefits of testing time functions}
+
+Testing time and date handling is essential because:
+\begin{enumerate}
+\item \textbf{Timezone bugs are subtle}: Code may work in one timezone but fail in another
+\item \textbf{User input varies}: Real users type dates in many formats
+\item \textbf{Edge cases matter}: None values, empty strings, start of day---all must be handled
+\item \textbf{Canvas expects specific format}: Timestamps must end with 'Z' (UTC indicator)
+\end{enumerate}
+
+By writing these tests \emph{first} in the document, we clearly specify the expected behavior before diving into implementation details.
+This pedagogical approach---\emph{show what it does, then show how it does it}---helps readers understand the purpose before the mechanism.
+
 \section{Time formatting utilities}
 
 Function to format ISO timestamps in local time for better readability.
