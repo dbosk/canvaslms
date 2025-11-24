@@ -1023,55 +1023,153 @@ class LazySubmission:
     submission = object.__getattribute__(self, '_submission')
     return str(submission)
 
-  def __getstate__(self):
-    """
-    Prepare object for pickling.
+  <<pickle support for LazySubmission>>
+@
 
-    We can't pickle method references, so we exclude _original_get_submission.
-    It will be restored from the assignment object during unpickling.
-    """
-    state = {
-      '_submission': object.__getattribute__(self, '_submission'),
-      '_assignment': object.__getattribute__(self, '_assignment'),
-      '_includes': object.__getattribute__(self, '_includes'),
-      '_last_refresh': object.__getattribute__(self, '_last_refresh'),
-    }
-    return state
+\subsubsection{Pickle support for cache persistence}
 
-  def __setstate__(self, state):
-    """
-    Restore object after unpickling.
+The \texttt{LazySubmission} wrapper must support pickling to enable cache
+persistence.
+When the \texttt{Canvas} object is saved to disk (see cache.nw), Python's
+\texttt{pickle} module serializes the entire object hierarchy, including all
+cached submissions.
 
-    Restore all attributes from state, and reconstruct _original_get_submission
-    by finding it in the decorator's closure.
-    """
-    for key, value in state.items():
-      object.__setattr__(self, key, value)
+\paragraph{The pickling challenge}
 
-    # Restore the original method from the assignment's decorated method
-    # The decorated method has the original in its closure
-    assignment = state['_assignment']
-    decorated_method = assignment.__class__.get_submission
+Python's \texttt{pickle} cannot serialize certain objects, including:
+\begin{itemize}
+\item Function and method references (unless they're module-level functions)
+\item Lambda functions
+\item Generator objects
+\item Objects with circular references to unpicklable objects
+\end{itemize}
 
-    # The original method is captured in the decorator's closure
-    # We can access it via the closure of the decorated method
-    # The decorated method's __closure__ contains the original method
-    try:
-      # Find the original_get_submission in the closure
-      for cell in decorated_method.__closure__:
-        try:
-          obj = cell.cell_contents
-          # Check if it's a callable with the right name
-          if callable(obj) and hasattr(obj, '__name__') and \
-             'get_submission' in obj.__name__:
-            object.__setattr__(self, '_original_get_submission', obj)
-            break
-        except (AttributeError, ValueError):
-          continue
-    except (AttributeError, TypeError):
-      # If we can't find it in closure, fall back to None
-      # This means refresh won't work, but at least unpickling succeeds
-      object.__setattr__(self, '_original_get_submission', None)
+Our \texttt{LazySubmission} stores \texttt{\_original\_get\_submission}, which is
+a reference to the original (unwrapped) \texttt{get\_submission} method.
+This is a \emph{bound method} when called, but we store the \emph{unbound
+function} from the decorator's closure.
+Method objects are not picklable by default.
+
+\paragraph{The solution: reconstruct from closure}
+
+We implement \texttt{\_\_getstate\_\_} and \texttt{\_\_setstate\_\_} to handle
+pickling:
+\begin{enumerate}
+\item \textbf{Before pickling} (\texttt{\_\_getstate\_\_}): Exclude the
+  unpicklable \texttt{\_original\_get\_submission} from the state dictionary.
+  Save only the submission, assignment reference, includes list, and last
+  refresh timestamp.
+\item \textbf{After unpickling} (\texttt{\_\_setstate\_\_}): Reconstruct
+  \texttt{\_original\_get\_submission} by searching the decorator's closure.
+  The decorated method stores the original in its \texttt{\_\_closure\_\_}
+  attribute, which we can access via
+  \texttt{assignment.\_\_class\_\_.get\_submission}.
+\end{enumerate}
+
+\paragraph{Why closure search works}
+
+When the \texttt{cache\_submissions} decorator wraps
+\texttt{Assignment.get\_submission}, it captures the original method in a
+closure variable (line~1072 in the decorator):
+\begin{minted}{python}
+original_get_submission = cls.get_submission
+\end{minted}
+
+This variable is referenced by the \texttt{new\_get\_submission} function,
+making it part of the function's closure.
+After unpickling, we can access this closure via the class's decorated method.
+
+\paragraph{Limitations and failure modes}
+
+This approach has several limitations:
+\begin{description}
+\item[Version compatibility] If the decorator implementation changes between
+  pickle and unpickle (e.g., code upgrade), the closure structure may differ,
+  causing reconstruction to fail.
+\item[Closure ambiguity] If multiple callable objects exist in the closure with
+  \enquote{get\_submission} in their name, we might retrieve the wrong one.
+  The heuristic checks for callables with matching names.
+\item[Graceful degradation] If reconstruction fails, we set
+  \texttt{\_original\_get\_submission} to \texttt{None}.
+  The wrapper remains functional for read-only access (attributes pass through
+  to the wrapped submission), but calling \texttt{\_refresh()} will fail.
+  This is acceptable because:
+  \begin{itemize}
+  \item Cache files are typically invalidated on code changes
+  \item The user can clear the cache manually if issues arise
+  \item Better to have stale data than a complete crash
+  \end{itemize}
+\end{description}
+
+\paragraph{Alternative approaches considered}
+
+We considered but rejected these alternatives:
+\begin{description}
+\item[Storing method name as string] Reconstruct via \texttt{getattr(assignment,
+  'get\_submission')}.
+  Problem: This retrieves the \emph{decorated} method, not the original,
+  causing infinite recursion or double-wrapping.
+\item[Not using a wrapper] Store a \enquote{needs refresh} flag on the
+  submission itself.
+  Problem: Mutating Canvas API objects is fragile and breaks the lazy-loading
+  design.
+\item[Store assignment ID, re-fetch assignment] Reconstruct the entire context
+  from IDs.
+  Problem: Defeats the purpose of caching; would require API calls just to
+  restore cache state.
+\end{description}
+
+Now we implement the pickle support:
+<<pickle support for LazySubmission>>=
+def __getstate__(self):
+  """
+  Prepare object for pickling.
+
+  We can't pickle method references, so we exclude _original_get_submission.
+  It will be restored from the decorator's closure during unpickling.
+  """
+  state = {
+    '_submission': object.__getattribute__(self, '_submission'),
+    '_assignment': object.__getattribute__(self, '_assignment'),
+    '_includes': object.__getattribute__(self, '_includes'),
+    '_last_refresh': object.__getattribute__(self, '_last_refresh'),
+  }
+  return state
+
+def __setstate__(self, state):
+  """
+  Restore object after unpickling.
+
+  Restore all attributes from state, and reconstruct _original_get_submission
+  by searching the decorator's closure for the original method.
+  """
+  for key, value in state.items():
+    object.__setattr__(self, key, value)
+
+  # Restore the original method from the assignment's decorated method
+  # The decorated method has the original in its closure
+  assignment = state['_assignment']
+  decorated_method = assignment.__class__.get_submission
+
+  # The original method is captured in the decorator's closure
+  # We can access it via the closure of the decorated method
+  # The decorated method's __closure__ contains the original method
+  try:
+    # Find the original_get_submission in the closure
+    for cell in decorated_method.__closure__:
+      try:
+        obj = cell.cell_contents
+        # Check if it's a callable with the right name
+        if callable(obj) and hasattr(obj, '__name__') and \
+           'get_submission' in obj.__name__:
+          object.__setattr__(self, '_original_get_submission', obj)
+          break
+      except (AttributeError, ValueError):
+        continue
+  except (AttributeError, TypeError):
+    # If we can't find it in closure, fall back to None
+    # This means refresh won't work, but at least unpickling succeeds
+    object.__setattr__(self, '_original_get_submission', None)
 @
 
 This class is used by the caching decorator below.
