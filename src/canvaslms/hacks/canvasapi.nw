@@ -833,13 +833,214 @@ def make_course_groups_cacheable():
 @
 
 
+\subsection{Lazy-loading submissions}
+
+The current caching approach has an inefficiency: when we call
+\texttt{get\_submissions()}, we immediately check if each cached submission needs
+updating and refresh it if necessary.
+However, in many workflows we filter the submission list to access only a few
+submissions (e.g., filtering by user or assignment).
+This means we waste API calls refreshing submissions we never actually use.
+
+\subsubsection{Contrasting eager and lazy loading}
+
+Consider this usage pattern:
+\begin{minted}{python}
+submissions = assignment.get_submissions()
+filtered = [s for s in submissions if s.user_id == target_user]
+print(filtered[0].grade)
+\end{minted}
+
+With \emph{eager loading} (the old approach):
+\begin{enumerate}
+\item \texttt{get\_submissions()} returns 50 cached submissions
+\item We check each submission: is it stale? Does it need refresh?
+\item We make 50 API calls to refresh non-final grades
+\item We filter to 1 submission
+\item We access the grade (already fresh)
+\end{enumerate}
+
+With \emph{lazy loading} (the new approach):
+\begin{enumerate}
+\item \texttt{get\_submissions()} returns 50 wrapped submissions (no API calls)
+\item We filter to 1 submission (wrapper objects pass through filters)
+\item We access the grade attribute
+\item The wrapper detects access to mutable attribute, checks staleness
+\item We make 1 API call to refresh only the accessed submission
+\end{enumerate}
+
+The performance improvement is dramatic when filtering: \textbf{1 API call instead
+of 50}.
+
+\subsubsection{Design: LazySubmission wrapper}
+
+We implement lazy loading using a transparent wrapper class that intercepts
+attribute access.
+The wrapper stores the original submission and assignment reference, allowing it
+to refresh itself when needed.
+
+Key design decisions:
+\begin{description}
+\item[Mutable attributes] Only certain attributes change over time: grade,
+  grading dates, rubrics, submission data, comments, attachments, and submission
+  body.
+  We track these and trigger refresh only when they're accessed.
+\item[NOREFRESH\_GRADES behavior] Submissions with final grades (A, P, P+,
+  complete) are never refreshed, maintaining the existing policy.
+\item[Time-based staleness] We use the existing \texttt{outdated()} function
+  with 5-minute TTL for non-final grades.
+\item[Preserved includes] The wrapper stores the original \texttt{include}
+  parameters from \texttt{get\_submissions()} to ensure refreshes request the
+  same data.
+\item[Cache updates] When a wrapper refreshes, it updates its internal state.
+  Since the cache holds references to wrapper objects, the cache automatically
+  reflects the update.
+\end{description}
+
+\subsubsection{Implementation: LazySubmission class}
+
+The \texttt{LazySubmission} class wraps a submission object and intercepts
+attribute access using \texttt{\_\_getattribute\_\_}.
+
+<<LazySubmission class>>=
+class LazySubmission:
+  """
+  Transparent wrapper for Submission objects that lazily refreshes on access.
+
+  This wrapper intercepts access to mutable attributes (grade, timestamps,
+  rubrics, etc.) and refreshes the submission from Canvas if:
+  - The submission is stale (based on TTL)
+  - The grade is not a final grade (not in NOREFRESH_GRADES)
+
+  Immutable attributes (user_id, assignment_id, etc.) are accessed directly
+  without triggering a refresh.
+  """
+
+  # Attributes that can change and should trigger refresh when accessed
+  MUTABLE_ATTRS = {
+    'grade', 'graded_at', 'submitted_at', 'rubric_assessment',
+    'submission_data', 'submission_history', 'submission_comments',
+    'attachments', 'body', 'grade_matches_current_submission'
+  }
+
+  def __init__(self, submission, assignment, includes, original_get_submission):
+    """
+    Initialize lazy submission wrapper.
+
+    Parameters:
+      submission: The Submission object to wrap
+      assignment: The Assignment object this submission belongs to
+      includes: List of include parameters used when fetching
+      original_get_submission: Unwrapped get_submission method for refreshing
+    """
+    # Use object.__setattr__ to avoid triggering our custom __setattr__
+    object.__setattr__(self, '_submission', submission)
+    object.__setattr__(self, '_assignment', assignment)
+    object.__setattr__(self, '_includes', includes)
+    object.__setattr__(self, '_original_get_submission', original_get_submission)
+    object.__setattr__(self, '_last_refresh', datetime.now())
+
+  def _needs_refresh(self):
+    """Check if the wrapped submission needs refreshing."""
+    submission = object.__getattribute__(self, '_submission')
+    last_refresh = object.__getattribute__(self, '_last_refresh')
+
+    # Never refresh final grades
+    if submission.grade in NOREFRESH_GRADES:
+      return False
+
+    # Check time-based staleness (5-minute TTL for non-final grades)
+    if datetime.now() - last_refresh > timedelta(minutes=5):
+      return True
+
+    return False
+
+  def _refresh(self):
+    """Refresh the wrapped submission from Canvas."""
+    assignment = object.__getattribute__(self, '_assignment')
+    submission = object.__getattribute__(self, '_submission')
+    includes = object.__getattribute__(self, '_includes')
+    original_get_submission = object.__getattribute__(self, '_original_get_submission')
+
+    # Call original method directly (bypasses decorator, no double-wrapping)
+    fresh_submission = original_get_submission(
+      assignment,
+      submission.user_id,
+      include=list(includes)
+    )
+
+    # Update internal state (cache automatically updated via reference)
+    object.__setattr__(self, '_submission', fresh_submission)
+    object.__setattr__(self, '_last_refresh', datetime.now())
+
+  def __getattribute__(self, name):
+    """
+    Intercept attribute access to trigger refresh when needed.
+
+    Logic:
+    1. Internal attributes (_*) and methods: access directly
+    2. Mutable attributes: check staleness, refresh if needed, then delegate
+    3. All other attributes: delegate to wrapped submission
+    """
+    # Always access internal attributes directly to avoid recursion
+    if name.startswith('_') or name in ['MUTABLE_ATTRS']:
+      return object.__getattribute__(self, name)
+
+    # Check if this is a mutable attribute that might need refresh
+    if name in LazySubmission.MUTABLE_ATTRS:
+      if object.__getattribute__(self, '_needs_refresh')():
+        object.__getattribute__(self, '_refresh')()
+
+    # Delegate to wrapped submission
+    submission = object.__getattribute__(self, '_submission')
+    return getattr(submission, name)
+
+  def __setattr__(self, name, value):
+    """
+    Intercept attribute setting to handle both wrapper and submission attrs.
+
+    Internal attributes (_*) are set on the wrapper.
+    All other attributes are set on the wrapped submission.
+    """
+    if name.startswith('_'):
+      object.__setattr__(self, name, value)
+    else:
+      submission = object.__getattribute__(self, '_submission')
+      setattr(submission, name, value)
+
+  def __getattr__(self, name):
+    """Fallback for attributes not found on wrapper (delegates to submission)."""
+    submission = object.__getattribute__(self, '_submission')
+    return getattr(submission, name)
+
+  def __repr__(self):
+    """Delegate repr to wrapped submission."""
+    submission = object.__getattribute__(self, '_submission')
+    return repr(submission)
+
+  def __str__(self):
+    """Delegate str to wrapped submission."""
+    submission = object.__getattribute__(self, '_submission')
+    return str(submission)
+@
+
+This class is used by the caching decorator below.
+<<functions>>=
+<<LazySubmission class>>
+@
+
 \subsection{Caching submissions}
 
 For the results, we can construct something more specific.
 Results that we're interested in are submissions.
 We can only get submission from an assignment object.
-We can either get all submissions, or one specific submission if we specify the 
+We can either get all submissions, or one specific submission if we specify the
 user.
+
+Now we combine the caching mechanism with lazy loading.
+The cache stores \texttt{LazySubmission} wrappers instead of raw submissions.
+This means submissions are only refreshed when their attributes are actually
+accessed, not when the list is returned.
 <<functions>>=
 def make_assignment_submissions_cacheable():
   def cache_submissions(cls):
