@@ -1053,9 +1053,11 @@ def make_assignment_submissions_cacheable():
 @
 
 Then we can write the decorator as follows.
-We need to add a cache attribute in the constructor, so we must decorate the 
+We need to add a cache attribute in the constructor, so we must decorate the
 constructor.
-The we must decorate both [[get_submission]] and [[get_submissions]].
+We must also store the original [[get_submission]] method before decorating it,
+because [[LazySubmission]] needs to call it directly to avoid double-wrapping.
+Then we must decorate both [[get_submission]] and [[get_submissions]].
 <<decorator body for caching assignment submissions>>=
 old_constructor = cls.__init__
 
@@ -1066,6 +1068,8 @@ def new_init(*args, **kwargs):
 
 cls.__init__ = new_init
 
+# Store original method before wrapping (needed by LazySubmission)
+original_get_submission = cls.get_submission
 get_submission = cls.get_submission
 
 @functools.wraps(cls.get_submission)
@@ -1084,15 +1088,20 @@ cls.get_submissions = new_get_submissions
 @
 
 We decorate the method to get a specific submission, [[get_submission]].
-This way we can cache the submissions of users who have passed.
-Then we always return up-to-date submissions of students who are expected to 
-submit.
+With lazy loading, we wrap the submission in [[LazySubmission]] and cache the
+wrapper.
+The wrapper will handle staleness checking and refresh only when attributes are
+accessed.
 For this, we first need a cache attribute.
 <<extend class constructor for decorators>>=
 args[0].__cache = {}
 @
 
 Now we can treat how we get an individual submission.
+The logic is simplified compared to the eager approach: we only fetch if not in
+cache or if new includes are requested.
+We no longer check [[NOREFRESH_GRADES]] here---that's handled by
+[[LazySubmission._needs_refresh()]].
 <<return submission of user>>=
 if isinstance(user, User):
   uid = user.id
@@ -1101,52 +1110,81 @@ elif isinstance(user, int):
 else:
   raise TypeError(f"user must be User or int")
 
-submission = None
-
 if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
 
+# Check cache
 if uid in self.__cache:
-  submission, included = self.__cache[uid]
-  if not to_include.issubset(set(included)):
-    submission = None
-    to_include |= set(included)
+  lazy_submission = self.__cache[uid]
+  # Get current includes from the wrapper
+  current_includes = set(lazy_submission._includes)
 
-if not submission or submission.grade not in NOREFRESH_GRADES:
-  submission = get_submission(self, user, include=list(to_include))
-  self.__cache[uid] = (submission, to_include)
+  # If new includes are requested, merge and refetch
+  if not to_include.issubset(current_includes):
+    to_include |= current_includes
+    raw_submission = get_submission(self, user, include=list(to_include))
+    lazy_submission = LazySubmission(raw_submission, self, to_include,
+                                     original_get_submission)
+    self.__cache[uid] = lazy_submission
 
-return submission
+  return lazy_submission
+else:
+  # Not in cache, fetch and wrap
+  raw_submission = get_submission(self, user, include=list(to_include))
+  lazy_submission = LazySubmission(raw_submission, self, to_include,
+                                   original_get_submission)
+  self.__cache[uid] = lazy_submission
+  return lazy_submission
 @
 
 Now we can deal with [[get_submissions]].
-As we might call [[get_submission]] before any [[get_submissions]], we cannot 
+As we might call [[get_submission]] before any [[get_submissions]], we cannot
 rely on the cache as a check.
 We introduce a new attribute.
 <<extend class constructor for decorators>>=
 args[0].__all_fetched = False
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
+
+With lazy loading, we simplify the logic significantly.
+We no longer check each submission for staleness here---the [[LazySubmission]]
+wrapper handles that when attributes are accessed.
+We only refetch all if we haven't fetched before, or if new includes are
+requested that aren't in the cache.
 <<return a list of all submissions>>=
 if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
 
+# Check if we need to refetch due to new includes
+need_refetch = False
 if self.__all_fetched:
-  for submission, included in self.__cache.values():
-    if not to_include.issubset(included) or \
-       submission.grade not in NOREFRESH_GRADES:
-      self.get_submission(submission.user_id, include=list(to_include))
-else:
-  for _, included in self.__cache.values():
-    to_include |= included
+  # Check if any cached submission doesn't have the requested includes
+  for lazy_submission in self.__cache.values():
+    cached_includes = set(lazy_submission._includes)
+    if not to_include.issubset(cached_includes):
+      need_refetch = True
+      to_include |= cached_includes
+      break
 
-  for submission in get_submissions(self, **kwargs):
-    self.__cache[submission.user_id] = (submission, to_include)
+if not self.__all_fetched or need_refetch:
+  # If refetching, merge all previously requested includes
+  if need_refetch:
+    for lazy_submission in self.__cache.values():
+      to_include |= set(lazy_submission._includes)
 
-return [submission for submission, _ in self.__cache.values()]
+  # Fetch all and wrap with LazySubmission
+  for raw_submission in get_submissions(self, include=list(to_include)):
+    lazy_submission = LazySubmission(raw_submission, self, to_include,
+                                     original_get_submission)
+    self.__cache[raw_submission.user_id] = lazy_submission
+
+  self.__all_fetched = True
+
+# Return list of LazySubmission wrappers (no staleness checks here!)
+return list(self.__cache.values())
 @
 
