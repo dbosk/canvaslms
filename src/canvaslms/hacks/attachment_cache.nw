@@ -1,0 +1,268 @@
+\chapter{Caching submission attachments}
+
+When working with submission attachments, we want to avoid downloading the same
+file multiple times.
+This is particularly important when computing diffs between submission
+versions: if a student submits version N+1, we already have the attachments
+from versions N, N-1, \ldots cached locally.
+Computing the new diff then only requires downloading version N+1.
+
+\section{Design decisions}
+
+We face several design choices for caching attachment files:
+
+\subsection{Where to store cached files}
+
+We use a platform-specific cache directory provided by the [[appdirs]] package.
+This follows the conventions of the host operating system:
+\begin{itemize}
+\item Linux: [[~/.cache/canvaslms/attachments/]]
+\item macOS: [[~/Library/Caches/canvaslms/attachments/]]
+\item Windows: [[C:\Users\<user>\AppData\Local\canvaslms\attachments\]]
+\end{itemize}
+
+This is superior to storing files in the pickle cache because:
+\begin{itemize}
+\item Pickle files remain small (metadata only)
+\item Users can manage cache size and location using OS tools
+\item Cache cleanup doesn't affect submission metadata
+\end{itemize}
+
+\subsection{Content-addressed storage}
+
+We use \emph{content-addressed storage}: files are identified by the SHA-256
+hash of their content, not by Canvas attachment ID or filename.
+This provides perfect deduplication---if multiple students submit the same
+file, or if a student resubmits an unchanged file, we store it only once.
+
+The storage structure is:
+\begin{description}
+\item[Content files] [[<cache_dir>/attachments/<sha256>.dat]]
+\item[Metadata index] [[<cache_dir>/attachments/index.json]] mapping attachment
+  IDs to hashes
+\end{description}
+
+The index maps Canvas attachment IDs to cached file metadata:
+\begin{minted}{python}
+{
+  "12345": {
+    "hash": "a1b2c3...",
+    "filename": "report.pdf",
+    "size": 102400,
+    "content_type": "application/pdf",
+    "last_access": "2025-11-24T10:30:00"
+  }
+}
+\end{minted}
+
+\subsection{When attachments become stale}
+
+Attachments for a particular submission version are immutable---once submitted,
+they never change.
+Therefore, we cache attachment files forever (no time-to-live expiration).
+
+The only cleanup is \emph{age-based}: we remove files that haven't been
+accessed in a configurable number of days (default: 90 days).
+This prevents unbounded cache growth while keeping frequently-used files.
+
+\section{Implementation}
+
+<<attachment_cache.py>>=
+"""Content-addressed cache for Canvas submission attachments"""
+
+import appdirs
+import hashlib
+import json
+import pathlib
+import shutil
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+
+<<cache directory initialization>>
+<<cache operations>>
+@
+
+\subsection{Cache directory initialization}
+
+We use [[appdirs]] to get the platform-specific cache directory, and create the
+necessary subdirectories on first use.
+
+<<cache directory initialization>>=
+CACHE_DIR = pathlib.Path(appdirs.user_cache_dir("canvaslms")) / "attachments"
+INDEX_FILE = CACHE_DIR / "index.json"
+
+def _ensure_cache_dir():
+    """Create cache directory if it doesn't exist"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _load_index() -> Dict[str, Dict[str, Any]]:
+    """Load the metadata index from disk"""
+    _ensure_cache_dir()
+    if INDEX_FILE.exists():
+        with open(INDEX_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def _save_index(index: Dict[str, Dict[str, Any]]):
+    """Save the metadata index to disk"""
+    _ensure_cache_dir()
+    with open(INDEX_FILE, 'w') as f:
+        json.dump(index, f, indent=2)
+@
+
+\subsection{Computing content hashes}
+
+We use SHA-256 to compute content hashes because it provides:
+\begin{itemize}
+\item Strong collision resistance (extremely unlikely two different files hash
+  to the same value)
+\item Reasonable performance for typical attachment sizes
+\item Wide availability in Python's standard library
+\end{itemize}
+
+<<cache operations>>=
+def _compute_hash(file_path: pathlib.Path) -> str:
+    """Compute SHA-256 hash of file content"""
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+@
+
+\subsection{Retrieving cached attachments}
+
+When we need an attachment, we first check if it's in the cache.
+If found, we update the [[last_access]] timestamp to prevent premature cleanup,
+and return the path to the cached file.
+
+<<cache operations>>=
+def get_cached_attachment(attachment_id: int) -> Optional[pathlib.Path]:
+    """
+    Get cached file path for attachment, or None if not cached.
+
+    Updates last_access timestamp on cache hit.
+    """
+    index = _load_index()
+    attachment_key = str(attachment_id)
+
+    if attachment_key not in index:
+        return None
+
+    entry = index[attachment_key]
+    file_hash = entry["hash"]
+    cached_file = CACHE_DIR / f"{file_hash}.dat"
+
+    if not cached_file.exists():
+        # Index entry exists but file missing - remove stale entry
+        del index[attachment_key]
+        _save_index(index)
+        return None
+
+    # Update last access time
+    entry["last_access"] = datetime.now().isoformat()
+    _save_index(index)
+
+    return cached_file
+@
+
+\subsection{Caching new attachments}
+
+When we download a new attachment, we compute its hash, store the file by hash,
+and update the index.
+If a file with the same hash already exists (deduplication), we reuse it.
+
+<<cache operations>>=
+def cache_attachment(attachment_id: int, file_path: pathlib.Path,
+                     metadata: Dict[str, Any]):
+    """
+    Cache an attachment file using content-addressed storage.
+
+    Args:
+        attachment_id: Canvas attachment ID
+        file_path: Path to the downloaded file
+        metadata: Dictionary with 'filename', 'size', 'content_type'
+    """
+    _ensure_cache_dir()
+
+    # Compute content hash
+    file_hash = _compute_hash(file_path)
+    cached_file = CACHE_DIR / f"{file_hash}.dat"
+
+    # Copy file to cache if not already present (deduplication)
+    if not cached_file.exists():
+        shutil.copy2(file_path, cached_file)
+
+    # Update index
+    index = _load_index()
+    index[str(attachment_id)] = {
+        "hash": file_hash,
+        "filename": metadata.get("filename", "unknown"),
+        "size": metadata.get("size", 0),
+        "content_type": metadata.get("content_type", "application/octet-stream"),
+        "last_access": datetime.now().isoformat()
+    }
+    _save_index(index)
+@
+
+\subsection{Cache cleanup}
+
+We provide a cleanup function that removes files not accessed within a
+specified time window.
+This allows users to manage cache size manually via the [[canvaslms cache
+clear-attachments]] command.
+
+The cleanup process:
+\begin{enumerate}
+\item Load the index and identify attachments not accessed recently
+\item Remove their index entries
+\item Find all [[.dat]] files in the cache directory
+\item Build a set of hashes still referenced by the index
+\item Remove [[.dat]] files whose hashes aren't referenced (orphaned files)
+\item Report statistics about removed files and space freed
+\end{enumerate}
+
+<<cache operations>>=
+def cleanup_old_attachments(max_age_days: int = 90) -> Dict[str, Any]:
+    """
+    Remove cached attachments not accessed in max_age_days.
+
+    Returns:
+        Dictionary with 'files_removed' and 'bytes_freed' statistics
+    """
+    _ensure_cache_dir()
+    index = _load_index()
+    cutoff_date = datetime.now() - timedelta(days=max_age_days)
+
+    # Find attachments to remove from index
+    to_remove = []
+    for attachment_id, entry in index.items():
+        last_access = datetime.fromisoformat(entry["last_access"])
+        if last_access < cutoff_date:
+            to_remove.append(attachment_id)
+
+    # Remove old entries from index
+    for attachment_id in to_remove:
+        del index[attachment_id]
+    _save_index(index)
+
+    # Build set of hashes still referenced
+    referenced_hashes = {entry["hash"] for entry in index.values()}
+
+    # Find and remove orphaned .dat files
+    files_removed = 0
+    bytes_freed = 0
+
+    for dat_file in CACHE_DIR.glob("*.dat"):
+        file_hash = dat_file.stem  # filename without extension
+        if file_hash not in referenced_hashes:
+            file_size = dat_file.stat().st_size
+            dat_file.unlink()
+            files_removed += 1
+            bytes_freed += file_size
+
+    return {
+        "files_removed": files_removed,
+        "bytes_freed": bytes_freed
+    }
+@
