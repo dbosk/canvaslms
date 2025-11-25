@@ -655,8 +655,280 @@ def is_quantitative(responses: List[str]) -> bool:
   avg_length = sum(len(str(r)) for r in responses) / len(responses)
   if avg_length < 30:
     return True
-  
+
   return False
+@
+
+
+\subsection{Question title processing}
+
+Quiz question titles can be very long, especially in New Quizzes where the
+entire question text becomes the column header. These long titles can include:
+\begin{itemize}
+\item Multi-line questions with newline characters
+\item Embedded code snippets (Python functions, etc.)
+\item Special LaTeX characters that break compilation
+\item 200+ character questions spanning multiple sentences
+\end{itemize}
+
+For readability and LaTeX compatibility, we need to:
+\begin{enumerate}
+\item Create short titles for section headers (truncated at sentence boundaries)
+\item Display the full question text in the body
+\item Format code snippets properly in code blocks
+\item Escape all LaTeX special characters completely
+\end{enumerate}
+
+\subsubsection{Extracting question IDs}
+
+Classic Quizzes use the format ``588913: Question text'' where the ID appears
+as a prefix. New Quizzes have no ID prefix. We extract the ID (if present)
+for use in LaTeX labels, but remove it from the display title per user
+preference.
+<<functions>>=
+def extract_question_id(qcol):
+  """
+  Extract question ID and clean title from a question column name.
+
+  Args:
+    qcol: Question column name (e.g., "588913: How are you?" or "How are you?")
+
+  Returns:
+    Tuple of (question_id, title_without_id)
+    - question_id: String ID or None for New Quizzes
+    - title_without_id: Question text with ID prefix removed
+  """
+  import re
+
+  # Check for Classic Quiz format: "588913: Question text"
+  match = re.match(r'^(\d+):\s*(.+)$', qcol, re.DOTALL)
+  if match:
+    return match.group(1), match.group(2).strip()
+  else:
+    # New Quiz - no ID prefix
+    return None, qcol.strip()
+@
+
+
+\subsubsection{Creating short titles}
+
+Long question titles make section headers unwieldy. We truncate at the first
+sentence boundary (period, question mark, colon, semicolon, exclamation point)
+or at 80 characters, whichever comes first. This keeps headers scannable while
+preserving the full question in the body.
+
+The user specified to break at sentence boundaries including colons and similar
+punctuation, not just periods or question marks. This handles questions like
+``For the following code: [code here]'' where the colon naturally separates
+the prompt from details.
+<<functions>>=
+def create_short_title(title, max_length=80):
+  """
+  Create a short title by truncating at sentence boundary or max length.
+
+  Args:
+    title: Full question title (with newlines removed)
+    max_length: Maximum characters before forced truncation
+
+  Returns:
+    Short title with ellipsis if truncated
+  """
+  import re
+
+  # If already short enough, return as-is
+  if len(title) <= max_length:
+    return title
+
+  # Find first sentence boundary within max_length
+  # Look for: . ? ! : ; followed by space or end of string
+  # Use max_length as the search boundary
+  truncated = title[:max_length]
+
+  # Find sentence boundaries (. ? ! : ;) followed by space
+  sentence_pattern = r'[.?!:;](?:\s|$)'
+  matches = list(re.finditer(sentence_pattern, truncated))
+
+  if matches:
+    # Use the last sentence boundary found within max_length
+    last_match = matches[-1]
+    short_title = title[:last_match.end()].rstrip()
+
+    # Only add ellipsis if there's more content after
+    if len(title) > last_match.end():
+      short_title += '...'
+
+    return short_title
+
+  # No sentence boundary found - truncate at word boundary
+  last_space = truncated.rfind(' ')
+  if last_space > max_length * 0.5:  # At least halfway through
+    return truncated[:last_space] + '...'
+
+  # Forced truncation at max_length
+  return truncated + '...'
+@
+
+
+\subsubsection{Cleaning newlines}
+
+Question titles from New Quizzes often contain [[\n]] characters for multi-line
+questions or embedded code. These must be converted to spaces for inline display
+in section headers (LaTeX [[\subsection{}]] does not allow newlines).
+<<functions>>=
+def clean_newlines(text):
+  """
+  Replace newlines with spaces and normalize whitespace.
+
+  Args:
+    text: Text potentially containing \n characters
+
+  Returns:
+    Text with newlines replaced by spaces, multiple spaces collapsed
+  """
+  import re
+
+  # Replace newlines and carriage returns with spaces
+  cleaned = text.replace('\n', ' ').replace('\r', ' ')
+
+  # Normalize multiple spaces to single space
+  cleaned = re.sub(r'\s+', ' ', cleaned)
+
+  return cleaned.strip()
+@
+
+
+\subsubsection{Detecting and formatting code}
+
+Some New Quiz questions contain code snippets (Python functions, etc.). We
+detect code by looking for patterns like [[def ]], function calls with
+parentheses, or multiple newlines with indentation. When found, we format
+the code in appropriate code blocks (markdown or LaTeX).
+<<functions>>=
+def detect_and_format_code(text, format_type="markdown"):
+  """
+  Detect code snippets in text and format them appropriately.
+
+  Args:
+    text: Full question text that may contain code
+    format_type: "markdown" or "latex"
+
+  Returns:
+    Tuple of (has_code, formatted_text)
+    - has_code: Boolean indicating if code was detected
+    - formatted_text: Text with code wrapped in appropriate blocks
+  """
+  import re
+
+  # Heuristics for detecting code:
+  # - Contains "def " (Python function definition)
+  # - Contains "return " followed by code-like content
+  # - Has multiple lines with indentation patterns
+  # - Contains programming keywords
+  code_patterns = [
+    r'\bdef\s+\w+\s*\(',  # Python function definition
+    r'\breturn\s+[a-zA-Z0-9_\[\]\(\)]+',  # Return statement
+    r'[a-zA-Z_]\w*\s*\([^)]*\)\s*:',  # Function call with colon (Python)
+    r'\n\s{2,}\w+',  # Indented lines (at least 2 spaces)
+  ]
+
+  has_code = any(re.search(pattern, text) for pattern in code_patterns)
+
+  if not has_code:
+    return False, text
+
+  # Try to extract code portions
+  # Look for sections with newlines that look like code
+  # Simple heuristic: lines starting with "def " or having indentation
+  lines = text.split('\n')
+  code_lines = []
+  text_lines = []
+  in_code_block = False
+
+  for line in lines:
+    stripped = line.strip()
+
+    # Start code block on def, class, or heavily indented lines
+    if re.match(r'^(def|class|import|from)\s+', stripped) or \
+       (len(line) - len(line.lstrip()) >= 2 and stripped):
+      in_code_block = True
+      code_lines.append(line)
+    # Continue code block if we're in one and line has content
+    elif in_code_block and stripped:
+      code_lines.append(line)
+    # End code block on empty line or return to non-indented text
+    elif in_code_block and not stripped:
+      # Empty line might be part of code or end of code
+      # Keep it tentatively
+      code_lines.append(line)
+    else:
+      in_code_block = False
+      if code_lines and not code_lines[-1].strip():
+        # Remove trailing empty line from code block
+        code_lines.pop()
+      text_lines.append(line)
+
+  # Format the output
+  if not code_lines:
+    return False, text
+
+  # Reconstruct with code block formatting
+  result_parts = []
+
+  # Add text portion (question text before code)
+  if text_lines:
+    result_parts.append('\n'.join(text_lines).strip())
+
+  # Add code portion in appropriate format
+  code_text = '\n'.join(code_lines)
+
+  if format_type == "markdown":
+    result_parts.append(f"\n```python\n{code_text}\n```\n")
+  else:  # latex
+    # Use verbatim environment for LaTeX
+    result_parts.append(f"\n\\begin{{verbatim}}\n{code_text}\n\\end{{verbatim}}\n")
+
+  return True, '\n'.join(result_parts)
+@
+
+
+\subsubsection{Complete LaTeX escaping}
+
+The current implementation only escapes three LaTeX special characters
+([[_]], [[%]], [[&]]). However, LaTeX has many more special characters that
+will break compilation: [[$]], [[#]], [[{]], [[}]], [[~]], [[^]], [[\]].
+We need complete escaping for robust output.
+
+Note: The backslash must be escaped first to avoid double-escaping other
+replacements.
+<<functions>>=
+def escape_latex_complete(text):
+  """
+  Escape all LaTeX special characters for safe use in LaTeX output.
+
+  Args:
+    text: Text containing potential LaTeX special characters
+
+  Returns:
+    Text with all special characters properly escaped
+  """
+  # Order matters! Backslash must be first to avoid double-escaping
+  replacements = [
+    ('\\', '\\textbackslash{}'),
+    ('&', '\\&'),
+    ('%', '\\%'),
+    ('$', '\\$'),
+    ('#', '\\#'),
+    ('_', '\\_'),
+    ('{', '\\{'),
+    ('}', '\\}'),
+    ('~', '\\textasciitilde{}'),
+    ('^', '\\textasciicircum{}'),
+  ]
+
+  for old, new in replacements:
+    text = text.replace(old, new)
+
+  return text
 @
 
 
@@ -726,12 +998,49 @@ else:  # latex
 @
 
 <<output question header>>=
+# Extract question ID and clean title
+question_id, full_title = extract_question_id(qcol)
+
+# Clean newlines for inline display
+title_cleaned = clean_newlines(full_title)
+
+# Create short title for header
+short_title = create_short_title(title_cleaned)
+
+# Detect and format code in full question
+has_code, formatted_full_question = detect_and_format_code(
+  full_title,
+  format_type=args.format
+)
+
 if args.format == "markdown":
-  output_buffer.append(f"\n## {qcol}\n")
+  # Output short title as section header
+  output_buffer.append(f"\n## {short_title}\n\n")
+
+  # Output full question if it was truncated or has code
+  if short_title != title_cleaned or has_code:
+    output_buffer.append(f"**Full question:** {formatted_full_question}\n\n")
 else:  # latex
-  # Escape LaTeX special characters
-  question_escaped = qcol.replace('_', '\\_').replace('%', '\\%').replace('&', '\\&')
-  output_buffer.append(f"\\subsection{{{question_escaped}}}\n\n")
+  # Escape short title for LaTeX
+  short_title_escaped = escape_latex_complete(short_title)
+
+  # Create label from question ID or hash of title
+  if question_id:
+    label = f"q{question_id}"
+  else:
+    # Use hash for New Quizzes without IDs
+    label = f"q{abs(hash(qcol)) % 100000}"
+
+  output_buffer.append(f"\\subsection{{{short_title_escaped}}}\\label{{{label}}}\n\n")
+
+  # Output full question if it was truncated or has code
+  if short_title != title_cleaned or has_code:
+    # For LaTeX, formatted_full_question already has verbatim blocks if code present
+    # For non-code text, escape it
+    if not has_code:
+      formatted_full_question = escape_latex_complete(formatted_full_question)
+
+    output_buffer.append(f"\\textit{{Full question:}} {formatted_full_question}\n\n")
 @
 
 <<output no responses>>=
