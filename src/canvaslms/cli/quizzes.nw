@@ -241,6 +241,11 @@ analyse_parser.add_argument("--format", "-F",
     choices=["markdown", "latex"],
     default="markdown")
 
+analyse_parser.add_argument("--standalone",
+    help="Generate standalone LaTeX document with preamble (latex format only)",
+    action="store_true",
+    default=False)
+
 # Check if llm package is available
 try:
   import llm
@@ -721,10 +726,18 @@ The user specified to break at sentence boundaries including colons and similar
 punctuation, not just periods or question marks. This handles questions like
 ``For the following code: [code here]'' where the colon naturally separates
 the prompt from details.
+
+When code is embedded in the question (e.g., ``What does this code do? def
+foo(): return x''), we want to stop at the sentence boundary BEFORE the code
+begins. We detect code by looking for Python keywords and stop at the last
+sentence boundary before them.
 <<functions>>=
 def create_short_title(title, max_length=80):
   """
   Create a short title by truncating at sentence boundary or max length.
+
+  When code is detected in the title, stops at the last sentence boundary
+  before the code begins.
 
   Args:
     title: Full question title (with newlines removed)
@@ -739,41 +752,98 @@ def create_short_title(title, max_length=80):
   if len(title) <= max_length:
     return title
 
-  # Find first sentence boundary within max_length
-  # Look for: . ? ! : ; followed by space or end of string
-  # Use max_length as the search boundary
-  truncated = title[:max_length]
+  # Detect code keywords that might appear in questions
+  code_keywords = [
+    r'\bdef\s+',       # Python function definition
+    r'\bclass\s+',     # Python class definition
+    r'\bimport\s+',    # Import statement
+    r'\bfrom\s+',      # From import
+    r'\bfor\s+\w+\s+in\s+',  # For loop
+    r'\bif\s+\w+\s*[<>=!]',  # If statement with comparison
+    r'\bwhile\s+',     # While loop
+    r'\breturn\s+',    # Return statement
+    r'\bprint\s*\(',   # Print function
+  ]
 
-  # Find sentence boundaries (. ? ! : ;) followed by space
+  # Find the earliest position where code might start
+  code_start_pos = None
+  for pattern in code_keywords:
+    match = re.search(pattern, title)
+    if match:
+      if code_start_pos is None or match.start() < code_start_pos:
+        code_start_pos = match.start()
+
+  # Determine the search boundary for sentence breaks
+  if code_start_pos is not None:
+    # Code detected - search for sentence boundary before code
+    search_boundary = min(code_start_pos, max_length)
+  else:
+    # No code detected - use max_length
+    search_boundary = max_length
+
+  # Find sentence boundaries (. ? ! : ;) followed by space or end
   sentence_pattern = r'[.?!:;](?:\s|$)'
-  matches = list(re.finditer(sentence_pattern, truncated))
+  matches = list(re.finditer(sentence_pattern, title[:search_boundary]))
 
   if matches:
-    # Use the last sentence boundary found within max_length
+    # Use the last sentence boundary found
     last_match = matches[-1]
     short_title = title[:last_match.end()].rstrip()
 
-    # Only add ellipsis if there's more content after
+    # Add ellipsis if there's more content after
     if len(title) > last_match.end():
       short_title += '...'
 
     return short_title
 
-  # No sentence boundary found - truncate at word boundary
+  # No sentence boundary found before code - truncate at word boundary
+  truncated = title[:search_boundary]
   last_space = truncated.rfind(' ')
-  if last_space > max_length * 0.5:  # At least halfway through
+  if last_space > search_boundary * 0.5:  # At least halfway through
     return truncated[:last_space] + '...'
 
-  # Forced truncation at max_length
+  # Forced truncation at search_boundary
   return truncated + '...'
+@
+
+
+\subsubsection{Unescaping newlines}
+
+Canvas CSV exports contain literal [[\textbackslash n]] strings (two characters:
+backslash followed by n) rather than actual newline characters. Before we can
+properly detect and format code, we must convert these escaped newlines to
+actual newline characters.
+
+This is a critical preprocessing step. Without it, [[detect_and_format_code()]]
+cannot split the text into lines, causing code to appear on a single line.
+<<functions>>=
+def unescape_newlines(text):
+  """
+  Convert literal \\n strings to actual newline characters.
+
+  Canvas CSV exports contain escaped newlines as two-character strings.
+  This function converts them to actual newline characters for proper
+  text processing.
+
+  Args:
+    text: Text potentially containing literal \\n strings
+
+  Returns:
+    Text with \\n converted to actual newline characters
+  """
+  return text.replace('\\n', '\n')
 @
 
 
 \subsubsection{Cleaning newlines}
 
-Question titles from New Quizzes often contain [[\n]] characters for multi-line
-questions or embedded code. These must be converted to spaces for inline display
-in section headers (LaTeX [[\subsection{}]] does not allow newlines).
+After processing code blocks, we need to clean newlines from question titles
+for inline display in section headers. LaTeX [[\subsection{}]] does not allow
+newlines, so we convert them to spaces.
+
+Note the contrast with [[unescape_newlines()]]: that function converts escaped
+[[\textbackslash n]] to real newlines for code processing, while this function
+converts real newlines to spaces for inline display.
 <<functions>>=
 def clean_newlines(text):
   """
@@ -932,21 +1002,59 @@ def escape_latex_complete(text):
 @
 
 
+\subsection{LaTeX preamble generation}
+
+When the user requests a standalone LaTeX document ([[-{}-standalone]]), we
+wrap the output in a complete document with [[documentclass]] and necessary
+packages.
+
+The preamble includes:
+\begin{itemize}
+\item [[verbatim]] package for code blocks
+\item [[inputenc]] with UTF-8 for Swedish characters (å, ä, ö)
+\end{itemize}
+
+By default, LaTeX output is fragments meant for inclusion in a larger document
+(e.g., via [[\input{}]]). The standalone option makes it directly compilable.
+<<functions>>=
+def generate_latex_preamble():
+  """Generate LaTeX document preamble for standalone documents"""
+  return """\\documentclass{article}
+\\usepackage{verbatim}
+\\usepackage[utf8]{inputenc}
+\\begin{document}
+"""
+
+def generate_latex_postamble():
+  """Generate LaTeX document closing for standalone documents"""
+  return """\\end{document}
+"""
+@
+
+
 \subsection{Rendering output}
 
 We need to render the output buffer in the appropriate format.
 For markdown, we use the [[rich]] package to render it nicely.
 When stdout is a terminal, we use a pager (similar to submissions).
 When piped to a file, we output plain markdown without the pager.
-For LaTeX, we just output the raw LaTeX without a pager (always goes to a file).
+
+For LaTeX, we output raw LaTeX (no pager, always goes to a file). If the
+[[-{}-standalone]] option is specified, we wrap the content in a complete
+document with preamble and postamble.
 <<render output>>=
+# Join the output buffer
 output_text = ''.join(output_buffer)
+
+# Add LaTeX preamble/postamble if standalone mode
+if args.format == "latex" and args.standalone:
+  output_text = generate_latex_preamble() + output_text + generate_latex_postamble()
 
 if args.format == "markdown":
   # Use rich to render markdown
   console = Console()
   md = Markdown(output_text)
-  
+
   if sys.stdout.isatty():
     # Output to terminal with pager
     pager = ""
@@ -954,11 +1062,11 @@ if args.format == "markdown":
       pager = os.environ["MANPAGER"]
     elif "PAGER" in os.environ:
       pager = os.environ["PAGER"]
-    
+
     styles = False
     if "less" in pager and ("-R" in pager or "-r" in pager):
       styles = True
-    
+
     with console.pager(styles=styles):
       console.print(md)
   else:
@@ -1001,17 +1109,21 @@ else:  # latex
 # Extract question ID and clean title
 question_id, full_title = extract_question_id(qcol)
 
-# Clean newlines for inline display
-title_cleaned = clean_newlines(full_title)
+# CRITICAL: Unescape \n strings from CSV to actual newlines
+# Canvas exports contain literal "\n" (two chars) not real newlines
+full_title = unescape_newlines(full_title)
 
-# Create short title for header
-short_title = create_short_title(title_cleaned)
-
-# Detect and format code in full question
+# Detect and format code in full question (needs real newlines to work)
 has_code, formatted_full_question = detect_and_format_code(
   full_title,
   format_type=args.format
 )
+
+# Clean newlines for inline display in title
+title_cleaned = clean_newlines(full_title)
+
+# Create short title for header (detects code and stops before it)
+short_title = create_short_title(title_cleaned)
 
 if args.format == "markdown":
   # Output short title as section header
@@ -1067,7 +1179,7 @@ if has_commas:
     output_buffer.append("\n**Option distribution:**\n\n")
     for value, count in freq.most_common():
       percentage = (count / len(responses)) * 100
-      value_display = value.replace('\n', ' ')[:70]
+      value_display = value.replace('\n', ' ')
       output_buffer.append(f"- {value_display}: {count} ({percentage:.1f}%)\n")
   else:  # latex
     output_buffer.append(f"Total responses: {len(responses)}\\\\\n")
@@ -1113,14 +1225,14 @@ else:
       output_buffer.append("\n**Response distribution:**\n\n")
       for value, count in freq.most_common():
         percentage = (count / len(responses)) * 100
-        value_display = value.replace('\n', ' ')[:70]
+        value_display = value.replace('\n', ' ')
         output_buffer.append(f"- {value_display}: {count} ({percentage:.1f}%)\n")
     else:  # latex
       output_buffer.append(f"Total responses: {len(responses)}\\\\\n\n")
       output_buffer.append("\\textbf{Response distribution:}\n\\begin{itemize}\n")
       for value, count in freq.most_common():
         percentage = (count / len(responses)) * 100
-        value_escaped = value.replace('\n', ' ').replace('_', '\\_').replace('%', '\\%').replace('&', '\\&')[:70]
+        value_escaped = escape_latex_complete(value.replace('\n', ' '))
         output_buffer.append(f"  \\item {value_escaped}: {count} ({percentage:.1f}\\%)\n")
       output_buffer.append("\\end{itemize}\n\n")
 @
