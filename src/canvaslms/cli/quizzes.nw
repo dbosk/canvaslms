@@ -807,31 +807,83 @@ def create_short_title(title, max_length=80):
 @
 
 
-\subsubsection{Unescaping newlines}
+\subsubsection{Processing HTML formatting from Canvas}
 
-Canvas CSV exports contain literal [[\textbackslash n]] strings (two characters:
-backslash followed by n) rather than actual newline characters. Before we can
-properly detect and format code, we must convert these escaped newlines to
-actual newline characters.
+Canvas CSV exports contain HTML formatting that must be converted to plain text.
+The user discovered (via debugging with pdb) that Canvas uses HTML tags in the
+CSV data:
+\begin{itemize}
+\item [[<br>]] and [[<br/>]] tags for line breaks
+\item [[<pre>...</pre>]] tags wrapping code blocks
+\item HTML entities like [[&lt;]], [[&gt;]], [[&amp;]], [[&nbsp;]]
+\item The format varies from question to question
+\end{itemize}
 
-This is a critical preprocessing step. Without it, [[detect_and_format_code()]]
-cannot split the text into lines, causing code to appear on a single line.
+This HTML must be processed before code detection, otherwise code appears on one
+line and entities display incorrectly. We use Python's standard library
+([[html.unescape()]] and [[re]] module) to handle this robustly.
+
+The function returns a tuple: the cleaned text plus a flag indicating whether
+[[<pre>]] tags were found. The [[<pre>]] tag is a strong signal from Canvas
+that the content is preformatted code, which helps [[detect_and_format_code()]]
+make better decisions.
 <<functions>>=
-def unescape_newlines(text):
+def process_html_formatting(text):
   """
-  Convert literal \\n strings to actual newline characters.
+  Convert Canvas CSV HTML formatting to plain text with newlines.
 
-  Canvas CSV exports contain escaped newlines as two-character strings.
-  This function converts them to actual newline characters for proper
-  text processing.
+  Canvas CSV exports contain HTML that needs conversion:
+  - <br> or <br/> tags → newlines
+  - <pre>...</pre> → extract content, mark as code
+  - HTML entities (&lt;, &gt;, &amp;, &nbsp;, etc.) → decoded characters
+  - Other tags (<code>, <p>, <span>) → stripped (content kept)
+  - Legacy literal \\n strings → newlines (backwards compatibility)
 
   Args:
-    text: Text potentially containing literal \\n strings
+    text: Text from Canvas CSV with potential HTML formatting
 
   Returns:
-    Text with \\n converted to actual newline characters
+    Tuple of (plain_text, has_pre_tag)
+    - plain_text: Text with HTML converted to plain text with newlines
+    - has_pre_tag: True if <pre> tag was found (strong code signal)
   """
-  return text.replace('\\n', '\n')
+  import html
+  import re
+
+  # Detect <pre> tags (strong signal this is code/preformatted)
+  has_pre_tag = bool(re.search(r'<pre\b', text, flags=re.IGNORECASE))
+
+  # 1. Convert <br> tags to newlines (handles <br>, <br/>, <br />)
+  text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+
+  # 2. Extract <pre> content, remove tags
+  text = re.sub(r'<pre\b[^>]*>(.*?)</pre>', r'\1',
+                text, flags=re.IGNORECASE | re.DOTALL)
+
+  # 3. Convert <p> and <div> to newlines (block elements)
+  text = re.sub(r'</?p\b[^>]*>', '\n', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?div\b[^>]*>', '\n', text, flags=re.IGNORECASE)
+
+  # 4. Strip inline tags (keep content): <code>, <span>, <strong>, etc.
+  text = re.sub(r'</?code\b[^>]*>', '', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?span\b[^>]*>', '', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?strong\b[^>]*>', '', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?em\b[^>]*>', '', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?b\b[^>]*>', '', text, flags=re.IGNORECASE)
+  text = re.sub(r'</?i\b[^>]*>', '', text, flags=re.IGNORECASE)
+
+  # 5. Unescape HTML entities (&lt; → <, &gt; → >, &amp; → &, etc.)
+  # Python's html.unescape handles all standard named and numeric entities
+  text = html.unescape(text)
+
+  # 6. Handle legacy literal \n strings (backwards compatibility)
+  # Some older Canvas exports might still use this format
+  text = text.replace('\\n', '\n')
+
+  # 7. Normalize excessive newlines (max 2 consecutive)
+  text = re.sub(r'\n{3,}', '\n\n', text)
+
+  return text.strip(), has_pre_tag
 @
 
 
@@ -873,14 +925,23 @@ Some New Quiz questions contain code snippets (Python functions, etc.). We
 detect code by looking for patterns like [[def ]], function calls with
 parentheses, or multiple newlines with indentation. When found, we format
 the code in appropriate code blocks (markdown or LaTeX).
+
+Canvas uses [[<pre>]] tags to mark preformatted content, which is a strong
+signal that the content is code. When [[has_pre_tag=True]], we trust Canvas's
+signal and format the entire text as code if it contains typical code patterns.
+This is more reliable than heuristics alone.
 <<functions>>=
-def detect_and_format_code(text, format_type="markdown"):
+def detect_and_format_code(text, format_type="markdown", has_pre_tag=False):
   """
   Detect code snippets in text and format them appropriately.
+
+  Canvas uses <pre> tags to mark preformatted content. When has_pre_tag=True,
+  we trust Canvas's signal and check if the content looks like code.
 
   Args:
     text: Full question text that may contain code
     format_type: "markdown" or "latex"
+    has_pre_tag: True if Canvas marked this with <pre> tag
 
   Returns:
     Tuple of (has_code, formatted_text)
@@ -889,18 +950,33 @@ def detect_and_format_code(text, format_type="markdown"):
   """
   import re
 
-  # Heuristics for detecting code:
-  # - Contains "def " (Python function definition)
-  # - Contains "return " followed by code-like content
-  # - Has multiple lines with indentation patterns
-  # - Contains programming keywords
+  # Define code pattern indicators
   code_patterns = [
-    r'\bdef\s+\w+\s*\(',  # Python function definition
-    r'\breturn\s+[a-zA-Z0-9_\[\]\(\)]+',  # Return statement
-    r'[a-zA-Z_]\w*\s*\([^)]*\)\s*:',  # Function call with colon (Python)
-    r'\n\s{2,}\w+',  # Indented lines (at least 2 spaces)
+    r'\bdef\s+\w+\s*\(',           # Python function definition
+    r'\bclass\s+\w+',               # Python class definition
+    r'\bimport\s+\w+',              # Import statement
+    r'\breturn\s+',                 # Return statement
+    r'\bfor\s+\w+\s+in\s+',        # For loop
+    r'\bif\s+\w+\s*[<>=!]',        # If statement with comparison
+    r'\bwhile\s+',                  # While loop
+    r'[a-zA-Z_]\w*\s*\([^)]*\)\s*:',  # Function call with colon
+    r'\n\s{2,}\w+',                # Indented lines (at least 2 spaces)
+    r'[a-zA-Z_]\w*\s*=\s*',        # Variable assignment
   ]
 
+  # If Canvas used <pre>, check if content looks like code
+  if has_pre_tag:
+    has_code_patterns = any(re.search(pattern, text, re.MULTILINE)
+                            for pattern in code_patterns)
+
+    if has_code_patterns:
+      # Format the entire text as code (Canvas already marked it as preformatted)
+      if format_type == "markdown":
+        return True, f"```python\n{text}\n```"
+      else:  # latex
+        return True, f"\\begin{{verbatim}}\n{text}\n\\end{{verbatim}}"
+
+  # Fallback to heuristic detection (no <pre> tag or didn't look like code)
   has_code = any(re.search(pattern, text) for pattern in code_patterns)
 
   if not has_code:
@@ -1109,14 +1185,17 @@ else:  # latex
 # Extract question ID and clean title
 question_id, full_title = extract_question_id(qcol)
 
-# CRITICAL: Unescape \n strings from CSV to actual newlines
-# Canvas exports contain literal "\n" (two chars) not real newlines
-full_title = unescape_newlines(full_title)
+# CRITICAL: Process Canvas HTML formatting (entities, <br>, <pre>, etc.)
+# Canvas CSV exports contain HTML that must be converted to plain text
+# Returns tuple: (clean_text, has_pre_tag) where has_pre_tag indicates <pre> was found
+full_title, has_pre_tag = process_html_formatting(full_title)
 
-# Detect and format code in full question (needs real newlines to work)
+# Detect and format code in full question (uses clean text + pre tag signal)
+# The has_pre_tag helps detect code more reliably
 has_code, formatted_full_question = detect_and_format_code(
   full_title,
-  format_type=args.format
+  format_type=args.format,
+  has_pre_tag=has_pre_tag
 )
 
 # Clean newlines for inline display in title
