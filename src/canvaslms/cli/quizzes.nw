@@ -246,6 +246,11 @@ analyse_parser.add_argument("--standalone",
     action="store_true",
     default=False)
 
+analyse_parser.add_argument("--use-minted",
+    help="Use minted package for syntax-highlighted code (requires pygments)",
+    action="store_true",
+    default=False)
+
 # Check if llm package is available
 try:
   import llm
@@ -880,7 +885,13 @@ def process_html_formatting(text):
   # Some older Canvas exports might still use this format
   text = text.replace('\\n', '\n')
 
-  # 7. Normalize excessive newlines (max 2 consecutive)
+  # 7. Convert multiple consecutive spaces to newline + spaces (indentation)
+  # When code lacks proper <pre> tags, multiple spaces often indicate indentation.
+  # Insert newline BEFORE the spaces so they become indentation of the next line.
+  # Example: "def FIXA():  a = int(...)" → "def FIXA():\n  a = int(...)"
+  text = re.sub(r'  +', r'\n\g<0>', text)
+
+  # 8. Normalize excessive newlines (max 2 consecutive)
   text = re.sub(r'\n{3,}', '\n\n', text)
 
   return text.strip(), has_pre_tag
@@ -931,7 +942,7 @@ signal that the content is code. When [[has_pre_tag=True]], we trust Canvas's
 signal and format the entire text as code if it contains typical code patterns.
 This is more reliable than heuristics alone.
 <<functions>>=
-def detect_and_format_code(text, format_type="markdown", has_pre_tag=False):
+def detect_and_format_code(text, format_type="markdown", has_pre_tag=False, use_minted=False):
   """
   Detect code snippets in text and format them appropriately.
 
@@ -942,6 +953,7 @@ def detect_and_format_code(text, format_type="markdown", has_pre_tag=False):
     text: Full question text that may contain code
     format_type: "markdown" or "latex"
     has_pre_tag: True if Canvas marked this with <pre> tag
+    use_minted: If True, use minted package for LaTeX code formatting
 
   Returns:
     Tuple of (has_code, formatted_text)
@@ -974,7 +986,20 @@ def detect_and_format_code(text, format_type="markdown", has_pre_tag=False):
       if format_type == "markdown":
         return True, f"```python\n{text}\n```"
       else:  # latex
-        return True, f"\\begin{{verbatim}}\n{text}\n\\end{{verbatim}}"
+        # Check if code is single-line or multi-line
+        is_multiline = '\n' in text
+        if is_multiline:
+          # Multi-line code: use environment
+          if use_minted:
+            return True, f"\\begin{{minted}}{{python}}\n{text}\n\\end{{minted}}"
+          else:
+            return True, f"\\begin{{verbatim}}\n{text}\n\\end{{verbatim}}"
+        else:
+          # Single-line code: use inline command
+          if use_minted:
+            return True, f"\\mintinline{{python}}{{{text}}}"
+          else:
+            return True, f"\\verb|{text}|"
 
   # Fallback to heuristic detection (no <pre> tag or didn't look like code)
   has_code = any(re.search(pattern, text) for pattern in code_patterns)
@@ -1030,8 +1055,20 @@ def detect_and_format_code(text, format_type="markdown", has_pre_tag=False):
   if format_type == "markdown":
     result_parts.append(f"\n```python\n{code_text}\n```\n")
   else:  # latex
-    # Use verbatim environment for LaTeX
-    result_parts.append(f"\n\\begin{{verbatim}}\n{code_text}\n\\end{{verbatim}}\n")
+    # Check if code is single-line or multi-line
+    is_multiline = '\n' in code_text
+    if is_multiline:
+      # Multi-line code: use environment
+      if use_minted:
+        result_parts.append(f"\n\\begin{{minted}}{{python}}\n{code_text}\n\\end{{minted}}\n")
+      else:
+        result_parts.append(f"\n\\begin{{verbatim}}\n{code_text}\n\\end{{verbatim}}\n")
+    else:
+      # Single-line code: use inline command
+      if use_minted:
+        result_parts.append(f"\\mintinline{{python}}{{{code_text}}}")
+      else:
+        result_parts.append(f"\\verb|{code_text}|")
 
   return True, '\n'.join(result_parts)
 @
@@ -1093,9 +1130,16 @@ The preamble includes:
 By default, LaTeX output is fragments meant for inclusion in a larger document
 (e.g., via [[\input{}]]). The standalone option makes it directly compilable.
 <<functions>>=
-def generate_latex_preamble():
+def generate_latex_preamble(use_minted=False):
   """Generate LaTeX document preamble for standalone documents"""
-  return """\\documentclass{article}
+  if use_minted:
+    return """\\documentclass{article}
+\\usepackage{minted}
+\\usepackage[utf8]{inputenc}
+\\begin{document}
+"""
+  else:
+    return """\\documentclass{article}
 \\usepackage{verbatim}
 \\usepackage[utf8]{inputenc}
 \\begin{document}
@@ -1124,7 +1168,7 @@ output_text = ''.join(output_buffer)
 
 # Add LaTeX preamble/postamble if standalone mode
 if args.format == "latex" and args.standalone:
-  output_text = generate_latex_preamble() + output_text + generate_latex_postamble()
+  output_text = generate_latex_preamble(args.use_minted) + output_text + generate_latex_postamble()
 
 if args.format == "markdown":
   # Use rich to render markdown
@@ -1163,9 +1207,11 @@ if quantitative_questions:
   
   for qcol in quantitative_questions:
     <<output question header>>
-    
-    responses = [row[qcol] for row in rows if row[qcol] and row[qcol].strip()]
-    
+
+    raw_responses = [row[qcol] for row in rows if row[qcol] and row[qcol].strip()]
+    # Process HTML entities and tags in responses before analysis
+    responses = [process_html_formatting(resp)[0] for resp in raw_responses]
+
     if not responses:
       <<output no responses>>
       continue
@@ -1195,7 +1241,8 @@ full_title, has_pre_tag = process_html_formatting(full_title)
 has_code, formatted_full_question = detect_and_format_code(
   full_title,
   format_type=args.format,
-  has_pre_tag=has_pre_tag
+  has_pre_tag=has_pre_tag,
+  use_minted=args.use_minted
 )
 
 # Clean newlines for inline display in title
@@ -1326,10 +1373,12 @@ if qualitative_questions:
   
   for qcol in qualitative_questions:
     <<output question header>>
-    
-    responses = [row[qcol] for row in rows 
-                 if row[qcol] and row[qcol].strip()]
-    
+
+    raw_responses = [row[qcol] for row in rows
+                     if row[qcol] and row[qcol].strip()]
+    # Process HTML entities and tags in responses before analysis
+    responses = [process_html_formatting(resp)[0] for resp in raw_responses]
+
     if not responses:
       <<output no responses>>
       continue
