@@ -377,7 +377,9 @@ for submission in submission_list:
                              history=args.history,
                              tmpdir=tmpdir/subdir,
                              json_format=args.json,
-                             diff=args.diff)
+                             diff=args.diff,
+                             diff_threshold_fixed=args.diff_threshold_fixed,
+                             diff_threshold_percent=args.diff_threshold_percent)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -408,7 +410,19 @@ The [[--open]] option is added by [[add_view_options]] with these choices:
 [[open]], [[all]], and the shell choices defined in [[choices_for_shells]].
 <<condition that [[args.open]] tells us to spawn a shell>>=
 args.open in choices_for_shells
+@
+
+We define constants for the default diff threshold values used in renamed file
+matching.
+These values control how aggressively files with different names are matched
+when showing diffs.
+<<define diff threshold constants>>=
+DEFAULT_DIFF_THRESHOLD_FIXED = 5
+DEFAULT_DIFF_THRESHOLD_PERCENT = 50
+@
+
 <<constants>>=
+<<define diff threshold constants>>
 <<define [[choices_for_shells]]>>
 @
 
@@ -694,6 +708,19 @@ def add_view_options(parser):
 
   parser.add_argument("--diff", action="store_true",
     help="Show diffs between submission versions. Automatically enables --history.")
+
+  parser.add_argument("--diff-threshold-fixed", type=int,
+    default=DEFAULT_DIFF_THRESHOLD_FIXED,
+    metavar="N",
+    help="Fixed edit distance threshold for matching renamed files. "
+         "Files with distance <= N will match. Default: %(default)s")
+
+  parser.add_argument("--diff-threshold-percent", type=int,
+    default=DEFAULT_DIFF_THRESHOLD_PERCENT,
+    metavar="PCT",
+    help="Percentage threshold for matching renamed files. "
+         "Files with distance <= PCT%% of filename length will match. "
+         "Default: %(default)s")
 
   parser.add_argument("--open", required=False,
     nargs="?", default=None, const="open",
@@ -1332,7 +1359,9 @@ prev_metadata = format_submission(prev_submission,
                                   tmpdir=version_dir,
                                   json_format=json_format,
                                   md_title_level=md_title_level+"#",
-                                  diff=False)
+                                  diff=False,
+                                  diff_threshold_fixed=diff_threshold_fixed,
+                                  diff_threshold_percent=diff_threshold_percent)
 
 versions[version] = prev_metadata
 @
@@ -1392,14 +1421,19 @@ except ImportError:
 
 The diff functionality requires an additional parameter to the format\_submission
 function to control whether we show diffs or full content for each version.
+Additionally, we need parameters to control the matching thresholds.
 <<[[format_submission]] args>>=
 diff=False,
+diff_threshold_fixed=DEFAULT_DIFF_THRESHOLD_FIXED,
+diff_threshold_percent=DEFAULT_DIFF_THRESHOLD_PERCENT,
 @
 
-We also need to document this parameter for users of the function.
+We also need to document these parameters for users of the function.
 <<[[format_submission]] doc>>=
 `diff` is a boolean indicating whether to show diffs between submission versions
 instead of showing each version in full. Only works when `history` is True.
+`diff_threshold_fixed` and `diff_threshold_percent` control the matching
+sensitivity for renamed files (see [[match_renamed_files]] for details).
 @
 
 \subsection{Design decisions}
@@ -1544,7 +1578,9 @@ if version == 0:
                                           tmpdir=version_dir,
                                           json_format=json_format,
                                           md_title_level=md_title_level+"##",
-                                          diff=False)
+                                          diff=False,
+                                          diff_threshold_fixed=diff_threshold_fixed,
+                                          diff_threshold_percent=diff_threshold_percent)
   diff_output += format_section(f"Version {version} (Full Content)",
                                 version_0_formatted,
                                 md_title_level=md_title_level+"#")
@@ -1556,7 +1592,9 @@ else:
   version_diff = generate_diff(prev_content,
                                curr_content,
                                f"Version {version-1}",
-                               f"Version {version}")
+                               f"Version {version}",
+                               diff_threshold_fixed,
+                               diff_threshold_percent)
   if version_diff:
     diff_output += format_section(f"Version {version} "
                                     f"(Changes from Version {version-1})",
@@ -1653,11 +1691,15 @@ for attachment in submission.attachments:
 This function generates unified diffs between two content dictionaries, handling
 different content types appropriately.
 <<functions>>=
-def generate_diff(prev_content, curr_content, prev_label, curr_label):
+def generate_diff(prev_content, curr_content, prev_label, curr_label,
+                 diff_threshold_fixed=DEFAULT_DIFF_THRESHOLD_FIXED,
+                 diff_threshold_percent=DEFAULT_DIFF_THRESHOLD_PERCENT):
   """
-  Generates a unified diff between two content dictionaries. Each key 
+  Generates a unified diff between two content dictionaries. Each key
   represents a part of the submission (body, quiz_answers, attachments).
   The attachments key contains itself a dictionary of filename to content.
+
+  The diff_threshold parameters control renamed file matching sensitivity.
 
   Returns a string with the diff output, or None if no differences.
   """
@@ -1745,85 +1787,104 @@ For example:
 \item [[lab1.java]] → [[lab1_revised.java]]
 \end{itemize}
 
-When there is exactly one file in each of two consecutive versions, we apply
-heuristics to determine if they should be treated as the same file (and thus
-diffed) rather than as separate add/delete operations.
+We use \emph{edit distance} (Levenshtein distance) to detect renamed files
+and match them across versions.
+This allows diffing the actual content changes rather than showing spurious
+add/delete operations.
 
-The matching criteria are:
+The matching algorithm works for any number of files:
 \begin{enumerate}
-\item Both files must have the same extension ([[.py]], [[.java]], etc.).
-      Different extensions suggest different file types, which shouldn't be
-      compared.
-\item The filenames (without extension) must share either:
+\item Compute edit distance between all pairs of files with matching extensions
+\item Sort pairs by edit distance (lowest first)
+\item Accept matches greedily, ensuring one-to-one mapping
+\item Only accept matches below a conservative threshold:
   \begin{itemize}
-  \item A common prefix of at least 3 characters, or
-  \item A common suffix of at least 3 characters, or
-  \item One name contains the other as a substring.
+  \item Distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]], or
+  \item Distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\%
+    of the longer filename (without extension)
   \end{itemize}
 \end{enumerate}
+
+This approach correctly handles cases like:
+\begin{itemize}
+\item Single file renames: [[lab.py]] → [[lab_final.py]]
+\item Multiple file renames: [[part1.py]], [[part2.py]] →
+  [[part1_v2.py]], [[part2_v2.py]]
+\item Mixed scenarios: [[lab.py]] → [[lab_final.py]] while [[test.py]]
+  remains unchanged
+\item Adding similarly-named files: [[lab1.py]] → [[lab1_final.py]]
+  with new [[lab1_test.py]]
+\end{itemize}
+
+The key insight is that by considering lowest-distance pairs first,
+we naturally find the correct matches even when students add or remove
+files with similar names.
+
+\subsubsection{Adjusting matching thresholds}
+
+The default thresholds (distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]]
+or $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of length) work well
+for most common renaming patterns.
+However, some students use more substantial renames that exceed these limits.
+
+For example, [[lab_6_auxiliary.py]] $\to$ [[new_lab_6_auxiliary_functions.py]]
+has an edit distance of 14, which exceeds the default threshold of 9
+(max of [[DEFAULT_DIFF_THRESHOLD_FIXED]] and
+[[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of 30 characters).
+
+To match such files, increase the thresholds using command-line options:
+\begin{description}
+\item[{[[--diff-threshold-fixed N]]}]
+  Sets the minimum edit distance allowed
+  (default: [[DEFAULT_DIFF_THRESHOLD_FIXED]]).
+  Use higher values to match files with more character changes.
+\item[{[[--diff-threshold-percent PCT]]}]
+  Sets the percentage of filename length allowed
+  (default: [[DEFAULT_DIFF_THRESHOLD_PERCENT]]).
+  Use higher percentages to match files with proportionally larger changes.
+\end{description}
+
+The threshold used is the \emph{maximum} of these two values, so increasing
+either one allows more permissive matching.
+
+Examples:
+\begin{itemize}
+\item [[--diff-threshold-percent 50]] allows up to 50\% of filename length
+  (would match [[lab_6_auxiliary.py]] $\to$
+  [[new_lab_6_auxiliary_functions.py]])
+\item [[--diff-threshold-fixed 15]] allows up to 15 character edits
+  (also matches the above pair)
+\item [[--diff-threshold-fixed 20 --diff-threshold-percent 60]]
+  very permissive matching for heavily renamed files
+\end{itemize}
+
+Be conservative when increasing thresholds: very high values may cause
+incorrect matches between unrelated files.
+The diff headers always show both filenames, allowing you to verify matches
+are correct.
 
 When files are matched this way, the diff header shows both original names
 ([[--- Version 0/solution.py]] and [[+++ Version 1/solution_final.py]]) to
 make the matching transparent to the grader.
 This allows instructors to verify that the heuristic made the correct match.
 
-This heuristic intentionally only applies when there's a single file in each
-version.
-With multiple files, we fall back to exact name matching to avoid incorrect
-pairings (\eg matching [[test.py]] with [[test_data.py]] when both versions
-contain multiple files).
+We use the [[match_renamed_files()]] function to find matches using edit
+distance.
+This works for both single files and multiple files, using an optimal
+matching algorithm that considers all pairs and selects the best matches.
+The function uses a conservative threshold to avoid incorrect pairings
+(\eg it won't match [[test.py]] with [[test_data.py]] because the edit
+distance is too large).
+
 <<match single files with different names>>=
-if (len(prev_attachments) == 1 and len(curr_attachments) == 1
-    and list(prev_attachments.keys())[0] != list(curr_attachments.keys())[0]):
-  prev_filename = list(prev_attachments.keys())[0]
-  curr_filename = list(curr_attachments.keys())[0]
-  
-  <<check if files should be matched>>
-@
+# Find renamed files using edit distance matching
+filename_mapping = match_renamed_files(prev_attachments, curr_attachments,
+                                      diff_threshold_fixed,
+                                      diff_threshold_percent)
 
-We check if two files with different names should be treated as the same file
-by looking for common prefixes, suffixes, or file extensions.
-<<check if files should be matched>>=
-should_match = False
-
-# Check for common file extension
-prev_ext = get_file_extension(prev_filename)
-curr_ext = get_file_extension(curr_filename)
-
-if prev_ext and curr_ext and prev_ext == curr_ext:
-  # Same extension - check for common prefix or suffix
-  prev_base = get_file_base(prev_filename)
-  curr_base = get_file_base(curr_filename)
-  
-  <<set [[should_match]] if common prefix or suffix>>
-
-if should_match:
-  # Store the mapping for diff generation
-  # Use the current version's name as the canonical name
-  filename_mapping[curr_filename] = prev_filename
+# Rename files in prev_attachments to match current names
+for curr_filename, prev_filename in filename_mapping.items():
   prev_attachments[curr_filename] = prev_attachments.pop(prev_filename)
-@
-
-Check if filenames share a common prefix or suffix pattern.
-A prefix or suffix of at least 3 characters is considered sufficient.
-Or that one filename is a substring of the other.
-<<set [[should_match]] if common prefix or suffix>>=
-common_prefix_len = 0
-for i, (c1, c2) in enumerate(zip(prev_base, curr_base)):
-  if c1 == c2:
-    common_prefix_len = i + 1
-  else:
-    break
-
-common_suffix_len = 0
-for i, (c1, c2) in enumerate(zip(reversed(prev_base), reversed(curr_base))):
-  if c1 == c2:
-    common_suffix_len = i + 1
-  else:
-    break
-
-should_match = (common_prefix_len >= 3 or common_suffix_len >= 3
-                or prev_base in curr_base or curr_base in prev_base)
 @
 
 Each attachment file is compared individually.
@@ -1919,6 +1980,8 @@ limitations instructors should be aware of:
 Despite these limitations, the diff functionality significantly improves the
 efficiency of reviewing student submission revisions in the common case.
 
+\subsection{Filename processing helpers}
+
 Helper functions for file name processing used by the diff functionality.
 <<functions>>=
 def get_file_extension(filename):
@@ -1937,6 +2000,230 @@ def get_file_base(filename):
   if '.' in filename:
     return filename.rsplit('.', 1)[0]
   return filename
+@
+
+\subsection{Computing string similarity with edit distance}
+
+To match renamed files across submission versions, we need a measure of
+similarity between filenames.
+The \emph{Levenshtein edit distance} (or simply \enquote{edit distance})
+quantifies how different two strings are by counting the minimum number of
+single-character edits needed to transform one string into the other.
+
+The three allowed edit operations are:
+\begin{description}
+\item[Insertion] Add a character (\eg [[lab1]] $\to$ [[lab_1]])
+\item[Deletion] Remove a character (\eg [[lab_1]] $\to$ [[lab1]])
+\item[Substitution] Replace one character with another
+  (\eg [[Lab1]] $\to$ [[lab1]])
+\end{description}
+
+For example, transforming [[solution.py]] to [[solution_final.py]] requires
+inserting [[_final]] (6 operations), so the edit distance is 6.
+Transforming [[Lab1.py]] to [[lab1.py]] requires changing [[L]] to [[l]]
+(1 substitution), so the edit distance is 1.
+
+The smaller the edit distance, the more similar the strings.
+An edit distance of 0 means the strings are identical.
+
+We use edit distance to match filenames because it naturally handles the
+common patterns students use when renaming files:
+\begin{itemize}
+\item Adding suffixes: [[lab.py]] $\to$ [[lab_final.py]]
+\item Changing separators: [[lab_1.py]] $\to$ [[lab-1.py]]
+\item Fixing capitalization: [[Solution.py]] $\to$ [[solution.py]]
+\item Adding prefixes: [[test.py]] $\to$ [[new_test.py]]
+\end{itemize}
+
+<<functions>>=
+def compute_edit_distance(str1, str2):
+  """
+  Compute Levenshtein edit distance between two strings.
+
+  Returns the minimum number of single-character edits (insertions,
+  deletions, or substitutions) needed to transform str1 into str2.
+  """
+  <<compute edit distance using dynamic programming>>
+@
+
+The edit distance algorithm uses \emph{dynamic programming}.
+We build a matrix [[dp]] where [[dp[i][j]]] represents the edit distance
+between the first [[i]] characters of [[str1]] and the first [[j]] characters
+of [[str2]].
+
+The base cases are:
+\begin{itemize}
+\item [[dp[0][j] = j]] --- transforming empty string to [[str2[0:j]]]
+  requires [[j]] insertions
+\item [[dp[i][0] = i]] --- transforming [[str1[0:i]]] to empty string
+  requires [[i]] deletions
+\end{itemize}
+
+For each position [[(i, j)]], we consider three possibilities:
+\begin{description}
+\item[Characters match] If [[str1[i-1] == str2[j-1]]], no edit needed.
+  Take [[dp[i-1][j-1]]].
+\item[Substitution] Replace [[str1[i-1]]] with [[str2[j-1]]].
+  Cost: [[dp[i-1][j-1] + 1]].
+\item[Insertion] Insert [[str2[j-1]]].
+  Cost: [[dp[i][j-1] + 1]].
+\item[Deletion] Delete [[str1[i-1]]].
+  Cost: [[dp[i-1][j] + 1]].
+\end{description}
+
+We take the minimum of these options.
+The final answer is [[dp[len(str1)][len(str2)]]].
+
+<<compute edit distance using dynamic programming>>=
+m, n = len(str1), len(str2)
+
+# Create DP table
+dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+# Base cases
+for i in range(m + 1):
+  dp[i][0] = i  # Delete all characters from str1
+for j in range(n + 1):
+  dp[0][j] = j  # Insert all characters from str2
+
+# Fill DP table
+for i in range(1, m + 1):
+  for j in range(1, n + 1):
+    if str1[i-1] == str2[j-1]:
+      # Characters match, no edit needed
+      dp[i][j] = dp[i-1][j-1]
+    else:
+      # Take minimum of insert, delete, substitute
+      dp[i][j] = 1 + min(
+        dp[i-1][j],    # Delete from str1
+        dp[i][j-1],    # Insert from str2
+        dp[i-1][j-1]   # Substitute
+      )
+
+return dp[m][n]
+@
+
+\subsection{Matching renamed files using edit distance}
+
+With the edit distance function available, we can now match files across
+submission versions even when they have been renamed.
+The challenge is handling multiple files: if a student submits three files
+in version 0 and three files in version 1, which old files correspond to
+which new files?
+
+We want to find the \emph{optimal matching} that pairs files with minimal
+total edit distance.
+However, we must be conservative: only match files when we have high confidence
+the match is correct.
+An incorrect match would show a confusing diff between unrelated files.
+
+Our approach uses a greedy algorithm based on sorted distances:
+\begin{enumerate}
+\item Compute edit distance between every pair of files (old and new) with
+  matching extensions
+\item Sort all candidate pairs by edit distance (lowest first)
+\item Accept matches in order, skipping pairs where either file is already
+  matched
+\item Only accept matches below a conservative threshold
+\end{enumerate}
+
+This gives us near-optimal one-to-one matching without the complexity of
+the Hungarian algorithm.
+The key insight is that by considering lowest-distance pairs first, we naturally
+find the best matches.
+
+For example, if a student renames [[lab1.py]] to [[lab1_final.py]] (distance 6)
+and also adds a new file [[lab1_test.py]], we correctly match the first pair
+because its distance is lower than any pairing involving [[lab1_test.py]].
+
+<<functions>>=
+def match_renamed_files(prev_attachments, curr_attachments,
+                       fixed_threshold=DEFAULT_DIFF_THRESHOLD_FIXED,
+                       percent_threshold=DEFAULT_DIFF_THRESHOLD_PERCENT):
+  """
+  Match files across versions using edit distance.
+
+  Args:
+    prev_attachments: Dictionary of previous version's attachments
+    curr_attachments: Dictionary of current version's attachments
+    fixed_threshold: Maximum edit distance for a match
+                    (default: DEFAULT_DIFF_THRESHOLD_FIXED)
+    percent_threshold: Maximum distance as percentage of filename length
+                      (default: DEFAULT_DIFF_THRESHOLD_PERCENT)
+
+  Returns a dictionary mapping current filename -> previous filename
+  for files that appear to be renames.
+  """
+  <<build candidate matches with distances>>
+  <<accept matches in distance order>>
+@
+
+First, we compute edit distances for all candidate pairs.
+We only consider pairs with matching file extensions, since students rarely
+change extensions when renaming (\eg [[.py]] to [[.txt]]).
+
+<<build candidate matches with distances>>=
+candidates = []
+
+for curr_filename in curr_attachments:
+  curr_ext = get_file_extension(curr_filename)
+  curr_base = get_file_base(curr_filename)
+
+  for prev_filename in prev_attachments:
+    # Only match files with same extension
+    prev_ext = get_file_extension(prev_filename)
+    if prev_ext != curr_ext or not prev_ext:
+      continue
+
+    # Skip if names are identical (will be matched automatically later)
+    if curr_filename == prev_filename:
+      continue
+
+    prev_base = get_file_base(prev_filename)
+    distance = compute_edit_distance(prev_base, curr_base)
+
+    candidates.append((distance, curr_filename, prev_filename))
+@
+
+Next, we sort candidates by distance and accept matches greedily.
+We track which files have been matched to ensure one-to-one mapping.
+
+We use a conservative threshold: only accept matches where the edit distance
+is small relative to the filename length.
+By default, we require distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]]
+or distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of the
+longer filename's base length.
+These thresholds can be adjusted using [[--diff-threshold-fixed]] and
+[[--diff-threshold-percent]] command-line options.
+
+This prevents matching unrelated files that happen to have short names
+(\eg [[a.py]] and [[b.py]] have distance 1 but shouldn't be matched).
+
+<<accept matches in distance order>>=
+filename_mapping = {}
+matched_prev = set()
+matched_curr = set()
+
+# Sort by distance (ascending)
+candidates.sort(key=lambda x: x[0])
+
+for distance, curr_filename, prev_filename in candidates:
+  # Skip if either file already matched
+  if curr_filename in matched_curr or prev_filename in matched_prev:
+    continue
+
+  # Conservative threshold: distance <= fixed or <= percent% of base length
+  curr_base = get_file_base(curr_filename)
+  prev_base = get_file_base(prev_filename)
+  max_base_len = max(len(curr_base), len(prev_base))
+  threshold = max(fixed_threshold, int(percent_threshold / 100.0 * max_base_len))
+
+  if distance <= threshold:
+    filename_mapping[curr_filename] = prev_filename
+    matched_curr.add(curr_filename)
+    matched_prev.add(prev_filename)
+
+return filename_mapping
 @
 
 
