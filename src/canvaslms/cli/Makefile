@@ -9,7 +9,7 @@ MODULES+=	assignments.py assignments.tex
 MODULES+=	submissions.py submissions.tex
 MODULES+=	grade.py grade.tex
 MODULES+=	results.py results.tex
-MODULES+=	calendar.py calendar.tex
+MODULES+=	canvas_calendar.py canvas_calendar.tex
 MODULES+=	discussions.py discussions.tex
 MODULES+= 	utils.py utils.tex
 MODULES+=	quizzes.py quizzes.tex
@@ -19,6 +19,13 @@ all: ${MODULES}
 
 .INTERMEDIATE: cli.py
 __init__.py: cli.py
+	mv $< $@
+
+.INTERMEDIATE: canvas-calendar.py
+canvas-calendar.py: canvas_calendar.nw
+	${NOTANGLE.py}
+
+canvas_calendar.py: canvas-calendar.py
 	mv $< $@
 
 
