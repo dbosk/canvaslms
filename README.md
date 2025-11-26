@@ -9,36 +9,31 @@ makes automating tasks much easier.
 
 Start by login to your Canvas server
 
-``` {.text}
+```bash
+pipx install canvaslms
 canvaslms login
 ```
 
 Let's consider how to grade students logging into the student-shell SSH
 server. We store the list of students' Canvas and KTH IDs in a file.
 
-``` {.text}
-canvaslms users -c DD1301 -s | cut -f 1,2 > students.csv
+```bash
+canvaslms users -sc DD1301 | cut -f 1,2 > students.csv
 ```
 
 Then we check who has logged into student-shell.
-
-``` {.text startFrom="2"}
+```bash
 ssh student-shell.sys.kth.se last | cut -f 1 -d " " | sort | uniq \
   > logged-in.csv
 ```
 
 Finally, we check who of our students logged in.
-
-``` {.text startFrom="4"}
-for s in $(cut -f 2 students.csv); do
-  grep $s logged-in.csv && \
-```
-
-Finally, we can set their grade to P and add the comment "Well done!" in
+We can set their grade to P and add the comment "Well done!" in
 Canvas. We set the grades for the two assignments whose titles match the
 regular expression `(Preparing the terminal|The terminal)`.
-
-``` {.text startFrom="6"}
+```bash
+for s in $(cut -f 2 students.csv); do
+  grep $s logged-in.csv && \
     canvaslms grade -c DD1301 -a "(Preparing the terminal|The terminal)" \
       -u $(grep $s students.csv | cut -f 1) \
       -g P -m "Well done!"
@@ -71,17 +66,17 @@ llm keys set openai  # or another provider
 
 ## Installation
 
-Install the PyPI package using pip or pipx:
+Install the PyPI package using `pip` or `pipx`:
 ```bash
 # Basic installation (Python 3.8+)
-pip install canvaslms
+python3 -m pip install canvaslms
 # or
-pipx install canvaslms
+pipx install canvaslms # recommended
 
 # With optional LLM support for AI summaries (Python 3.9+)
-pip install canvaslms[llm]
+python3 -m pip install canvaslms[llm]
 # or
-pipx install canvaslms[llm]
+pipx install canvaslms[llm] # recommended
 ```
 
 The `[llm]` extra includes the `llm` package and various LLM provider plugins (OpenAI, Anthropic, Gemini, Azure) for AI-powered features like quiz analysis summaries.

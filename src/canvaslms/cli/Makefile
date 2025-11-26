@@ -13,6 +13,7 @@ MODULES+=	canvas_calendar.py canvas_calendar.tex
 MODULES+=	discussions.py discussions.tex
 MODULES+= 	utils.py utils.tex
 MODULES+=	quizzes.py quizzes.tex
+MODULES+=	cache.py cache.tex
 
 .PHONY: all
 all: ${MODULES}
