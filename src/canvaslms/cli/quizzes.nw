@@ -294,6 +294,10 @@ except argparse.ArgumentError:
 
 The [[quizzes list]] command lists all quizzes in a course, including both
 new quizzes (assignments) and classic quizzes (accessed via [[get_quizzes()]]).
+
+We use the [[filter_quizzes()]] helper with a pattern of [[.*]] to get all
+quizzes, which provides consistent error handling and ensures we search both
+Classic and New Quizzes.
 <<functions>>=
 def list_command(config, canvas, args):
   """Lists all quizzes in a course"""
@@ -303,45 +307,47 @@ def list_command(config, canvas, args):
   if not course_list:
     canvaslms.cli.err(1, "No course found matching criteria")
 
-  for course in course_list:
-    <<list all quizzes in course>>
+  # Use filter_quizzes to get all quizzes (filter_quizzes attaches course to each quiz)
+  quiz_list = list(filter_quizzes(course_list, ".*"))
+
+  if not quiz_list:
+    canvaslms.cli.err(1, "No quizzes found in the specified course(s)")
+
+  <<list all quizzes>>
 @
 
 \subsection{Listing all quizzes}
 
-We need to list both New Quizzes (from assignments) and Classic Quizzes.
-The output format follows the same pattern as [[assignments list]]:
-course code, title, type, published status, due date.
-<<list all quizzes in course>>=
-# Keep track of quiz IDs we've already listed to avoid duplicates.
+We output the quiz list in CSV format with course code, title, type, published
+status, and due date. The [[filter_quizzes()]] function already attached the
+course to each quiz, so we can access it via [[quiz.course]].
+<<list all quizzes>>=
+# Keep track of quiz IDs we've already listed to avoid duplicates
 listed_quiz_ids = set()
 
-# Output using csv module.
+# Output using csv module
 writer = csv.writer(sys.stdout, delimiter=args.delimiter)
 writer.writerow(["Course Code", "Quiz Title", "Quiz Type",
                  "Published", "Due Date"])
 
-quizzes = fetch_all_quizzes(course)
+for quiz in quiz_list:
+  if quiz.id in listed_quiz_ids:
+    continue
 
-if not quizzes:
-  continue
+  # Determine quiz type
+  if hasattr(quiz, 'quiz_type'):
+    quiz_type = getattr(quiz, 'quiz_type', 'quiz')
+  else:
+    quiz_type = "new_quiz"
 
-try:
-  for quiz in quizzes:
-    if quiz.id in listed_quiz_ids:
-      continue
-    if hasattr(quiz, 'quiz_type'):
-      quiz_type = getattr(quiz, 'quiz_type', 'quiz')
-    else:
-      quiz_type = "new_quiz"
-    published = "Published" if getattr(quiz, 'published', False) \
-                            else "Unpublished"
-    due_date = canvaslms.cli.utils.format_local_time(getattr(quiz, 'due_at', None))
-    writer.writerow([course.course_code, quiz.title, quiz_type,
-                     published, due_date])
-    listed_quiz_ids.add(quiz.id)
-except Exception as e:
-  canvaslms.cli.warn(f"Could not process quizzes: {e}")
+  published = "Published" if getattr(quiz, 'published', False) \
+                          else "Unpublished"
+  due_date = canvaslms.cli.utils.format_local_time(getattr(quiz, 'due_at', None))
+
+  # Use the course attached by filter_quizzes()
+  writer.writerow([quiz.course.course_code, quiz.title, quiz_type,
+                   published, due_date])
+  listed_quiz_ids.add(quiz.id)
 @
 
 To fetch the quizzes we need to call both [[get_quizzes()]] and
@@ -370,21 +376,131 @@ def fetch_all_quizzes(course):
   return quizzes
 @
 
+\subsection{Filtering quizzes by pattern}
+
+Now that we can fetch all quizzes from a course, we need a way to filter them
+based on user criteria. Following the established pattern from [[courses.py]],
+[[assignments.py]], and [[users.py]], we create a [[filter_quizzes()]] helper
+that searches both Classic and New Quizzes.
+
+The function takes a list of courses and a regex pattern, yielding quizzes
+whose title or ID matches the pattern. This consolidates the duplicate search
+logic that was previously scattered throughout the codebase.
+<<functions>>=
+def filter_quizzes(course_list, regex):
+  """Returns all quizzes from courses whose title or ID matches regex
+
+  Searches both Classic Quizzes and New Quizzes. Yields Quiz objects
+  with an attached course attribute for later reference.
+
+  Args:
+    course_list: List of Course objects to search
+    regex: Regular expression string to match against quiz title or ID
+
+  Yields:
+    Quiz objects (both classic and new quizzes) that match the pattern
+  """
+  pattern = re.compile(regex, re.IGNORECASE)
+
+  for course in course_list:
+    quizzes = fetch_all_quizzes(course)
+    for quiz in quizzes:
+      # Match against quiz title or Canvas ID
+      if pattern.search(quiz.title) or pattern.search(str(quiz.id)):
+        # Attach course reference for later use (e.g., downloading reports)
+        quiz.course = course
+        yield quiz
+@
+
+\subsection{Quiz option management functions}
+
+Following the [[process_XXX_option()]] pattern established in the codebase,
+we provide two functions for consistent quiz selection across commands:
+\begin{itemize}
+\item [[add_quiz_option()]] adds the necessary argparse options
+\item [[process_quiz_option()]] processes those options and returns filtered quizzes
+\end{itemize}
+
+This pattern provides several benefits:
+\begin{itemize}
+\item \textbf{Consistency}: Same interface as courses, assignments, users
+\item \textbf{Reusability}: Both [[list]] and [[analyse]] commands can use it
+\item \textbf{Error handling}: Centralized [[EmptyListError]] handling
+\item \textbf{Dependency management}: Automatically handles course option dependency
+\end{itemize}
+
+Note that we reuse the [[-a/--assignment]] argument name for backward
+compatibility with existing scripts and user workflows.
+<<functions>>=
+def add_quiz_option(parser, required=False, suppress_help=False):
+  """Adds quiz selection option to argparse parser
+
+  Args:
+    parser: The argparse parser to add options to
+    required: Whether the quiz option should be required
+    suppress_help: If True, hide this option from help output
+  """
+  # Add course option dependency (may already exist)
+  try:
+    courses.add_course_option(parser, required=required,
+                             suppress_help=suppress_help)
+  except argparse.ArgumentError:
+    # Option already added by another module
+    pass
+
+  # Use -a/--assignment for backward compatibility
+  parser.add_argument("-a", "--assignment",
+    required=required,
+    default=".*" if not required else None,
+    help=argparse.SUPPRESS if suppress_help else
+         "Regex matching quiz title or Canvas ID, default: '.*'")
+
+def process_quiz_option(canvas, args):
+  """Processes quiz option, returns a list of matching quizzes
+
+  Args:
+    canvas: Canvas API instance
+    args: Parsed command-line arguments
+
+  Returns:
+    List of Quiz objects matching the criteria
+
+  Raises:
+    canvaslms.cli.EmptyListError: If no quizzes match the criteria
+  """
+  # First get the course list
+  course_list = courses.process_course_option(canvas, args)
+
+  # Get quiz regex pattern (from -a/--assignment argument)
+  quiz_regex = getattr(args, 'assignment', '.*')
+
+  # Filter quizzes using our helper
+  quiz_list = list(filter_quizzes(course_list, quiz_regex))
+
+  if not quiz_list:
+    raise canvaslms.cli.EmptyListError(
+      "No quizzes found matching the criteria")
+
+  return quiz_list
+@
+
 
 \section{Processing the [[quizzes analyse]] command}
 
 The main command processing determines whether to use CSV file or Canvas API.
+When we use the Canvas API we can process multiple quizzes in one go.
+So we can use multiple files to analyse.
+Whereas with CSV file input we only have one file to process.
 <<functions>>=
 def analyse_command(config, canvas, args):
   """Analyzes quiz or survey data from CSV file or Canvas"""
-  <<process quizzes command>>
-@
+  csv_files = []
+  if args.csv:
+    csv_files.append(args.csv)
+  else:
+    <<fill [[csv_files]] from Canvas>>
 
-<<process quizzes command>>=
-if args.csv:
-  <<process CSV file>>
-else:
-  <<fetch from Canvas and process>>
+  <<process [[csv_files]]>>
 @
 
 
@@ -397,21 +513,21 @@ When processing a CSV file, we need to:
 \item Separate quantitative and qualitative questions
 \item Generate summaries
 \end{enumerate}
-<<process CSV file>>=
-if not os.path.exists(args.csv):
-  canvaslms.cli.err(1, f"CSV file not found: {args.csv}")
-
-try:
-  with open(args.csv, 'r', encoding='utf-8') as f:
-    reader = csv.DictReader(f)
-    rows = list(reader)
-    
-    if not rows:
-      canvaslms.cli.err(1, "CSV file is empty")
-    
-    <<parse and summarize CSV data>>
-except Exception as e:
-  canvaslms.cli.err(1, f"Error processing CSV: {e}")
+<<process [[csv_files]]>>=
+for csv_file in csv_files:
+  try:
+    with open(csv_file, 'r') as f:
+      reader = csv.DictReader(f)
+      rows = list(reader)
+      
+      if not rows:
+        canvaslms.cli.err(1, "CSV file is empty")
+      
+      <<parse and summarize CSV data [[rows]]>>
+  except FileNotFoundError:
+    canvaslms.cli.err(1, f"CSV file not found: {csv_file}")
+  except Exception as e:
+    canvaslms.cli.err(1, f"Error processing CSV: {e}")
 @
 
 
@@ -420,7 +536,7 @@ except Exception as e:
 The Canvas CSV format has a complex structure where questions appear as column 
 headers with their IDs.
 We need to identify which columns are questions and which are metadata.
-<<parse and summarize CSV data>>=
+<<parse and summarize CSV data [[rows]]>>=
 <<categorize and summarize quiz data>>
 @
 
@@ -1535,202 +1651,88 @@ We need to search for quizzes in two places:
 
 Both quiz types are handled by generating a student analysis report, polling
 until complete, and downloading the resulting CSV for processing.
-<<fetch from Canvas and process>>=
-# Ensure we have course and assignment specified
-if not hasattr(args, 'course') or not args.course:
-  canvaslms.cli.err(1, "Course must be specified when not using CSV file")
-
+<<fill [[csv_files]] from Canvas>>=
 try:
-  # Get the course list
-  course_list = courses.process_course_option(canvas, args)
-  
-  if not course_list:
-    canvaslms.cli.err(1, "No course found matching criteria")
-  
-  for course in course_list:
-    # Search for quiz in two places, preferring Classic Quizzes (more reliable API)
-    quiz = None
+  # Use the unified quiz selection pattern
+  quiz_list = process_quiz_option(canvas, args)
 
-    # First, try to find in Classic Quizzes (accessed via get_quizzes())
-    # These have reliable API support for report generation
-    <<search for classic quiz>>
+  # Download report for each matching quiz
+  for quiz in quiz_list:
+    <<download quiz report and add file to [[csv_files]]>>
 
-    # If not found in Classic Quizzes, try New Quizzes via get_new_quizzes()
-    if quiz is None:
-      <<search for new quiz>>
-    
-    if quiz is None:
-      canvaslms.cli.warn(f"No quiz/survey found matching criteria in {course.course_code}")
-      continue
-
-    <<fetch quiz submissions from Canvas>>
-    <<process Canvas quiz data>>
-  
 except canvaslms.cli.EmptyListError as e:
   canvaslms.cli.err(1, str(e))
 except Exception as e:
   canvaslms.cli.err(1, f"Error fetching from Canvas: {e}")
 @
 
-\subsection{Searching for classic quizzes}
+\subsection{Downloading quiz reports to temporary files}
 
-Classic quizzes (including anonymous surveys) are not accessible through the
-assignments API. We need to search for them using [[get_quizzes()]].
-<<search for classic quiz>>=
-# Get all quizzes in the course
-quizzes = course.get_quizzes()
+For each quiz, we need to generate a report, poll until it's ready, download the
+CSV, and save it to a temporary file. The approach differs slightly between
+Classic Quizzes and New Quizzes, but both result in a CSV file URL that we
+download and add to our [[csv_files]] list.
+<<download quiz report and add file to [[csv_files]]>>=
+import tempfile
+import requests
 
-# Build regex pattern from assignment argument
-if hasattr(args, 'assignment') and args.assignment:
-  pattern = re.compile(args.assignment, re.IGNORECASE)
-
-  for q in quizzes:
-    # Match against quiz title or ID
-    if pattern.search(q.title) or pattern.search(str(q.id)):
-      quiz = q
-      break
-@
-
-\subsection{Searching for New Quizzes}
-
-New Quizzes are retrieved via [[get_new_quizzes()]] API method.
-<<search for new quiz>>=
-try:
-  new_quizzes = course.get_new_quizzes()
-
-  # Build regex pattern from assignment argument
-  if hasattr(args, 'assignment') and args.assignment:
-    pattern = re.compile(args.assignment, re.IGNORECASE)
-
-    for q in new_quizzes:
-      # Match against quiz title or ID
-      if pattern.search(q.title) or pattern.search(str(q.id)):
-        quiz = q
-        break
-except Exception as e:
-  # New Quizzes API might not be available
-  canvaslms.cli.warn(f"Could not search New Quizzes: {e}")
-@
-
-We need to fetch quiz submissions and extract the data to analyze.
-For classic quizzes, we can use [[get_quiz_report]] to get the student analysis report.
-<<fetch quiz submissions from Canvas>>=
-# Check if this is a Classic Quiz or New Quiz and handle accordingly
-try:
-  if is_new_quiz(quiz):
-    <<fetch New Quiz report>>
-  else:
-    <<fetch Classic Quiz report>>
-except AttributeError:
-  # Quiz doesn't support the report API
-  print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
-  print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
-  print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
-  print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
-  sys.exit(0)
-except Exception as e:
-  canvaslms.cli.warn(f"Could not fetch quiz report via API: {e}")
-  print(f"\nNote: For best results, export the Student Analysis Report as CSV manually.")
-  print(f"To export: Go to Quiz -> ... menu -> Student Analysis")
-  print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
-  sys.exit(1)
-@
-
-\subsection{Fetching Classic Quiz reports}
-
-Classic quizzes use the [[create_report()]] method which returns a report
-object. We poll until complete, then download the CSV.
-<<fetch Classic Quiz report>>=
-# Try to create a student analysis report (works for surveys, graded_surveys, etc.)
-try:
-  report = quiz.create_report(report_type='student_analysis', includes_all_versions=True)
-except AttributeError:
-  # Quiz doesn't support create_report, fall back to manual export
-  print(f"Note: Canvas API quiz data processing is limited for this quiz type.")
-  print(f"For best results, export the Student Analysis Report as CSV and use --csv option.")
-  print(f"\nTo export: Go to Quiz -> ... menu -> Student Analysis")
-  print(f"Download the CSV and run: canvaslms quizzes analyse --csv <file.csv>")
-  sys.exit(0)
-
-# Poll until the report is ready
-# We need to refresh the report object to check progress
-for attempt in range(30):
-  report = quiz.get_quiz_report(report.id)
-  final_report = poll_progress(report, max_attempts=1)
-  if final_report:
-    report = final_report
-    break
-
-# Check if we have the file URL
+# Fetch the report based on quiz type
 file_url = None
-if hasattr(report, 'file'):
-  if hasattr(report.file, 'url'):
-    file_url = report.file.url
-  elif isinstance(report.file, dict):
-    file_url = report.file.get('url')
 
-if file_url:
-  # Download and parse the CSV data
-  reader = download_csv_report(file_url)
-  # Process the CSV data
-  <<process quiz CSV data from API>>
+if is_new_quiz(quiz):
+  # New Quiz - use New Quiz Reports API
+  try:
+    progress = create_new_quiz_report(quiz.course, quiz.id,
+                                      canvas._Canvas__requester)
+    progress = poll_progress(progress)
+
+    if progress and hasattr(progress, 'results'):
+      if isinstance(progress.results, dict):
+        file_url = progress.results.get('url')
+  except Exception as e:
+    canvaslms.cli.warn(f"Error creating New Quiz report for '{quiz.title}': {e}")
+    continue
 else:
-  canvaslms.cli.err(1, "Report file URL not available")
-@
+  # Classic Quiz - use create_report()
+  try:
+    report = quiz.create_report(report_type='student_analysis',
+                               includes_all_versions=True)
 
-\subsection{Fetching New Quiz reports}
+    # Poll until ready
+    for attempt in range(30):
+      report = quiz.get_quiz_report(report.id)
+      final_report = poll_progress(report, max_attempts=1)
+      if final_report:
+        report = final_report
+        break
 
-New Quizzes use a different API endpoint. We call the helper to create the
-report, which returns a Progress object directly.
-
-\textbf{Known Issue:} The New Quiz Reports API was recently introduced in
-January 2025. Testing shows that the API may return ``Not Found'' errors on
-some Canvas instances, possibly due to:
-\begin{itemize}
-\item The API not being enabled on all Canvas instances
-\item Missing permissions or feature flags
-\item New Quizzes with no student submissions
-\end{itemize}
-
-The implementation is correct according to the Canvas API documentation. If
-the API call fails, users should use the CSV export method as described in
-the introduction.
-<<fetch New Quiz report>>=
-# Create the report using the New Quiz API
-# Note: Canvas uses name-mangled private attribute __requester
-progress = create_new_quiz_report(course, quiz.id, canvas._Canvas__requester)
-
-# Poll until the report is ready
-progress = poll_progress(progress)
-
-if not progress:
-  canvaslms.cli.err(1, "Report generation timed out")
-
-# Extract the file URL from the progress results
-file_url = None
-if hasattr(progress, 'results'):
-  if isinstance(progress.results, dict):
-    file_url = progress.results.get('url')
+    # Extract file URL
+    if hasattr(report, 'file'):
+      if hasattr(report.file, 'url'):
+        file_url = report.file.url
+      elif isinstance(report.file, dict):
+        file_url = report.file.get('url')
+  except Exception as e:
+    canvaslms.cli.warn(f"Error creating Classic Quiz report for '{quiz.title}': {e}")
+    continue
 
 if not file_url:
-  canvaslms.cli.err(1, "Report file URL not available from New Quiz report")
+  canvaslms.cli.warn(f"Report file URL not available for quiz '{quiz.title}'")
+  continue
 
-# Download and parse the CSV data
-reader = download_csv_report(file_url)
-# Process the CSV data
-<<process quiz CSV data from API>>
+# Download CSV to temporary file
+try:
+  response = requests.get(file_url)
+  response.raise_for_status()
+
+  # Create temp file and write CSV data
+  temp_fd, temp_path = tempfile.mkstemp(suffix='.csv', text=True)
+  with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+    f.write(response.content.decode('utf-8'))
+
+  csv_files.append(temp_path)
+except Exception as e:
+  canvaslms.cli.warn(f"Error downloading report for quiz '{quiz.title}': {e}")
+  continue
 @
 
-<<process quiz CSV data from API>>=
-# Convert the CSV reader data into the same format as our file processing
-rows = list(reader)
-if not rows:
-  canvaslms.cli.err(1, "No data in quiz report")
-
-# Process it the same way as CSV file processing
-<<categorize and summarize quiz data>>
-@
-
-<<process Canvas quiz data>>=
-# This section intentionally left empty for future implementation
-@
