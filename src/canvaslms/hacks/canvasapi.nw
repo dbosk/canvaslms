@@ -20,7 +20,11 @@ from datetime import datetime, timedelta
 import functools
 import importlib
 import inspect
+import logging
+import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 <<constants>>
 <<functions>>
@@ -671,6 +675,11 @@ So the only grades that we should use are passing grades that can't be
 improved.
 <<constants>>=
 NOREFRESH_GRADES = ["A", "P", "P+", "complete"]
+
+# Threshold for bulk refresh optimization
+# Can be overridden via environment variables
+BULK_REFRESH_THRESHOLD = float(os.environ.get('CANVASLMS_BULK_THRESHOLD', '0.2'))
+BULK_REFRESH_MIN_COUNT = int(os.environ.get('CANVASLMS_BULK_MIN_COUNT', '3'))
 @
 
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
@@ -954,6 +963,18 @@ class LazySubmission:
       return True
 
     return False
+
+  def would_need_refresh(self):
+    """
+    Check if submission would need refresh WITHOUT triggering it.
+
+    Used by pre-check phase to count stale submissions before deciding
+    whether to do bulk refresh.
+
+    Returns:
+        bool: True if submission would refresh on next access
+    """
+    return self._needs_refresh()
 
   def _refresh(self):
     """Refresh the wrapped submission from Canvas."""
@@ -1333,6 +1354,9 @@ if "include" in kwargs:
 else:
   to_include = set()
 
+# Extract check_bulk_refresh parameter (default: False)
+check_bulk_refresh = kwargs.get("check_bulk_refresh", False)
+
 # Check if we need to refetch due to new includes
 need_refetch = False
 if self.__all_fetched:
@@ -1357,8 +1381,58 @@ if not self.__all_fetched or need_refetch:
     self.__cache[raw_submission.user_id] = lazy_submission
 
   self.__all_fetched = datetime.now()
+elif check_bulk_refresh:
+  # Cache exists, includes satisfied, AND caller requested bulk refresh check
+  <<check staleness threshold and bulk refresh if needed>>
 
 # Return list of LazySubmission wrappers (no staleness checks here!)
 return list(self.__cache.values())
+@
+
+The bulk refresh pre-check logic counts how many submissions would need refresh
+and triggers a bulk fetch if the count exceeds the threshold.
+<<check staleness threshold and bulk refresh if needed>>=
+stale_count = 0
+total_count = len(self.__cache)
+
+if total_count > 0:
+  # Count stale submissions (non-mutating check)
+  for lazy_submission in self.__cache.values():
+    if lazy_submission.would_need_refresh():
+      stale_count += 1
+
+  # Calculate threshold
+  if isinstance(BULK_REFRESH_THRESHOLD, float):
+    threshold = max(int(total_count * BULK_REFRESH_THRESHOLD),
+                   BULK_REFRESH_MIN_COUNT)
+  else:
+    threshold = BULK_REFRESH_THRESHOLD
+
+  # If threshold exceeded, perform bulk refresh
+  if stale_count >= threshold:
+    logger.info(f"Bulk refresh: {stale_count}/{total_count} submissions stale, "
+                f"threshold={threshold}")
+
+    # Merge all includes from cached submissions
+    all_includes = set()
+    for lazy_submission in self.__cache.values():
+      all_includes |= set(lazy_submission._includes)
+    all_includes |= to_include
+
+    # Perform bulk refresh (1 API call)
+    for raw_submission in get_submissions(self, include=list(all_includes)):
+      if raw_submission.user_id in self.__cache:
+        # Update existing wrapper in-place
+        lazy_submission = self.__cache[raw_submission.user_id]
+        object.__setattr__(lazy_submission, '_submission', raw_submission)
+        object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+        object.__setattr__(lazy_submission, '_includes', all_includes)
+      else:
+        # New submission appeared since cache was created
+        lazy_submission = LazySubmission(raw_submission, self, all_includes,
+                                       original_get_submission)
+        self.__cache[raw_submission.user_id] = lazy_submission
+
+    self.__all_fetched = datetime.now()
 @
 
