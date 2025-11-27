@@ -1198,6 +1198,120 @@ This class is used by the caching decorator below.
 <<LazySubmission class>>
 @
 
+\subsubsection{Threshold-based bulk refresh optimization}
+
+While lazy loading solves the problem of wasted refreshes when filtering
+submissions, it introduces a new inefficiency in the opposite scenario: when
+workflows access \emph{all} submissions' mutable attributes, lazy loading
+triggers individual API calls for each stale submission.
+
+\paragraph{The performance bottleneck}
+
+Consider the [[-U]] (ungraded) option in [[submissions.nw]]:
+\begin{minted}{python}
+for submission in submissions:
+    if is_submission_ungraded(submission):
+        yield submission
+\end{minted}
+
+The [[is_submission_ungraded()]] function checks [[submitted_at]],
+[[graded_at]], and [[grade_matches_current_submission]]---all mutable
+attributes.
+With 50 submissions where 40 are stale:
+\begin{enumerate}
+\item Access [[submission.submitted_at]] → triggers refresh check
+\item Submission is stale → makes API call to refresh
+\item Repeat for all 50 submissions
+\item Result: 40 individual API calls
+\end{enumerate}
+
+This is \textbf{40× slower} than fetching all submissions in one bulk request.
+
+\paragraph{The solution: pre-check and bulk refresh}
+
+We add an optional pre-check phase that counts how many submissions would need
+refresh before accessing them. If the count exceeds a threshold, we trigger one
+bulk fetch instead of many individual refreshes.
+
+The optimization is opt-in via a [[check_bulk_refresh]] parameter to
+[[get_submissions()]]:
+\begin{enumerate}
+\item Count stale submissions using [[would_need_refresh()]] (non-mutating check)
+\item Calculate threshold: [[max(total × 0.2, 3)]] (20\% with minimum 3)
+\item If [[stale_count ≥ threshold]], perform bulk refresh (1 API call)
+\item Update all [[LazySubmission]] wrappers in-place with fresh data
+\item Return refreshed cache so subsequent attribute access doesn't trigger refreshes
+\end{enumerate}
+
+\paragraph{When to enable bulk refresh}
+
+The optimization is beneficial when workflows will access mutable attributes on
+\emph{most} submissions:
+\begin{description}
+\item[[{-U}]] (ungraded option)] Always enabled---checks all submissions'
+  grading state
+\item[Unfiltered listings] Enabled when no [[--user]], [[--category]], or
+  [[--group]] filters are applied
+\item[Specific user filtering] Disabled---only a few submissions will be
+  accessed
+\end{description}
+
+\paragraph{Threshold configuration}
+
+The threshold is configurable via environment variables:
+\begin{description}
+\item[[CANVASLMS_BULK_THRESHOLD]] Fraction of stale submissions needed (default:
+  0.2 = 20\%)
+\item[[CANVASLMS_BULK_MIN_COUNT]] Minimum number of stale submissions required
+  (default: 3)
+\end{description}
+
+Examples:
+\begin{itemize}
+\item Small assignment (10 submissions): threshold = [[max(2, 3) = 3]] (30\%)
+\item Medium assignment (50 submissions): threshold = 10 (20\%)
+\item Large assignment (200 submissions): threshold = 40 (20\%)
+\end{itemize}
+
+\paragraph{Trade-offs}
+
+\emph{Advantages:}
+\begin{itemize}
+\item Dramatic reduction in API calls for [[-U]] scenarios (40 calls → 1 call)
+\item Faster execution when many submissions are accessed
+\item Respects final grade policy ([[NOREFRESH_GRADES]] never counted as stale)
+\item Updates cache in-place (preserves object identity and references)
+\end{itemize}
+
+\emph{Disadvantages:}
+\begin{itemize}
+\item Pre-check adds overhead (one pass through cache to count staleness)
+\item May refresh submissions that won't ultimately be accessed (if filtering
+  happens after refresh)
+\item Bulk refresh fetches all includes, increasing response size slightly
+\end{itemize}
+
+The threshold (20\% minimum 3) balances these trade-offs: we only bulk refresh
+when it's likely to save significant API calls.
+
+\paragraph{Design rationale}
+
+Why implement in the decorator, not in [[LazySubmission]]?
+\begin{itemize}
+\item The decorator has access to the entire cache (all submissions)
+\item [[LazySubmission]] only knows about individual submissions
+\item Threshold calculation requires global view of staleness
+\item Bulk refresh requires coordinating multiple wrappers
+\end{itemize}
+
+Why opt-in instead of automatic?
+\begin{itemize}
+\item Filtering workflows benefit from lazy loading (don't want bulk refresh)
+\item [[-U]] and unfiltered listings benefit from bulk refresh
+\item Call site knows the access pattern, decorator doesn't
+\item Opt-in ensures we only bulk refresh when beneficial
+\end{itemize}
+
 \subsection{Caching submissions}
 
 For the results, we can construct something more specific.
