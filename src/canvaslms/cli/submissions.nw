@@ -795,8 +795,80 @@ We provide the following functions:
   \item [[list_submissions]], which returns all submissions;
   \item [[list_ungraded_submissions]], which returns all ungraded submissions.
 \end{itemize}
-We return the submissions for a list of assignments, since we can match several 
+We return the submissions for a list of assignments, since we can match several
 assignments with a regular expression (using [[filter_assignments]]).
+
+\subsection{Filtering strategy for ungraded submissions}
+\label{SubmissionsFiltering}
+
+Canvas provides a [[bucket="ungraded"]] parameter to filter submissions
+server-side.
+However, using this parameter causes cache inconsistencies: the caching system
+in [[canvasapi.nw]] doesn't track the [[bucket]] parameter, leading to
+incorrect results when mixing calls with and without this parameter.
+
+Instead, we always fetch all submissions and filter locally.
+This approach:
+\begin{itemize}
+\item Ensures cache correctness---no ambiguity in cache keys.
+\item Maintains lazy-loading performance---the [[LazySubmission]] wrapper only
+refreshes accessed items.
+\item Simplifies the caching logic---no need to track the bucket parameter.
+\end{itemize}
+
+A submission is considered ungraded if:
+\begin{itemize}
+\item It has been submitted ([[submitted_at]] is not [[None]]).
+\item AND either:
+  \begin{itemize}
+  \item It has never been graded ([[graded_at is None]]), or
+  \item The grade doesn't match the current submission
+([[not grade_matches_current_submission]])---this occurs when a student
+resubmits after receiving a grade.
+  \end{itemize}
+\end{itemize}
+
+This local filtering logic matches Canvas's server-side [[bucket="ungraded"]]
+behavior while avoiding cache consistency issues.
+
+Note that we set [[submission.assignment]] for \emph{all} submissions, not just
+those we yield.
+This ensures that all submissions in the cache have this attribute set
+consistently, regardless of which filtering path is used to access them later.
+
+\subsection{Helper function to check if a submission is ungraded}
+
+The logic for determining whether a submission is ungraded is used in multiple
+places throughout the codebase.
+We extract it into a helper function to maintain consistency and avoid code
+duplication.
+
+This function implements the filtering strategy described above
+(\cref{SubmissionsFiltering}), encapsulating the logic so it can be reused
+by other modules (such as [[assignments.nw]] and [[results.nw]]).
+<<functions>>=
+def is_submission_ungraded(submission):
+    """
+    Returns True if the submission is ungraded or needs regrading.
+
+    A submission is considered ungraded if:
+    - It has been submitted (submitted_at is not None), AND
+    - Either it has never been graded (graded_at is None), OR
+    - The grade doesn't match the current submission (not
+      grade_matches_current_submission) -- this occurs when a student
+      resubmits after receiving a grade.
+
+    Parameters:
+        submission: A Canvas Submission object
+
+    Returns:
+        bool: True if the submission needs grading, False otherwise
+    """
+    return (submission.submitted_at and
+            (submission.graded_at is None or
+             not submission.grade_matches_current_submission))
+@
+
 <<functions>>=
 def list_submissions(assignments, include=["submission_comments"]):
   for assignment in assignments:
@@ -807,12 +879,10 @@ def list_submissions(assignments, include=["submission_comments"]):
 
 def list_ungraded_submissions(assignments, include=["submisson_comments"]):
   for assignment in assignments:
-    submissions = assignment.get_submissions(bucket="ungraded",
-      include=include)
+    submissions = assignment.get_submissions(include=include)
     for submission in submissions:
-      if submission.submitted_at and (submission.graded_at is None or
-          not submission.grade_matches_current_submission):
-        submission.assignment = assignment
+      submission.assignment = assignment
+      if is_submission_ungraded(submission):
         yield submission
 @
 
