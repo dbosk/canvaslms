@@ -144,8 +144,9 @@ class TestParseDate:
         """ISO format: YYYY-MM-DD"""
         result = parse_date("2023-12-15")
         assert result.endswith("Z")
-        # Date interpreted as start of day local time
-        assert "2023-12-15" in result
+        # Date interpreted as start of day local time (00:00 CET)
+        # 2023-12-15 00:00 CET (UTC+1) = 2023-12-14 23:00 UTC
+        assert "2023-12-14T23:00:00Z" == result
 
     @freeze_time("2023-12-15 10:00:00")
     def test_iso_with_time(self):
@@ -176,14 +177,18 @@ class TestParseDate:
         """US format: MM/DD/YYYY"""
         result = parse_date("12/15/2023")
         assert result.endswith("Z")
-        assert "2023-12-15" in result
+        # Date interpreted as start of day local time (00:00 CET)
+        # 2023-12-15 00:00 CET (UTC+1) = 2023-12-14 23:00 UTC
+        assert "2023-12-14T23:00:00Z" == result
 
     @freeze_time("2023-12-15 10:00:00")
     def test_month_name_format(self):
         """Month name format: Dec 15 2023"""
         result = parse_date("Dec 15 2023")
         assert result.endswith("Z")
-        assert "2023-12-15" in result
+        # Date interpreted as start of day local time (00:00 CET)
+        # 2023-12-15 00:00 CET (UTC+1) = 2023-12-14 23:00 UTC
+        assert "2023-12-14T23:00:00Z" == result
 
     def test_invalid_format_raises_error(self):
         """Completely invalid string should raise ValueError"""
