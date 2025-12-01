@@ -21,6 +21,7 @@ import functools
 import importlib
 import inspect
 import logging
+import time
 import sys
 
 logger = logging.getLogger(__name__)
@@ -503,7 +504,7 @@ if not obj:
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, kwargs)
   logger.info(f"Cache miss{cache_status}: {attr_name} id={id} fetched in "
-               f"{fetch_elapsed:.2f}s")
+              f"{fetch_elapsed:.2f}s")
 else:
   logger.info(f"Cache hit: {attr_name} id={id}")
 
@@ -619,8 +620,8 @@ attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
 
 bulk_elapsed = time.perf_counter() - bulk_start
 logger.info(f"Bulk refresh: {len(fetched_objs)} {attr_name}s in "
-             f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
-             f"processing: {process_elapsed:.2f}s)")
+            f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
+            f"processing: {process_elapsed:.2f}s)")
 @
 
 Finally, when we want to return all the objects, we will yield them instead.
@@ -644,7 +645,7 @@ for obj, obj_kwargs in attr_cache.values():
     obj = get_attr(self, obj.id, **obj_kwargs)
     refresh_elapsed = time.perf_counter() - refresh_start
     logger.info(f"Individual refresh: {attr_name} id={obj.id} in "
-                 f"{refresh_elapsed:.2f}s")
+                f"{refresh_elapsed:.2f}s")
   yield obj
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
@@ -949,6 +950,8 @@ args[0].__cache = {}
 @
 
 Now we can treat how we get an individual submission.
+We also want to add info messages to log cache hits and misses and their 
+timings.
 <<return submission of user>>=
 if isinstance(user, User):
   uid = user.id
@@ -964,14 +967,27 @@ if "include" in kwargs:
 else:
   to_include = set()
 
+cache_status = ""
 if uid in self.__cache:
   submission, included = self.__cache[uid]
   if not to_include.issubset(set(included)):
+    cache_status = " (new include required)"
     submission = None
     to_include |= set(included)
+else:
+  cache_status = " (not found)"
 
-if not submission or submission.grade not in NOREFRESH_GRADES:
+if submission and submission.grade in NOREFRESH_GRADES:
+  logger.info(f"Cache hit: submission user_id={uid}")
+elif submission and submission.grade not in NOREFRESH_GRADES:
+  if not cache_status:
+    cache_status = " (stale)"
+  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
+  fetch_start = time.perf_counter()
   submission = get_submission(self, user, include=list(to_include))
+  fetch_elapsed = time.perf_counter() - fetch_start
+  submission._fetched_at = datetime.now()
+  logger.info(f"Fetched submission user_id={uid} in {fetch_elapsed:.2f}s")
   self.__cache[uid] = (submission, to_include)
 
 return submission
@@ -992,16 +1008,26 @@ else:
   to_include = set()
 
 if self.__all_fetched:
+  logger.info(f"Using cached submissions for assignment id={self.id}")
   for submission, included in self.__cache.values():
-    if not to_include.issubset(included) or \
-       submission.grade not in NOREFRESH_GRADES:
-      self.get_submission(submission.user_id, include=list(to_include))
+    # Use the cached method above to trigger any individual refreshes.
+    self.get_submission(submission.user_id, include=list(to_include))
 else:
+  # Collect everything to include.
   for _, included in self.__cache.values():
     to_include |= included
 
-  for submission in get_submissions(self, **kwargs):
+  logger.info(f"Fetching all submissions for assignment id={self.id}")
+  start_fetch = time.perf_counter()
+  submissions = list(get_submissions(self, include=list(to_include)))
+  fetch_elapsed = time.perf_counter() - start_fetch
+  logger.info(f"Bulk refresh: {len(submissions)} submissions in "
+              f"{fetch_elapsed:.2f}s")
+
+  for submission in submissions:
     self.__cache[submission.user_id] = (submission, to_include)
+
+  self.__all_fetched = datetime.now()
 
 return [submission for submission, _ in self.__cache.values()]
 @
