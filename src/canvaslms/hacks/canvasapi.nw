@@ -22,6 +22,7 @@ import importlib
 import inspect
 import logging
 import os
+import time
 import sys
 
 logger = logging.getLogger(__name__)
@@ -476,30 +477,52 @@ For example:
 }
 \end{minted}
 <<return cached result or fetch from [[get_attr]]>>=
+import time
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 
 <<let [[id]] be the ID of the object to fetch>>
 
 try:
   obj, prev_kwargs = attr_cache[id]
+  cache_status = ""
 except KeyError:
   obj = None
   prev_kwargs = {}
+  cache_status = " (not found)"
 
-if obj and (must_update(prev_kwargs, kwargs) or outdated(obj)):
+if obj and must_update(prev_kwargs, kwargs):
   obj = None
+  cache_status = " (new kwargs required)"
+elif obj and outdated(obj):
+  obj = None
+  cache_status = " (stale)"
 
 if not obj:
+  fetch_start = time.perf_counter()
   obj = get_attr(self, *args, **kwargs)
+  fetch_elapsed = time.perf_counter() - fetch_start
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, kwargs)
+  logger.info(f"Cache miss{cache_status}: {attr_name} id={id} fetched in "
+              f"{fetch_elapsed:.2f}s")
+else:
+  logger.info(f"Cache hit: {attr_name} id={id}")
 
 return obj
 @
 
+We log cache hits and misses to measure caching effectiveness.
+Cache hits should be nearly instantaneous (microseconds), as we're just
+returning a cached object.
+Cache misses require API calls to Canvas, which typically take hundreds of
+milliseconds to seconds depending on network latency and server response time.
+This timing data helps identify whether caching is providing the expected
+performance benefits.
+
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
-We'll return to the [[outdated]] function later, that one determines from the 
+We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
 The [[get_*]] methods all take either an ID or an object as argument.
@@ -568,30 +591,62 @@ else:
 To fetch all again, we must merge the keyword arguments.
 This is done with the [[merge_kwargs]] function.
 Then we must add each object to the cache.
+
+We separately time the API call versus processing to identify bottlenecks.
+The API call time represents network latency and Canvas server response time,
+while processing time represents local cache updates and object manipulation.
+This helps distinguish between network bottlenecks and local processing
+overhead.
 <<fetch all and populate [[attr_cache]]>>=
+import time
+bulk_start = time.perf_counter()
+
 union_kwargs = merge_kwargs(
   [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
 
-for obj in get_attrs(self, *args, **union_kwargs):
+api_start = time.perf_counter()
+fetched_objs = list(get_attrs(self, *args, **union_kwargs))
+api_elapsed = time.perf_counter() - api_start
+
+process_start = time.perf_counter()
+for obj in fetched_objs:
   old_obj = attr_cache.get(obj.id, None)
   <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, union_kwargs)
+process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
+
+bulk_elapsed = time.perf_counter() - bulk_start
+logger.info(f"Bulk refresh: {len(fetched_objs)} {attr_name}s in "
+            f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
+            f"processing: {process_elapsed:.2f}s)")
 @
 
 Finally, when we want to return all the objects, we will yield them instead.
-It's more efficient to use a generator in this case, as that would make us 
+It's more efficient to use a generator in this case, as that would make us
 update when (if) needed.
-When we update an object, we should use the same keyword arguments as specified 
-in the cache---not the requested ones---because these will, at this point, be 
+When we update an object, we should use the same keyword arguments as specified
+in the cache---not the requested ones---because these will, at this point, be
 the largest possible set of keyword arguments.
+
+We log individual refresh timing to show the cost of updating stale cache
+entries without a full bulk fetch.
+This provides contrast with bulk refresh performance: individual refreshes make
+one API call per outdated object, while bulk refresh makes a single API call
+for all objects.
+The timing data reveals when the bulk refresh threshold optimization is
+beneficial.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
   if outdated(obj):
+    refresh_start = time.perf_counter()
     obj = get_attr(self, obj.id, **obj_kwargs)
+    refresh_elapsed = time.perf_counter() - refresh_start
+    logger.info(f"Individual refresh: {attr_name} id={obj.id} in "
+                f"{refresh_elapsed:.2f}s")
   yield obj
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
@@ -1548,5 +1603,4 @@ if total_count > 0:
         self.__cache[raw_submission.user_id] = lazy_submission
 
     self.__all_fetched = datetime.now()
-@
 
