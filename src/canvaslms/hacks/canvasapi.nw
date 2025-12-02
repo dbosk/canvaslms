@@ -917,9 +917,9 @@ The we must decorate both [[get_submission]] and [[get_submissions]].
 old_constructor = cls.__init__
 
 @functools.wraps(cls.__init__)
-def new_init(*args, **kwargs):
+def new_init(self, *args, **kwargs):
   <<extend class constructor for decorators>>
-  old_constructor(*args, **kwargs)
+  old_constructor(self, *args, **kwargs)
 
 cls.__init__ = new_init
 
@@ -934,7 +934,7 @@ cls.get_submission = new_get_submission
 get_submissions = cls.get_submissions
 
 @functools.wraps(cls.get_submissions)
-def new_get_submissions(self, **kwargs):
+def new_get_submissions(self, *args, **kwargs):
   <<return a list of all submissions>>
 
 cls.get_submissions = new_get_submissions
@@ -943,16 +943,17 @@ cls.get_submissions = new_get_submissions
 We decorate the method to get a specific submission, [[get_submission]].
 This way we can cache the submissions of users who have passed.
 Then we always return up-to-date submissions of students who are expected to 
-submit.
+update their submissions.
 For this, we first need a cache attribute.
 <<extend class constructor for decorators>>=
-args[0].__cache = {}
+self.__cache = {}
 @
 
-Now we can treat how we get an individual submission.
+Let's start with how we get an individual submission.
 We also want to add info messages to log cache hits and misses and their 
 timings.
 <<return submission of user>>=
+# canvasapi allows either User object or user ID.
 if isinstance(user, User):
   uid = user.id
 elif isinstance(user, int):
@@ -967,30 +968,44 @@ if "include" in kwargs:
 else:
   to_include = set()
 
-cache_status = ""
-if uid in self.__cache:
-  submission, included = self.__cache[uid]
-  if not to_include.issubset(set(included)):
-    cache_status = " (new include required)"
-    submission = None
-    to_include |= set(included)
-else:
-  cache_status = " (not found)"
-
-if submission and submission.grade in NOREFRESH_GRADES:
-  logger.info(f"Cache hit: submission user_id={uid}")
-elif submission and submission.grade not in NOREFRESH_GRADES:
-  if not cache_status:
-    cache_status = " (stale)"
-  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
+if must_refresh(uid, to_include, self.__cache):
   fetch_start = time.perf_counter()
   submission = get_submission(self, user, include=list(to_include))
   fetch_elapsed = time.perf_counter() - fetch_start
   submission._fetched_at = datetime.now()
   logger.info(f"Fetched submission user_id={uid} in {fetch_elapsed:.2f}s")
   self.__cache[uid] = (submission, to_include)
+else:
+  submission, _ = self.__cache[uid]
 
 return submission
+@ We also add the time of last fetch ([[._fetched_at]]), that way we don't need 
+to update all the time, but with short intervals (see the [[outdated]] 
+function).
+<<functions>>=
+def must_refresh(uid, to_include, cache):
+  """
+  Returns True if the submission needs refreshing based on kwargs.
+  """
+  cache_status = ""
+  if uid in cache:
+    submission, included = cache[uid]
+    if not to_include.issubset(set(included)):
+      cache_status = " (new include required)"
+      submission = None
+      to_include |= set(included)
+  else:
+    cache_status = " (not found)"
+
+  if submission:
+    if not outdated(submission):
+      logger.info(f"Cache hit: submission user_id={uid}")
+      return False
+    elif not cache_status:
+      cache_status = " (stale)"
+
+  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
+  return True
 @
 
 Now we can deal with [[get_submissions]].
@@ -998,7 +1013,7 @@ As we might call [[get_submission]] before any [[get_submissions]], we cannot
 rely on the cache as a check.
 We introduce a new attribute.
 <<extend class constructor for decorators>>=
-args[0].__all_fetched = False
+self.__all_fetched = None
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 <<return a list of all submissions>>=
@@ -1007,28 +1022,54 @@ if "include" in kwargs:
 else:
   to_include = set()
 
+# Collect everything to include from before.
+for _, included in self.__cache.values():
+  to_include |= included
+
 if self.__all_fetched:
   logger.info(f"Using cached submissions for assignment id={self.id}")
+  num_needs_refresh = 0
   for submission, included in self.__cache.values():
-    # Use the cached method above to trigger any individual refreshes.
-    self.get_submission(submission.user_id, include=list(to_include))
+    if must_refresh(submission.user_id, to_include, self.__cache):
+      num_needs_refresh += 1
+      if num_needs_refresh >= THRESHOLD_INDIVIDUAL_REFRESH:
+        break
+  if num_needs_refresh < THRESHOLD_INDIVIDUAL_REFRESH:
+    logger.info(f"Refreshing {num_needs_refresh} individual submissions "
+                f"for assignment id={self.id}")
+    for submission, _ in self.__cache.values():
+      # Use the cached method above to trigger any individual refreshes.
+      self.get_submission(submission.user_id, include=list(to_include))
+  else:
+    logger.info(f"Refreshing all submissions for assignment id={self.id} "
+                f"due to {num_needs_refresh} needing refresh")
+    <<bulk refresh all submissions>>
 else:
-  # Collect everything to include.
-  for _, included in self.__cache.values():
-    to_include |= included
 
   logger.info(f"Fetching all submissions for assignment id={self.id}")
-  start_fetch = time.perf_counter()
-  submissions = list(get_submissions(self, include=list(to_include)))
-  fetch_elapsed = time.perf_counter() - start_fetch
-  logger.info(f"Bulk refresh: {len(submissions)} submissions in "
-              f"{fetch_elapsed:.2f}s")
-
-  for submission in submissions:
-    self.__cache[submission.user_id] = (submission, to_include)
-
-  self.__all_fetched = datetime.now()
+  <<bulk refresh all submissions>>
 
 return [submission for submission, _ in self.__cache.values()]
+<<bulk refresh all submissions>>=
+start_fetch = time.perf_counter()
+submissions = list(get_submissions(self, include=list(to_include)))
+fetch_elapsed = time.perf_counter() - start_fetch
+logger.info(f"Bulk refresh: {len(submissions)} submissions in "
+            f"{fetch_elapsed:.2f}s")
+
+for submission in submissions:
+  submission._fetched_at = datetime.now()
+  self.__cache[submission.user_id] = (submission, to_include)
+
+self.__all_fetched = datetime.now()
+@
+
+Based on some tests, it takes Canvas roughly \si{3}{\second} to return all 
+submissions.
+It takes Canvas roughly \si{0.5}{\second} to return an individual submission.
+So if we have more than 6 submissions to refresh, it's better to refresh them 
+all at once.
+<<constants>>=
+THRESHOLD_INDIVIDUAL_REFRESH = 6
 @
 
