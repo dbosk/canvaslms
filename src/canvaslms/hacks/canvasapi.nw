@@ -20,7 +20,11 @@ from datetime import datetime, timedelta
 import functools
 import importlib
 import inspect
+import logging
+import time
 import sys
+
+logger = logging.getLogger(__name__)
 
 <<constants>>
 <<functions>>
@@ -472,30 +476,52 @@ For example:
 }
 \end{minted}
 <<return cached result or fetch from [[get_attr]]>>=
+import time
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 
 <<let [[id]] be the ID of the object to fetch>>
 
 try:
   obj, prev_kwargs = attr_cache[id]
+  cache_status = ""
 except KeyError:
   obj = None
   prev_kwargs = {}
+  cache_status = " (not found)"
 
-if obj and (must_update(prev_kwargs, kwargs) or outdated(obj)):
+if obj and must_update(prev_kwargs, kwargs):
   obj = None
+  cache_status = " (new kwargs required)"
+elif obj and outdated(obj):
+  obj = None
+  cache_status = " (stale)"
 
 if not obj:
+  fetch_start = time.perf_counter()
   obj = get_attr(self, *args, **kwargs)
+  fetch_elapsed = time.perf_counter() - fetch_start
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, kwargs)
+  logger.info(f"Cache miss{cache_status}: {attr_name} id={id} fetched in "
+              f"{fetch_elapsed:.2f}s")
+else:
+  logger.info(f"Cache hit: {attr_name} id={id}")
 
 return obj
 @
 
+We log cache hits and misses to measure caching effectiveness.
+Cache hits should be nearly instantaneous (microseconds), as we're just
+returning a cached object.
+Cache misses require API calls to Canvas, which typically take hundreds of
+milliseconds to seconds depending on network latency and server response time.
+This timing data helps identify whether caching is providing the expected
+performance benefits.
+
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
-We'll return to the [[outdated]] function later, that one determines from the 
+We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
 The [[get_*]] methods all take either an ID or an object as argument.
@@ -564,30 +590,62 @@ else:
 To fetch all again, we must merge the keyword arguments.
 This is done with the [[merge_kwargs]] function.
 Then we must add each object to the cache.
+
+We separately time the API call versus processing to identify bottlenecks.
+The API call time represents network latency and Canvas server response time,
+while processing time represents local cache updates and object manipulation.
+This helps distinguish between network bottlenecks and local processing
+overhead.
 <<fetch all and populate [[attr_cache]]>>=
+import time
+bulk_start = time.perf_counter()
+
 union_kwargs = merge_kwargs(
   [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
 
-for obj in get_attrs(self, *args, **union_kwargs):
+api_start = time.perf_counter()
+fetched_objs = list(get_attrs(self, *args, **union_kwargs))
+api_elapsed = time.perf_counter() - api_start
+
+process_start = time.perf_counter()
+for obj in fetched_objs:
   old_obj = attr_cache.get(obj.id, None)
   <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, union_kwargs)
+process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
+
+bulk_elapsed = time.perf_counter() - bulk_start
+logger.info(f"Bulk refresh: {len(fetched_objs)} {attr_name}s in "
+            f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
+            f"processing: {process_elapsed:.2f}s)")
 @
 
 Finally, when we want to return all the objects, we will yield them instead.
-It's more efficient to use a generator in this case, as that would make us 
+It's more efficient to use a generator in this case, as that would make us
 update when (if) needed.
-When we update an object, we should use the same keyword arguments as specified 
-in the cache---not the requested ones---because these will, at this point, be 
+When we update an object, we should use the same keyword arguments as specified
+in the cache---not the requested ones---because these will, at this point, be
 the largest possible set of keyword arguments.
+
+We log individual refresh timing to show the cost of updating stale cache
+entries without a full bulk fetch.
+This provides contrast with bulk refresh performance: individual refreshes make
+one API call per outdated object, while bulk refresh makes a single API call
+for all objects.
+The timing data reveals when the bulk refresh threshold optimization is
+beneficial.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
   if outdated(obj):
+    refresh_start = time.perf_counter()
     obj = get_attr(self, obj.id, **obj_kwargs)
+    refresh_elapsed = time.perf_counter() - refresh_start
+    logger.info(f"Individual refresh: {attr_name} id={obj.id} in "
+                f"{refresh_elapsed:.2f}s")
   yield obj
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
@@ -859,9 +917,9 @@ The we must decorate both [[get_submission]] and [[get_submissions]].
 old_constructor = cls.__init__
 
 @functools.wraps(cls.__init__)
-def new_init(*args, **kwargs):
+def new_init(self, *args, **kwargs):
   <<extend class constructor for decorators>>
-  old_constructor(*args, **kwargs)
+  old_constructor(self, *args, **kwargs)
 
 cls.__init__ = new_init
 
@@ -876,7 +934,7 @@ cls.get_submission = new_get_submission
 get_submissions = cls.get_submissions
 
 @functools.wraps(cls.get_submissions)
-def new_get_submissions(self, **kwargs):
+def new_get_submissions(self, *args, **kwargs):
   <<return a list of all submissions>>
 
 cls.get_submissions = new_get_submissions
@@ -885,14 +943,17 @@ cls.get_submissions = new_get_submissions
 We decorate the method to get a specific submission, [[get_submission]].
 This way we can cache the submissions of users who have passed.
 Then we always return up-to-date submissions of students who are expected to 
-submit.
+update their submissions.
 For this, we first need a cache attribute.
 <<extend class constructor for decorators>>=
-args[0].__cache = {}
+self.__cache = {}
 @
 
-Now we can treat how we get an individual submission.
+Let's start with how we get an individual submission.
+We also want to add info messages to log cache hits and misses and their 
+timings.
 <<return submission of user>>=
+# canvasapi allows either User object or user ID.
 if isinstance(user, User):
   uid = user.id
 elif isinstance(user, int):
@@ -907,17 +968,44 @@ if "include" in kwargs:
 else:
   to_include = set()
 
-if uid in self.__cache:
-  submission, included = self.__cache[uid]
-  if not to_include.issubset(set(included)):
-    submission = None
-    to_include |= set(included)
-
-if not submission or submission.grade not in NOREFRESH_GRADES:
+if must_refresh(uid, to_include, self.__cache):
+  fetch_start = time.perf_counter()
   submission = get_submission(self, user, include=list(to_include))
+  fetch_elapsed = time.perf_counter() - fetch_start
+  submission._fetched_at = datetime.now()
+  logger.info(f"Fetched submission user_id={uid} in {fetch_elapsed:.2f}s")
   self.__cache[uid] = (submission, to_include)
+else:
+  submission, _ = self.__cache[uid]
 
 return submission
+@ We also add the time of last fetch ([[._fetched_at]]), that way we don't need 
+to update all the time, but with short intervals (see the [[outdated]] 
+function).
+<<functions>>=
+def must_refresh(uid, to_include, cache):
+  """
+  Returns True if the submission needs refreshing based on kwargs.
+  """
+  cache_status = ""
+  if uid in cache:
+    submission, included = cache[uid]
+    if not to_include.issubset(set(included)):
+      cache_status = " (new include required)"
+      submission = None
+      to_include |= set(included)
+  else:
+    cache_status = " (not found)"
+
+  if submission:
+    if not outdated(submission):
+      logger.info(f"Cache hit: submission user_id={uid}")
+      return False
+    elif not cache_status:
+      cache_status = " (stale)"
+
+  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
+  return True
 @
 
 Now we can deal with [[get_submissions]].
@@ -925,7 +1013,7 @@ As we might call [[get_submission]] before any [[get_submissions]], we cannot
 rely on the cache as a check.
 We introduce a new attribute.
 <<extend class constructor for decorators>>=
-args[0].__all_fetched = False
+self.__all_fetched = None
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 <<return a list of all submissions>>=
@@ -934,18 +1022,54 @@ if "include" in kwargs:
 else:
   to_include = set()
 
-if self.__all_fetched:
-  for submission, included in self.__cache.values():
-    if not to_include.issubset(included) or \
-       submission.grade not in NOREFRESH_GRADES:
-      self.get_submission(submission.user_id, include=list(to_include))
-else:
-  for _, included in self.__cache.values():
-    to_include |= included
+# Collect everything to include from before.
+for _, included in self.__cache.values():
+  to_include |= included
 
-  for submission in get_submissions(self, **kwargs):
-    self.__cache[submission.user_id] = (submission, to_include)
+if self.__all_fetched:
+  logger.info(f"Using cached submissions for assignment id={self.id}")
+  num_needs_refresh = 0
+  for submission, included in self.__cache.values():
+    if must_refresh(submission.user_id, to_include, self.__cache):
+      num_needs_refresh += 1
+      if num_needs_refresh >= THRESHOLD_INDIVIDUAL_REFRESH:
+        break
+  if num_needs_refresh < THRESHOLD_INDIVIDUAL_REFRESH:
+    logger.info(f"Refreshing {num_needs_refresh} individual submissions "
+                f"for assignment id={self.id}")
+    for submission, _ in self.__cache.values():
+      # Use the cached method above to trigger any individual refreshes.
+      self.get_submission(submission.user_id, include=list(to_include))
+  else:
+    logger.info(f"Refreshing all submissions for assignment id={self.id} "
+                f"due to {num_needs_refresh} needing refresh")
+    <<bulk refresh all submissions>>
+else:
+
+  logger.info(f"Fetching all submissions for assignment id={self.id}")
+  <<bulk refresh all submissions>>
 
 return [submission for submission, _ in self.__cache.values()]
+<<bulk refresh all submissions>>=
+start_fetch = time.perf_counter()
+submissions = list(get_submissions(self, include=list(to_include)))
+fetch_elapsed = time.perf_counter() - start_fetch
+logger.info(f"Bulk refresh: {len(submissions)} submissions in "
+            f"{fetch_elapsed:.2f}s")
+
+for submission in submissions:
+  submission._fetched_at = datetime.now()
+  self.__cache[submission.user_id] = (submission, to_include)
+
+self.__all_fetched = datetime.now()
+@
+
+Based on some tests, it takes Canvas roughly \si{3}{\second} to return all 
+submissions.
+It takes Canvas roughly \si{0.5}{\second} to return an individual submission.
+So if we have more than 6 submissions to refresh, it's better to refresh them 
+all at once.
+<<constants>>=
+THRESHOLD_INDIVIDUAL_REFRESH = 6
 @
 
