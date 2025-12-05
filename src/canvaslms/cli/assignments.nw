@@ -34,12 +34,15 @@ import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 import csv
 import json
+import logging
 import os
 import pypandoc
 import re
 import rich.console
 import rich.markdown
 import sys
+
+logger = logging.getLogger(__name__)
 
 <<functions>>
 
@@ -91,6 +94,12 @@ def add_assignment_option(parser, ungraded=True, required=False, suppress_help=F
 
 def process_assignment_option(canvas, args):
   course_list = courses.process_course_option(canvas, args)
+  # If required filters were requested (set-dates passes required=True), ensure at least one provided.
+  if hasattr(args, 'assignment') and hasattr(args, 'assignment_group') and hasattr(args, 'module'):
+    if (args.assignment is None or args.assignment == '') and \
+       (args.assignment_group is None or args.assignment_group == '') and \
+       (args.module is None or args.module == ''):
+      raise canvaslms.cli.EmptyListError("At least one of -a, -A or -M must be specified")
   <<process options for selecting assignments to assignments list>>
   assignments_list = list(assignments_list)
   if not assignments_list:
@@ -158,20 +167,23 @@ if ungraded:
 <<add filter options: required or combinable>>
 @
 
-When filters are required, we maintain the mutually exclusive group to keep the
-interface simple.
-When filters are optional, we allow combination by adding them directly to the
-parser (not to a mutually exclusive group).
+When filters are required, we still allow combination; we only enforce that at
+least one of -a, -A or -M is specified. When filters are optional, all three can
+be combined exactly the same way. The difference is only the validation that at
+least one filter was provided.
 <<add filter options: required or combinable>>=
 if required:
-  filter_group = parser.add_mutually_exclusive_group(required=True)
-  filter_group.add_argument("-a", "--assignment",
+  # Required mode: allow combining filters; we just validate later that at least one was provided.
+  parser.add_argument("-a", "--assignment",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching assignment title or Canvas identifier")
-  filter_group.add_argument("-A", "--assignment-group",
+  parser.add_argument("-A", "--assignment-group",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching assignment group title or Canvas identifier")
-  filter_group.add_argument("-M", "--module",
+  parser.add_argument("-M", "--module",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching module title or Canvas identifier")
 else:
@@ -746,7 +758,13 @@ ungraded assignments.
 <<functions>>=
 def filter_assignments(assignments_containers, regex, ungraded=False):
   """Returns all assignments from assignments_container whose
-  title matches regex"""
+  title matches regex.
+
+  We normalize a missing regex (None or empty string) to '.*' to match all.
+  This handles required-filter contexts where -M/-A are used without -a.
+  """
+  if regex is None or regex == "":
+    regex = ".*"
   p = re.compile(regex)
   for assignment in list_assignments(assignments_containers, ungraded=ungraded):
     if p.search(assignment.name):
@@ -817,8 +835,7 @@ assignment_data = {}
 <<parse lock date argument>>
 
 if not assignment_data:
-  print("No date options provided. Use --due-at, --unlock-at, or --lock-at.", 
-        file=sys.stderr)
+  logger.error("No date options provided. Use --due-at, --unlock-at, or --lock-at.")
   return
 
 # Wrap the assignment data in the structure Canvas expects
@@ -834,23 +851,23 @@ to Canvas-compatible UTC timestamps.
 <<parse due date argument>>=
 if args.due_at is not None:
   try:
-    assignment_data['due_at'] = utils.parse_date(args.due_at)
+    assignment_data['due_at'] = canvaslms.cli.utils.parse_date(args.due_at)
   except ValueError as e:
-    print(f"Error parsing due date: {e}", file=sys.stderr)
+    logger.error(f"Error parsing due date: {e}")
     return
 <<parse unlock date argument>>=
 if args.unlock_at is not None:
   try:
-    assignment_data['unlock_at'] = utils.parse_date(args.unlock_at)
+    assignment_data['unlock_at'] = canvaslms.cli.utils.parse_date(args.unlock_at)
   except ValueError as e:
-    print(f"Error parsing unlock date: {e}", file=sys.stderr)
+    logger.error(f"Error parsing unlock date: {e}")
     return
 <<parse lock date argument>>=
 if args.lock_at is not None:
   try:
-    assignment_data['lock_at'] = utils.parse_date(args.lock_at)
+    assignment_data['lock_at'] = canvaslms.cli.utils.parse_date(args.lock_at)
   except ValueError as e:
-    print(f"Error parsing lock date: {e}", file=sys.stderr)
+    logger.error(f"Error parsing lock date: {e}")
     return
 @
 
@@ -860,19 +877,17 @@ Finally, we iterate through the selected assignments and update their dates
 using the Canvas API.
 <<update assignment dates>>=
 for assignment in assignment_list:
-  if args.verbose:
-    print(f"Updating assignment '{assignment.name}' (ID: {assignment.id})")
-    for field, value in assignment_data.items():
-      if value is None:
-        print(f"  Clearing {field}")
-      else:
-        print(f"  Setting {field} to {value}")
-  
+  logger.info(f"Updating assignment '{assignment.name}' (ID: {assignment.id})")
+  for field, value in assignment_data.items():
+    if value is None:
+      logger.info(f"  Clearing {field}")
+    else:
+      logger.info(f"  Setting {field} to {value}")
+
   try:
     assignment.edit(**updates)
-    if not args.verbose:
-      print(f"Updated dates for assignment '{assignment.name}'")
+    logger.info(f"Updated dates for assignment '{assignment.name}'")
   except Exception as e:
-    print(f"Error updating assignment '{assignment.name}' (ID: {assignment.id}): {e}", file=sys.stderr)
+    logger.error(f"Error updating assignment '{assignment.name}' (ID: {assignment.id}): {e}")
 @
 

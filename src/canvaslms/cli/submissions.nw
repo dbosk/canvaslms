@@ -26,11 +26,13 @@ import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
+import canvaslms.hacks.attachment_cache as attachment_cache
 
 import argparse
 import csv
-import difflib
+<<import [[difflib]]>>
 import json
+import logging
 import os
 import pathlib
 import subprocess
@@ -45,6 +47,8 @@ import tempfile
 import textwrap
 import urllib.request
 import webbrowser
+
+logger = logging.getLogger(__name__)
 
 <<constants>>
 <<functions>>
@@ -1168,10 +1172,30 @@ def convert_to_md(attachment: canvasapi.file.File,
 contents = convert_to_md(attachment, tmpdir)
 @
 
-The download is simple.
+We check if the attachment is already cached before downloading.
+If cached, we copy from the cache to avoid redundant network requests.
+Otherwise, we download the file and add it to the cache.
+
+This is particularly important for computing diffs between submission versions:
+if a student submits version N+1, we already have the attachments from versions
+N, N-1, \ldots cached locally, so we only need to download version N+1.
+
 <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>=
 outfile = tmpdir / attachment.filename
-attachment.download(outfile)
+cached_path = attachment_cache.get_cached_attachment(attachment.id)
+
+if cached_path:
+  # Use cached file - copy to temporary directory for processing
+  import shutil
+  shutil.copy(cached_path, outfile)
+else:
+  # Download and cache for future use
+  attachment.download(outfile)
+  attachment_cache.cache_attachment(attachment.id, outfile, {
+    'filename': attachment.filename,
+    'size': getattr(attachment, 'size', 0),
+    'content_type': getattr(attachment, 'content-type', 'application/octet-stream')
+  })
 @
 
 If the content type is text, we can just decode it and use it in a Markdown 
@@ -1355,6 +1379,17 @@ patterns in their revisions.
 The implementation handles parameter handling, content extraction from various
 submission types (text, quiz answers, file attachments), and unified diff
 generation.
+
+We will use the [[difflib.unified_diff]] function to generate the diffs.
+Or, if available, use [[patiencediff]] package instead.
+Fortunately, [[patiencediff]] has the same interface as [[difflib]], so we can 
+just try to import it first, and fall back to [[difflib]] if not available.
+<<import [[difflib]]>>=
+try:
+  import patiencediff as difflib
+except ImportError:
+  import difflib
+@
 
 \subsection{Adding diff parameter to [[format_submission]]}
 
@@ -2071,15 +2106,16 @@ else:
 
 \subsection{Verbose output when setting grades}
 
-If verbose mode is enabled, we want to print out what's happening.
+We log grading operations at INFO level, which is visible with the [[-v]]
+flag. This provides detailed feedback about what's happening during grading
+operations without cluttering normal output.
 <<if verbose, print [[submission]] and [[results]] to stdout>>=
-if args.verbose:
-  print(f"Grading {submission.assignment.course.course_code} "
-        f"{submission.assignment.name} for {submission.user.name}")
-  if args.grade:
-    print(f"  Setting grade to: {args.grade}")
-  if args.message:
-    print(f"  Adding comment: {args.message}")
+logger.info(f"Grading {submission.assignment.course.course_code} "
+             f"{submission.assignment.name} for {submission.user.name}")
+if args.grade:
+  logger.info(f"  Setting grade to: {args.grade}")
+if args.message:
+  logger.info(f"  Adding comment: {args.message}")
 @
 
 \subsection{Error handling for grading operations}

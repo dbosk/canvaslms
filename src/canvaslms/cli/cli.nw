@@ -34,6 +34,7 @@ import argcomplete, argparse
 from canvasapi import Canvas
 import canvaslms.cli.login
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -42,6 +43,7 @@ from urllib3.util.retry import Retry
 
 <<modules>>
 
+logger = logging.getLogger(__name__)
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
 <<classes and exceptions>>
@@ -61,19 +63,22 @@ class EmptyListError(Exception):
   pass
 @
 
-We will use the function [[err]] for errors and [[warn]] for warnings, both 
+We will use the function [[err]] for errors and [[warn]] for warnings, both
 inspired by err(3) and warn(3) in the BSD world.
 These will be available as [[canvaslms.cli.err]] and [[canvaslms.cli.warn]].
+
+These functions now use Python's logging module internally, so all error and
+warning messages benefit from proper logging infrastructure (levels, formatting,
+redirection).
 <<functions>>=
 def err(rc, msg):
-  """Prints msg to stderr, prints a stack trace and
-  exits with rc as return code"""
-  print(f"{sys.argv[0]}: error: {msg}", file=sys.stderr)
+  """Logs error msg and exits with rc as return code"""
+  logger.error(f"{sys.argv[0]}: {msg}")
   sys.exit(rc)
 
 def warn(msg):
-  """Prints msg to stderr"""
-  print(f"{sys.argv[0]}: {msg}", file=sys.stderr)
+  """Logs warning msg"""
+  logger.warning(f"{sys.argv[0]}: {msg}")
 @
 
 
@@ -166,9 +171,58 @@ subp = argp.add_subparsers(
 argcomplete.autocomplete(argp)
 args = argp.parse_args()
 
+<<configure logging based on verbose flag>>
+
 config = read_configuration(args.config_file)
 
 <<run subcommands>>
+@
+
+We configure Python's logging module based on the [[-v]]/[[--verbose]] and
+[[-q]]/[[--quiet]] flags.
+These flags can be stacked to control verbosity precisely, mapping to the
+complete Python logging hierarchy.
+
+We calculate a \emph{net verbosity} by subtracting the quiet count from the
+verbose count.
+This allows [[-v]] and [[-q]] to offset each other naturally:
+for example, [[-vv -q]] gives net verbosity 1, equivalent to [[-v]].
+
+The net verbosity maps to logging levels as follows:
+\begin{description}
+\item[Net $\leq -3$ ([[-qqq]] or more)] Completely silent (no output)
+\item[Net $= -2$ ([[-qq]])] [[CRITICAL]] messages only
+\item[Net $= -1$ ([[-q]])] [[ERROR]] and [[CRITICAL]] messages
+\item[Net $= 0$ (default)] [[WARNING]], [[ERROR]], and [[CRITICAL]] messages
+\item[Net $= 1$ ([[-v]])] [[INFO]], [[WARNING]], [[ERROR]], and [[CRITICAL]]
+\item[Net $= 2$ ([[-vv]])] [[DEBUG]] and all above
+\item[Net $\geq 3$ ([[-vvv]] or more)] [[NOTSET]]\,---\,everything including library internals
+\end{description}
+
+<<configure logging based on verbose flag>>=
+net_verbosity = args.verbose - args.quiet
+
+if net_verbosity <= -3:
+  # -qqq or more: completely silent
+  logging.basicConfig(level=logging.CRITICAL + 1, format='[%(levelname)s] %(message)s')
+elif net_verbosity == -2:
+  # -qq: critical only
+  logging.basicConfig(level=logging.CRITICAL, format='[%(levelname)s] %(message)s')
+elif net_verbosity == -1:
+  # -q: errors and critical
+  logging.basicConfig(level=logging.ERROR, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 0:
+  # default: warnings and above
+  logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 1:
+  # -v: info and above
+  logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 2:
+  # -vv: debug and above
+  logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
+else:  # net_verbosity >= 3
+  # -vvv or more: everything including library debug messages
+  logging.basicConfig(level=logging.NOTSET, format='[%(levelname)s] %(message)s')
 @
 
 
@@ -196,12 +250,17 @@ argp.add_argument("-d", "--delimiter",
   default="\t",
   help="Sets the delimiter for CSV output, the default is the tab character")
 argp.add_argument("-q", "--quiet",
-  action="store_true",
-  help="Suppress error messages, report only exit codes")
+  action="count",
+  default=0,
+  help="Decrease verbosity: -q=ERROR only, -qq=CRITICAL only, -qqq=silent")
+argp.add_argument("-v", "--verbose",
+  action="count",
+  default=0,
+  help="Increase verbosity: -v=INFO, -vv=DEBUG, -vvv=all library debug")
 @
 
 
-\subsection{The subcommands}
+\subsection{Logging in and setting up Canvas}
 
 Each subcommand will have its own module in the package.
 Each such module must have a function [[add_command]] that takes the [[subp]] 
@@ -210,7 +269,6 @@ For example, the [[login]] command:
 The \texttt{login} command is located in [[canvaslms.cli.login]].
 <<modules>>=
 import canvaslms.cli.login
-import canvaslms.cli.utils
 <<add subcommands to subp>>=
 canvaslms.cli.login.add_command(subp)
 @
@@ -238,8 +296,9 @@ else:
 if args.func:
   try:
     args.func(config, canvas, args)
+    <<save canvas to cache after command>>
   except EmptyListError as e:
-    if not args.quiet:
+    if args.quiet == 0:
       err(1, str(e))
     else:
       sys.exit(1)
@@ -253,11 +312,13 @@ So we don't want to uncessarily create it (and fail) if the command is
 args.func == canvaslms.cli.login.login_command
 @
 
-To create the Canvas object, we must read the credentials using the 
+To create the Canvas object, we must read the credentials using the
 [[canvaslms.cli.login]] module.
-If there are no credentials, we give an error about running the [[login]] 
+If there are no credentials, we give an error about running the [[login]]
 command first.
-Otherwise, we create the Canvas object named [[canvas]].
+Otherwise, we try to load the Canvas object from the persistent cache.
+If that fails (cache doesn't exist or is invalid), we create a new Canvas
+object and will save it to the cache after the command completes.
 <<create canvas object>>=
 hostname, token = canvaslms.cli.login.load_credentials(config)
 
@@ -266,9 +327,11 @@ if not (hostname and token):
 
 <<add https to hostname if needed>>
 
-canvas = Canvas(hostname, token)
+<<try to load canvas from cache>>
 
-<<configure retry policy for canvas>>
+if not canvas:
+  canvas = Canvas(hostname, token)
+  <<configure retry policy for canvas>>
 @
 
 Now, we must specify a URL to the Canvas server, not actually a hostname.
@@ -280,7 +343,26 @@ if "://" not in hostname:
 @
 
 
-\subsection{Configuring retry policy with exponential backoff}
+\subsubsection{Loading Canvas from cache}
+
+Before creating a new Canvas object from scratch, we try to load it from the
+persistent cache.
+This can significantly speed up commands by reusing previously fetched course
+data, assignments, users, and submissions.
+<<try to load canvas from cache>>=
+canvas = canvaslms.cli.cache.load_canvas_cache(token, hostname)
+@
+
+After successfully executing a command, we save the Canvas object to the cache
+for future use.
+We only save if the canvas object was actually used (not [[None]]).
+<<save canvas to cache after command>>=
+if canvas:
+  canvaslms.cli.cache.save_canvas_cache(canvas, token, hostname)
+@
+
+
+\subsubsection{Configuring retry policy with exponential backoff}
 
 The Canvas API, like most web services, can experience transient failures due to
 network issues, temporary server overload, or rate limiting.
@@ -384,6 +466,9 @@ adapter = HTTPAdapter(max_retries=retry_strategy)
 canvas._Canvas__requester._session.mount("https://", adapter)
 canvas._Canvas__requester._session.mount("http://", adapter)
 @
+
+
+\subsection{Adding the subcommands}
 
 Finally, let's add all the commands.
 
@@ -489,10 +574,26 @@ import canvaslms.cli.quizzes
 canvaslms.cli.quizzes.add_command(subp)
 @
 
-If we use the [[quizzes]] command with a CSV file, we don't need to log in to 
+If we use the [[quizzes]] command with a CSV file, we don't need to log in to
 Canvas.
-So we don't want to unnecessarily create the Canvas object in that case (and 
+So we don't want to unnecessarily create the Canvas object in that case (and
 possibly fail).
 <<we don't need [[canvas]]>>=
 or (args.func == canvaslms.cli.quizzes.analyse_command
     and args.csv)
+@
+
+\paragraph{The \texttt{cache} command}
+
+The \texttt{cache} command is located in [[canvaslms.cli.cache]].
+<<modules>>=
+import canvaslms.cli.cache
+<<add subcommands to subp>>=
+canvaslms.cli.cache.add_command(subp)
+@
+
+The [[cache]] command doesn't need a Canvas object, as it just manages the
+cache files.
+So we don't want to unnecessarily create the Canvas object in that case.
+<<we don't need [[canvas]]>>=
+or args.func == canvaslms.cli.cache.clear_command
