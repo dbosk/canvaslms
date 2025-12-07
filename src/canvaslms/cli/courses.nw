@@ -31,18 +31,10 @@ def add_command(subp):
 \section{Testing course filtering and selection}
 \label{sec:courses:testing}
 
-Before examining the implementation, let's understand how course filtering should work through test examples.
 Course filtering is fundamental to the entire [[canvaslms]] tool---almost every command starts by selecting courses.
+Tests are distributed throughout this chapter, appearing immediately after each implementation to verify correctness.
 
-The course filtering functions must handle:
-\begin{enumerate}
-\item Regex matching against course names, codes, and IDs
-\item Empty results (raising [[EmptyListError]])
-\item Multiple matches vs single matches
-\item Edge cases like None values and special regex characters
-\end{enumerate}
-
-\subsection{Testing philosophy: the shared option pattern}
+\subsection{Testing philosophy}
 
 The [[add_course_option()]] and [[process_course_option()]] functions follow a critical pattern used throughout this codebase:
 \begin{description}
@@ -53,17 +45,9 @@ The [[add_course_option()]] and [[process_course_option()]] functions follow a c
 This pattern appears in [[courses]], [[assignments]], [[users]], [[submissions]], and more.
 By testing it thoroughly here, we establish confidence in the entire codebase.
 
-\subsection{Variation theory in course filtering tests}
+\subsection{Test structure}
 
-We apply variation theory to course filtering:
-\begin{description}
-\item[Invariant] The regex matching logic and EmptyListError behavior
-\item[Variant] Input patterns (names, codes, IDs), number of courses, regex patterns (simple, complex, special characters)
-\end{description}
-
-Let's see the expected behavior through concrete examples.
-
-\subsubsection{Test structure}
+We define the test file structure early, but the actual test implementations appear after their corresponding functionality:
 
 <<test courses.py>>=
 """
@@ -87,12 +71,139 @@ from canvaslms.cli.courses import (
 <<test process course option>>
 @
 
-\subsubsection{Testing filter\_courses}
+The [[courses]] subcommand takes one positional argument, that is a regular
+expression for filtering the courses.
+<<add arguments>>=
+courses_parser.add_argument("regex",
+  default=".*", nargs="?",
+  help="Regex for filtering courses, default: '.*'")
+@
 
-The [[filter_courses()]] function is a generator that yields courses matching a regex pattern.
-It searches three attributes: [[name]], [[course_code]], and [[id]].
+We also take an option [[--all]] to show all courses.
+By default we just want to show the courses that haven't ended.
+<<add arguments>>=
+courses_parser.add_argument("-a", "--all",
+  action="store_true", default=False,
+  help="List all courses, by default list only current courses.")
+@
 
-Let's verify it handles various matching scenarios:
+We add the option [[--id]] to show the Canvas ID of the course.
+<<add arguments>>=
+courses_parser.add_argument("-i", "--id",
+  action="store_true", default=False,
+  help="Include Canvas ID of the course as first column.")
+@ We also want to add [[--ladok]] or [[-l]] to show the integration ID for
+LADOK.
+<<add arguments>>=
+courses_parser.add_argument("-l", "--ladok",
+  action="store_true", default=False,
+  help="Include LADOK ID (integration ID) of the course as "
+       "first (or second, with -i) column.")
+@
+
+
+\section{Producing a list of courses, [[courses_command]]}%
+\label{list-courses-function}
+
+We provide the function~[[courses_command]] which will be called by the main 
+argument parser.
+<<functions>>=
+def courses_command(config, canvas, args):
+  """Prints the users list of courses in CSV format to stdout"""
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+
+  course_list = filter_courses(canvas, args.regex)
+
+  <<filter out current courses>>
+
+  <<check for empty course list>>
+
+  for course in course_list:
+    <<write course data to output>>
+@ We will cover the set up and processing of the options in the following 
+sections.
+
+
+\section{Filter the list of courses}
+
+We want to filter the courses depending on the [[--all]] argument.
+<<filter out current courses>>=
+if not args.all:
+  is_current_course = lambda x: \
+      x.start_at is None \
+      or (x.end_at is None and \
+        arrow.get(x.start_at)-arrow.now().shift(years=-1) \
+          > datetime.timedelta(0)) \
+      or x.end_at is not None and arrow.get(x.end_at) > arrow.now()
+  course_list = filter(is_current_course, course_list)
+@
+
+Now we need to check if the course list is empty and warn the user.
+<<check for empty course list>>=
+# Convert to list and check if empty
+course_list = list(course_list)
+if not course_list:
+  raise canvaslms.cli.EmptyListError("No courses found matching the criteria.")
+@
+
+\section{Output the course data}
+
+We have the course data in a [[course]] object.
+Now we just print the interesting data about it.
+<<columns in CSV output>>=
+<canvas ID>* <SIS course ID>* <course-code> <course-name> \
+  <start-time> <end-time>
+<<write course data to output>>=
+row = []
+if args.id:
+  row.append(course.id)
+if args.ladok:
+  row.append(course.sis_course_id)
+row.extend([
+  course.course_code,
+  course.name,
+  course.start_at,
+  course.end_at
+])
+output.writerow(row)
+@
+
+
+\section{Find course based on course code}%
+\label{search-course-code}
+\label{filter-courses}
+
+We provide the function~[[filter_courses]] that will filter the list of courses
+based on a regular expression~[[regex]].
+<<functions>>=
+def filter_courses(canvas, regex):
+  courses = canvas.get_courses()
+  p = re.compile(regex)
+  for course in courses:
+    <<yield course matching regex>>
+@
+
+We will match a course if the [[regex]] (compiled into [[p]]) will match any of
+the attributes [[course_code]] or [[name]] of a course.
+<<yield course matching regex>>=
+if p.search(course.name):
+  yield course
+elif p.search(course.course_code):
+  yield course
+elif p.search(str(course.id)):
+  yield course
+@
+
+\subsection{Verifying course filtering}
+
+Now let's verify this filtering logic works correctly across various scenarios.
+The [[filter_courses()]] function is a generator that yields courses matching a regex pattern, searching three attributes: [[name]], [[course_code]], and [[id]].
+
+We apply variation theory to these tests:
+\begin{description}
+\item[Invariant] The regex matching logic across all three attributes
+\item[Variant] Input patterns (names, codes, IDs), number of matches, regex complexity
+\end{description}
 
 <<test filter courses>>=
 class TestFilterCourses:
@@ -183,14 +294,59 @@ class TestFilterCourses:
         assert result[0].name == "C++ Programming (Advanced)"
 @
 
-Notice how these tests demonstrate the flexibility of regex matching: you can search by name, code, or ID, and the function handles all three uniformly.
-This is powerful for users---they don't need to remember which field they're searching.
+These tests demonstrate the flexibility of regex matching: users can search by name, code, or ID, and the function handles all three uniformly.
+This is powerful---users don't need to remember which field they're searching.
 
-\subsubsection{Testing process\_course\_option}
+
+\section{Selecting a course on the command line}
+
+We provide one way to identify a course: by matching the course code, course
+name or Canvas ID against a regular expression.
+
+We provide a function that can be used by other subcommands to set up options
+for selecting a course in this way.
+If the [[required]] option is specified, we want the course option to be
+required (\eg for the [[grade]] command).
+<<functions>>=
+def add_course_option(parser, required=False, suppress_help=False):
+  """Adds the -c option to argparse parser to filter out courses
+
+  Args:
+    parser: The argparse parser to add options to
+    required: Whether the course option should be required
+    suppress_help: If True, hide this option from help output (default: False)
+  """
+  <<set up options for selecting courses>>
+
+def process_course_option(canvas, args):
+  """Processes -c option, returns a list of courses"""
+  <<process options for selecting courses>>
+  course_list = list(course_list)
+  if not course_list:
+    raise canvaslms.cli.EmptyListError("No courses found matching the criteria.")
+  return course_list
+@
+
+We need a course, so we require a regular expression that matches the course
+title, course code or Canvas identifier.
+<<set up options for selecting courses>>=
+parser.add_argument("-c", "--course", required=required, default=".*",
+  help=argparse.SUPPRESS if suppress_help else
+    "Regex matching courses on title, course code or Canvas ID, "
+    "default: '.*'")
+@
+
+When we check for either of these arguments, we set up a list of courses,
+[[course_list]], that will be returned.
+<<process options for selecting courses>>=
+course_list = filter_courses(canvas, args.course)
+@ We use the [[filter_courses]] from \cref{filter-courses}.
+
+\subsection{Verifying process\_course\_option}
 
 The [[process_course_option()]] function wraps [[filter_courses()]] and adds critical error handling: it raises [[EmptyListError]] when no courses match.
-
 This is essential behavior---many commands depend on having at least one course selected.
+
 Let's verify this error handling works correctly:
 
 <<test process course option>>=
@@ -253,187 +409,12 @@ class TestProcessCourseOption:
             process_course_option(mock_canvas, args)
 @
 
-\subsection{Why these tests matter}
-
-Course filtering is the foundation of the [[canvaslms]] tool.
-Testing it thoroughly ensures:
-
+These tests validate that the [[add_XXX_option]]/[[process_XXX_option]] pattern works reliably:
 \begin{enumerate}
 \item \textbf{Reliable command execution:} Commands won't fail mysteriously when courses don't match
 \item \textbf{Clear error messages:} Users get [[EmptyListError]] with helpful message, not generic exceptions
 \item \textbf{Flexible matching:} Users can search by any identifying attribute
-\item \textbf{Pattern validation:} The [[add_XXX_option]]/[[process_XXX_option]] pattern is proven reliable
 \end{enumerate}
 
 Since this pattern is reused for assignments, users, submissions, and more, confidence in these tests extends across the entire codebase.
-
-By presenting tests before implementation, we clearly establish the contract: what inputs the functions accept, what outputs they produce, and what errors they raise.
-
-The [[courses]] subcommand takes one positional argument, that is a regular 
-expression for filtering the courses.
-<<add arguments>>=
-courses_parser.add_argument("regex",
-  default=".*", nargs="?",
-  help="Regex for filtering courses, default: '.*'")
-@
-
-We also take an option [[--all]] to show all courses.
-By default we just want to show the courses that haven't ended.
-<<add arguments>>=
-courses_parser.add_argument("-a", "--all",
-  action="store_true", default=False,
-  help="List all courses, by default list only current courses.")
-@
-
-
-\section{Producing a list of courses, [[courses_command]]}%
-\label{list-courses-function}
-
-We provide the function~[[courses_command]] which will be called by the main 
-argument parser.
-<<functions>>=
-def courses_command(config, canvas, args):
-  """Prints the users list of courses in CSV format to stdout"""
-  output = csv.writer(sys.stdout, delimiter=args.delimiter)
-
-  course_list = filter_courses(canvas, args.regex)
-
-  <<filter out current courses>>
-
-  <<check for empty course list>>
-
-  for course in course_list:
-    <<write course data to output>>
-@ We will cover the set up and processing of the options in the following 
-sections.
-
-
-\section{Filter the list of courses}
-
-We want to filter the courses depending on the [[--all]] argument.
-<<filter out current courses>>=
-if not args.all:
-  is_current_course = lambda x: \
-      x.start_at is None \
-      or (x.end_at is None and \
-        arrow.get(x.start_at)-arrow.now().shift(years=-1) \
-          > datetime.timedelta(0)) \
-      or x.end_at is not None and arrow.get(x.end_at) > arrow.now()
-  course_list = filter(is_current_course, course_list)
-@
-
-Now we need to check if the course list is empty and warn the user.
-<<check for empty course list>>=
-# Convert to list and check if empty
-course_list = list(course_list)
-if not course_list:
-  raise canvaslms.cli.EmptyListError("No courses found matching the criteria.")
-@
-
-\section{Output the course data}
-
-We have the course data in a [[course]] object.
-Now we just print the interesting data about it.
-<<columns in CSV output>>=
-<canvas ID>* <SIS course ID>* <course-code> <course-name> \
-  <start-time> <end-time>
-<<write course data to output>>=
-row = []
-if args.id:
-  row.append(course.id)
-if args.ladok:
-  row.append(course.sis_course_id)
-row.extend([
-  course.course_code,
-  course.name,
-  course.start_at,
-  course.end_at
-])
-output.writerow(row)
-@
-
-We add the option [[--id]] to show the Canvas ID of the course.
-<<add arguments>>=
-courses_parser.add_argument("-i", "--id",
-  action="store_true", default=False,
-  help="Include Canvas ID of the course as first column.")
-@ We also want to add [[--ladok]] or [[-l]] to show the integration ID for 
-LADOK.
-<<add arguments>>=
-courses_parser.add_argument("-l", "--ladok",
-  action="store_true", default=False,
-  help="Include LADOK ID (integration ID) of the course as "
-       "first (or second, with -i) column.")
-@
-
-
-\section{Find course based on course code}%
-\label{search-course-code}
-\label{filter-courses}
-
-We provide the function~[[filter_courses]] that will filter the list of courses 
-based on a regular expression~[[regex]].
-<<functions>>=
-def filter_courses(canvas, regex):
-  courses = canvas.get_courses()
-  p = re.compile(regex)
-  for course in courses:
-    <<yield course matching regex>>
-@
-
-We will match a course if the [[regex]] (compiled into [[p]]) will match any of 
-the attributes [[course_code]] or [[name]] of a course.
-<<yield course matching regex>>=
-if p.search(course.name):
-  yield course
-elif p.search(course.course_code):
-  yield course
-elif p.search(str(course.id)):
-  yield course
-@
-
-
-\section{Selecting a course on the command line}
-
-We provide one way to identify a course: by matching the course code, course 
-name or Canvas ID against a regular expression.
-
-We provide a function that can be used by other subcommands to set up options 
-for selecting a course in this way.
-If the [[required]] option is specified, we want the course option to be 
-required (\eg for the [[grade]] command).
-<<functions>>=
-def add_course_option(parser, required=False, suppress_help=False):
-  """Adds the -c option to argparse parser to filter out courses
-
-  Args:
-    parser: The argparse parser to add options to
-    required: Whether the course option should be required
-    suppress_help: If True, hide this option from help output (default: False)
-  """
-  <<set up options for selecting courses>>
-
-def process_course_option(canvas, args):
-  """Processes -c option, returns a list of courses"""
-  <<process options for selecting courses>>
-  course_list = list(course_list)
-  if not course_list:
-    raise canvaslms.cli.EmptyListError("No courses found matching the criteria.")
-  return course_list
-@
-
-We need a course, so we require a regular expression that matches the course 
-title, course code or Canvas identifier.
-<<set up options for selecting courses>>=
-parser.add_argument("-c", "--course", required=required, default=".*",
-  help=argparse.SUPPRESS if suppress_help else
-    "Regex matching courses on title, course code or Canvas ID, "
-    "default: '.*'")
-@
-
-When we check for either of these arguments, we set up a list of courses, 
-[[course_list]], that will be returned.
-<<process options for selecting courses>>=
-course_list = filter_courses(canvas, args.course)
-@ We use the [[filter_courses]] from \cref{filter-courses}.
 

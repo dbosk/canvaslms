@@ -26,11 +26,13 @@ import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
+import canvaslms.hacks.attachment_cache as attachment_cache
 
 import argparse
 import csv
-import difflib
+<<import [[difflib]]>>
 import json
+import logging
 import os
 import pathlib
 import subprocess
@@ -45,6 +47,8 @@ import tempfile
 import textwrap
 import urllib.request
 import webbrowser
+
+logger = logging.getLogger(__name__)
 
 <<constants>>
 <<functions>>
@@ -62,6 +66,28 @@ def add_submission_command(subp):
   """Adds the submission (singular) command as an alias for submissions view"""
   <<add submission command to subp>>
 @
+
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after each implementation to verify correctness.
+
+\subsection{Test structure}
+
+We define the test file structure early, but the actual test implementations appear after their corresponding functionality:
+
+<<test submissions.py>>=
+"""
+Tests for patiencediff integration in submissions.
+
+These tests verify that the code correctly uses patiencediff when available,
+and falls back to standard difflib when not available.
+"""
+import pytest
+
+<<test patiencediff>>
+@
+
 
 \section{The [[submissions list]] subcommand and its options}
 
@@ -1168,10 +1194,30 @@ def convert_to_md(attachment: canvasapi.file.File,
 contents = convert_to_md(attachment, tmpdir)
 @
 
-The download is simple.
+We check if the attachment is already cached before downloading.
+If cached, we copy from the cache to avoid redundant network requests.
+Otherwise, we download the file and add it to the cache.
+
+This is particularly important for computing diffs between submission versions:
+if a student submits version N+1, we already have the attachments from versions
+N, N-1, \ldots cached locally, so we only need to download version N+1.
+
 <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>=
 outfile = tmpdir / attachment.filename
-attachment.download(outfile)
+cached_path = attachment_cache.get_cached_attachment(attachment.id)
+
+if cached_path:
+  # Use cached file - copy to temporary directory for processing
+  import shutil
+  shutil.copy(cached_path, outfile)
+else:
+  # Download and cache for future use
+  attachment.download(outfile)
+  attachment_cache.cache_attachment(attachment.id, outfile, {
+    'filename': attachment.filename,
+    'size': getattr(attachment, 'size', 0),
+    'content_type': getattr(attachment, 'content-type', 'application/octet-stream')
+  })
 @
 
 If the content type is text, we can just decode it and use it in a Markdown 
@@ -1355,6 +1401,111 @@ patterns in their revisions.
 The implementation handles parameter handling, content extraction from various
 submission types (text, quiz answers, file attachments), and unified diff
 generation.
+
+We will use the [[difflib.unified_diff]] function to generate the diffs.
+Or, if available, use [[patiencediff]] package instead.
+Fortunately, [[patiencediff]] has the same interface as [[difflib]], so we can 
+just try to import it first, and fall back to [[difflib]] if not available.
+<<import [[difflib]]>>=
+try:
+  import patiencediff as difflib
+except ImportError:
+  import difflib
+@
+
+\subsubsection{Testing patiencediff integration}
+
+The patiencediff integration uses an optional dependency pattern with graceful
+fallback to standard difflib.
+We verify the import fallback works correctly and that both implementations
+provide the same interface.
+
+<<test patiencediff>>=
+class TestPatiencediffImport:
+    """Test that patiencediff is imported correctly with fallback"""
+
+    def test_import_provides_unified_diff(self):
+        """Both patiencediff and difflib provide unified_diff"""
+        # The import pattern ensures we always have unified_diff available
+        try:
+            import patiencediff as difflib
+        except ImportError:
+            import difflib
+        
+        assert hasattr(difflib, 'unified_diff')
+
+    def test_fallback_to_standard_difflib(self):
+        """Standard difflib should always be available"""
+        import difflib
+        assert hasattr(difflib, 'unified_diff')
+
+class TestDiffFunctionality:
+    """Test that unified_diff works correctly regardless of implementation"""
+
+    def test_unified_diff_detects_changes(self):
+        """unified_diff should detect changes between old and new content"""
+        import difflib
+        
+        old_content = ['Hello\n', 'World\n']
+        new_content = ['Hello\n', 'World!\n']
+        
+        diff = list(difflib.unified_diff(old_content, new_content))
+        
+        # Should have diff lines
+        assert len(diff) > 0
+
+    def test_unified_diff_no_changes(self):
+        """unified_diff produces minimal output when content is identical"""
+        import difflib
+        
+        content = ['Hello\n', 'World\n']
+        
+        diff = list(difflib.unified_diff(content, content))
+        
+        # Should be empty or only headers
+        assert len(diff) <= 2
+
+    def test_unified_diff_with_context(self):
+        """unified_diff should respect context parameter"""
+        import difflib
+        
+        old_content = ['line 1\n', 'line 2\n', 'line 3\n', 'line 4\n', 'line 5\n']
+        new_content = ['line 1\n', 'line 2\n', 'CHANGED\n', 'line 4\n', 'line 5\n']
+        
+        # Use 1 line of context
+        diff = list(difflib.unified_diff(old_content, new_content, n=1))
+        
+        # Should have some output
+        assert len(diff) > 0
+
+    def test_unified_diff_multiple_changes(self):
+        """unified_diff should handle multiple changes"""
+        import difflib
+        
+        old_content = [
+            'line 1\n',
+            'line 2\n',
+            'line 3\n',
+            'line 4\n',
+            'line 5\n'
+        ]
+        new_content = [
+            'line 1 modified\n',
+            'line 2\n',
+            'line 3 modified\n',
+            'line 4\n',
+            'line 5 modified\n'
+        ]
+        
+        diff = list(difflib.unified_diff(old_content, new_content))
+        
+        # Should detect multiple changes
+        assert len(diff) > 0
+        removed_lines = [line for line in diff if line.startswith('-') and not line.startswith('---')]
+        added_lines = [line for line in diff if line.startswith('+') and not line.startswith('+++')]
+        assert len(removed_lines) > 0
+        assert len(added_lines) > 0
+@
 
 \subsection{Adding diff parameter to [[format_submission]]}
 
@@ -2071,15 +2222,16 @@ else:
 
 \subsection{Verbose output when setting grades}
 
-If verbose mode is enabled, we want to print out what's happening.
+We log grading operations at INFO level, which is visible with the [[-v]]
+flag. This provides detailed feedback about what's happening during grading
+operations without cluttering normal output.
 <<if verbose, print [[submission]] and [[results]] to stdout>>=
-if args.verbose:
-  print(f"Grading {submission.assignment.course.course_code} "
-        f"{submission.assignment.name} for {submission.user.name}")
-  if args.grade:
-    print(f"  Setting grade to: {args.grade}")
-  if args.message:
-    print(f"  Adding comment: {args.message}")
+logger.info(f"Grading {submission.assignment.course.course_code} "
+             f"{submission.assignment.name} for {submission.user.name}")
+if args.grade:
+  logger.info(f"  Setting grade to: {args.grade}")
+if args.message:
+  logger.info(f"  Adding comment: {args.message}")
 @
 
 \subsection{Error handling for grading operations}

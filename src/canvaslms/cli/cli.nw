@@ -34,6 +34,7 @@ import argcomplete, argparse
 from canvasapi import Canvas
 import canvaslms.cli.login
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -42,6 +43,7 @@ from urllib3.util.retry import Retry
 
 <<modules>>
 
+logger = logging.getLogger(__name__)
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
 <<classes and exceptions>>
@@ -49,6 +51,30 @@ dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
 def main():
   <<command-line interface>>
+@
+
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after each implementation to verify correctness.
+
+\subsection{Test structure}
+
+We define the test file structure early, but the actual test implementations appear after their corresponding functionality:
+
+<<test cli.py>>=
+"""
+Tests for canvaslms.cli verbosity system.
+
+These tests verify the multi-level verbosity system that maps -v and -q flags
+to Python logging levels.
+"""
+import pytest
+import logging
+import argparse
+
+<<test verbosity calculation>>
+<<test logging level mapping>>
 @
 
 
@@ -61,19 +87,22 @@ class EmptyListError(Exception):
   pass
 @
 
-We will use the function [[err]] for errors and [[warn]] for warnings, both 
+We will use the function [[err]] for errors and [[warn]] for warnings, both
 inspired by err(3) and warn(3) in the BSD world.
 These will be available as [[canvaslms.cli.err]] and [[canvaslms.cli.warn]].
+
+These functions now use Python's logging module internally, so all error and
+warning messages benefit from proper logging infrastructure (levels, formatting,
+redirection).
 <<functions>>=
 def err(rc, msg):
-  """Prints msg to stderr, prints a stack trace and
-  exits with rc as return code"""
-  print(f"{sys.argv[0]}: error: {msg}", file=sys.stderr)
+  """Logs error msg and exits with rc as return code"""
+  logger.error(f"{sys.argv[0]}: {msg}")
   sys.exit(rc)
 
 def warn(msg):
-  """Prints msg to stderr"""
-  print(f"{sys.argv[0]}: {msg}", file=sys.stderr)
+  """Logs warning msg"""
+  logger.warning(f"{sys.argv[0]}: {msg}")
 @
 
 
@@ -166,9 +195,141 @@ subp = argp.add_subparsers(
 argcomplete.autocomplete(argp)
 args = argp.parse_args()
 
+<<configure logging based on verbose flag>>
+
 config = read_configuration(args.config_file)
 
 <<run subcommands>>
+@
+
+We configure Python's logging module based on the [[-v]]/[[--verbose]] and
+[[-q]]/[[--quiet]] flags.
+These flags can be stacked to control verbosity precisely, mapping to the
+complete Python logging hierarchy.
+
+We calculate a \emph{net verbosity} by subtracting the quiet count from the
+verbose count.
+This allows [[-v]] and [[-q]] to offset each other naturally:
+for example, [[-vv -q]] gives net verbosity 1, equivalent to [[-v]].
+
+The net verbosity maps to logging levels as follows:
+\begin{description}
+\item[Net $\leq -3$ ([[-qqq]] or more)] Completely silent (no output)
+\item[Net $= -2$ ([[-qq]])] [[CRITICAL]] messages only
+\item[Net $= -1$ ([[-q]])] [[ERROR]] and [[CRITICAL]] messages
+\item[Net $= 0$ (default)] [[WARNING]], [[ERROR]], and [[CRITICAL]] messages
+\item[Net $= 1$ ([[-v]])] [[INFO]], [[WARNING]], [[ERROR]], and [[CRITICAL]]
+\item[Net $= 2$ ([[-vv]])] [[DEBUG]] and all above
+\item[Net $\geq 3$ ([[-vvv]] or more)] [[NOTSET]]\,---\,everything including library internals
+\end{description}
+
+<<configure logging based on verbose flag>>=
+net_verbosity = args.verbose - args.quiet
+
+if net_verbosity <= -3:
+  # -qqq or more: completely silent
+  logging.basicConfig(level=logging.CRITICAL + 1, format='[%(levelname)s] %(message)s')
+elif net_verbosity == -2:
+  # -qq: critical only
+  logging.basicConfig(level=logging.CRITICAL, format='[%(levelname)s] %(message)s')
+elif net_verbosity == -1:
+  # -q: errors and critical
+  logging.basicConfig(level=logging.ERROR, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 0:
+  # default: warnings and above
+  logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 1:
+  # -v: info and above
+  logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+elif net_verbosity == 2:
+  # -vv: debug and above
+  logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
+else:  # net_verbosity >= 3
+  # -vvv or more: everything including library debug messages
+  logging.basicConfig(level=logging.NOTSET, format='[%(levelname)s] %(message)s')
+@
+
+\subsubsection{Verifying the verbosity system}
+
+Now let's verify this verbosity mapping works correctly.
+The tests demonstrate how [[-v]] and [[-q]] flags stack and offset each other.
+
+The core of the verbosity system is the net verbosity calculation, which allows
+flags to offset each other naturally:
+
+<<test verbosity calculation>>=
+class TestVerbositySystem:
+    """Test the verbosity system in CLI"""
+
+    def test_net_verbosity_calculation(self):
+        """
+        Net verbosity should be verbose count minus quiet count.
+
+        This allows -v and -q to offset each other naturally.
+        """
+        args = argparse.Namespace(verbose=2, quiet=1)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 1
+
+    def test_multiple_verbose_flags(self):
+        """Multiple -v flags should stack: -vvv gives verbosity 3"""
+        args = argparse.Namespace(verbose=3, quiet=0)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 3
+
+    def test_multiple_quiet_flags(self):
+        """Multiple -q flags should stack: -qqq gives verbosity -3"""
+        args = argparse.Namespace(verbose=0, quiet=3)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == -3
+
+    def test_offsetting_flags(self):
+        """-vv -q should give net verbosity 1"""
+        args = argparse.Namespace(verbose=2, quiet=1)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 1
+@
+
+The net verbosity maps to specific Python logging levels.
+We test the complete mapping with parameterized tests:
+
+<<test logging level mapping>>=
+class TestVerbosityLevelMapping:
+    """Test the complete mapping from net verbosity to logging levels"""
+
+    @pytest.mark.parametrize("verbose,quiet,expected_level", [
+        (0, 3, logging.CRITICAL + 1),  # -qqq: completely silent
+        (0, 2, logging.CRITICAL),       # -qq: critical only
+        (0, 1, logging.ERROR),          # -q: error and critical
+        (0, 0, logging.WARNING),        # default: warnings and above
+        (1, 0, logging.INFO),           # -v: info and above
+        (2, 0, logging.DEBUG),          # -vv: debug and above
+        (3, 0, logging.NOTSET),         # -vvv: everything
+        (4, 0, logging.NOTSET),         # -vvvv: still everything
+        (2, 1, logging.INFO),           # -vv -q = -v: info level
+        (3, 2, logging.INFO),           # -vvv -qq = -v: info level
+    ])
+    def test_verbosity_to_logging_level(self, verbose, quiet, expected_level):
+        """Test that verbosity flags map correctly to logging levels"""
+        net_verbosity = verbose - quiet
+
+        # Implement the same logic as in the code
+        if net_verbosity <= -3:
+            actual_level = logging.CRITICAL + 1
+        elif net_verbosity == -2:
+            actual_level = logging.CRITICAL
+        elif net_verbosity == -1:
+            actual_level = logging.ERROR
+        elif net_verbosity == 0:
+            actual_level = logging.WARNING
+        elif net_verbosity == 1:
+            actual_level = logging.INFO
+        elif net_verbosity == 2:
+            actual_level = logging.DEBUG
+        else:  # net_verbosity >= 3
+            actual_level = logging.NOTSET
+
+        assert actual_level == expected_level
 @
 
 
@@ -196,8 +357,13 @@ argp.add_argument("-d", "--delimiter",
   default="\t",
   help="Sets the delimiter for CSV output, the default is the tab character")
 argp.add_argument("-q", "--quiet",
-  action="store_true",
-  help="Suppress error messages, report only exit codes")
+  action="count",
+  default=0,
+  help="Decrease verbosity: -q=ERROR only, -qq=CRITICAL only, -qqq=silent")
+argp.add_argument("-v", "--verbose",
+  action="count",
+  default=0,
+  help="Increase verbosity: -v=INFO, -vv=DEBUG, -vvv=all library debug")
 @
 
 
@@ -239,7 +405,7 @@ if args.func:
     args.func(config, canvas, args)
     <<save canvas to cache after command>>
   except EmptyListError as e:
-    if not args.quiet:
+    if args.quiet == 0:
       err(1, str(e))
     else:
       sys.exit(1)

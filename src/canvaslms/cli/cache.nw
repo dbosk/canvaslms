@@ -1,4 +1,5 @@
-\chapter{Cache persistence}
+\chapter{Cache persistence and management}
+\chaterprecis{Written by Dan-Claude and reviewed by Daniel Bosk.}
 
 We want to persist the Canvas object between runs to avoid redundant API calls.
 The Canvas object contains cached data for courses, assignments, users, and
@@ -10,6 +11,9 @@ However, the Canvas object contains sensitive data (course information, student
 data, etc.), so we must encrypt it before storing to disk.
 We use authenticated encryption to ensure both confidentiality and integrity.
 
+Additionally, we cache submission attachments to avoid re-downloading files.
+This is managed separately from the Canvas object cache.
+
 \section{Design overview}
 
 The cache persistence mechanism works as follows:
@@ -19,7 +23,7 @@ The cache persistence mechanism works as follows:
 \item If not, we create a new Canvas object from the API.
 \item After each command completes, we save the Canvas object to the cache.
 \item The cache is stored in the user's cache directory (from [[appdirs]]).
-\item We provide a [[cache clear]] subcommand to explicitly remove the cache.
+\item We provide [[cache clear]] and [[cache clear-attachments]] subcommands.
 \end{enumerate}
 
 The key derivation works as follows:
@@ -38,10 +42,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet, InvalidToken
 import hashlib
+import logging
 import os
 import pickle
 import pathlib
+import time
 
+import canvaslms.hacks.attachment_cache as attachment_cache
+
+logger = logging.getLogger(__name__)
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
 <<functions>>
@@ -57,9 +66,16 @@ The salt is derived from the hostname to ensure different keys for different
 Canvas instances.
 This prevents someone from reusing a decryption key across different Canvas
 servers.
+
+We log the key derivation time because PBKDF2 with 100,000 iterations is
+computationally expensive (typically 100--200ms).
+This adds latency to every cache save and load operation, which is a necessary
+security cost to prevent brute-force attacks on the cache encryption.
 <<functions>>=
 def derive_key(token, hostname):
   """Derives a Fernet key from the Canvas token and hostname"""
+  start = time.perf_counter()
+
   # Use hostname as salt (hashed to get consistent 16 bytes)
   salt = hashlib.sha256(hostname.encode()).digest()[:16]
 
@@ -71,6 +87,10 @@ def derive_key(token, hostname):
     iterations=100000,
   )
   key = base64.urlsafe_b64encode(kdf.derive(token.encode()))
+
+  elapsed = time.perf_counter() - start
+  logger.info(f"Key derivation: {elapsed:.2f}s (PBKDF2 100k iterations)")
+
   return key
 @
 
@@ -105,19 +125,34 @@ If the cache directory doesn't exist, we create it first.
 def save_canvas_cache(canvas, token, hostname):
   """Saves the Canvas object to encrypted cache"""
   try:
+    save_start = time.perf_counter()
+
     # Derive encryption key
     key = derive_key(token, hostname)
     fernet = Fernet(key)
 
     # Pickle and encrypt
+    pickle_start = time.perf_counter()
     pickled = pickle.dumps(canvas)
+    pickle_elapsed = time.perf_counter() - pickle_start
+    pickle_size = len(pickled)
+
+    encrypt_start = time.perf_counter()
     encrypted = fernet.encrypt(pickled)
+    encrypt_elapsed = time.perf_counter() - encrypt_start
 
     # Write to cache file
     cache_path = get_cache_path(hostname)
     <<create cache directory if needed>>
+    write_start = time.perf_counter()
     with open(cache_path, "wb") as f:
       f.write(encrypted)
+    write_elapsed = time.perf_counter() - write_start
+
+    save_elapsed = time.perf_counter() - save_start
+    logger.info(f"Canvas cache save: {save_elapsed:.2f}s total "
+                 f"(pickle: {pickle_elapsed:.2f}s/{pickle_size/1024:.1f}KB, "
+                 f"encrypt: {encrypt_elapsed:.2f}s, write: {write_elapsed:.2f}s)")
   except Exception:
     # If saving fails, silently continue
     # (cache is optional, don't break the command)
@@ -153,17 +188,32 @@ In all these cases, the correct behavior is to create a fresh Canvas object.
 def load_canvas_cache(token, hostname):
   """Loads the Canvas object from encrypted cache, returns None if unavailable"""
   try:
+    load_start = time.perf_counter()
+
     # Derive encryption key
     key = derive_key(token, hostname)
     fernet = Fernet(key)
 
     # Read and decrypt
     cache_path = get_cache_path(hostname)
+    read_start = time.perf_counter()
     with open(cache_path, "rb") as f:
       encrypted = f.read()
+    read_elapsed = time.perf_counter() - read_start
+    encrypted_size = len(encrypted)
 
+    decrypt_start = time.perf_counter()
     pickled = fernet.decrypt(encrypted)
+    decrypt_elapsed = time.perf_counter() - decrypt_start
+
+    unpickle_start = time.perf_counter()
     canvas = pickle.loads(pickled)
+    unpickle_elapsed = time.perf_counter() - unpickle_start
+
+    load_elapsed = time.perf_counter() - load_start
+    logger.info(f"Canvas cache load: {load_elapsed:.2f}s total "
+                 f"(read: {read_elapsed:.2f}s/{encrypted_size/1024:.1f}KB, "
+                 f"decrypt: {decrypt_elapsed:.2f}s, unpickle: {unpickle_elapsed:.2f}s)")
 
     return canvas
   except (FileNotFoundError, InvalidToken, pickle.UnpicklingError, Exception):
@@ -187,21 +237,24 @@ def clear_cache(hostname):
 @
 
 
-\subsection{The cache command}
+\section{The cache command and subcommands}
 
-The [[cache]] subcommand provides control over the cache.
-Currently, it only supports [[clear]], but we could add other operations in the
-future (e.g., [[cache status]] to show cache size and age).
+The [[cache]] command provides control over the various caches.
+We provide subcommands for different cache management operations:
+\begin{description}
+\item[[cache clear]] Clears the encrypted Canvas object cache
+\item[[cache clear-attachments]] Removes old cached attachment files
+\end{description}
+
 <<functions>>=
 def add_command(subp):
   """Adds the cache command to argparse parser"""
   cache_parser = subp.add_parser(
     "cache",
-    help="Manage the Canvas object cache",
+    help="Manage caches",
     description="""
-Manages the persistent cache of Canvas data. The cache stores previously
-fetched courses, assignments, users, and submissions to speed up subsequent
-commands. The cache is encrypted using your Canvas token.
+Manages the persistent caches used by canvaslms. This includes the encrypted
+Canvas object cache and the attachment file cache.
 """
   )
 
@@ -211,13 +264,24 @@ commands. The cache is encrypted using your Canvas token.
     required=True
   )
 
-  # cache clear command
-  clear_parser = cache_subp.add_parser(
-    "clear",
-    help="Clear the cached Canvas data"
-  )
-  clear_parser.set_defaults(func=clear_command)
+  <<add cache clear subcommand>>
+  <<add cache clear-attachments subcommand>>
+@
 
+\subsection{The cache clear subcommand}
+
+The [[cache clear]] subcommand removes the encrypted Canvas object cache.
+This forces a fresh fetch of all Canvas data on the next run.
+
+<<add cache clear subcommand>>=
+clear_parser = cache_subp.add_parser(
+  "clear",
+  help="Clear the cached Canvas data"
+)
+clear_parser.set_defaults(func=clear_command)
+@
+
+<<functions>>=
 def clear_command(config, canvas, args):
   """Clears the Canvas cache"""
   import canvaslms.cli.login
@@ -231,7 +295,88 @@ def clear_command(config, canvas, args):
     hostname = f"https://{hostname}"
 
   if clear_cache(hostname):
-    print(f"Cache cleared for {hostname}")
+    logger.info(f"Cache cleared for {hostname}")
   else:
-    print(f"No cache found for {hostname}")
+    logger.info(f"No cache found for {hostname}")
 @
+
+\subsection{The cache clear-attachments subcommand}
+
+The [[cache clear-attachments]] subcommand removes cached attachment files that
+haven't been accessed recently.
+This helps manage disk space without requiring users to manually locate and
+delete cache files.
+
+The subcommand accepts an [[--older-than-days]] option (default: 90 days) to
+control how aggressively files are removed.
+A shorter period frees more space but requires more re-downloads; a longer
+period keeps more files but uses more disk space.
+
+<<add cache clear-attachments subcommand>>=
+clear_attachments_parser = cache_subp.add_parser("clear-attachments",
+  help="Remove old cached attachment files",
+  description="""
+  Removes cached attachment files that haven't been accessed in the specified
+  number of days. This helps manage disk space while keeping frequently-used
+  files available.
+
+  Cached attachments are stored in a platform-specific cache directory and use
+  content-addressed storage (files are identified by SHA-256 hash). This means
+  identical files submitted by different students or in different submission
+  versions are stored only once.
+
+  The cleanup process:
+  1. Identifies attachments not accessed within the time window
+  2. Removes their index entries
+  3. Removes orphaned data files no longer referenced by any index entry
+  4. Reports statistics about files removed and space freed
+  """)
+clear_attachments_parser.add_argument("--older-than-days",
+  type=int,
+  default=90,
+  help="Remove files not accessed in this many days (default: 90)")
+clear_attachments_parser.set_defaults(func=clear_attachments_command)
+@
+
+<<functions>>=
+def clear_attachments_command(config, canvas, args):
+  """Removes old cached attachments and reports statistics"""
+  max_age = args.older_than_days
+
+  print(f"Removing cached attachments not accessed in {max_age} days...")
+
+  stats = attachment_cache.cleanup_old_attachments(max_age_days=max_age)
+
+  files_removed = stats["files_removed"]
+  bytes_freed = stats["bytes_freed"]
+
+  # Convert bytes to human-readable format
+  if bytes_freed < 1024:
+    size_str = f"{bytes_freed} bytes"
+  elif bytes_freed < 1024 * 1024:
+    size_str = f"{bytes_freed / 1024:.1f} KB"
+  elif bytes_freed < 1024 * 1024 * 1024:
+    size_str = f"{bytes_freed / (1024 * 1024):.1f} MB"
+  else:
+    size_str = f"{bytes_freed / (1024 * 1024 * 1024):.2f} GB"
+
+  if files_removed == 0:
+    print(f"No files older than {max_age} days found.")
+  else:
+    print(f"Removed {files_removed} file(s), freed {size_str}.")
+@
+
+\section{Future extensions}
+
+This module can be extended with additional cache management commands:
+
+\begin{description}
+\item[[cache stats]] Display statistics about cache usage (number of files,
+  total size, oldest/newest files)
+\item[[cache list]] List all cached attachments with details
+\item[[cache clear-all]] Remove all caches (attachments, pickles, etc.)
+\item[[cache show-location]] Display the cache directory path
+\end{description}
+
+The subcommand structure makes these additions straightforward---just add new
+subparsers in new chunks.

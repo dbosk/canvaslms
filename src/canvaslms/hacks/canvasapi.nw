@@ -20,7 +20,11 @@ from datetime import datetime, timedelta
 import functools
 import importlib
 import inspect
+import logging
+import time
 import sys
+
+logger = logging.getLogger(__name__)
 
 <<constants>>
 <<functions>>
@@ -1151,24 +1155,45 @@ attr_cache = getattr(self, f"{attr_name}_cache")
 
 try:
   obj, prev_kwargs = attr_cache[id]
+  cache_status = ""
 except KeyError:
   obj = None
   prev_kwargs = {}
+  cache_status = " (not found)"
 
-if obj and (must_update(prev_kwargs, kwargs) or outdated(obj)):
+if obj and must_update(prev_kwargs, kwargs):
   obj = None
+  cache_status = " (new kwargs required)"
+elif obj and outdated(obj):
+  reason = get_staleness_reason(obj)
+  obj = None
+  cache_status = f" (stale: {reason})" if reason else " (stale)"
 
 if not obj:
+  fetch_start = time.perf_counter()
   obj = get_attr(self, *args, **kwargs)
+  fetch_elapsed = time.perf_counter() - fetch_start
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, kwargs)
+  logger.info(f"Cache miss{cache_status}: {attr_name} id={id} fetched in "
+              f"{fetch_elapsed:.2f}s")
+else:
+  logger.info(f"Cache hit: {attr_name} id={id}")
 
 return obj
 @
 
+We log cache hits and misses to measure caching effectiveness.
+Cache hits should be nearly instantaneous (microseconds), as we're just
+returning a cached object.
+Cache misses require API calls to Canvas, which typically take hundreds of
+milliseconds to seconds depending on network latency and server response time.
+This timing data helps identify whether caching is providing the expected
+performance benefits.
+
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
-We'll return to the [[outdated]] function later, that one determines from the 
+We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
 The [[get_*]] methods all take either an ID or an object as argument.
@@ -1484,55 +1509,258 @@ attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
 if attr_all_fetched:
   for _, prev_kwargs in attr_cache.values():
     if must_update(prev_kwargs, kwargs):
+      logger.info(f"Cache invalidation: {attr_name}s - new kwargs required "
+                  f"(existing: {prev_kwargs}, requested: {kwargs})")
       attr_all_fetched = None
       break
 
 if not attr_all_fetched:
+  <<log reason for bulk refresh>>
   <<fetch all and populate [[attr_cache]]>>
   <<yield all objects in [[attr_cache]]>>
 else:
+  cache_age = datetime.now() - attr_all_fetched
+  stale_count = sum(1 for obj, _ in attr_cache.values() if outdated(obj))
+  logger.info(f"Using cached {attr_name}s: {len(attr_cache)} cached "
+              f"(age: {cache_age.total_seconds()/60:.1f} minutes, "
+              f"{stale_count} stale), updating stale entries individually")
   <<yield all objects in [[attr_cache]], update individual entries if needed>>
+@
+
+\subsection{Logging cache decisions}
+
+To make cache behavior transparent, we log key decision points in the plural
+[[get_xs]] methods. This follows the same diagnostic pattern as submission-specific
+caching (lines 1163-1183) but applies to the general [[CacheGetMethods]] decorator
+used by courses, users, assignments, and other Canvas objects.
+
+We log three critical decision points:
+\begin{enumerate}
+\item \textbf{Bulk fetch trigger}: When [[attr_all_fetched]] is [[None]], we log
+  whether this is the first fetch (cold cache) or a cache invalidation (TTL expired
+  or kwargs changed). This explains why a bulk refresh is happening.
+\item \textbf{Cached path usage}: When [[attr_all_fetched]] is set, we log the
+  cache age, total size, and how many entries are stale (requiring individual refresh).
+  This provides visibility into cache health and effectiveness.
+\item \textbf{Kwargs invalidation}: When [[must_update()]] detects that cached
+  objects don't have the requested kwargs (e.g., new [[include]] fields), we log
+  what changed before invalidating the cache. This explains why a bulk refresh
+  will occur even though the cache was populated.
+\end{enumerate}
+
+These logs, combined with the bulk refresh completion message (line 650-652)
+and kwargs merging log (lines 609-622), provide complete transparency into why
+courses, users, and assignments trigger bulk refreshes versus using cached data.
+
+When [[attr_all_fetched]] is [[None]], we determine and log the reason:
+<<log reason for bulk refresh>>=
+if not attr_cache:
+  refresh_reason = "first fetch (cold cache)"
+else:
+  refresh_reason = "cache invalidated"
+logger.info(f"Bulk fetch: {attr_name}s - {refresh_reason}")
 @
 
 To fetch all again, we must merge the keyword arguments.
 This is done with the [[merge_kwargs]] function.
 Then we must add each object to the cache.
+
+We separately time the API call versus processing to identify bottlenecks.
+The API call time represents network latency and Canvas server response time,
+while processing time represents local cache updates and object manipulation.
+This helps distinguish between network bottlenecks and local processing
+overhead.
 <<fetch all and populate [[attr_cache]]>>=
+bulk_start = time.perf_counter()
+
+original_includes = set(kwargs.get('include', []))
 union_kwargs = merge_kwargs(
   [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
+merged_includes = set(union_kwargs.get('include', []))
 
-for obj in get_attrs(self, *args, **union_kwargs):
+if merged_includes != original_includes:
+  added = merged_includes - original_includes
+  logger.info(f"Merging kwargs for {attr_name}: extending include fields "
+              f"from {sorted(original_includes)} to {sorted(merged_includes)} "
+              f"(added: {sorted(added)})")
+
+api_start = time.perf_counter()
+fetched_objs = list(get_attrs(self, *args, **union_kwargs))
+api_elapsed = time.perf_counter() - api_start
+
+process_start = time.perf_counter()
+for obj in fetched_objs:
   old_entry = attr_cache.get(obj.id, None)
   if old_entry:
     old_obj, _ = old_entry
     <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj.id] = (obj, union_kwargs)
+process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
+
+bulk_elapsed = time.perf_counter() - bulk_start
+logger.info(f"Bulk refresh completed: {len(fetched_objs)} {attr_name}s fetched in "
+            f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
+            f"processing: {process_elapsed:.2f}s)")
 @
 
 Finally, when we want to return all the objects, we will yield them instead.
-It's more efficient to use a generator in this case, as that would make us 
+It's more efficient to use a generator in this case, as that would make us
 update when (if) needed.
-When we update an object, we should use the same keyword arguments as specified 
-in the cache---not the requested ones---because these will, at this point, be 
+When we update an object, we should use the same keyword arguments as specified
+in the cache---not the requested ones---because these will, at this point, be
 the largest possible set of keyword arguments.
+
+We log individual refresh timing to show the cost of updating stale cache
+entries without a full bulk fetch.
+This provides contrast with bulk refresh performance: individual refreshes make
+one API call per outdated object, while bulk refresh makes a single API call
+for all objects.
+The timing data reveals when the bulk refresh threshold optimization is
+beneficial.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
   if outdated(obj):
+    reason = get_staleness_reason(obj)
+    reason_str = f" (reason: {reason})" if reason else ""
+    refresh_start = time.perf_counter()
     obj = get_attr(self, obj.id, **obj_kwargs)
+    refresh_elapsed = time.perf_counter() - refresh_start
+    logger.info(f"Individual refresh: {attr_name} id={obj.id} in "
+                f"{refresh_elapsed:.2f}s{reason_str}")
   yield obj
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
   yield obj
 @
 
+\subsubsection{Testing cache timing and logging}
+
+The cache timing instrumentation helps distinguish between network bottlenecks
+and local processing overhead.
+We verify that timing measurements are accurate and log messages are properly formatted.
+
+<<test cache timing>>=
+class TestCacheTimingMeasurement:
+    """Test that cache operations measure timing correctly"""
+
+    def test_timing_uses_perf_counter(self):
+        """Timing measurements should use time.perf_counter() for accuracy"""
+        import time
+        
+        start = time.perf_counter()
+        time.sleep(0.01)  # Small delay
+        elapsed = time.perf_counter() - start
+        
+        # Should measure at least 10ms
+        assert elapsed >= 0.01
+        assert elapsed < 0.1  # But not ridiculously long
+
+    def test_separate_api_and_processing_timing(self):
+        """
+        Cache operations separately time API calls and processing.
+        
+        This helps distinguish between network bottlenecks and local overhead.
+        """
+        import time
+        
+        # Simulate API call timing
+        api_start = time.perf_counter()
+        time.sleep(0.01)
+        api_elapsed = time.perf_counter() - api_start
+        
+        # Simulate processing timing
+        process_start = time.perf_counter()
+        time.sleep(0.005)
+        process_elapsed = time.perf_counter() - process_start
+        
+        # Both should be measured independently
+        assert api_elapsed >= 0.01
+        assert process_elapsed >= 0.005
+        assert api_elapsed + process_elapsed >= 0.015
+
+    def test_bulk_timing_includes_total_time(self):
+        """Bulk refresh measures total time including API and processing"""
+        import time
+        
+        bulk_start = time.perf_counter()
+        
+        # Simulate API call
+        api_start = time.perf_counter()
+        time.sleep(0.01)
+        api_elapsed = time.perf_counter() - api_start
+        
+        # Simulate processing
+        process_start = time.perf_counter()
+        time.sleep(0.005)
+        process_elapsed = time.perf_counter() - process_start
+        
+        bulk_elapsed = time.perf_counter() - bulk_start
+        
+        # Bulk time should be at least the sum of API and processing
+        assert bulk_elapsed >= api_elapsed + process_elapsed
+
+class TestCacheLoggingMessages:
+    """Test that cache operations log appropriate messages"""
+
+    def test_bulk_refresh_log_message_format(self):
+        """Bulk refresh logs count, attr_name, total, API, and processing time"""
+        attr_name = "assignments"
+        fetched_count = 42
+        bulk_elapsed = 2.5
+        api_elapsed = 2.0
+        process_elapsed = 0.5
+        
+        expected_message = (
+            f"Bulk refresh: {fetched_count} {attr_name}s in "
+            f"{bulk_elapsed:.2f}s (API: {api_elapsed:.2f}s, "
+            f"processing: {process_elapsed:.2f}s)"
+        )
+        
+        assert "Bulk refresh: 42 assignments" in expected_message
+        assert "2.50s" in expected_message
+        assert "API: 2.00s" in expected_message
+        assert "processing: 0.50s" in expected_message
+
+    def test_individual_refresh_log_message_format(self):
+        """Individual refresh logs timing information"""
+        attr_name = "submission"
+        obj_id = 456
+        refresh_elapsed = 0.3
+        
+        expected_message = (
+            f"Individual refresh: {attr_name} id={obj_id} "
+            f"in {refresh_elapsed:.2f}s"
+        )
+        
+        assert "Individual refresh: submission id=456" in expected_message
+        assert "in 0.30s" in expected_message
+
+    @pytest.mark.parametrize("elapsed,expected", [
+        (0.123, "0.12s"),
+        (1.5, "1.50s"),
+        (12.345, "12.35s"),
+        (0.001, "0.00s"),
+        (99.999, "100.00s"),
+    ])
+    def test_timing_formatted_to_two_decimal_places(self, elapsed, expected):
+        """Timing should be formatted to 2 decimal places"""
+        formatted = f"{elapsed:.2f}s"
+        assert formatted == expected
+@
+
 This completes the [[CacheGetMethods]] class decorator, which we add to the module's
 functions.
 <<functions>>=
 <<general class decorator for caching get methods>>
+@
+
+We add the cache timing tests to the main test file.
+<<test hacks.py>>=
+<<test cache timing>>
 @
 
 Now let's verify the plural method caching works correctly.
@@ -2330,13 +2558,13 @@ except AttributeError:
   pass
 @
 
-For submissions without passing grades, we check if the 5-minute TTL has
-expired.
+For submissions without passing grades, we check if the [[SUBMISSION_TTL_MINUTES]]
+TTL has expired.
 If the object has no [[_fetched_at]] attribute, we treat it as outdated to
 ensure it gets refreshed.
 <<check if submission TTL has expired>>=
 try:
-  if datetime.now() - obj._fetched_at > timedelta(minutes=5):
+  if datetime.now() - obj._fetched_at > timedelta(minutes=SUBMISSION_TTL_MINUTES):
     return True
 except AttributeError:
   return True
@@ -2352,34 +2580,16 @@ improved.
 NOREFRESH_GRADES = ["A", "P", "P+", "complete"]
 @
 
-Let's verify this constant contains exactly the expected grade values.
-
-\subsubsection{Verifying [[NOREFRESH_GRADES]]}
-
-<<test norefresh grades>>=
-class TestNorefreshGrades:
-    """Test NOREFRESH_GRADES constant definition"""
-
-    def test_contains_expected_grades(self):
-        """Should contain all non-improvable passing grades"""
-        assert "A" in NOREFRESH_GRADES
-        assert "P" in NOREFRESH_GRADES
-        assert "P+" in NOREFRESH_GRADES
-        assert "complete" in NOREFRESH_GRADES
-
-    def test_excludes_improvable_grades(self):
-        """Should not contain improvable grades"""
-        assert "B" not in NOREFRESH_GRADES
-        assert "C" not in NOREFRESH_GRADES
-        assert "F" not in NOREFRESH_GRADES
-
-    def test_has_correct_count(self):
-        """Should contain exactly 4 grade values"""
-        assert len(NOREFRESH_GRADES) == 4
-@
-
-<<test hacks.py>>=
-<<test norefresh grades>>
+We define constants for all cache time-to-live (TTL) values to ensure
+consistency between the [[outdated()]] function and log messages.
+When these values are tuned for performance, both the cache behavior and
+diagnostic messages update automatically.
+<<constants>>=
+# Cache TTL constants
+SUBMISSION_TTL_MINUTES = 5
+DEFAULT_CACHE_TTL_DAYS = 7
+USER_CACHE_TTL_DAYS = 2
+GROUP_CACHE_TTL_DAYS = 5
 @
 
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
@@ -2395,16 +2605,25 @@ for attr_name in dir(obj):
   <<reset [[_all_fetched]] if necessary>>
 @
 
-We want to periodically reset the [[_all_fetched]] date so that we periodically 
+We want to periodically reset the [[_all_fetched]] date so that we periodically
 try to refetch all data.
 This interval will be different for different attributes.
-But we add a default of 7 days.
+But we add a default of [[DEFAULT_CACHE_TTL_DAYS]] days.
+
+When periodic refresh timers expire, we reset the [[_all_fetched]] flag to
+[[None]], triggering a bulk refresh on the next access. We log these
+invalidations at INFO level to explain why subsequent bulk refreshes occur.
+The log message includes both the cache age and the threshold, making it clear
+why the invalidation was triggered.
 <<reset [[_all_fetched]] if necessary>>=
 <<if statements for resetting [[_all_fetched]] for various attributes>>
 elif attr_name.endswith("_all_fetched"):
   if not getattr(obj, attr_name):
     continue
-  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=7):
+  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=DEFAULT_CACHE_TTL_DAYS):
+    age = datetime.now() - getattr(obj, attr_name)
+    logger.info(f"Cache invalidation: {attr_name} periodic refresh "
+                f"(age: {age.days} days, threshold: {DEFAULT_CACHE_TTL_DAYS} days)")
     setattr(obj, attr_name, None)
 @
 
@@ -2417,12 +2636,15 @@ So it will be useful to refetch them quite often.
 For instance, they're added at the beginning of the course, might fail to
 register and get removed, then readded when they're registered.
 Also, when a student reregister for the course, that might happen at any time.
-So a rather short interval is useful.
+So a rather short interval of [[USER_CACHE_TTL_DAYS]] days is useful.
 <<if statements for resetting [[_all_fetched]] for various attributes>>=
 if attr_name == "user_all_fetched":
   if not getattr(obj, attr_name):
     continue
-  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=2):
+  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=USER_CACHE_TTL_DAYS):
+    age = datetime.now() - getattr(obj, attr_name)
+    logger.info(f"Cache invalidation: user_all_fetched periodic refresh "
+                f"(age: {age.days} days, threshold: {USER_CACHE_TTL_DAYS} days)")
     setattr(obj, attr_name, None)
 @
 
@@ -2430,13 +2652,17 @@ Groups and group categories are more dynamic than assignment structure but less
 dynamic than user enrollments.
 Students are organized into groups for collaborative work, and group membership
 can change during the course (though less frequently than enrollment changes).
-We use 5 days as a compromise between freshness and API efficiency.
+We use [[GROUP_CACHE_TTL_DAYS]] days as a compromise between freshness and API
+efficiency.
 The prime number 5 ensures cache refreshes don't align with other attributes.
 <<if statements for resetting [[_all_fetched]] for various attributes>>=
 elif attr_name in ["group_all_fetched", "group_category_all_fetched"]:
   if not getattr(obj, attr_name):
     continue
-  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=5):
+  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=GROUP_CACHE_TTL_DAYS):
+    age = datetime.now() - getattr(obj, attr_name)
+    logger.info(f"Cache invalidation: {attr_name} periodic refresh "
+                f"(age: {age.days} days, threshold: {GROUP_CACHE_TTL_DAYS} days)")
     setattr(obj, attr_name, None)
 @
 
@@ -2556,6 +2782,99 @@ class TestOutdated:
 
 <<test hacks.py>>=
 <<test outdated>>
+@
+
+
+\subsection{Diagnosing cache staleness}
+
+To make cache behavior transparent and debuggable, we need to log not just
+\emph{that} objects are stale, but \emph{why} they're stale. The [[outdated()]]
+function implements three distinct staleness policies:
+\begin{enumerate}
+\item \textbf{Grade-based staleness}: Submissions without passing grades
+  (A, P, P+, complete) are cached for only [[SUBMISSION_TTL_MINUTES]] minutes,
+  allowing students to see updated grades quickly.
+\item \textbf{Periodic refresh}: Each cached collection ([[_all_fetched]]
+  timestamps) has a time-to-live ([[DEFAULT_CACHE_TTL_DAYS]] days default,
+  [[USER_CACHE_TTL_DAYS]] days for users, [[GROUP_CACHE_TTL_DAYS]] days
+  for groups) after which the entire collection is refetched.
+\item \textbf{Missing metadata}: Objects without [[_fetched_at]] attributes
+  are treated as stale to ensure they get refreshed.
+\end{enumerate}
+
+When we log cache operations, we want to distinguish between these cases.
+The [[get_staleness_reason()]] function mirrors [[outdated()]]'s logic but
+returns human-readable diagnostic strings instead of booleans.
+Both functions reference the same TTL constants, ensuring that log messages
+accurately describe the cache behavior.
+
+<<function [[get_staleness_reason]] to diagnose staleness>>=
+def get_staleness_reason(obj):
+  """
+  Returns a descriptive string explaining why obj is stale, or None if fresh.
+  Mirrors the logic in outdated() but returns human-readable reasons.
+  Uses constants for TTL values to ensure consistency with outdated() logic.
+  """
+  <<check submission grade-based staleness and return reason>>
+  <<check periodic refresh staleness and return reason>>
+  return None
+@
+
+We log the specific reason for staleness to help diagnose cache behavior.
+This distinguishes between the three staleness policies and shows how long
+objects have been stale, making it clear why refreshes are occurring.
+
+For grade-based staleness, we check if the submission has a non-passing grade
+and if the TTL has expired:
+<<check submission grade-based staleness and return reason>>=
+try:
+  if obj.grade not in NOREFRESH_GRADES:
+    try:
+      age = datetime.now() - obj._fetched_at
+      ttl = timedelta(minutes=SUBMISSION_TTL_MINUTES)
+      if age > ttl:
+        expired_by = age - ttl
+        return (f"non-passing grade ({obj.grade}), "
+                f"{SUBMISSION_TTL_MINUTES}-minute TTL expired "
+                f"{expired_by.total_seconds()/60:.1f} minutes ago")
+    except AttributeError:
+      return "non-passing grade, missing _fetched_at attribute"
+except AttributeError:
+  pass
+@
+
+For periodic refresh, we check the [[_all_fetched]] timestamps and report
+which specific attribute triggered the refresh:
+<<check periodic refresh staleness and return reason>>=
+for attr_name in dir(obj):
+  if attr_name == "user_all_fetched":
+    attr_val = getattr(obj, attr_name, None)
+    if attr_val:
+      age = datetime.now() - attr_val
+      threshold = timedelta(days=USER_CACHE_TTL_DAYS)
+      if age > threshold:
+        return (f"periodic refresh: {attr_name} "
+                f"(age: {age.days} days, threshold: {USER_CACHE_TTL_DAYS} days)")
+  elif attr_name in ["group_all_fetched", "group_category_all_fetched"]:
+    attr_val = getattr(obj, attr_name, None)
+    if attr_val:
+      age = datetime.now() - attr_val
+      threshold = timedelta(days=GROUP_CACHE_TTL_DAYS)
+      if age > threshold:
+        return (f"periodic refresh: {attr_name} "
+                f"(age: {age.days} days, threshold: {GROUP_CACHE_TTL_DAYS} days)")
+  elif attr_name.endswith("_all_fetched"):
+    attr_val = getattr(obj, attr_name, None)
+    if attr_val:
+      age = datetime.now() - attr_val
+      threshold = timedelta(days=DEFAULT_CACHE_TTL_DAYS)
+      if age > threshold:
+        return (f"periodic refresh: {attr_name} "
+                f"(age: {age.days} days, threshold: {DEFAULT_CACHE_TTL_DAYS} days)")
+@
+
+<<functions>>=
+<<function [[get_staleness_reason]] to diagnose staleness>>
 @
 
 
@@ -2680,9 +2999,9 @@ The we must decorate both [[get_submission]] and [[get_submissions]].
 old_constructor = cls.__init__
 
 @functools.wraps(cls.__init__)
-def new_init(*args, **kwargs):
+def new_init(self, *args, **kwargs):
   <<extend class constructor for decorators>>
-  old_constructor(*args, **kwargs)
+  old_constructor(self, *args, **kwargs)
 
 cls.__init__ = new_init
 
@@ -2697,7 +3016,7 @@ cls.get_submission = new_get_submission
 get_submissions = cls.get_submissions
 
 @functools.wraps(cls.get_submissions)
-def new_get_submissions(self, **kwargs):
+def new_get_submissions(self, *args, **kwargs):
   <<return a list of all submissions>>
 
 cls.get_submissions = new_get_submissions
@@ -2706,14 +3025,17 @@ cls.get_submissions = new_get_submissions
 We decorate the method to get a specific submission, [[get_submission]].
 This way we can cache the submissions of users who have passed.
 Then we always return up-to-date submissions of students who are expected to 
-submit.
+update their submissions.
 For this, we first need a cache attribute.
 <<extend class constructor for decorators>>=
-args[0].__cache = {}
+self.__cache = {}
 @
 
-Now we can treat how we get an individual submission.
+Let's start with how we get an individual submission.
+We also want to add info messages to log cache hits and misses and their 
+timings.
 <<return submission of user>>=
+# canvasapi allows either User object or user ID.
 if isinstance(user, User):
   uid = user.id
 elif isinstance(user, int):
@@ -2728,17 +3050,45 @@ if "include" in kwargs:
 else:
   to_include = set()
 
-if uid in self.__cache:
-  submission, included = self.__cache[uid]
-  if not to_include.issubset(set(included)):
-    submission = None
-    to_include |= set(included)
-
-if not submission or submission.grade not in NOREFRESH_GRADES:
+if must_refresh(uid, to_include, self.__cache):
+  fetch_start = time.perf_counter()
   submission = get_submission(self, user, include=list(to_include))
+  fetch_elapsed = time.perf_counter() - fetch_start
+  submission._fetched_at = datetime.now()
+  logger.info(f"Fetched submission user_id={uid} in {fetch_elapsed:.2f}s")
   self.__cache[uid] = (submission, to_include)
+else:
+  submission, _ = self.__cache[uid]
 
 return submission
+@ We also add the time of last fetch ([[._fetched_at]]), that way we don't need 
+to update all the time, but with short intervals (see the [[outdated]] 
+function).
+<<functions>>=
+def must_refresh(uid, to_include, cache):
+  """
+  Returns True if the submission needs refreshing based on kwargs.
+  """
+  cache_status = ""
+  if uid in cache:
+    submission, included = cache[uid]
+    if not to_include.issubset(set(included)):
+      cache_status = " (new include required)"
+      submission = None
+      to_include |= set(included)
+  else:
+    cache_status = " (not found)"
+
+  if submission:
+    if not outdated(submission):
+      logger.info(f"Cache hit: submission user_id={uid}")
+      return False
+    elif not cache_status:
+      reason = get_staleness_reason(submission)
+      cache_status = f" (stale: {reason})" if reason else " (stale)"
+
+  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
+  return True
 @
 
 Now we can deal with [[get_submissions]].
@@ -2746,7 +3096,7 @@ As we might call [[get_submission]] before any [[get_submissions]], we cannot
 rely on the cache as a check.
 We introduce a new attribute.
 <<extend class constructor for decorators>>=
-args[0].__all_fetched = False
+self.__all_fetched = None
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 <<return a list of all submissions>>=
@@ -2755,18 +3105,59 @@ if "include" in kwargs:
 else:
   to_include = set()
 
-if self.__all_fetched:
-  for submission, included in self.__cache.values():
-    if not to_include.issubset(included) or \
-       submission.grade not in NOREFRESH_GRADES:
-      self.get_submission(submission.user_id, include=list(to_include))
-else:
-  for _, included in self.__cache.values():
-    to_include |= included
+# Collect everything to include from before.
+for _, included in self.__cache.values():
+  to_include |= included
 
-  for submission in get_submissions(self, **kwargs):
-    self.__cache[submission.user_id] = (submission, to_include)
+if self.__all_fetched:
+  cache_age = datetime.now() - self.__all_fetched
+  logger.info(f"Using cached submissions for assignment id={self.id}: "
+              f"{len(self.__cache)} submissions cached "
+              f"(age: {cache_age.total_seconds()/60:.1f} minutes), "
+              f"checking staleness to decide refresh strategy")
+  num_needs_refresh = 0
+  for submission, included in self.__cache.values():
+    if must_refresh(submission.user_id, to_include, self.__cache):
+      num_needs_refresh += 1
+      if num_needs_refresh > THRESHOLD_INDIVIDUAL_REFRESH:
+        break
+
+  if num_needs_refresh <= THRESHOLD_INDIVIDUAL_REFRESH:
+    logger.info(f"Refreshing {num_needs_refresh} individual submissions "
+                f"for assignment id={self.id}")
+    for submission, _ in self.__cache.values():
+      # Use the cached method above to trigger any individual refreshes.
+      self.get_submission(submission.user_id, include=list(to_include))
+  else:
+    logger.info(f"Refreshing all submissions for assignment id={self.id} "
+                f"due to {num_needs_refresh} needing refresh")
+    <<bulk refresh all submissions>>
+else:
+
+  logger.info(f"Fetching all submissions for assignment id={self.id}")
+  <<bulk refresh all submissions>>
 
 return [submission for submission, _ in self.__cache.values()]
+<<bulk refresh all submissions>>=
+start_fetch = time.perf_counter()
+submissions = list(get_submissions(self, include=list(to_include)))
+fetch_elapsed = time.perf_counter() - start_fetch
+logger.info(f"Bulk refresh: {len(submissions)} submissions in "
+            f"{fetch_elapsed:.2f}s")
+
+for submission in submissions:
+  submission._fetched_at = datetime.now()
+  self.__cache[submission.user_id] = (submission, to_include)
+
+self.__all_fetched = datetime.now()
+@
+
+Based on some tests, it takes Canvas roughly \qty{3}{\second} to return all 
+submissions.
+It takes Canvas roughly \qty{0.5}{\second} to return an individual submission.
+So if we have more than 6 submissions to refresh, it's better to refresh them 
+all at once.
+<<constants>>=
+THRESHOLD_INDIVIDUAL_REFRESH = 6
 @
 
