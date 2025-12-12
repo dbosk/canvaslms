@@ -9,6 +9,9 @@ all: attachment_cache.py attachment_cache.tex
 canvasapi.py: canvasapi.nw
 	${NOTANGLE.py}
 
+attachment_cache.py: attachment_cache.nw
+	notangle -R"[[$@]]" ${NOTANGLEFLAGS.py} $< > $@
+
 .PHONY: clean
 clean:
 	${RM} canvasapi.py canvasapi.tex
