@@ -377,25 +377,80 @@ We provide the following functions:
   roles.
 \end{itemize}
 
-First, we provide [[list_users]], which takes a list of courses and a list of 
+First, we provide [[list_users]], which takes a list of courses and a list of
 Canvas roles as arguments.
 Here we must be careful.
 For some courses we can't list the users, because of lacking permissions.
-Whenever we're searching for a particular user, we might look in all courses, 
+Whenever we're searching for a particular user, we might look in all courses,
 and then we must skip those where we can't list the users.
-This way we can search through all other courses instead of stopping at the 
+This way we can search through all other courses instead of stopping at the
 first error.
+
+\subsection{Fetching vs.\ filtering: enrollment types}
+
+Canvas provides an [[enrollment_type]] parameter to [[get_users()]] that
+filters users by role (student, teacher, TA, etc.).
+However, we treat this as a \emph{client-side filtering operation} rather than
+a server-side fetch scope parameter.
+
+The reason is caching efficiency.
+If we pass [[enrollment_type]] to Canvas, each role filter creates a separate
+cache entry.
+When the user queries different roles (for instance, first students, then TAs),
+each query invalidates the cache and triggers a new API call.
+
+Instead, we fetch all users once (without [[enrollment_type]]) and filter
+locally:
+\begin{enumerate}
+\item Fetch all users with [[include=["enrollments"]]] to get role data.
+\item Cache all users together (single cache entry per course).
+\item Filter by role in Python when [[roles]] parameter is specified.
+\end{enumerate}
+
+This is practical because:
+\begin{itemize}
+\item Course user lists are small (typically 30--300 users).
+\item User enrollments are static (roles rarely change during a course).
+\item One bulk fetch is faster than $N$ role-specific fetches.
+\item Local filtering is instant (no network latency).
+\end{itemize}
+
+The trade-off is slightly larger cache entries (storing all users instead of
+just students), but this is negligible compared to the API call savings when
+querying multiple roles.
+
+\subsubsection{Enrollment data structure}
+
+Each [[User]] object has an [[enrollments]] attribute when fetched with
+[[include=["enrollments"]]].
+This is a list of enrollment dictionaries, where each enrollment has a [[type]]
+field containing strings like [["StudentEnrollment"]], [["TaEnrollment"]], or
+[["TeacherEnrollment"]].
+
+We filter by checking if the requested role name (for example, [[student]])
+appears in the enrollment type string (case-insensitive).
+This handles Canvas's naming convention where role types are CamelCase with
+[[Enrollment]] suffix.
 <<functions>>=
 def list_users(courses, roles):
-  """List users in courses with roles"""
+  """
+  List users in courses with roles.
+
+  Fetches all users from Canvas without enrollment_type filtering,
+  then filters locally by role. This allows efficient caching:
+  all users are fetched once and cached, then filtered in-memory
+  for subsequent calls with different roles.
+  """
   users = list()
 
   for course in courses:
     try:
-      course_users = list(course.get_users(enrollment_type=roles))
+      <<fetch all users with enrollment data>>
+      <<filter users by role if specified>>
     except canvasapi.exceptions.CanvasException as err:
       canvaslms.cli.warn(f"skipped {course}: {err}")
       continue
+
     for user in course_users:
       user.course = course
     users.extend(course_users)
@@ -403,7 +458,40 @@ def list_users(courses, roles):
   return users
 @
 
-Second, we provide the most general function, [[filter_users]], which takes a 
+We fetch all users with [[include=["enrollments"]]] to ensure we have role data
+for filtering.
+This is the single API call that will be cached.
+<<fetch all users with enrollment data>>=
+course_users = list(course.get_users(include=["enrollments"]))
+@
+
+Now we filter locally by role if the [[roles]] parameter is specified.
+If no roles are specified, we return all users.
+<<filter users by role if specified>>=
+if roles:
+  filtered_users = []
+  for user in course_users:
+    <<check if user has matching enrollment>>
+  course_users = filtered_users
+@
+
+To check if a user matches the requested roles, we iterate through their
+enrollments and look for role names that match.
+The [[enrollment['type']]] field contains strings like [["StudentEnrollment"]],
+so we convert both the enrollment type and requested role to lowercase and check
+if the role appears in the enrollment type.
+We use [[break]] to avoid adding the same user multiple times if they have
+multiple matching enrollments.
+<<check if user has matching enrollment>>=
+if hasattr(user, 'enrollments'):
+  for enrollment in user.enrollments:
+    enrollment_type = enrollment.get('type', '').lower()
+    if any(role.lower() in enrollment_type for role in roles):
+      filtered_users.append(user)
+      break
+@
+
+Second, we provide the most general function, [[filter_users]], which takes a
 list of courses, a list of Canvas roles and a regex as arguments.
 It returns the matching users.
 
