@@ -761,98 +761,173 @@ def create_new_quiz_report(course, assignment_id, requester):
 
 \subsection{Determining question type}
 
-We need to determine if a question is quantitative or qualitative based on the 
+We need to determine if a question is quantitative or qualitative based on the
 responses.
-For questions where Canvas lists comma-separated options (like multi-select 
+For questions where Canvas lists comma-separated options (like multi-select
 questions), we need to detect when substrings reoccur systematically.
+
+\subsubsection{The comma extraction problem}
+
 This gets subtle when each visible option is a paragraph that itself contains
 commas: a naive split would incorrectly turn one option into several pieces.
-Instead we scan all responses for repeated comma-delimited phrases and, for
+Consider two students answering a multi-select question:
+\begin{itemize}
+\item Student A: ``Option 1, which is long, Option 2''
+\item Student B: ``Option 2, Option 3''
+\end{itemize}
+
+A naive comma split would produce ``Option 1'', ``which is long'', ``Option 2'',
+etc., when we actually want ``Option 1, which is long'', ``Option 2'', ``Option 3''.
+
+\paragraph{Solution approach}
+We scan all responses for repeated comma-delimited phrases and, for
 segmenting, prefer the longest frequently repeated phrases.
 This way, when two paragraphs always occur together separated by a comma, we
 treat the combined text as one option; but when simpler labels like
 ``Yes'', ``No'' and ``Maybe'' appear in various combinations, we still recover
 the individual atomic options.
+
+The algorithm has five stages:
+\begin{enumerate}
+\item Parse responses into comma-separated parts.
+\item Build a phrase index: count all contiguous phrase combinations.
+\item Filter to phrases that appear at least twice (repeated = real option).
+\item Greedily select longest/most-frequent phrases without overlap.
+\item Collect selected phrases as final options.
+\end{enumerate}
+
 <<functions>>=
 def extract_comma_separated_options(responses: List[str]) -> List[str]:
   """Extract options from comma-separated responses using longest matches"""
   from typing import List, Tuple
 
-  segmented: List[List[str]] = []
-  for resp in responses:
-    text = (resp or "").strip()
-    if not text:
-      segmented.append([])
-      continue
-    parts = [part.strip() for part in text.split(',')]
-    segmented.append(parts)
-
-  PhraseSpan = Tuple[int, int, int]
-  candidate_counts: Counter[str] = Counter()
-  candidate_occurrences: Dict[str, List[PhraseSpan]] = defaultdict(list)
-
-  for resp_index, parts in enumerate(segmented):
-    n = len(parts)
-    for start in range(n):
-      phrase = ""
-      for end in range(start, n):
-        if phrase:
-          phrase = f"{phrase}, {parts[end]}"
-        else:
-          phrase = parts[end]
-        if phrase:
-          candidate_counts[phrase] += 1
-          candidate_occurrences[phrase].append((resp_index, start, end))
-
-  repeated_phrases = {
-    phrase for phrase, count in candidate_counts.items() if count >= 2 and phrase
-  }
-
-  all_options: List[str] = []
-
-  for resp_index, parts in enumerate(segmented):
-    n = len(parts)
-    if n == 0:
-      continue
-
-    occurrences: List[Tuple[str, int, int, int, int]] = []
-    for phrase in repeated_phrases:
-      for span_resp_index, start, end in candidate_occurrences[phrase]:
-        if span_resp_index == resp_index:
-          count = candidate_counts[phrase]
-          span_len = end - start + 1
-          occurrences.append((phrase, start, end, count, span_len))
-
-    occurrences.sort(key=lambda item: (-item[3], -item[4], -len(item[0])))
-
-    used = [False] * n
-    selected_spans: List[Tuple[int, int, str]] = []
-
-    for phrase, start, end, _count, _span_len in occurrences:
-      if any(used[index] for index in range(start, end + 1)):
-        continue
-      for index in range(start, end + 1):
-        used[index] = True
-      selected_spans.append((start, end, phrase))
-
-    selected_spans.sort(key=lambda span: span[0])
-
-    current_index = 0
-    for start, end, phrase in selected_spans:
-      if current_index < start:
-        fallback = ", ".join(parts[current_index:start]).strip()
-        if fallback:
-          all_options.append(fallback)
-      all_options.append(phrase)
-      current_index = end + 1
-
-    if current_index < n:
-      fallback = ", ".join(parts[current_index:]).strip()
-      if fallback:
-        all_options.append(fallback)
+  <<parse responses into parts>>
+  <<build phrase index>>
+  <<filter to repeated phrases>>
+  <<select options from each response>>
 
   return all_options
+@
 
+\paragraph{Stage 1: Parse responses}
+We split each response on commas and store the parts list.
+Empty responses get an empty parts list.
+<<parse responses into parts>>=
+segmented: List[List[str]] = []
+for resp in responses:
+  text = (resp or "").strip()
+  if not text:
+    segmented.append([])
+    continue
+  parts = [part.strip() for part in text.split(',')]
+  segmented.append(parts)
+@
+
+\paragraph{Stage 2: Build phrase index}
+For each response, we enumerate all contiguous subsequences of parts.
+Each subsequence becomes a candidate phrase (rejoined with commas).
+We count how many times each phrase appears across all responses and
+record where it occurs (response index, start position, end position).
+<<build phrase index>>=
+PhraseSpan = Tuple[int, int, int]
+candidate_counts: Counter[str] = Counter()
+candidate_occurrences: Dict[str, List[PhraseSpan]] = defaultdict(list)
+
+for resp_index, parts in enumerate(segmented):
+  n = len(parts)
+  for start in range(n):
+    phrase = ""
+    for end in range(start, n):
+      if phrase:
+        phrase = f"{phrase}, {parts[end]}"
+      else:
+        phrase = parts[end]
+      if phrase:
+        candidate_counts[phrase] += 1
+        candidate_occurrences[phrase].append((resp_index, start, end))
+@
+
+\paragraph{Stage 3: Filter to repeated phrases}
+A phrase appearing only once might be a unique free-text answer or an
+artifact of wrong splitting.
+Phrases appearing twice or more are likely real options that were selected
+by multiple students.
+<<filter to repeated phrases>>=
+repeated_phrases = {
+  phrase for phrase, count in candidate_counts.items() if count >= 2 and phrase
+}
+@
+
+\paragraph{Stage 4: Select options from each response}
+For each response, we greedily select phrases prioritized by:
+\begin{enumerate}
+\item Frequency (more common = more likely a real option)
+\item Span length (longer = absorbs internal commas correctly)
+\item String length (tie-breaker)
+\end{enumerate}
+We mark used positions to prevent overlap, then collect the selected phrases
+in order, using any uncovered parts as fallback.
+<<select options from each response>>=
+all_options: List[str] = []
+
+for resp_index, parts in enumerate(segmented):
+  n = len(parts)
+  if n == 0:
+    continue
+
+  <<find candidate phrases for this response>>
+  <<greedily select non-overlapping phrases>>
+  <<collect selected phrases in order>>
+@
+
+<<find candidate phrases for this response>>=
+occurrences: List[Tuple[str, int, int, int, int]] = []
+for phrase in repeated_phrases:
+  for span_resp_index, start, end in candidate_occurrences[phrase]:
+    if span_resp_index == resp_index:
+      count = candidate_counts[phrase]
+      span_len = end - start + 1
+      occurrences.append((phrase, start, end, count, span_len))
+
+occurrences.sort(key=lambda item: (-item[3], -item[4], -len(item[0])))
+@
+
+<<greedily select non-overlapping phrases>>=
+used = [False] * n
+selected_spans: List[Tuple[int, int, str]] = []
+
+for phrase, start, end, _count, _span_len in occurrences:
+  if any(used[index] for index in range(start, end + 1)):
+    continue
+  for index in range(start, end + 1):
+    used[index] = True
+  selected_spans.append((start, end, phrase))
+
+selected_spans.sort(key=lambda span: span[0])
+@
+
+<<collect selected phrases in order>>=
+current_index = 0
+for start, end, phrase in selected_spans:
+  if current_index < start:
+    fallback = ", ".join(parts[current_index:start]).strip()
+    if fallback:
+      all_options.append(fallback)
+  all_options.append(phrase)
+  current_index = end + 1
+
+if current_index < n:
+  fallback = ", ".join(parts[current_index:]).strip()
+  if fallback:
+    all_options.append(fallback)
+@
+
+\subsubsection{Quantitative vs.\ qualitative classification}
+
+Now that we can extract options from comma-separated responses, we need to
+classify questions as quantitative (suitable for statistics) or qualitative
+(suitable for listing individual responses and AI summary).
+<<functions>>=
 def is_quantitative(responses: List[str]) -> bool:
   """Determine if responses are quantitative (numbers/categories) or qualitative (free text)"""
   if not responses:
