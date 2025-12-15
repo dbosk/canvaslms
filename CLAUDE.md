@@ -556,6 +556,16 @@ When asked to review literate quality of a `.nw` file, evaluate:
 
 Provide specific, actionable improvements with rationale.
 
+### Noweb Escaping Rules
+
+- **Code references**: Use `[[variable_name]]` syntax to reference code inline in LaTeX
+- **Important**: Do NOT escape underscores when using `[[...]]` notation
+  - ❌ Wrong: `[[is\_quiz\_assignment]]`
+  - ✅ Correct: `[[is_quiz_assignment]]`
+  - The `[[...]]` quoting handles all escaping automatically
+- **LaTeX text**: Only escape underscores in regular LaTeX text outside `[[...]]`
+  - Example: `The function [[get_quizzes()]] uses the \_api attribute` (underscore escaped only outside brackets)
+
 ## Build System
 
 ### Core Build Commands
@@ -566,9 +576,6 @@ make all           # Runs compile + generates doc/canvaslms.pdf
 
 # Generate Python from .nw sources only
 make compile       # Tangles .nw files and runs poetry build
-
-# Install locally for development
-make install       # Installs with pip -e and sets up bash completion
 
 # Clean generated files
 make distclean     # Removes build/, dist/, *.egg-info
@@ -808,8 +815,16 @@ def example_command(config, canvas, args):
 
 ## Testing and Development
 
+### Running Commands for Testing
+
+- Use `poetry run canvaslms <subcommand>` to test commands in the Poetry environment
+- This ensures you're testing against the current development version with all dependencies
+- Example: `poetry run canvaslms quizzes analyse -c <course> -a <assignment>`
+
+### Development Workflow
+
 - No pytest framework currently in place
-- Use `make install` for local development with editable install
+- Use `poetry run` or `poetry shell` for running the local development version.
 - Poetry manages dependencies and builds
 - Use `pdbpp` for debugging (included in dev dependencies)
 
