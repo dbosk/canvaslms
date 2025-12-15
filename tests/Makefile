@@ -5,16 +5,18 @@
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
 # Auto-discover test chunks in .nw files
-# Output format: "unit/test_modulename.py:sourcefile.nw:chunk_with_underscores"
-# We convert spaces to underscores in the chunk name to avoid word-splitting issues
+# Output format: "unit/test_modulename.py:sourcefile.nw:test%20modulename.py"
+# We encode the single space in "test <name>.py" as %20 to avoid
+# word-splitting issues, while preserving literal underscores in names like
+# "attachment_cache".
 define find_tests
 ( \
 	find ../src -name '*.nw' | xargs grep -l "<<test [^>]*\.py>>" | \
 		while read file; do \
 			chunk=$$(grep -o "<<test [^>]*\.py>>" "$$file" | head -1 | \
 			         sed 's/<<test \(.*\)\.py>>/\1/'); \
-			chunk_safe=$$(echo "$$chunk" | sed 's/ /_/g'); \
-			echo "unit/test_$${chunk_safe}.py:$$file:test_$${chunk_safe}.py"; \
+			chunk_safe=$$(echo "$$chunk" | sed 's/ /%20/g'); \
+			echo "unit/test_$${chunk_safe}.py:$$file:test%20$${chunk_safe}.py"; \
 		done; \
 	[ -f conftest.nw ] && echo "conftest.py:conftest.nw:conftest.py"; \
 ) | sort -u
@@ -22,11 +24,11 @@ endef
 
 # Generate build target for each discovered test
 # Input: test_file:source_file:chunk_name_with_underscores
-# Convert underscores back to spaces for the actual chunk name
+# Convert %20 back to spaces for the actual chunk name
 define def_target
 $(shell echo $1 | cut -d: -f1): $(shell echo $1 | cut -d: -f2)
 	@mkdir -p $$(dir $$@)
-	notangle -R"$(shell echo $1 | cut -d: -f3 | sed 's/_/ /g')" $$< | cpif $$@ && noroots $$<
+	notangle -R"$(shell echo $1 | cut -d: -f3 | sed 's/%20/ /g')" $$< | cpif $$@ && noroots $$<
 endef
 
 # Discover all tests
