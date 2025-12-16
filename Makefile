@@ -3,12 +3,17 @@ SUBDIR_GOALS=	all clean distclean
 SUBDIR+=		src/canvaslms
 SUBDIR+=		doc
 SUBDIR+=		docker
+SUBDIR+=		tests
 
 version=$(shell sed -n 's/^ *version *= *\"\([^\"]\+\)\"/\1/p' pyproject.toml)
 
 
 .PHONY: all
-all: compile doc/canvaslms.pdf
+all: compile doc/canvaslms.pdf test
+
+.PHONY: test
+test:
+	${MAKE} -C tests test
 
 .PHONY: install
 install: compile

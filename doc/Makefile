@@ -4,6 +4,7 @@ LATEXFLAGS+=	-shell-escape
 TEX_PYTHONTEX=	yes
 
 SRC_DIR=			../src/canvaslms
+TEST_DIR=			../tests
 
 .PHONY: all
 all: canvaslms.pdf
@@ -29,6 +30,7 @@ canvaslms.pdf: ${SRC_DIR}/grades/grades.tex
 canvaslms.pdf: ${SRC_DIR}/cli/calendar.tex
 canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex
+canvaslms.pdf: ${TEST_DIR}/conftest.tex
 
 canvaslms.pdf: src
 
@@ -47,6 +49,7 @@ clean:
 .PHONY: distclean
 distclean: clean
 	${MAKE} -C ${SRC_DIR} clean distclean
+	${MAKE} -C ${TEST_DIR} clean distclean
 
 
 INCLUDE_MAKEFILES=../makefiles
