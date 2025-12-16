@@ -5,25 +5,25 @@
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
 # Auto-discover test chunks in .nw files
-# Output format: "unit/test_modulename.py:sourcefile.nw:test%20modulename.py"
-# We encode the single space in "test <name>.py" as %20 to avoid
+# Output format: "unit/test_modulename.py:sourcefile.nw:test%20[[modulename.py]]"
+# We encode the single space in "test [[name.py]]" as %20 to avoid
 # word-splitting issues, while preserving literal underscores in names like
 # "attachment_cache".
 define find_tests
 ( \
-	find ../src -name '*.nw' | xargs grep -l "<<test [^>]*\.py>>" | \
+	find ../src -name '*.nw' | xargs grep -l '<<test \[\[.*\.py\]\]>>' | \
 		while read file; do \
-			chunk=$$(grep -o "<<test [^>]*\.py>>" "$$file" | head -1 | \
-			         sed 's/<<test \(.*\)\.py>>/\1/'); \
+			chunk=$$(grep -o '<<test \[\[\([^]]*\)\.py\]\]>>' "$$file" | head -1 | \
+			         sed 's/<<test \[\[\(.*\)\.py\]\]>>/\1/'); \
 			chunk_safe=$$(echo "$$chunk" | sed 's/ /%20/g'); \
-			echo "unit/test_$${chunk_safe}.py:$$file:test%20$${chunk_safe}.py"; \
+			echo "unit/test_$${chunk_safe}.py:$$file:test%20[[$$chunk_safe.py]]"; \
 		done; \
-	[ -f conftest.nw ] && echo "conftest.py:conftest.nw:conftest.py"; \
+	[ -f conftest.nw ] && echo "conftest.py:conftest.nw:[[conftest.py]]"; \
 ) | sort -u
 endef
 
 # Generate build target for each discovered test
-# Input: test_file:source_file:chunk_name_with_underscores
+# Input: test_file:source_file:chunk_name_with_%20_for_spaces
 # Convert %20 back to spaces for the actual chunk name
 define def_target
 $(shell echo $1 | cut -d: -f1): $(shell echo $1 | cut -d: -f2)
