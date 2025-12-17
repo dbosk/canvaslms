@@ -379,15 +379,23 @@ add_assignment_option(set_dates_parser, ungraded=False, required=True)
 <<set up date options for set-dates>>
 @
 
-The [[edit]] subcommand updates assignment content from a Markdown file with
-YAML front matter. This enables a Git-based workflow: export assignment content
-with [[view]] (piped to a file), edit locally, and push changes back with
-[[edit -f]].
+The [[edit]] subcommand updates assignment content. It supports two modes:
+\begin{description}
+\item[Interactive mode] (default): Opens matching assignments one by one in your
+  editor, shows a preview, and asks whether to accept, edit further, or discard.
+  This is the default when no [[-f]] option is given.
+\item[File mode] ([[-f]]): Reads content from a Markdown file with YAML front
+  matter and updates directly without preview. This enables a Git-based workflow:
+  export assignment content with [[view]] (piped to a file), edit locally, and
+  push changes back with [[edit -f]].
+\end{description}
 <<add assignments edit subcommand>>=
 edit_parser = assignments_subp.add_parser("edit",
-    help="Edit assignment content from a file",
-    description="Update assignment content from a Markdown file with YAML front "
-      "matter. Use 'assignments view ... > file.md' to export to editable format.")
+    help="Edit assignment content interactively or from a file",
+    description="Edit assignment content. Without -f, opens each matching "
+      "assignment in your editor for interactive editing with preview. "
+      "With -f, reads from a Markdown file with YAML front matter and updates "
+      "directly (script-friendly).")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
@@ -860,27 +868,39 @@ for assignment in assignment_list:
 
 \section{The [[assignments edit]] command}
 
-The [[edit]] command updates assignment content from a Markdown file with YAML
-front matter. This enables a bidirectional workflow: use [[render]] to export
-an assignment's content, edit it locally (perhaps in a Git repository), and
-push the changes back to Canvas with [[edit -f]].
+The [[edit]] command updates assignment content. It supports two workflows:
+
+\begin{description}
+\item[Interactive editing] When no [[-f]] option is given, the command opens
+  each matching assignment in your editor with the current content pre-populated.
+  After editing, it shows a preview and asks whether to accept the changes, edit
+  further, or discard. This enables quick edits without leaving the terminal.
+\item[File-based editing] When [[-f]] is provided, the command reads content
+  from a Markdown file with YAML front matter and updates directly. This enables
+  a Git-based workflow: export with [[view]], edit locally, push back with
+  [[edit -f]].
+\end{description}
 
 The command uses the content module's schema-based approach, allowing the same
 infrastructure to work across announcements, assignments, and pages.
 <<functions>>=
 def assignments_edit_command(config, canvas, args):
-  """Edit assignment content from a Markdown file with YAML front matter."""
-  if not args.file:
-    logger.error("The -f/--file option is required for the edit command.")
-    print("Error: Please specify a file with -f/--file", file=sys.stderr)
-    return
-
-  <<read and validate assignment content from file>>
-  <<update assignment with new content>>
+  """Edit assignment content interactively or from file."""
+  if args.file:
+    <<edit assignments from file>>
+  else:
+    <<edit assignments interactively>>
 
 @
 
-\subsection{Reading assignment content from file}
+\subsection{File-based editing}
+
+When [[-f]] is provided, we read from the file, validate, and update directly.
+This mode is script-friendly and does not require user interaction.
+<<edit assignments from file>>=
+<<read and validate assignment content from file>>
+<<update assignment with new content>>
+@
 
 We read the file using the content module's infrastructure, then validate the
 attributes against the assignment schema.
@@ -946,4 +966,162 @@ if 'points_possible' in attributes and attributes['points_possible'] is not None
   update_data['assignment']['points_possible'] = attributes['points_possible']
 if 'published' in attributes:
   update_data['assignment']['published'] = attributes['published']
+@
+
+\subsection{Interactive editing}
+
+When no [[-f]] is given, we enter interactive mode. This involves:
+\begin{enumerate}
+\item Fetching all matching assignments
+\item Showing a confirmation dialog listing what will be edited
+\item For each assignment: open editor, preview, accept/edit/discard
+\item Reporting results at the end
+\end{enumerate}
+
+This workflow allows batch editing with human review---users can match multiple
+assignments with a regex and then review each one before committing changes.
+<<edit assignments interactively>>=
+<<get assignments for interactive editing>>
+<<confirm assignments to edit>>
+<<edit each assignment interactively>>
+<<report interactive assignment edit results>>
+@
+
+First we fetch the matching assignments. We use [[process_assignment_option]]
+which handles the course and assignment filtering.
+<<get assignments for interactive editing>>=
+try:
+  assignment_list = process_assignment_option(canvas, args)
+except canvaslms.cli.EmptyListError as e:
+  print(f"Error: {e}", file=sys.stderr)
+  return
+@
+
+Before starting the edit loop, we show the user what will be edited and ask for
+confirmation. This prevents accidentally editing many assignments when the
+pattern matches more than expected.
+<<confirm assignments to edit>>=
+print(f"Will edit {len(assignment_list)} assignment(s):", file=sys.stderr)
+for assignment in assignment_list:
+  course_code = assignment.course.course_code if hasattr(assignment, 'course') else "?"
+  print(f"  - {course_code}: {assignment.name}", file=sys.stderr)
+
+try:
+  confirm = input("Continue? [y/N] ").strip().lower()
+except (EOFError, KeyboardInterrupt):
+  print("\nCancelled.", file=sys.stderr)
+  return
+
+if confirm not in ['y', 'yes']:
+  print("Cancelled.", file=sys.stderr)
+  return
+@
+
+Now we edit each assignment one by one. For each assignment, we:
+\begin{enumerate}
+\item Render current content to Markdown with YAML front matter
+\item Open the editor with this content pre-populated
+\item Show preview and enter accept/edit/discard loop
+\item On accept, update the assignment in Canvas
+\end{enumerate}
+<<edit each assignment interactively>>=
+updated_count = 0
+skipped_count = 0
+
+for assignment in assignment_list:
+  course_code = assignment.course.course_code if hasattr(assignment, 'course') else "?"
+  print(f"\nEditing: {course_code}: {assignment.name}", file=sys.stderr)
+
+  <<render current assignment content>>
+  <<open editor with assignment content>>
+  <<interactive confirm and update single assignment>>
+@
+
+We render the current assignment content using the content module's
+[[render_to_markdown]] function, which extracts attributes according to the
+schema and converts the HTML description to Markdown.
+<<render current assignment content>>=
+current_content = canvaslms.cli.content.render_to_markdown(
+    assignment,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    content_attr='description')
+current_attrs = canvaslms.cli.content.extract_attributes_from_object(
+    assignment, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+@
+
+We open the user's editor with the current content. The [[get_content_from_editor]]
+function handles creating a temporary file, opening the editor, and parsing
+the result.
+<<open editor with assignment content>>=
+result = canvaslms.cli.content.get_content_from_editor(
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    current_attrs,
+    current_content.split('---', 2)[-1].strip() if '---' in current_content else '')
+if result is None:
+  print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+attributes, markdown_content = result
+@
+
+After editing, we enter the interactive confirm loop. The user can preview the
+content, accept it (which triggers the update), edit further, or discard changes.
+<<interactive confirm and update single assignment>>=
+title = attributes.get('name', assignment.name)
+result = canvaslms.cli.content.interactive_confirm_and_edit(
+    title, markdown_content, attributes,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA, "Assignment")
+
+if result is None:
+  print("Discarded changes for this assignment.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+final_attrs, final_content = result
+<<update single assignment from interactive edit>>
+@
+
+When the user accepts, we convert the Markdown to HTML and update the assignment.
+<<update single assignment from interactive edit>>=
+try:
+  html_content = pypandoc.convert_text(final_content, 'html', format='md')
+except Exception as e:
+  logger.warning(f"Failed to convert markdown to HTML: {e}")
+  html_content = final_content
+
+update_data = {
+  'assignment': {
+    'name': final_attrs.get('name', assignment.name),
+    'description': html_content,
+  }
+}
+
+# Add optional attributes
+if 'due_at' in final_attrs and final_attrs['due_at'] is not None:
+  update_data['assignment']['due_at'] = final_attrs['due_at']
+if 'unlock_at' in final_attrs and final_attrs['unlock_at'] is not None:
+  update_data['assignment']['unlock_at'] = final_attrs['unlock_at']
+if 'lock_at' in final_attrs and final_attrs['lock_at'] is not None:
+  update_data['assignment']['lock_at'] = final_attrs['lock_at']
+if 'points_possible' in final_attrs and final_attrs['points_possible'] is not None:
+  update_data['assignment']['points_possible'] = final_attrs['points_possible']
+if 'published' in final_attrs:
+  update_data['assignment']['published'] = final_attrs['published']
+
+try:
+  assignment.edit(**update_data)
+  print(f"Updated assignment: {assignment.name}", file=sys.stderr)
+  updated_count += 1
+except Exception as e:
+  logger.error(f"Error updating assignment '{assignment.name}': {e}")
+  print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+  skipped_count += 1
+@
+
+Finally, we report a summary of what was done.
+<<report interactive assignment edit results>>=
+print(f"\nDone. Updated {updated_count}/{len(assignment_list)} assignment(s).", file=sys.stderr)
+if skipped_count > 0:
+  print(f"Skipped {skipped_count} assignment(s).", file=sys.stderr)
 @

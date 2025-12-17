@@ -201,14 +201,23 @@ def format_page(page):
 
 \section{The [[pages edit]] subcommand}
 
-The [[edit]] subcommand updates page content from a Markdown file with YAML
-front matter. This enables a Git-based workflow: export page content with
-[[view]] (piped to a file), edit locally, and push changes back with [[edit -f]].
+The [[edit]] subcommand updates page content. It supports two modes:
+\begin{description}
+\item[Interactive mode] (default): Opens matching pages one by one in your
+  editor, shows a preview, and asks whether to accept, edit further, or discard.
+  This is the default when no [[-f]] option is given.
+\item[File mode] ([[-f]]): Reads content from a Markdown file with YAML front
+  matter and updates directly without preview. This enables a Git-based workflow:
+  export page content with [[view]] (piped to a file), edit locally, and push
+  changes back with [[edit -f]].
+\end{description}
 <<add pages edit subcommand>>=
 edit_parser = pages_subp.add_parser("edit",
-    help="Edit page content from a file",
-    description="Update wiki page content from a Markdown file with YAML front "
-      "matter. Use 'pages view ... > file.md' to export to editable format.")
+    help="Edit page content interactively or from a file",
+    description="Edit wiki page content. Without -f, opens each matching "
+      "page in your editor for interactive editing with preview. "
+      "With -f, reads from a Markdown file with YAML front matter and updates "
+      "directly (script-friendly).")
 edit_parser.set_defaults(func=pages_edit_command)
 add_page_options(edit_parser, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
@@ -216,17 +225,21 @@ canvaslms.cli.content.add_file_option(edit_parser)
 
 <<functions>>=
 def pages_edit_command(config, canvas, args):
-  """Edit wiki page content from a Markdown file with YAML front matter."""
-  if not args.file:
-    logger.error("The -f/--file option is required for the edit command.")
-    print("Error: Please specify a file with -f/--file", file=sys.stderr)
-    return
-
-  <<read and validate page content from file>>
-  <<update pages with new content>>
+  """Edit wiki page content interactively or from file."""
+  if args.file:
+    <<edit pages from file>>
+  else:
+    <<edit pages interactively>>
 @
 
-\subsection{Reading page content from file}
+\subsection{File-based editing}
+
+When [[-f]] is provided, we read from the file, validate, and update directly.
+This mode is script-friendly and does not require user interaction.
+<<edit pages from file>>=
+<<read and validate page content from file>>
+<<update pages with new content>>
+@
 
 We read the file using the content module's infrastructure, then validate the
 attributes against the page schema.
@@ -288,4 +301,163 @@ if 'front_page' in attributes:
   update_data['wiki_page']['front_page'] = attributes['front_page']
 if 'editing_roles' in attributes and attributes['editing_roles']:
   update_data['wiki_page']['editing_roles'] = attributes['editing_roles']
+@
+
+\subsection{Interactive editing}
+
+When no [[-f]] is given, we enter interactive mode. This involves:
+\begin{enumerate}
+\item Fetching all matching pages
+\item Showing a confirmation dialog listing what will be edited
+\item For each page: open editor, preview, accept/edit/discard
+\item Reporting results at the end
+\end{enumerate}
+
+This workflow allows batch editing with human review---users can match multiple
+pages with a regex and then review each one before committing changes.
+<<edit pages interactively>>=
+<<get pages for interactive editing>>
+<<confirm pages to edit>>
+<<edit each page interactively>>
+<<report interactive page edit results>>
+@
+
+First we fetch the matching pages. We use [[process_page_option]] which handles
+the course and page filtering.
+<<get pages for interactive editing>>=
+try:
+  page_list = process_page_option(canvas, args)
+except canvaslms.cli.EmptyListError as e:
+  print(f"Error: {e}", file=sys.stderr)
+  return
+@
+
+Before starting the edit loop, we show the user what will be edited and ask for
+confirmation. This prevents accidentally editing many pages when the pattern
+matches more than expected.
+<<confirm pages to edit>>=
+print(f"Will edit {len(page_list)} page(s):", file=sys.stderr)
+for page in page_list:
+  course_code = page.course.course_code if hasattr(page, 'course') else "?"
+  print(f"  - {course_code}: {page.title}", file=sys.stderr)
+
+try:
+  confirm = input("Continue? [y/N] ").strip().lower()
+except (EOFError, KeyboardInterrupt):
+  print("\nCancelled.", file=sys.stderr)
+  return
+
+if confirm not in ['y', 'yes']:
+  print("Cancelled.", file=sys.stderr)
+  return
+@
+
+Now we edit each page one by one. For each page, we need to fetch the full page
+content (the list only has basic info), then:
+\begin{enumerate}
+\item Render current content to Markdown with YAML front matter
+\item Open the editor with this content pre-populated
+\item Show preview and enter accept/edit/discard loop
+\item On accept, update the page in Canvas
+\end{enumerate}
+<<edit each page interactively>>=
+updated_count = 0
+skipped_count = 0
+
+for page in page_list:
+  # Fetch full page content (list only has basic info)
+  full_page = page.course.get_page(page.url)
+  full_page.course = page.course
+
+  course_code = page.course.course_code if hasattr(page, 'course') else "?"
+  print(f"\nEditing: {course_code}: {full_page.title}", file=sys.stderr)
+
+  <<render current page content>>
+  <<open editor with page content>>
+  <<interactive confirm and update single page>>
+@
+
+We render the current page content using the content module's
+[[render_to_markdown]] function, which extracts attributes according to the
+schema and converts the HTML body to Markdown.
+<<render current page content>>=
+current_content = canvaslms.cli.content.render_to_markdown(
+    full_page,
+    canvaslms.cli.content.PAGE_SCHEMA,
+    content_attr='body')
+current_attrs = canvaslms.cli.content.extract_attributes_from_object(
+    full_page, canvaslms.cli.content.PAGE_SCHEMA)
+@
+
+We open the user's editor with the current content. The [[get_content_from_editor]]
+function handles creating a temporary file, opening the editor, and parsing
+the result.
+<<open editor with page content>>=
+result = canvaslms.cli.content.get_content_from_editor(
+    canvaslms.cli.content.PAGE_SCHEMA,
+    current_attrs,
+    current_content.split('---', 2)[-1].strip() if '---' in current_content else '')
+if result is None:
+  print("Editor cancelled. Skipping this page.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+attributes, markdown_content = result
+@
+
+After editing, we enter the interactive confirm loop. The user can preview the
+content, accept it (which triggers the update), edit further, or discard changes.
+<<interactive confirm and update single page>>=
+title = attributes.get('title', full_page.title)
+result = canvaslms.cli.content.interactive_confirm_and_edit(
+    title, markdown_content, attributes,
+    canvaslms.cli.content.PAGE_SCHEMA, "Page")
+
+if result is None:
+  print("Discarded changes for this page.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+final_attrs, final_content = result
+<<update single page from interactive edit>>
+@
+
+When the user accepts, we convert the Markdown to HTML and update the page.
+<<update single page from interactive edit>>=
+try:
+  html_content = pypandoc.convert_text(final_content, 'html', format='md')
+except Exception as e:
+  logger.warning(f"Failed to convert markdown to HTML: {e}")
+  html_content = final_content
+
+update_data = {
+  'wiki_page': {
+    'title': final_attrs.get('title', full_page.title),
+    'body': html_content,
+  }
+}
+
+# Add optional attributes
+if 'published' in final_attrs:
+  update_data['wiki_page']['published'] = final_attrs['published']
+if 'front_page' in final_attrs:
+  update_data['wiki_page']['front_page'] = final_attrs['front_page']
+if 'editing_roles' in final_attrs and final_attrs['editing_roles']:
+  update_data['wiki_page']['editing_roles'] = final_attrs['editing_roles']
+
+try:
+  full_page.edit(**update_data)
+  print(f"Updated page: {full_page.title}", file=sys.stderr)
+  updated_count += 1
+except Exception as e:
+  logger.error(f"Error updating page '{full_page.title}': {e}")
+  print(f"Error updating page '{full_page.title}': {e}", file=sys.stderr)
+  skipped_count += 1
+@
+
+Finally, we report a summary of what was done.
+<<report interactive page edit results>>=
+print(f"\nDone. Updated {updated_count}/{len(page_list)} page(s).", file=sys.stderr)
+if skipped_count > 0:
+  print(f"Skipped {skipped_count} page(s).", file=sys.stderr)
 @
