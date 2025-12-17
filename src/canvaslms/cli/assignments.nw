@@ -28,6 +28,7 @@ import argparse
 import arrow
 import canvasapi
 import canvaslms.cli
+import canvaslms.cli.content
 import canvaslms.cli.courses as courses
 import canvaslms.cli.modules as modules
 import canvaslms.cli.utils
@@ -339,6 +340,7 @@ add_assignment_option(assignments_parser, suppress_help=True)
 <<add assignments list subcommand>>
 <<add assignments view subcommand>>
 <<add assignments set-dates subcommand>>
+<<add assignments edit subcommand>>
 @
 
 The [[list]] subcommand shows assignments in a tabular format suitable for 
@@ -375,6 +377,20 @@ set_dates_parser = assignments_subp.add_parser("set-dates",
 set_dates_parser.set_defaults(func=assignments_set_dates_command)
 add_assignment_option(set_dates_parser, ungraded=False, required=True)
 <<set up date options for set-dates>>
+@
+
+The [[edit]] subcommand updates assignment content from a Markdown file with
+YAML front matter. This enables a Git-based workflow: export assignment content
+with [[view]] (piped to a file), edit locally, and push changes back with
+[[edit -f]].
+<<add assignments edit subcommand>>=
+edit_parser = assignments_subp.add_parser("edit",
+    help="Edit assignment content from a file",
+    description="Update assignment content from a Markdown file with YAML front "
+      "matter. Use 'assignments view ... > file.md' to export to editable format.")
+edit_parser.set_defaults(func=assignments_edit_command)
+add_assignment_option(edit_parser, ungraded=False, required=True)
+canvaslms.cli.content.add_file_option(edit_parser)
 @
 
 
@@ -521,15 +537,14 @@ def assignments_view_command(config, canvas, args):
 
   assignment_list = process_assignment_option(canvas, args)
   for assignment in assignment_list:
-    output = format_assignment(assignment)
-
     if sys.stdout.isatty():
+      output = format_assignment(assignment)
       <<check if we should use styles>>
       with console.pager(styles=styles, links=True):
         console.print(rich.markdown.Markdown(output,
                                              code_theme="manni"))
     else:
-      print(output)
+      <<output assignment in editable format>>
 @ Note that we use the theme [[manni]] for the code, as this works in both dark 
 and light terminals.
 
@@ -551,6 +566,20 @@ elif "PAGER" in os.environ:
 styles = False
 if "less" in pager and ("-R" in pager or "-r" in pager):
   styles = True
+@
+
+\subsection{Editable output format}
+
+When output is piped (not a TTY), we output the assignment in an editable
+format: YAML front matter with attributes followed by the description
+converted to Markdown. This format can be saved to a file, edited, and
+pushed back to Canvas using [[assignments edit -f]].
+<<output assignment in editable format>>=
+output = canvaslms.cli.content.render_to_markdown(
+    assignment,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    content_attr='description')
+print(output)
 @
 
 
@@ -828,3 +857,93 @@ for assignment in assignment_list:
     logger.error(f"Error updating assignment '{assignment.name}' (ID: {assignment.id}): {e}")
 @
 
+
+\section{The [[assignments edit]] command}
+
+The [[edit]] command updates assignment content from a Markdown file with YAML
+front matter. This enables a bidirectional workflow: use [[render]] to export
+an assignment's content, edit it locally (perhaps in a Git repository), and
+push the changes back to Canvas with [[edit -f]].
+
+The command uses the content module's schema-based approach, allowing the same
+infrastructure to work across announcements, assignments, and pages.
+<<functions>>=
+def assignments_edit_command(config, canvas, args):
+  """Edit assignment content from a Markdown file with YAML front matter."""
+  if not args.file:
+    logger.error("The -f/--file option is required for the edit command.")
+    print("Error: Please specify a file with -f/--file", file=sys.stderr)
+    return
+
+  <<read and validate assignment content from file>>
+  <<update assignment with new content>>
+
+@
+
+\subsection{Reading assignment content from file}
+
+We read the file using the content module's infrastructure, then validate the
+attributes against the assignment schema.
+<<read and validate assignment content from file>>=
+try:
+  attributes, markdown_content = canvaslms.cli.content.read_content_from_file(args.file)
+except FileNotFoundError:
+  logger.error(f"File not found: {args.file}")
+  print(f"Error: File not found: {args.file}", file=sys.stderr)
+  return
+except Exception as e:
+  logger.error(f"Error reading file: {e}")
+  print(f"Error reading file: {e}", file=sys.stderr)
+  return
+
+errors = canvaslms.cli.content.validate_attributes(
+    attributes, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+if errors:
+  for error in errors:
+    print(f"Validation error: {error}", file=sys.stderr)
+  return
+@
+
+\subsection{Updating assignment with new content}
+
+We convert the Markdown content to HTML for Canvas and build the update
+dictionary. The assignment description is the HTML body of the assignment
+instructions.
+<<update assignment with new content>>=
+html_content = pypandoc.convert_text(markdown_content, 'html', format='md')
+
+assignment_list = process_assignment_option(canvas, args)
+
+for assignment in assignment_list:
+  update_data = {
+    'assignment': {
+      'name': attributes.get('name', assignment.name),
+      'description': html_content,
+    }
+  }
+
+  <<add optional assignment attributes to update>>
+
+  try:
+    assignment.edit(**update_data)
+    print(f"Updated assignment: {assignment.name}", file=sys.stderr)
+  except Exception as e:
+    logger.error(f"Error updating assignment '{assignment.name}': {e}")
+    print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+@
+
+We add optional attributes only if they are present in the YAML front matter.
+This allows users to update just the description without changing dates, or to
+update dates along with content.
+<<add optional assignment attributes to update>>=
+if 'due_at' in attributes and attributes['due_at'] is not None:
+  update_data['assignment']['due_at'] = attributes['due_at']
+if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
+  update_data['assignment']['unlock_at'] = attributes['unlock_at']
+if 'lock_at' in attributes and attributes['lock_at'] is not None:
+  update_data['assignment']['lock_at'] = attributes['lock_at']
+if 'points_possible' in attributes and attributes['points_possible'] is not None:
+  update_data['assignment']['points_possible'] = attributes['points_possible']
+if 'published' in attributes:
+  update_data['assignment']['published'] = attributes['published']
+@

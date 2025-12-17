@@ -1,0 +1,291 @@
+\chapter{The [[pages]] command}
+\chapterprecis{%
+  This chapter provides commands for managing Canvas wiki pages.
+}
+
+This chapter provides the [[pages]] module with its subcommands: [[list]],
+[[view]], and [[edit]]. Canvas wiki pages are a flexible content type used
+for course information, resources, and documentation that doesn't fit into
+announcements or assignments.
+
+The module follows the same bidirectional workflow as announcements and
+assignments: pages can be exported to Markdown with YAML front matter using
+[[view]] (piped to a file), edited locally (perhaps in a Git repository),
+and pushed back to Canvas using [[edit -f]].
+
+
+\section{Module outline}
+
+We structure the module following the standard CLI pattern, with functions
+for adding commands and processing options.
+<<[[pages.py]]>>=
+import logging
+import re
+import sys
+
+import pypandoc
+import rich.console
+import rich.markdown
+
+import canvaslms.cli
+import canvaslms.cli.content
+import canvaslms.cli.courses
+
+logger = logging.getLogger(__name__)
+
+<<functions>>
+
+def add_command(subp):
+  """Adds the pages command with subcommands to argparse parser"""
+  pages_parser = subp.add_parser("pages",
+    help="Manage course wiki pages",
+    description="Manage wiki pages in Canvas courses: list, view, and edit.")
+
+  pages_subp = pages_parser.add_subparsers(
+    title="pages commands",
+    dest="pages_command",
+    required=True)
+
+  <<add pages list subcommand>>
+  <<add pages view subcommand>>
+  <<add pages edit subcommand>>
+@
+
+
+\section{Common options for page selection}
+
+All page commands need to select a course and optionally filter pages by title.
+We provide helper functions to add these options consistently.
+<<functions>>=
+def add_page_options(parser, required=False):
+  """Add course and page selection options to a parser."""
+  canvaslms.cli.courses.add_course_option(parser, required=required)
+  parser.add_argument("-p", "--page",
+    default=".*",
+    help="Regex matching page title or URL slug, default: '.*'")
+
+def process_page_option(canvas, args):
+  """Process page options and return matching pages."""
+  course_list = canvaslms.cli.courses.process_course_option(canvas, args)
+  pages = []
+  for course in course_list:
+    pages.extend(filter_pages(course, args.page))
+  if not pages:
+    raise canvaslms.cli.EmptyListError("No pages found matching the criteria")
+  return pages
+
+def filter_pages(course, regex):
+  """Return pages from course whose title or URL matches regex."""
+  pattern = re.compile(regex)
+  result = []
+  for page in course.get_pages():
+    if pattern.search(page.title) or pattern.search(page.url):
+      page.course = course
+      result.append(page)
+  return result
+@
+
+
+\section{The [[pages list]] subcommand}
+
+The [[list]] subcommand shows pages in a tabular format suitable for
+processing with standard UNIX tools. Output is tab-separated: course code,
+page title, published status, and URL.
+<<add pages list subcommand>>=
+list_parser = pages_subp.add_parser("list",
+    help="List wiki pages in a course",
+    description="Lists wiki pages from courses. "
+      "Output: <course> <title> <published> <url>")
+list_parser.set_defaults(func=pages_list_command)
+add_page_options(list_parser)
+@
+
+<<functions>>=
+def pages_list_command(config, canvas, args):
+  """List wiki pages from courses."""
+  import csv
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  pages = process_page_option(canvas, args)
+
+  for page in pages:
+    output.writerow([
+      page.course.course_code,
+      page.title,
+      "published" if page.published else "unpublished",
+      page.html_url
+    ])
+@
+
+
+\section{The [[pages view]] subcommand}
+
+The [[view]] subcommand displays detailed page content. When output is a TTY,
+it shows rich formatting with a pager. When piped, it outputs YAML front matter
+plus Markdown suitable for editing and pushing back with [[edit -f]].
+<<add pages view subcommand>>=
+view_parser = pages_subp.add_parser("view",
+    help="View page content",
+    description="View wiki page content. When piped, outputs editable format "
+      "with YAML front matter.")
+view_parser.set_defaults(func=pages_view_command)
+add_page_options(view_parser)
+@
+
+<<functions>>=
+def pages_view_command(config, canvas, args):
+  """View wiki page content."""
+  console = rich.console.Console()
+  pages = process_page_option(canvas, args)
+
+  for page in pages:
+    <<fetch full page content>>
+
+    if sys.stdout.isatty():
+      output = format_page(full_page)
+      with console.pager(styles=False, links=True):
+        console.print(rich.markdown.Markdown(output, code_theme="manni"))
+    else:
+      <<output page in editable format>>
+@
+
+\subsection{Editable output format}
+
+When output is piped (not a TTY), we output the page in an editable format:
+YAML front matter with attributes followed by the body converted to Markdown.
+This format can be saved to a file, edited, and pushed back to Canvas using
+[[pages edit -f]].
+<<output page in editable format>>=
+output = canvaslms.cli.content.render_to_markdown(
+    full_page,
+    canvaslms.cli.content.PAGE_SCHEMA,
+    content_attr='body')
+print(output)
+@
+
+The page object returned by [[get_pages()]] doesn't include the body content.
+We need to fetch the full page using [[get_page()]] with the URL slug.
+<<fetch full page content>>=
+full_page = page.course.get_page(page.url)
+full_page.course = page.course
+@
+
+<<functions>>=
+def format_page(page):
+  """Format a wiki page for terminal display."""
+  text = f"# {page.title}\n\n"
+  text += f"## Metadata\n\n"
+  text += f"- Course: {page.course.course_code}\n"
+  text += f"- Published: {'Yes' if page.published else 'No'}\n"
+  text += f"- URL: {page.html_url}\n"
+
+  if hasattr(page, 'front_page') and page.front_page:
+    text += f"- Front page: Yes\n"
+
+  if hasattr(page, 'editing_roles'):
+    text += f"- Editing roles: {page.editing_roles}\n"
+
+  text += "\n## Content\n\n"
+
+  if page.body:
+    try:
+      markdown_content = pypandoc.convert_text(page.body, 'md', format='html')
+      text += markdown_content
+    except Exception:
+      text += page.body
+  else:
+    text += "(No content)"
+
+  return text
+@
+
+
+\section{The [[pages edit]] subcommand}
+
+The [[edit]] subcommand updates page content from a Markdown file with YAML
+front matter. This enables a Git-based workflow: export page content with
+[[view]] (piped to a file), edit locally, and push changes back with [[edit -f]].
+<<add pages edit subcommand>>=
+edit_parser = pages_subp.add_parser("edit",
+    help="Edit page content from a file",
+    description="Update wiki page content from a Markdown file with YAML front "
+      "matter. Use 'pages view ... > file.md' to export to editable format.")
+edit_parser.set_defaults(func=pages_edit_command)
+add_page_options(edit_parser, required=True)
+canvaslms.cli.content.add_file_option(edit_parser)
+@
+
+<<functions>>=
+def pages_edit_command(config, canvas, args):
+  """Edit wiki page content from a Markdown file with YAML front matter."""
+  if not args.file:
+    logger.error("The -f/--file option is required for the edit command.")
+    print("Error: Please specify a file with -f/--file", file=sys.stderr)
+    return
+
+  <<read and validate page content from file>>
+  <<update pages with new content>>
+@
+
+\subsection{Reading page content from file}
+
+We read the file using the content module's infrastructure, then validate the
+attributes against the page schema.
+<<read and validate page content from file>>=
+try:
+  attributes, markdown_content = canvaslms.cli.content.read_content_from_file(args.file)
+except FileNotFoundError:
+  logger.error(f"File not found: {args.file}")
+  print(f"Error: File not found: {args.file}", file=sys.stderr)
+  return
+except Exception as e:
+  logger.error(f"Error reading file: {e}")
+  print(f"Error reading file: {e}", file=sys.stderr)
+  return
+
+errors = canvaslms.cli.content.validate_attributes(
+    attributes, canvaslms.cli.content.PAGE_SCHEMA)
+if errors:
+  for error in errors:
+    print(f"Validation error: {error}", file=sys.stderr)
+  return
+@
+
+\subsection{Updating pages with new content}
+
+We convert the Markdown content to HTML for Canvas and build the update
+dictionary. The Canvas API expects page updates with a [[wiki_page]] wrapper.
+<<update pages with new content>>=
+html_content = pypandoc.convert_text(markdown_content, 'html', format='md')
+
+pages = process_page_option(canvas, args)
+
+for page in pages:
+  full_page = page.course.get_page(page.url)
+  full_page.course = page.course
+
+  update_data = {
+    'wiki_page': {
+      'title': attributes.get('title', full_page.title),
+      'body': html_content,
+    }
+  }
+
+  <<add optional page attributes to update>>
+
+  try:
+    full_page.edit(**update_data)
+    print(f"Updated page: {full_page.title}", file=sys.stderr)
+  except Exception as e:
+    logger.error(f"Error updating page '{full_page.title}': {e}")
+    print(f"Error updating page '{full_page.title}': {e}", file=sys.stderr)
+@
+
+We add optional attributes only if they are present in the YAML front matter.
+<<add optional page attributes to update>>=
+if 'published' in attributes:
+  update_data['wiki_page']['published'] = attributes['published']
+if 'front_page' in attributes:
+  update_data['wiki_page']['front_page'] = attributes['front_page']
+if 'editing_roles' in attributes and attributes['editing_roles']:
+  update_data['wiki_page']['editing_roles'] = attributes['editing_roles']
+@
