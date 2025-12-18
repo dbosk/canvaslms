@@ -395,10 +395,15 @@ edit_parser = assignments_subp.add_parser("edit",
     description="Edit assignment content. Without -f, opens each matching "
       "assignment in your editor for interactive editing with preview. "
       "With -f, reads from a Markdown file with YAML front matter and updates "
-      "directly (script-friendly).")
+      "directly (script-friendly). If the YAML contains an 'id' field, the "
+      "command uses it to identify the assignment; use --create to create a new "
+      "assignment if the ID is not found.")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
+edit_parser.add_argument("--create",
+    action="store_true",
+    help="Create a new assignment if the ID in the YAML is not found")
 @
 
 
@@ -593,12 +598,21 @@ contain this assignment. When editing:
 \end{description}
 <<output assignment in editable format>>=
 <<get current modules for assignment>>
+<<get rubric for assignment>>
 output = canvaslms.cli.content.render_to_markdown(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     content_attr='description',
-    extra_attributes={'modules': assignment_modules})
+    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
 print(output)
+@
+
+We fetch the rubric if it exists. The rubric is available as an attribute on
+the assignment object when the assignment has a rubric attached.
+<<get rubric for assignment>>=
+assignment_rubric = None
+if hasattr(assignment, 'rubric') and assignment.rubric:
+  assignment_rubric = assignment.rubric
 @
 
 We fetch the current module membership using [[get_item_modules]] from the
@@ -945,31 +959,120 @@ if errors:
 
 \subsection{Updating assignment with new content}
 
-We convert the Markdown content to HTML for Canvas and build the update
-dictionary. The assignment description is the HTML body of the assignment
-instructions.
+We convert the Markdown content to HTML for Canvas. If the YAML front matter
+contains an [[id]] field, we use it to identify the specific assignment to
+update. This enables a Git-based workflow where the assignment can be reliably
+identified even if the name changes. If the ID is not found and [[--create]] is
+specified, we create a new assignment instead.
+
+If no [[id]] is in the YAML, we fall back to the filter-based matching using
+[[-a]], [[-A]], and [[-M]] options (the existing behavior).
 <<update assignment with new content>>=
 html_content = pypandoc.convert_text(markdown_content, 'html', format='md')
 
+if 'id' in attributes and attributes['id']:
+  <<update or create assignment by id>>
+else:
+  <<update assignments by filter matching>>
+@
+
+\subsubsection{ID-based assignment identification}
+
+When the YAML contains an [[id]] field, we look up the assignment directly by
+its Canvas ID. This is more reliable than filter matching because it identifies
+exactly one assignment even if multiple assignments have similar names.
+<<update or create assignment by id>>=
+assignment_id = attributes['id']
+course_list = courses.process_course_option(canvas, args)
+if not course_list:
+  print("Error: No courses found matching criteria", file=sys.stderr)
+  return
+
+course = course_list[0]
+try:
+  assignment = course.get_assignment(assignment_id)
+  assignment.course = course
+  <<update existing assignment>>
+except Exception as e:
+  if args.create:
+    <<create new assignment>>
+  else:
+    print(f"Error: Assignment with ID '{assignment_id}' not found. "
+          f"Use --create to create a new assignment.", file=sys.stderr)
+    return
+@
+
+When updating an existing assignment, we build the update dictionary and call
+the Canvas API.
+<<update existing assignment>>=
+update_data = {
+  'assignment': {
+    'name': attributes.get('name', assignment.name),
+    'description': html_content,
+  }
+}
+
+<<add optional assignment attributes to update>>
+
+try:
+  assignment.edit(**update_data)
+  print(f"Updated assignment: {assignment.name}", file=sys.stderr)
+  <<update assignment module membership>>
+except Exception as e:
+  logger.error(f"Error updating assignment '{assignment.name}': {e}")
+  print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+@
+
+\subsubsection{Creating new assignments}
+
+When [[--create]] is specified and the assignment doesn't exist, we create a
+new one. We use the Canvas API's [[create_assignment]] method.
+<<create new assignment>>=
+create_params = {
+  'name': attributes.get('name', 'Untitled Assignment'),
+  'description': html_content,
+}
+if 'due_at' in attributes and attributes['due_at'] is not None:
+  create_params['due_at'] = attributes['due_at']
+if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
+  create_params['unlock_at'] = attributes['unlock_at']
+if 'lock_at' in attributes and attributes['lock_at'] is not None:
+  create_params['lock_at'] = attributes['lock_at']
+if 'points_possible' in attributes and attributes['points_possible'] is not None:
+  create_params['points_possible'] = attributes['points_possible']
+if 'published' in attributes:
+  create_params['published'] = attributes['published']
+
+try:
+  new_assignment = course.create_assignment(assignment=create_params)
+  new_assignment.course = course
+  print(f"Created assignment: {new_assignment.name} (id: {new_assignment.id})", file=sys.stderr)
+  <<update new assignment module membership>>
+except Exception as e:
+  logger.error(f"Error creating assignment: {e}")
+  print(f"Error creating assignment: {e}", file=sys.stderr)
+@
+
+For newly created assignments, we also process module membership if specified.
+<<update new assignment module membership>>=
+if 'modules' in attributes:
+  module_regexes = attributes['modules']
+  added, removed = modules.update_item_modules(
+      new_assignment.course, 'Assignment', new_assignment.id, module_regexes)
+  if added:
+    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+@
+
+\subsubsection{Filter-based assignment matching}
+
+When no ID is specified in the YAML, we use the filter options ([[-a]], [[-A]],
+[[-M]]) to find matching assignments. This maintains backwards compatibility
+with the original behavior.
+<<update assignments by filter matching>>=
 assignment_list = process_assignment_option(canvas, args)
 
 for assignment in assignment_list:
-  update_data = {
-    'assignment': {
-      'name': attributes.get('name', assignment.name),
-      'description': html_content,
-    }
-  }
-
-  <<add optional assignment attributes to update>>
-
-  try:
-    assignment.edit(**update_data)
-    print(f"Updated assignment: {assignment.name}", file=sys.stderr)
-    <<update assignment module membership>>
-  except Exception as e:
-    logger.error(f"Error updating assignment '{assignment.name}': {e}")
-    print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+  <<update existing assignment>>
 @
 
 We add optional attributes only if they are present in the YAML front matter.
@@ -1096,22 +1199,29 @@ for assignment in assignment_list:
 @
 
 We extract the current assignment attributes using the content module's schema.
-The [[get_content_from_editor]] function will handle extracting the description,
-converting it from HTML to Markdown, and excluding it from the YAML front matter.
+We also fetch the current module membership and rubric so they can be viewed
+and edited.
 <<render current assignment content>>=
 current_attrs = canvaslms.cli.content.extract_attributes_from_object(
     assignment, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+assignment_modules = modules.get_item_modules(
+    assignment.course, 'Assignment', assignment.id)
+assignment_rubric = None
+if hasattr(assignment, 'rubric') and assignment.rubric:
+  assignment_rubric = assignment.rubric
 @
 
 We open the user's editor with the current content. By specifying
 [[content_attr='description']], the editor function automatically extracts the
 description from the attributes, converts HTML to Markdown for the body, and
-excludes it from the YAML front matter.
+excludes it from the YAML front matter. We include the [[modules]] and
+[[rubric]] attributes so users can view and edit them.
 <<open editor with assignment content>>=
 result = canvaslms.cli.content.get_content_from_editor(
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     current_attrs,
-    content_attr='description')
+    content_attr='description',
+    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
 if result is None:
   print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
   skipped_count += 1
