@@ -793,13 +793,14 @@ class CacheGetMethods:
   <<notes in [[CacheGetMethods]] doc>>
   """
   def __init__(self, attribute_name, cache=None, include_plural=True,
-               include_singular=True, plural_name=None):
+               include_singular=True, plural_name=None, cache_key='id'):
     """No parameters required"""
     self.__attribute_name = attribute_name
     self.__include_plural = include_plural
     self.__include_singular = include_singular
     self.__plural_name = plural_name
     self.__cache = cache if cache else {}
+    self.__cache_key = cache_key
 
   def __call__(self, cls):
     """Applies the decorator to the class cls"""
@@ -919,6 +920,7 @@ value that remains constant throughout the wrapper functions' lifetime.
 <<update constructor with new attributes>>=
 init = cls.__init__
 attr_name = self.__attribute_name
+cache_key = self.__cache_key
 
 @functools.wraps(init)
 def new_init(*args, **kwargs):
@@ -935,6 +937,7 @@ caching or falls back to the original [[get_*]] function.
 <<update the singular method>>=
 singular_name = f"get_{self.__attribute_name}"
 get_attr = getattr(cls, singular_name)
+cache_key = self.__cache_key
 
 @functools.wraps(get_attr)
 def new_get_attr(self, *args, **kwargs):
@@ -947,6 +950,7 @@ if self.__plural_name:
 else:
   plural_name = f"get_{self.__attribute_name}s"
 get_attrs = getattr(cls, plural_name)
+cache_key = self.__cache_key
 
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
@@ -1103,8 +1107,10 @@ The keyword arguments ([[**kwargs]]) specify additional options.
 However, in most cases the [[*args]] will only contain one element, and that is 
 an ID.
 <<notes in [[CacheGetMethods]] doc>>=
-We assume that the first positional argument is the ID of the object to fetch.
-This must be the same as the `.id` attribute of an object (`obj.id`).
+We assume that the first positional argument identifies the object to fetch.
+By default, this must match the [[.id]] attribute of the returned object.
+For objects identified by other attributes (e.g., pages use URL slugs), use
+the [[cache_key]] parameter to specify which attribute to use.
 
 Parameters:
   attribute_name: The attribute name to cache (e.g., "assignment", "user").
@@ -1114,6 +1120,9 @@ Parameters:
   plural_name: Custom plural name for irregular plurals (default: None, uses
                attribute_name + "s"). For example, "group_categories" instead
                of "group_categorys".
+  cache_key: The attribute name to use as cache key (default: 'id'). For
+             objects identified by URL instead of numeric ID (like pages),
+             use cache_key='url'.
 @
 
 This allows us to specify how the cache is structured.
@@ -1154,11 +1163,11 @@ if not obj:
   obj = get_attr(self, *args, **kwargs)
   fetch_elapsed = time.perf_counter() - fetch_start
   obj._fetched_at = datetime.now()
-  attr_cache[obj.id] = (obj, kwargs)
-  logger.info(f"Cache miss{cache_status}: {attr_name} id={id} fetched in "
+  attr_cache[getattr(obj, cache_key)] = (obj, kwargs)
+  logger.info(f"Cache miss{cache_status}: {attr_name} {cache_key}={id} fetched in "
               f"{fetch_elapsed:.2f}s")
 else:
-  logger.info(f"Cache hit: {attr_name} id={id}")
+  logger.info(f"Cache hit: {attr_name} {cache_key}={id}")
 
 return obj
 @
@@ -1176,21 +1185,23 @@ That one focuses on the keyword arguments.
 We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
-The [[get_*]] methods all take either an ID or an object as argument.
-If it's an object, then we can get the ID from that object.
+The [[get_*]] methods all take either a key (ID or URL) or an object as argument.
+If it's an object, then we can get the key from that object using [[cache_key]].
+For most Canvas objects, this is the [[id]] attribute (an integer).
+For pages, this is the [[url]] attribute (a string).
 <<let [[id]] be the ID of the object to fetch>>=
 try:
-  obj = args[0]
-  id = obj.id
+  arg = args[0]
+  id = getattr(arg, cache_key)
 except IndexError:
   raise TypeError(f"{singular_name}() missing 1 required positional "
-                  f"argument: 'id'")
+                  f"argument: '{cache_key}'")
 except AttributeError:
-  if isinstance(obj, int):
-    id = obj
+  if isinstance(arg, (int, str)):
+    id = arg
   else:
-    raise TypeError(f"{singular_name}() argument 1 must be int or "
-                    f"Canvas object, not {type(obj)}")
+    raise TypeError(f"{singular_name}() argument 1 must be int, str, or "
+                    f"Canvas object, not {type(arg)}")
 @
 
 Now let's verify the singular method caching works correctly.
@@ -1566,12 +1577,13 @@ api_elapsed = time.perf_counter() - api_start
 
 process_start = time.perf_counter()
 for obj in fetched_objs:
-  old_entry = attr_cache.get(obj.id, None)
+  obj_key = getattr(obj, cache_key)
+  old_entry = attr_cache.get(obj_key, None)
   if old_entry:
     old_obj, _ = old_entry
     <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
-  attr_cache[obj.id] = (obj, union_kwargs)
+  attr_cache[obj_key] = (obj, union_kwargs)
 process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
@@ -1600,12 +1612,13 @@ beneficial.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
   if outdated(obj):
+    obj_key = getattr(obj, cache_key)
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
     refresh_start = time.perf_counter()
-    obj = get_attr(self, obj.id, **obj_kwargs)
+    obj = get_attr(self, obj_key, **obj_kwargs)
     refresh_elapsed = time.perf_counter() - refresh_start
-    logger.info(f"Individual refresh: {attr_name} id={obj.id} in "
+    logger.info(f"Individual refresh: {attr_name} {cache_key}={obj_key} in "
                 f"{refresh_elapsed:.2f}s{reason_str}")
   yield obj
 <<yield all objects in [[attr_cache]]>>=
