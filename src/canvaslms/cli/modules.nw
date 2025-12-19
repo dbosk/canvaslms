@@ -23,7 +23,7 @@ First, it provides the [[modules]] subcommand with two sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
-\item [[modules show]] --- displays module contents including all items and
+\item [[modules view]] --- displays module contents including all items and
   their completion requirements
 \end{itemize}
 
@@ -57,20 +57,20 @@ def add_command(subp):
   list_parser.set_defaults(func=modules_list_command)
   <<add list arguments>>
   
-  # Add 'show' subcommand
-  show_parser = modules_subp.add_parser("show",
+  # Add 'view' subcommand
+  view_parser = modules_subp.add_parser("view",
     help="Shows modules and their contents",
     description="Shows modules and their contents. Output: course, "
                 "module name, item type, item name, [item id], "
                 "completion requirement")
-  show_parser.set_defaults(func=modules_show_command)
-  <<add show arguments>>
+  view_parser.set_defaults(func=modules_view_command)
+  <<add view arguments>>
 @
 
 Both subcommands accept a regular expression for filtering modules by name
 or Canvas ID.
 This allows users to work with specific modules or groups of related modules.
-Additionally, the [[show]] subcommand supports an optional [[--show-id]] flag
+Additionally, the [[view]] subcommand supports an optional [[--show-id]] flag
 to include Canvas item IDs in the output.
 These IDs are useful for automation and scripting, but omitted by default for
 cleaner, more readable output.
@@ -81,12 +81,12 @@ list_parser.add_argument("regex",
   help="Regex for filtering modules, default: '.*'")
 courses.add_course_option(list_parser, required=True)
 
-<<add show arguments>>=
-show_parser.add_argument("regex",
+<<add view arguments>>=
+view_parser.add_argument("regex",
   default=".*", nargs="?",
   help="Regex for filtering modules, default: '.*'")
-courses.add_course_option(show_parser, required=True)
-show_parser.add_argument("--show-id", action="store_true",
+courses.add_course_option(view_parser, required=True)
+view_parser.add_argument("--show-id", action="store_true",
   help="Include Canvas IDs in output")
 @
 
@@ -112,11 +112,11 @@ def modules_list_command(config, canvas, args):
       <<write module information to output>>
 @
 
-\section{Showing modules and their contents, [[modules_show_command]]}
+\section{Viewing modules and their contents, [[modules_view_command]]}
 
-The [[modules show]] subcommand provides detailed information about module
+The [[modules view]] subcommand provides detailed information about module
 contents.
-Unlike [[modules list]] which shows module-level metadata, [[modules show]]
+Unlike [[modules list]] which shows module-level metadata, [[modules view]]
 enumerates every item within matching modules, including their type (Assignment,
 Page, File, etc.), title, and completion requirements.
 
@@ -124,10 +124,10 @@ We must handle several edge cases:
 modules with no items, API errors when fetching items, and optional inclusion
 of Canvas IDs based on the [[--show-id]] flag.
 <<functions>>=
-def modules_show_command(config, canvas, args):
+def modules_view_command(config, canvas, args):
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
   course_list = courses.process_course_option(canvas, args)
-  
+
   for course in course_list:
     modules = filter_modules(course, args.regex)
     for module in modules:
@@ -221,7 +221,7 @@ progress_mode = "sequential" if sequential else "any-order"
 
 \subsection{Module item output format}
 
-For the [[modules show]] command, we output information about each item within
+For the [[modules view]] command, we output information about each item within
 matching modules.
 The output includes: course code, module name, item type, item title,
 optionally the Canvas ID (when [[--show-id]] is specified), and any
@@ -421,4 +421,201 @@ def filter_assignments_by_module_list(modules, assignments):
   for assignment in assignments:
     if assignment.id in all_assignment_ids:
       yield assignment
+@
+
+\subsection{Filtering pages by module membership}
+
+Similarly, we provide a function to filter pages by module membership. The
+difference from assignments is that pages are identified by their URL slug
+([[page_url]]) rather than a numeric ID.
+<<functions>>=
+def filter_pages_by_module_list(modules, pages):
+  """Returns elements in pages that belong to any of the modules"""
+  all_page_urls = set()
+  for module in modules:
+    try:
+      for item in module.get_module_items():
+        if hasattr(item, 'type') and item.type == "Page":
+          all_page_urls.add(item.page_url)
+    except AttributeError:
+      pass
+
+  for page in pages:
+    if page.url in all_page_urls:
+      yield page
+@
+
+
+\section{Querying and updating module membership}
+
+When editing pages or assignments, users may want to control which modules
+contain the item.
+The front matter can include a [[modules]] field with a list of regex patterns
+specifying which modules should contain the item.
+To support this, we need two utility functions:
+\begin{description}
+\item[get_item_modules] Returns the names of modules currently containing an item
+\item[update_item_modules] Adds or removes an item from modules based on regex patterns
+\end{description}
+
+\subsection{Getting current module membership}
+
+To find which modules contain an item, we must iterate through all modules
+in the course and check each module's items.
+This is necessary because Canvas does not provide a direct API to query
+\enquote{which modules contain this assignment?}---we must search.
+
+The function handles two item types differently:
+\begin{description}
+\item[Assignment] Identified by [[content_id]] matching the assignment's numeric ID
+\item[Page] Identified by [[page_url]] matching the page's URL slug
+\end{description}
+
+<<functions>>=
+def get_item_modules(course, item_type, item_id):
+  """Get list of modules containing an item.
+
+  Args:
+      course: Canvas course object
+      item_type: 'Assignment' or 'Page'
+      item_id: For Assignment: assignment.id (int),
+               For Page: page.url (string slug)
+
+  Returns:
+      List of module names containing this item
+  """
+  modules = []
+  for module in course.get_modules():
+    try:
+      for item in module.get_module_items():
+        if not hasattr(item, 'type') or item.type != item_type:
+          continue
+        <<check if item matches and add module to list>>
+    except Exception:
+      # Skip modules we can't access
+      pass
+  return modules
+@
+
+The matching logic differs by item type.
+For assignments, Canvas stores the assignment ID in [[content_id]].
+For pages, Canvas stores the URL slug in [[page_url]].
+<<check if item matches and add module to list>>=
+if item_type == 'Assignment':
+  if hasattr(item, 'content_id') and item.content_id == item_id:
+    modules.append(module.name)
+    break
+elif item_type == 'Page':
+  if hasattr(item, 'page_url') and item.page_url == item_id:
+    modules.append(module.name)
+    break
+@
+
+\subsection{Updating module membership based on patterns}
+
+The [[update_item_modules]] function synchronizes an item's module membership
+with a list of regex patterns.
+The semantics are:
+\begin{description}
+\item[Empty list] Remove the item from all modules
+\item[Non-empty list] The item should be in exactly those modules matching
+  at least one regex pattern---add to matching modules, remove from non-matching
+\end{description}
+
+This provides a declarative interface: the user specifies the desired state,
+and we compute the necessary additions and removals.
+
+<<functions>>=
+def update_item_modules(course, item_type, item_id, module_regexes):
+  """Update module membership for an item based on regex patterns.
+
+  Args:
+      course: Canvas course object
+      item_type: 'Assignment' or 'Page'
+      item_id: For Assignment: assignment.id (int),
+               For Page: page.url (string slug)
+      module_regexes: List of regex patterns to match module names.
+                      Empty list means remove from all modules.
+
+  Returns:
+      Tuple of (added_modules, removed_modules) as lists of module names
+  """
+  <<find modules matching regex patterns>>
+  <<compute and apply module membership changes>>
+  return added, removed
+@
+
+First, we compile all regex patterns and find which modules match.
+We match against both module name and Canvas ID, consistent with
+[[filter_modules]].
+<<find modules matching regex patterns>>=
+all_modules = list(course.get_modules())
+
+matching_module_ids = set()
+for pattern in module_regexes:
+  regex = re.compile(pattern)
+  for module in all_modules:
+    if regex.search(module.name) or regex.search(str(module.id)):
+      matching_module_ids.add(module.id)
+@
+
+For each module, we determine the current state (is the item present?)
+and the desired state (does the module match a regex?).
+Then we add or remove as needed.
+<<compute and apply module membership changes>>=
+added = []
+removed = []
+
+for module in all_modules:
+  <<find current module item if present>>
+  should_be_in = module.id in matching_module_ids
+  <<add or remove item from module as needed>>
+@
+
+We search the module's items to find if our item is currently present.
+<<find current module item if present>>=
+current_item = None
+try:
+  for item in module.get_module_items():
+    if not hasattr(item, 'type') or item.type != item_type:
+      continue
+    if item_type == 'Assignment':
+      if hasattr(item, 'content_id') and item.content_id == item_id:
+        current_item = item
+        break
+    elif item_type == 'Page':
+      if hasattr(item, 'page_url') and item.page_url == item_id:
+        current_item = item
+        break
+except Exception:
+  pass
+@
+
+Finally, we add or remove based on comparing current vs desired state.
+When adding, we use [[create_module_item]] with the appropriate type and ID.
+When removing, we call [[delete()]] on the module item object.
+<<add or remove item from module as needed>>=
+if should_be_in and current_item is None:
+  # Add to module
+  try:
+    if item_type == 'Assignment':
+      module.create_module_item({
+        'type': 'Assignment',
+        'content_id': item_id
+      })
+    else:  # Page
+      module.create_module_item({
+        'type': 'Page',
+        'page_url': item_id
+      })
+    added.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't add
+elif not should_be_in and current_item is not None:
+  # Remove from module
+  try:
+    current_item.delete()
+    removed.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't remove
 @
