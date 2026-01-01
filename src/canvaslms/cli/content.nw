@@ -1,0 +1,951 @@
+\chapter{Content editing and rendering utilities}
+\label{ContentModule}
+
+This module provides reusable infrastructure for editing and rendering Canvas
+content---announcements, assignments, pages, and eventually rubrics---with YAML
+front matter. The key insight is that these different content types share
+common patterns: they have attributes that can be edited, content that can be
+written in Markdown, and a need for bidirectional workflows between Canvas and
+local files.
+
+\section{The problem: editing content across Canvas types}
+
+Canvas supports many types of rich content: announcements with scheduled
+posting dates, assignments with due dates and submission settings, wiki pages
+with published states. Each type has its own set of attributes, but the
+editing workflow is remarkably similar:
+
+\begin{enumerate}
+\item Fetch the content from Canvas (or create new)
+\item Edit the content locally (in an editor or from a file)
+\item Preview the changes
+\item Push the content back to Canvas
+\end{enumerate}
+
+The [[discussions.nw]] module originally implemented this workflow for
+announcements. However, the implementation was announcement-specific, making it
+impossible to reuse for assignments or pages without code duplication.
+
+This module extracts the common infrastructure into reusable functions that
+work with any content type through a schema-based approach.
+
+\section{The bidirectional workflow}
+
+We want to support two directions of content flow:
+
+\begin{description}
+\item[Canvas to file] Render a Canvas object (announcement, assignment, page)
+  to a Markdown file with YAML front matter. This enables storing content in a
+  Git repository, version-controlling changes, and collaborating on content
+  through pull requests.
+\item[File to Canvas] Read a Markdown file with YAML front matter and use it
+  to create or update Canvas content. This is the [[-f]] option that enables
+  scriptable content management.
+\end{description}
+
+The YAML front matter format is familiar from static site generators like
+Jekyll and Hugo, making it intuitive for developers to work with.
+
+\section{Module outline}
+
+We structure the module to follow the logical flow of content processing:
+parsing, schema handling, rendering, file operations, and interactive editing.
+<<[[content.py]]>>=
+"""Content editing and rendering utilities for Canvas LMS.
+
+This module provides reusable infrastructure for editing Canvas content
+(announcements, assignments, pages) with YAML front matter, enabling
+bidirectional workflows between Canvas and local files.
+"""
+
+<<content imports>>
+<<content constants>>
+
+logger = logging.getLogger(__name__)
+
+<<yaml front matter functions>>
+<<schema functions>>
+<<rendering functions>>
+<<file input functions>>
+<<editor functions>>
+<<preview functions>>
+<<interactive functions>>
+@
+
+The imports cover standard library modules for file handling and subprocess
+management, plus third-party libraries for YAML parsing and rich terminal
+output.
+<<content imports>>=
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+
+import pypandoc
+import rich.console
+import rich.markdown
+import yaml
+@
+
+\section{Testing overview}
+
+Tests are distributed throughout this module, appearing after each
+implementation section. The test file imports the module and pytest.
+<<[[test content.py]]>>=
+"""Tests for content editing and rendering utilities."""
+import pytest
+import tempfile
+import os
+
+import canvaslms.cli.content as content
+
+<<test yaml functions>>
+<<test schema functions>>
+<<test rendering functions>>
+<<test file input functions>>
+@
+
+
+\section{YAML front matter: a familiar solution}
+
+YAML front matter is a convention from static site generators where metadata
+appears at the beginning of a file, delimited by \texttt{---} markers. This
+format is familiar to developers and provides a clear separation between
+structured attributes and free-form content.
+
+\begin{verbatim}
+---
+title: "Example Announcement"
+published: true
+delayed_post_at: 2024-12-25T08:00:00
+---
+Your announcement content here in **Markdown** format.
+\end{verbatim}
+
+\subsection{Parsing YAML front matter}
+
+The [[parse_yaml_front_matter]] function extracts the YAML section from content
+and returns both the parsed attributes and the remaining content. If no front
+matter is present, it returns an empty dictionary and the original content
+unchanged.
+<<yaml front matter functions>>=
+def parse_yaml_front_matter(content):
+    """Parse YAML front matter from content.
+
+    Args:
+        content: String containing optional YAML front matter followed by content
+
+    Returns:
+        Tuple of (attributes dict, content string without front matter)
+    """
+    if not content.strip().startswith('---'):
+        return {}, content
+
+    parts = content.split('---', 2)
+    if len(parts) < 3:
+        return {}, content
+
+    try:
+        yaml_str = parts[1]
+        attributes = yaml.safe_load(yaml_str) or {}
+        message_content = parts[2].lstrip('\n')
+        return attributes, message_content
+    except yaml.YAMLError as e:
+        logger.warning(f"Failed to parse YAML front matter: {e}")
+        return {}, content
+
+@
+
+\subsection{Formatting YAML front matter}
+
+The [[format_yaml_front_matter]] function performs the inverse operation:
+given attributes and content, it produces a string with proper YAML front
+matter formatting.
+<<yaml front matter functions>>=
+def format_yaml_front_matter(attributes, message_content):
+    """Format content with YAML front matter.
+
+    Args:
+        attributes: Dictionary of attributes
+        message_content: The message content
+
+    Returns:
+        String with YAML front matter and content
+    """
+    if not attributes:
+        return message_content
+
+    yaml_str = yaml.dump(attributes, default_flow_style=False, sort_keys=False)
+    return f"---\n{yaml_str}---\n{message_content}"
+
+@
+
+\subsection{Verifying YAML functions}
+
+We verify the parsing handles various edge cases correctly.
+<<test yaml functions>>=
+class TestParseYamlFrontMatter:
+    """Tests for parse_yaml_front_matter function."""
+
+    def test_empty_content_returns_empty_dict(self):
+        """Empty content returns empty attributes."""
+        attrs, result = content.parse_yaml_front_matter("")
+        assert attrs == {}
+        assert result == ""
+
+    def test_no_frontmatter_returns_content_unchanged(self):
+        """Content without front matter passes through unchanged."""
+        original = "Just some content\nwith multiple lines"
+        attrs, result = content.parse_yaml_front_matter(original)
+        assert attrs == {}
+        assert result == original
+
+    def test_valid_frontmatter_parsed_correctly(self):
+        """Valid YAML front matter is parsed into attributes."""
+        text = """---
+title: Test Title
+published: true
+---
+Content here"""
+        attrs, result = content.parse_yaml_front_matter(text)
+        assert attrs == {'title': 'Test Title', 'published': True}
+        assert result == "Content here"
+
+    def test_frontmatter_with_null_values(self):
+        """Null values in YAML are preserved."""
+        text = """---
+title: Test
+delayed_post_at: null
+---
+Content"""
+        attrs, _ = content.parse_yaml_front_matter(text)
+        assert attrs['delayed_post_at'] is None
+
+
+class TestFormatYamlFrontMatter:
+    """Tests for format_yaml_front_matter function."""
+
+    def test_empty_attributes_returns_content_only(self):
+        """Empty attributes dict returns just the content."""
+        result = content.format_yaml_front_matter({}, "Content here")
+        assert result == "Content here"
+
+    def test_formats_attributes_correctly(self):
+        """Attributes are formatted as YAML front matter."""
+        attrs = {'title': 'Test', 'published': True}
+        result = content.format_yaml_front_matter(attrs, "Content")
+        assert result.startswith("---\n")
+        assert "title: Test" in result
+        assert result.endswith("---\nContent")
+
+@
+
+
+\section{Content schemas}
+\label{sec:content-schemas}
+
+Different Canvas content types have different attributes. An announcement has
+[[title]], [[published]], [[delayed_post_at]], while an assignment has
+[[name]], [[due_at]], [[points_possible]]. Rather than hardcoding these
+differences, we use a schema-based approach.
+
+A schema is a dictionary that defines:
+\begin{description}
+\item[default] The default value for the attribute
+\item[required] Whether the attribute must be provided
+\item[canvas\_attr] The name of the attribute on the Canvas API object
+\item[description] Human-readable description for documentation
+\end{description}
+
+\subsection{The announcement schema}
+
+We define the schema for announcements, which will be used by the
+[[discussions]] module.
+<<content constants>>=
+ANNOUNCEMENT_SCHEMA = {
+    'title': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'title',
+        'description': 'Announcement title'
+    },
+    'message': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'message',
+        'description': 'Announcement body (HTML)'
+    },
+    'published': {
+        'default': True,
+        'required': False,
+        'canvas_attr': 'published',
+        'description': 'Whether to publish immediately'
+    },
+    'delayed_post_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'delayed_post_at',
+        'description': 'Schedule for future posting (ISO datetime)'
+    },
+    'lock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'lock_at',
+        'description': 'Date to lock discussion (ISO datetime)'
+    },
+    'require_initial_post': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'require_initial_post',
+        'description': 'Require initial post before viewing'
+    },
+    'allow_rating': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'allow_rating',
+        'description': 'Allow rating posts'
+    },
+    'only_graders_can_rate': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'only_graders_can_rate',
+        'description': 'Restrict rating to graders'
+    },
+    'sort_by_rating': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'sort_by_rating',
+        'description': 'Sort posts by rating'
+    },
+}
+
+@
+
+\subsection{The assignment schema}
+
+Assignments have different attributes than announcements. The key attributes
+are [[name]] (the title) and various dates controlling availability and due
+dates. The [[description]] (HTML body with instructions) is handled separately
+via the [[content_attr]] parameter in rendering functions---it becomes the
+Markdown content after the YAML front matter, not a front matter attribute.
+
+We include [[id]] to enable identification of assignments during editing.
+When an assignment is exported and re-imported, the ID allows the edit command
+to find the correct assignment even if the name has changed.
+
+The [[rubric]] attribute contains the full rubric structure if one is attached
+to the assignment. This enables viewing and creating rubrics via YAML.
+<<content constants>>=
+ASSIGNMENT_SCHEMA = {
+    'name': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'name',
+        'description': 'Assignment name/title'
+    },
+    'id': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'id',
+        'description': 'Assignment ID (for identification during edit)'
+    },
+    'due_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'due_at',
+        'description': 'Due date (ISO 8601 datetime)'
+    },
+    'unlock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'unlock_at',
+        'description': 'Available from date (ISO 8601 datetime)'
+    },
+    'lock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'lock_at',
+        'description': 'Available until date (ISO 8601 datetime)'
+    },
+    'points_possible': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'points_possible',
+        'description': 'Maximum points for the assignment'
+    },
+    'published': {
+        'default': True,
+        'required': False,
+        'canvas_attr': 'published',
+        'description': 'Whether the assignment is visible to students'
+    },
+    'rubric': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'rubric',
+        'description': 'Rubric criteria and ratings'
+    },
+}
+
+@
+
+\subsection{The page schema}
+
+Canvas wiki pages have their own set of attributes. The [[body]] (HTML content)
+is handled separately via the [[content_attr]] parameter in rendering
+functions---it becomes the Markdown content after the YAML front matter, not a
+front matter attribute. Pages have settings for editing permissions and whether
+a page is the course front page.
+
+We include [[url]] (the page's URL slug) to enable identification during
+editing. When a page is exported and re-imported, the URL allows the edit
+command to find the correct page even if the title has changed.
+<<content constants>>=
+PAGE_SCHEMA = {
+    'title': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'title',
+        'description': 'Page title'
+    },
+    'url': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'url',
+        'description': 'Page URL slug (for identification during edit)'
+    },
+    'published': {
+        'default': True,
+        'required': False,
+        'canvas_attr': 'published',
+        'description': 'Whether the page is visible to students'
+    },
+    'front_page': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'front_page',
+        'description': 'Set as the course front page'
+    },
+    'editing_roles': {
+        'default': 'teachers',
+        'required': False,
+        'canvas_attr': 'editing_roles',
+        'description': 'Who can edit: teachers, students, members, or public'
+    },
+}
+
+@
+
+\subsection{Creating a template from a schema}
+
+The [[create_schema_template]] function generates a dictionary of default
+values from a schema. This is used when opening an editor with a blank
+template showing all available attributes.
+<<schema functions>>=
+def create_schema_template(schema):
+    """Create an attributes template from a schema definition.
+
+    Args:
+        schema: Dict mapping attribute names to their definitions.
+                Each definition has 'default', 'required', 'canvas_attr' keys.
+
+    Returns:
+        Dict with attribute names mapped to their default values.
+    """
+    return {name: defn['default'] for name, defn in schema.items()}
+
+@
+
+\subsection{Extracting attributes from Canvas objects}
+
+The [[extract_attributes_from_object]] function reads attribute values from a
+Canvas API object using the schema's [[canvas_attr]] mappings. This enables
+the Canvas-to-file direction: given an announcement object, extract its
+attributes for rendering to Markdown.
+<<schema functions>>=
+def extract_attributes_from_object(obj, schema):
+    """Extract attributes from a Canvas object using schema.
+
+    This enables the 'infer from object' capability. Given an announcement,
+    assignment, or page object, extract attributes according to the schema.
+
+    Args:
+        obj: Canvas API object (Announcement, Assignment, Page, etc.)
+        schema: Schema defining which attributes to extract
+
+    Returns:
+        Dict with attribute values extracted from the object
+    """
+    attributes = {}
+    for name, defn in schema.items():
+        canvas_attr = defn.get('canvas_attr', name)
+        value = getattr(obj, canvas_attr, defn['default'])
+        attributes[name] = value
+    return attributes
+
+@
+
+\subsection{Validating attributes}
+
+The [[validate_attributes]] function checks that required attributes are
+present and returns a list of error messages. An empty list means validation
+passed.
+<<schema functions>>=
+def validate_attributes(attributes, schema):
+    """Validate attributes against schema.
+
+    Args:
+        attributes: Dict of attribute values
+        schema: Schema with required/optional definitions
+
+    Returns:
+        List of error messages (empty if valid)
+    """
+    errors = []
+    for name, defn in schema.items():
+        if defn.get('required', False):
+            value = attributes.get(name)
+            if value is None or value == '':
+                errors.append(f"Required attribute '{name}' is missing or empty")
+    return errors
+
+@
+
+\subsection{Verifying schema functions}
+<<test schema functions>>=
+class TestSchemaFunctions:
+    """Tests for schema manipulation functions."""
+
+    def test_create_template_with_defaults(self):
+        """Template contains all schema attributes with defaults."""
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+            'published': {'default': True, 'required': False, 'canvas_attr': 'published'},
+        }
+        template = content.create_schema_template(schema)
+        assert template == {'title': '', 'published': True}
+
+    def test_extract_attributes_from_object(self):
+        """Attributes are extracted from object using canvas_attr mapping."""
+        class MockAnnouncement:
+            title = "Test Title"
+            published = True
+            delayed_post_at = None
+
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+            'published': {'default': True, 'required': False, 'canvas_attr': 'published'},
+            'delayed_post_at': {'default': None, 'required': False, 'canvas_attr': 'delayed_post_at'},
+        }
+        attrs = content.extract_attributes_from_object(MockAnnouncement(), schema)
+        assert attrs['title'] == "Test Title"
+        assert attrs['published'] is True
+        assert attrs['delayed_post_at'] is None
+
+    def test_validate_missing_required_attribute(self):
+        """Validation fails when required attribute is missing."""
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+        }
+        errors = content.validate_attributes({}, schema)
+        assert len(errors) == 1
+        assert "title" in errors[0]
+
+    def test_validate_empty_required_attribute(self):
+        """Validation fails when required attribute is empty string."""
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+        }
+        errors = content.validate_attributes({'title': ''}, schema)
+        assert len(errors) == 1
+
+    def test_validate_passes_with_all_required(self):
+        """Validation passes when all required attributes present."""
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+            'published': {'default': True, 'required': False, 'canvas_attr': 'published'},
+        }
+        errors = content.validate_attributes({'title': 'Test'}, schema)
+        assert errors == []
+
+@
+
+
+\section{Rendering Canvas objects to Markdown}
+
+The [[render_to_markdown]] function implements the Canvas-to-file direction.
+Given a Canvas object and schema, it produces a Markdown string with YAML
+front matter that can be saved to a file and version-controlled.
+
+Some attributes needed in the output aren't part of the Canvas object itself.
+For example, module membership is stored separately from page or assignment
+objects. The [[extra_attributes]] parameter allows callers to include such
+additional attributes in the YAML front matter without modifying the schema.
+<<rendering functions>>=
+def render_to_markdown(obj, schema, content_attr='message', extra_attributes=None):
+    """Render a Canvas object to Markdown with YAML front matter.
+
+    This is the Canvas-to-file direction: take a Canvas object and produce
+    a Markdown file suitable for Git storage.
+
+    Args:
+        obj: Canvas API object
+        schema: Schema for attribute extraction
+        content_attr: Name of the attribute containing HTML content
+                     (e.g., 'message' for announcements, 'description' for assignments)
+        extra_attributes: Optional dict of additional attributes to include
+                         in the YAML front matter (e.g., {'modules': ['Module 1']})
+
+    Returns:
+        Markdown string with YAML front matter
+    """
+    attributes = extract_attributes_from_object(obj, schema)
+    if extra_attributes:
+        attributes.update(extra_attributes)
+
+    html_content = getattr(obj, content_attr, '') or ''
+    if html_content:
+        try:
+            markdown_content = pypandoc.convert_text(html_content, 'md', format='html')
+        except Exception as e:
+            logger.warning(f"Failed to convert HTML to Markdown: {e}")
+            markdown_content = html_content
+    else:
+        markdown_content = ''
+
+    return format_yaml_front_matter(attributes, markdown_content)
+
+@
+
+\subsection{Verifying rendering}
+<<test rendering functions>>=
+class TestRenderToMarkdown:
+    """Tests for render_to_markdown function."""
+
+    def test_renders_object_with_attributes(self):
+        """Canvas object is rendered with YAML front matter."""
+        class MockAnnouncement:
+            title = "Test Announcement"
+            published = True
+            message = "<p>Hello <strong>world</strong></p>"
+
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+            'published': {'default': True, 'required': False, 'canvas_attr': 'published'},
+        }
+        result = content.render_to_markdown(MockAnnouncement(), schema, 'message')
+        assert result.startswith("---\n")
+        assert "title: Test Announcement" in result
+        assert "published: true" in result
+
+    def test_handles_empty_content(self):
+        """Empty content attribute produces empty body."""
+        class MockAnnouncement:
+            title = "Empty"
+            published = True
+            message = ""
+
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+        }
+        result = content.render_to_markdown(MockAnnouncement(), schema, 'message')
+        assert "title: Empty" in result
+
+    def test_includes_extra_attributes(self):
+        """Extra attributes are included in YAML front matter."""
+        class MockPage:
+            title = "Test Page"
+            body = "<p>Content</p>"
+
+        schema = {
+            'title': {'default': '', 'required': True, 'canvas_attr': 'title'},
+        }
+        extra = {'modules': ['Week 1', 'Week 2']}
+        result = content.render_to_markdown(
+            MockPage(), schema, 'body', extra_attributes=extra)
+        assert "title: Test Page" in result
+        assert "modules:" in result
+        assert "- Week 1" in result
+        assert "- Week 2" in result
+
+@
+
+
+\section{Reading content from files}
+
+The [[read_content_from_file]] function implements the file-to-Canvas
+direction. It reads a Markdown file with YAML front matter and returns the
+parsed attributes and content.
+<<file input functions>>=
+def read_content_from_file(file_path):
+    """Read content from a Markdown file with YAML front matter.
+
+    This is the file-to-Canvas direction: read a Markdown file (possibly
+    from a Git repo) and parse its attributes and content.
+
+    Args:
+        file_path: Path to the Markdown file
+
+    Returns:
+        Tuple of (attributes dict, markdown content)
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file has invalid YAML front matter
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        file_content = f.read()
+
+    attributes, markdown_content = parse_yaml_front_matter(file_content)
+    return attributes, markdown_content
+
+@
+
+\subsection{The file option}
+
+The [[add_file_option]] function adds the [[-f/--file]] argument to a parser.
+This is used by commands that want to support reading content from files.
+<<file input functions>>=
+def add_file_option(parser):
+    """Add the -f/--file option to a parser.
+
+    Args:
+        parser: argparse parser to add the option to
+    """
+    parser.add_argument("-f", "--file",
+        help="Read content from a Markdown file with YAML front matter. "
+             "When specified, ignores -i/--interactive and -m/--message.")
+
+@
+
+\subsection{Verifying file input}
+<<test file input functions>>=
+class TestReadContentFromFile:
+    """Tests for read_content_from_file function."""
+
+    def test_reads_valid_file(self):
+        """Valid file with front matter is parsed correctly."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write("""---
+title: Test File
+published: true
+---
+File content here""")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            attrs, markdown = content.read_content_from_file(temp_path)
+            assert attrs['title'] == "Test File"
+            assert attrs['published'] is True
+            assert "File content here" in markdown
+        finally:
+            os.unlink(temp_path)
+
+    def test_raises_on_missing_file(self):
+        """FileNotFoundError raised for missing file."""
+        with pytest.raises(FileNotFoundError):
+            content.read_content_from_file("/nonexistent/path/file.md")
+
+    def test_handles_file_without_frontmatter(self):
+        """File without front matter returns empty attributes."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write("Just plain content")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            attrs, markdown = content.read_content_from_file(temp_path)
+            assert attrs == {}
+            assert "Just plain content" in markdown
+        finally:
+            os.unlink(temp_path)
+
+@
+
+
+\section{Editor integration}
+
+The [[get_content_from_editor]] function opens the user's preferred editor
+with a template based on the schema. After editing, it parses the result and
+returns the attributes and content.
+
+This is a generalized version of [[get_announcement_from_editor]] from
+[[discussions.nw]], designed to work with any content type through schemas.
+
+When editing existing content, the [[content_attr]] parameter specifies which
+attribute contains the body content (e.g., \verb|description| for assignments,
+\verb|body| for pages, \verb|message| for announcements). The function
+automatically extracts this content from [[initial_attributes]], converts it
+from HTML to Markdown, and excludes it from the YAML front matter---since the
+body content appears as the markdown document body, not as metadata.
+<<editor functions>>=
+def get_content_from_editor(schema, initial_attributes=None, content_attr=None):
+    """Open editor to edit content with YAML front matter.
+
+    Args:
+        schema: Schema defining available attributes
+        initial_attributes: Optional pre-populated attributes (including content)
+        content_attr: Name of attribute that represents body content.
+                     If provided: extracts from initial_attributes, converts
+                     HTML to Markdown, excludes from YAML front matter.
+
+    Returns:
+        Tuple of (attributes dict, markdown content), or None if cancelled
+    """
+    editor = os.environ.get('EDITOR', 'nano')
+
+    if initial_attributes is None:
+        initial_attributes = {}
+
+    # Extract and convert content from attributes if content_attr specified
+    markdown_body = ""
+    if content_attr and content_attr in initial_attributes:
+        html_content = initial_attributes.get(content_attr, '') or ''
+        if html_content:
+            try:
+                markdown_body = pypandoc.convert_text(html_content, 'md', format='html')
+            except Exception:
+                markdown_body = html_content
+
+    # Build template: schema defaults + initial_attributes, minus content_attr
+    template_attrs = create_schema_template(schema)
+    if content_attr:
+        template_attrs.pop(content_attr, None)
+    template_attrs.update(initial_attributes)
+    if content_attr:
+        template_attrs.pop(content_attr, None)  # Also remove from merged attrs
+
+    template_content = format_yaml_front_matter(template_attrs, markdown_body)
+
+    with tempfile.NamedTemporaryFile(mode='w+', suffix='.md', delete=False) as temp_file:
+        temp_file.write(template_content)
+        temp_file_path = temp_file.name
+
+    try:
+        try:
+            subprocess.run([editor, temp_file_path], check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Editor exited with error code {e.returncode}")
+            return None
+        except FileNotFoundError:
+            logger.error(f"Editor '{editor}' not found")
+            return None
+        except Exception as e:
+            logger.error(f"Error opening editor: {e}")
+            return None
+
+        with open(temp_file_path, 'r') as temp_file:
+            file_content = temp_file.read()
+
+        attributes, markdown_content = parse_yaml_front_matter(file_content)
+        return attributes, markdown_content.strip()
+
+    finally:
+        try:
+            os.unlink(temp_file_path)
+        except OSError:
+            pass
+
+@
+
+
+\section{Preview functions}
+
+The [[render_content_preview]] function displays a preview of content in the
+terminal using Rich for formatting. This helps users verify their content
+before submitting to Canvas.
+<<preview functions>>=
+def render_content_preview(title, markdown_content, attributes=None, content_type="Content"):
+    """Render a preview of content in the terminal using Rich.
+
+    Args:
+        title: Title to display in preview header
+        markdown_content: Markdown content to render
+        attributes: Optional dict of attributes to display
+        content_type: Type label (e.g., 'Announcement', 'Assignment')
+    """
+    console = rich.console.Console(stderr=True)
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    console.print(f"[bold cyan]Preview {content_type}: {title}[/bold cyan]")
+    print("=" * 60 + "\n", file=sys.stderr)
+
+    if attributes:
+        console.print("[bold]Attributes:[/bold]")
+        for key, value in attributes.items():
+            if key != 'title':
+                console.print(f"  {key}: {value}")
+        print(file=sys.stderr)
+
+    try:
+        console.print(rich.markdown.Markdown(markdown_content))
+    except Exception:
+        console.print(markdown_content)
+
+    print("\n" + "=" * 60 + "\n", file=sys.stderr)
+
+@
+
+
+\section{Interactive confirmation}
+
+The [[interactive_confirm_and_edit]] function provides an accept/edit/discard
+loop. Users can preview their content, choose to accept it, edit it further,
+or discard their changes.
+
+The function is generalized to work with any content type by accepting the
+schema for re-editing.
+<<interactive functions>>=
+def interactive_confirm_and_edit(title, message, attributes, schema, content_type="Content"):
+    """Interactive loop for confirming or editing content.
+
+    Args:
+        title: Content title
+        message: Markdown content
+        attributes: Current attributes
+        schema: Schema for re-editing
+        content_type: Type label for display
+
+    Returns:
+        Tuple of (attributes, message), or None if cancelled
+    """
+    current_message = message
+    current_attributes = attributes.copy()
+    current_title = title
+
+    while True:
+        render_content_preview(current_title, current_message, current_attributes, content_type)
+
+        print("Options:", file=sys.stderr)
+        print(f"  [a] Accept and post {content_type.lower()}", file=sys.stderr)
+        print("  [e] Edit again", file=sys.stderr)
+        print("  [d] Discard and cancel", file=sys.stderr)
+
+        try:
+            choice = input("Your choice (a/e/d): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.", file=sys.stderr)
+            return None
+
+        if choice in ['a', 'accept']:
+            return current_attributes, current_message
+        elif choice in ['e', 'edit']:
+            result = get_content_from_editor(schema, current_attributes, current_message)
+            if result is None:
+                print("Editor cancelled or failed. Keeping previous content.", file=sys.stderr)
+            else:
+                new_attributes, new_message = result
+                if new_message.strip():
+                    current_message = new_message
+                    current_attributes = new_attributes
+                    current_title = new_attributes.get('title', current_title)
+                else:
+                    print("Message cannot be empty. Keeping previous content.", file=sys.stderr)
+        elif choice in ['d', 'discard', 'cancel']:
+            return None
+        else:
+            print(f"Invalid choice '{choice}'. Please enter 'a', 'e', or 'd'.", file=sys.stderr)
+
+@
