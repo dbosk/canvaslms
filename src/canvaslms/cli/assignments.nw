@@ -41,6 +41,7 @@ import pypandoc
 import re
 import rich.console
 import rich.markdown
+import rich.syntax
 import sys
 
 logger = logging.getLogger(__name__)
@@ -355,15 +356,36 @@ list_parser.set_defaults(func=assignments_list_command)
 add_assignment_option(list_parser)
 @
 
-The [[view]] subcommand provides detailed information about assignments in 
+The [[view]] subcommand provides detailed information about assignments in
 a human-readable format with rich formatting when displayed in a terminal.
+
+\subsection{The [[--html]] option}
+
+By default, [[view]] converts assignment descriptions from HTML to Markdown for
+easier reading and editing. However, some assignments contain elements that
+don't convert well to Markdown: embedded videos, iframes, complex tables, or
+custom HTML formatting. The [[--html]] option preserves the original HTML
+content.
+
+When [[--html]] is specified:
+\begin{description}
+\item[TTY output] Shows syntax-highlighted HTML in the pager
+\item[Piped output] Outputs YAML front matter plus raw HTML body
+\end{description}
+
+This enables a round-trip workflow where HTML assignments can be viewed, edited,
+and pushed back without losing any formatting.
 <<add assignments view subcommand>>=
-# Add view subcommand (was the old "assignment" command)  
+# Add view subcommand (was the old "assignment" command)
 view_parser = assignments_subp.add_parser("view",
     help="View assignment details",
-    description="Views detailed information about assignments")
+    description="Views detailed information about assignments. "
+      "Use --html to preserve HTML instead of converting to Markdown.")
 view_parser.set_defaults(func=assignments_view_command)
 add_assignment_option(view_parser)
+view_parser.add_argument("--html",
+    action="store_true",
+    help="Output raw HTML instead of converting to Markdown")
 @
 
 The [[set-dates]] subcommand allows modification of assignment timing with 
@@ -397,13 +419,18 @@ edit_parser = assignments_subp.add_parser("edit",
       "With -f, reads from a Markdown file with YAML front matter and updates "
       "directly (script-friendly). If the YAML contains an 'id' field, the "
       "command uses it to identify the assignment; use --create to create a new "
-      "assignment if the ID is not found.")
+      "assignment if the ID is not found. Use --html to read/edit HTML directly "
+      "without Markdown conversion.")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
 edit_parser.add_argument("--create",
     action="store_true",
     help="Create a new assignment if the ID in the YAML is not found")
+edit_parser.add_argument("--html",
+    action="store_true",
+    help="Read file as HTML instead of converting from Markdown. "
+         "In interactive mode, edit HTML directly.")
 @
 
 
@@ -551,14 +578,20 @@ def assignments_view_command(config, canvas, args):
   assignment_list = process_assignment_option(canvas, args)
   for assignment in assignment_list:
     if sys.stdout.isatty():
-      output = format_assignment(assignment)
-      <<check if we should use styles>>
-      with console.pager(styles=styles, links=True):
-        console.print(rich.markdown.Markdown(output,
-                                             code_theme="manni"))
+      if args.html:
+        <<output assignment html in tty>>
+      else:
+        output = format_assignment(assignment)
+        <<check if we should use styles>>
+        with console.pager(styles=styles, links=True):
+          console.print(rich.markdown.Markdown(output,
+                                               code_theme="manni"))
     else:
-      <<output assignment in editable format>>
-@ Note that we use the theme [[manni]] for the code, as this works in both dark 
+      if args.html:
+        <<output assignment in html format>>
+      else:
+        <<output assignment in editable format>>
+@ Note that we use the theme [[manni]] for the code, as this works in both dark
 and light terminals.
 
 \subsection{Check if we should use styles}
@@ -621,6 +654,48 @@ in the Canvas API).
 <<get current modules for assignment>>=
 assignment_modules = modules.get_item_modules(
     assignment.course, 'Assignment', assignment.id)
+@
+
+\subsection{HTML output format}
+
+When [[--html]] is specified, we preserve the original HTML content instead of
+converting to Markdown. This is the counterpart to the editable format above.
+
+For TTY output, we display the HTML with syntax highlighting. We show a header
+with metadata first (same as the Markdown view), then the raw HTML body with
+syntax highlighting for readability.
+<<output assignment html in tty>>=
+header = f"# {assignment.name}\n\n"
+header += f"## Metadata\n\n"
+header += f"- Course: {assignment.course.course_code}\n"
+header += f"- Unlocks: {canvaslms.cli.utils.format_local_time(assignment.unlock_at) if assignment.unlock_at else 'None'}\n"
+header += f"- Due: {canvaslms.cli.utils.format_local_time(assignment.due_at) if assignment.due_at else 'None'}\n"
+header += f"- Locks: {canvaslms.cli.utils.format_local_time(assignment.lock_at) if assignment.lock_at else 'None'}\n"
+header += f"- URL: {assignment.html_url}\n"
+header += "\n## Description (HTML)\n\n"
+
+with console.pager(styles=True):
+  console.print(rich.markdown.Markdown(header))
+  if hasattr(assignment, 'description') and assignment.description:
+    syntax = rich.syntax.Syntax(assignment.description, "html", theme="monokai",
+                                word_wrap=True)
+    console.print(syntax)
+  else:
+    console.print("(No description)")
+@
+
+For piped output, we use [[render_to_html]] from the content module to produce
+YAML front matter with the raw HTML body. This can be saved to a file, edited,
+and pushed back using [[assignments edit --html -f]].
+<<output assignment in html format>>=
+<<get current modules for assignment>>
+<<get rubric for assignment>>
+output = canvaslms.cli.content.render_to_html(
+    assignment,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    content_attr='description',
+    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
+print(output)
 @
 
 
@@ -936,10 +1011,12 @@ This mode is script-friendly and does not require user interaction.
 @
 
 We read the file using the content module's infrastructure, then validate the
-attributes against the assignment schema.
+attributes against the assignment schema. The body content may be Markdown
+(default) or HTML (when [[--html]] is specified).
 <<read and validate assignment content from file>>=
 try:
-  attributes, markdown_content = canvaslms.cli.content.read_content_from_file(args.file)
+  # body_content is Markdown or HTML depending on args.html
+  attributes, body_content = canvaslms.cli.content.read_content_from_file(args.file)
 except FileNotFoundError:
   logger.error(f"File not found: {args.file}")
   print(f"Error: File not found: {args.file}", file=sys.stderr)
@@ -959,16 +1036,20 @@ if errors:
 
 \subsection{Updating assignment with new content}
 
-We convert the Markdown content to HTML for Canvas. If the YAML front matter
-contains an [[id]] field, we use it to identify the specific assignment to
-update. This enables a Git-based workflow where the assignment can be reliably
-identified even if the name changes. If the ID is not found and [[--create]] is
-specified, we create a new assignment instead.
+We convert the content to HTML for Canvas (unless [[--html]] is specified, in
+which case the content is already HTML). If the YAML front matter contains an
+[[id]] field, we use it to identify the specific assignment to update. This
+enables a Git-based workflow where the assignment can be reliably identified
+even if the name changes. If the ID is not found and [[--create]] is specified,
+we create a new assignment instead.
 
 If no [[id]] is in the YAML, we fall back to the filter-based matching using
 [[-a]], [[-A]], and [[-M]] options (the existing behavior).
 <<update assignment with new content>>=
-html_content = pypandoc.convert_text(markdown_content, 'html', format='md')
+if args.html:
+  html_content = body_content  # Already HTML, no conversion needed
+else:
+  html_content = pypandoc.convert_text(body_content, 'html', format='md')
 
 if 'id' in attributes and attributes['id']:
   <<update or create assignment by id>>
@@ -1216,18 +1297,66 @@ We open the user's editor with the current content. By specifying
 description from the attributes, converts HTML to Markdown for the body, and
 excludes it from the YAML front matter. We include the [[modules]] and
 [[rubric]] attributes so users can view and edit them.
+
+When [[--html]] is specified, we need a different approach: we open the editor
+with the raw HTML content and skip the HTML-to-Markdown conversion. We do this
+by not specifying [[content_attr]], instead manually including the description
+in the initial content.
 <<open editor with assignment content>>=
-result = canvaslms.cli.content.get_content_from_editor(
-    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
-    current_attrs,
-    content_attr='description',
-    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
+if args.html:
+  <<open editor with html assignment content>>
+else:
+  result = canvaslms.cli.content.get_content_from_editor(
+      canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+      current_attrs,
+      content_attr='description',
+      extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
 if result is None:
   print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
   skipped_count += 1
   continue
 
-attributes, markdown_content = result
+# body_content is Markdown or HTML depending on args.html
+attributes, body_content = result
+@
+
+For HTML mode, we build the editor content manually: YAML front matter with
+assignment attributes, followed by the raw HTML body. We remove [[description]]
+from the attributes since it becomes the document content after the front matter.
+<<open editor with html assignment content>>=
+import tempfile
+import subprocess
+
+editor = os.environ.get('EDITOR', 'nano')
+
+# Build initial content: YAML front matter + HTML body
+html_attrs = current_attrs.copy()
+html_body = html_attrs.pop('description', '') or ''
+html_attrs['modules'] = assignment_modules
+html_attrs['rubric'] = assignment_rubric
+
+initial_content = canvaslms.cli.content.format_yaml_front_matter(
+    html_attrs, html_body)
+
+with tempfile.NamedTemporaryFile(mode='w+', suffix='.html', delete=False) as f:
+  f.write(initial_content)
+  temp_path = f.name
+
+try:
+  subprocess.run([editor, temp_path], check=True)
+  with open(temp_path, 'r') as f:
+    edited_content = f.read()
+  attributes, html_body = canvaslms.cli.content.parse_yaml_front_matter(
+      edited_content)
+  result = (attributes, html_body.strip())
+except Exception as e:
+  logger.error(f"Error opening editor: {e}")
+  result = None
+finally:
+  try:
+    os.unlink(temp_path)
+  except OSError:
+    pass
 @
 
 After editing, we enter the interactive confirm loop. The user can preview the
@@ -1235,7 +1364,7 @@ content, accept it (which triggers the update), edit further, or discard changes
 <<interactive confirm and update single assignment>>=
 title = attributes.get('name', assignment.name)
 result = canvaslms.cli.content.interactive_confirm_and_edit(
-    title, markdown_content, attributes,
+    title, body_content, attributes,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA, "Assignment")
 
 if result is None:
@@ -1248,12 +1377,17 @@ final_attrs, final_content = result
 @
 
 When the user accepts, we convert the Markdown to HTML and update the assignment.
+If the user is working in HTML mode, we skip the conversion since the content
+is already HTML.
 <<update single assignment from interactive edit>>=
-try:
-  html_content = pypandoc.convert_text(final_content, 'html', format='md')
-except Exception as e:
-  logger.warning(f"Failed to convert markdown to HTML: {e}")
+if args.html:
   html_content = final_content
+else:
+  try:
+    html_content = pypandoc.convert_text(final_content, 'html', format='md')
+  except Exception as e:
+    logger.warning(f"Failed to convert markdown to HTML: {e}")
+    html_content = final_content
 
 update_data = {
   'assignment': {
