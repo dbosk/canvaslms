@@ -2,7 +2,7 @@
 
 Quick lookup table for all 41 open issues. See `ISSUE_STATUS_ANALYSIS.md` for detailed analysis.
 
-## Issues to Close (13) ✅
+## Issues to Close (12) ✅
 
 | # | Title | Status |
 |---|-------|--------|
@@ -15,15 +15,15 @@ Quick lookup table for all 41 open issues. See `ISSUE_STATUS_ANALYSIS.md` for de
 | 73 | Make `submissions view` show diffs | ✅ Implemented |
 | 57 | Add `calendar` command | ✅ Implemented |
 | 45 | Make courses command filter based on favourites | ✅ Implemented |
-| 43 | Handle quizzes | ✅ Implemented |
 | 25 | submission: option to diff all versions | ✅ Implemented (duplicate of #73) |
 | 2 | Publish markdown instruction as assignment | ✅ Implemented |
 | 1 | Publish markdown file as Canvas page | ✅ Implemented |
 
-## Issues to Update (4) ⚠️
+## Issues to Update (5) ⚠️
 
 | # | Title | What Works | What's Missing |
 |---|-------|-----------|----------------|
+| 43 | Handle quizzes | List and analyze quizzes | Cannot create/edit quizzes or manage item banks |
 | 214 | Add `scripts` subcommand | All underlying commands exist | Dedicated `scripts` subcommand |
 | 182 | Cron script for emailing students | `results --missing` provides data | Pre-built script/examples |
 | 147 | Transfer partial results from prev years | Manual workflow supported | Automated bulk tool |

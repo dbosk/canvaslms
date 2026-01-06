@@ -12,7 +12,7 @@ This PR addresses issue #277 by conducting a comprehensive review of all 41 open
 
 ## Key Findings
 
-### ✅ 13 Issues Should Be Closed (Fully Implemented)
+### ✅ 12 Issues Should Be Closed (Fully Implemented)
 
 Notable discoveries:
 - **#1, #2, #243**: Markdown → Canvas publishing is fully working (`pages edit -f`, `assignments edit -f`)
@@ -20,11 +20,11 @@ Notable discoveries:
 - **#73, #25**: Submission diffs are working (`submissions view --diff`)
 - **#212**: Module filtering is available (`-M/--module` flag)
 - **#57**: Calendar commands are fully implemented
-- **#43**: Quiz handling with analysis features
 - **#253**: Missing assignment tracking works correctly
 
-### ⚠️ 4 Issues Need Documentation Updates (Partially Implemented)
+### ⚠️ 5 Issues Need Documentation Updates (Partially Implemented)
 
+- **#43**: Quiz handling - can list and analyze quizzes, but cannot create/edit or manage item banks
 - **#214**: Foundation exists for cron scripts, but no dedicated subcommand
 - **#182**: Missing assignment emails possible but needs examples
 - **#147**: Manual grade transfer workflow supported
@@ -52,8 +52,8 @@ Both documents include:
 
 The repository owner can now:
 
-1. **Close 13 issues** - with comments documenting the implementation
-2. **Update 4 issues** - add documentation of what works and what's missing
+1. **Close 12 issues** - with comments documenting the implementation
+2. **Update 5 issues** - add documentation of what works and what's missing
 3. **Keep 24 issues open** - prioritize for future development
 
 ## Verification Methodology

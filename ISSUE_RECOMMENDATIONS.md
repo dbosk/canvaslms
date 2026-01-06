@@ -4,13 +4,13 @@ Based on a comprehensive analysis of all 41 open issues in the canvaslms reposit
 
 ## Quick Summary
 
-- ✅ **13 issues should be closed** - fully implemented
-- ⚠️ **4 issues need documentation updates** - partially implemented  
+- ✅ **12 issues should be closed** - fully implemented
+- ⚠️ **5 issues need documentation updates** - partially implemented  
 - 🔄 **24 issues should remain open** - not yet implemented
 
 ---
 
-## Issues to Close (Fully Implemented) - 13 Issues
+## Issues to Close (Fully Implemented) - 12 Issues
 
 These issues have been fully implemented and should be closed:
 
@@ -25,7 +25,6 @@ These issues have been fully implemented and should be closed:
 | [#73](https://github.com/dbosk/canvaslms/issues/73) | Make `submissions view` show diffs | `--diff` flag with threshold options implemented |
 | [#57](https://github.com/dbosk/canvaslms/issues/57) | Add `calendar` command | Full calendar command with list/view/create subcommands |
 | [#45](https://github.com/dbosk/canvaslms/issues/45) | Make courses command filter based on favourites | Default behavior now filters appropriately |
-| [#43](https://github.com/dbosk/canvaslms/issues/43) | Handle quizzes | Full `quizzes` command with list and analyse subcommands |
 | [#25](https://github.com/dbosk/canvaslms/issues/25) | submission: option to diff all versions | Duplicate of #73, same `--diff` implementation |
 | [#2](https://github.com/dbosk/canvaslms/issues/2) | Publish markdown instruction as assignment | `assignments edit -f file.md --create` |
 | [#1](https://github.com/dbosk/canvaslms/issues/1) | Publish markdown file as Canvas page | `pages edit -f file.md --create` |
@@ -72,9 +71,28 @@ canvaslms calendar create -c COURSE --title "Office Hours" --start "2024-12-15 1
 
 ---
 
-## Issues to Update (Partial Implementation) - 4 Issues
+## Issues to Update (Partial Implementation) - 5 Issues
 
 These issues are partially implemented. Update them to document what's available:
+
+### [#43](https://github.com/dbosk/canvaslms/issues/43) - Handle quizzes
+
+**Status:** Partially implemented - read-only quiz access
+
+**What works:**
+- `canvaslms quizzes list` - List all quizzes in a course
+- `canvaslms quizzes analyse` - Analyze quiz/survey data with statistical summaries
+- Supports markdown and LaTeX output formats
+- AI-powered summaries available with optional LLM integration
+
+**What's missing:**
+- Cannot create quizzes
+- Cannot manage item banks
+- Cannot edit quizzes or add questions
+
+**Recommendation:** Document current read-only capabilities. Keep open for full quiz management (creation, editing, item banks).
+
+---
 
 ### [#214](https://github.com/dbosk/canvaslms/issues/214) - Add `scripts` subcommand with all cron scripts
 
@@ -187,8 +205,8 @@ These issues are valid enhancement requests that have not been implemented:
 
 ## Suggested Actions
 
-1. **Close the 13 fully implemented issues** with comments documenting the implementation
-2. **Update the 4 partially implemented issues** with:
+1. **Close the 12 fully implemented issues** with comments documenting the implementation
+2. **Update the 5 partially implemented issues** with:
    - What currently works
    - Example usage
    - What's still missing
