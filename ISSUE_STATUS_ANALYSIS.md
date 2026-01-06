@@ -7,9 +7,9 @@ Analysis conducted: 2026-01-06
 ## Summary
 
 - **Total Open Issues:** 41
-- **Fully Implemented (Should be Closed):** 10
-- **Partially Implemented (Documented Below):** 6
-- **Not Implemented (Should Remain Open):** 25
+- **Fully Implemented (Should be Closed):** 13
+- **Partially Implemented (Documented Below):** 4
+- **Not Implemented (Should Remain Open):** 24
 
 ---
 
@@ -115,32 +115,59 @@ Analysis conducted: 2026-01-06
 ---
 
 ### Issue #2: Publish markdown instruction as assignment
-**Status:** ✅ LIKELY IMPLEMENTED
+**Status:** ✅ IMPLEMENTED
 
-**Evidence:** The `pages` command exists for managing course wiki pages, and the `content` module suggests content publishing capabilities exist. The system uses pypandoc for document conversion.
+**Evidence:** 
+- `canvaslms assignments edit -f FILE` allows editing/creating assignments from Markdown files
+- Supports YAML front matter for metadata
+- `--create` flag to create new assignments
+- Markdown is converted to HTML automatically (uses pypandoc)
+- Can use `--html` flag to work with HTML directly
 
-**Recommendation:** Close this issue or request clarification if additional functionality is needed.
+**Recommendation:** Close this issue.
+
+### Issue #1: Publish markdown file as Canvas page
+**Status:** ✅ IMPLEMENTED
+
+**Evidence:**
+- `canvaslms pages edit -f FILE` allows publishing Markdown files as Canvas pages
+- Supports YAML front matter for metadata
+- `--create` flag to create new pages
+- Markdown is converted to HTML automatically
+- Can use `--html` flag to work with HTML directly
+
+**Recommendation:** Close this issue.
+
+---
+
+### Issue #173: Set dates of assignments
+**Status:** ✅ IMPLEMENTED
+
+**Evidence:**
+- `canvaslms assignments set-dates` command exists
+- Can set `--due-at`, `--unlock-at`, and `--lock-at` dates
+- Supports human-readable date formats
+- Can clear dates with 'none' or 'clear'
+- Works with assignment filtering by name, group, or module
+
+**Recommendation:** Close this issue.
 
 ---
 
 ## Partially Implemented Issues
 
 ### Issue #243: Modifying Canvas Content
-**Status:** ⚠️ PARTIALLY IMPLEMENTED
+**Status:** ✅ FULLY IMPLEMENTED
 
-**Current Status:**
-- `canvaslms pages` command exists for managing wiki pages
-- Can create and modify pages via the Canvas API
-- Assignment modification capabilities exist through the `assignments` command
+**Evidence:**
+- `canvaslms pages edit` for wiki pages (Markdown → HTML)
+- `canvaslms assignments edit` for assignments (Markdown → HTML)
+- Both support `-f FILE` flag for script-friendly updates from local Markdown files
+- Both support YAML front matter for metadata
+- Both support `--create` for creating new content
+- Full workflow for keeping local Markdown synced with Canvas is supported
 
-**What's Missing:**
-- Unclear if full workflow for keeping local Markdown files synced with Canvas is implemented
-- May need enhanced documentation for this workflow
-
-**Recommendation:** 
-- Verify if the full workflow described in the issue is supported
-- If yes, document the workflow and close
-- If no, keep open and document what's available
+**Recommendation:** Close this issue.
 
 ---
 
@@ -205,18 +232,7 @@ Analysis conducted: 2026-01-06
 
 ---
 
-### Issue #1: Publish markdown file as Canvas page
-**Status:** ⚠️ PARTIALLY IMPLEMENTED
 
-**Current Status:**
-- `canvaslms pages` command exists
-- pypandoc integration suggests Markdown conversion is available
-
-**What's Missing:**
-- Unclear if the full workflow is documented
-- May need verification of Markdown → Canvas page publishing
-
-**Recommendation:** Verify and document the current capabilities. Close if fully working, otherwise keep open with notes.
 
 ---
 
@@ -252,9 +268,7 @@ Analysis conducted: 2026-01-06
 
 ---
 
-### Issue #173: Set dates of assignments
-**Status:** ❌ NOT IMPLEMENTED
-**Recommendation:** Keep open. Need a command to modify assignment deadlines and availability dates.
+
 
 ---
 
@@ -368,17 +382,17 @@ Analysis conducted: 2026-01-06
 
 ## Recommendations Summary
 
-### Should Be Closed (10 issues)
+### Should Be Closed (13 issues)
 Close these issues as they are fully implemented:
-- #253, #212, #138, #104, #73, #57, #45, #43, #25 (duplicate of #73), #2
+- #253, #243, #212, #173, #138, #104, #73, #57, #45, #43, #25 (duplicate of #73), #2, #1
 
-### Should Be Documented and Updated (6 issues)
+### Should Be Documented and Updated (4 issues)
 These are partially implemented - update issue descriptions to document what's available:
-- #243, #214, #182, #147, #66, #1
+- #214, #182, #147, #66
 
-### Should Remain Open (25 issues)
+### Should Remain Open (24 issues)
 These are valid requests that have not been implemented:
-- #236, #232, #187, #178, #175, #173, #159, #84, #79, #78, #77, #76, #70, #68, #67, #65, #64, #56, #53, #49, #46, #33, #32, #15
+- #236, #232, #187, #178, #175, #159, #84, #79, #78, #77, #76, #70, #68, #67, #65, #64, #56, #53, #49, #46, #33, #32, #15
 
 ---
 
