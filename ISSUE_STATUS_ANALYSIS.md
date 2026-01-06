@@ -232,10 +232,6 @@ Analysis conducted: 2026-01-06
 
 ---
 
-
-
----
-
 ## Not Implemented Issues (Should Remain Open)
 
 ### Issue #236: Request users from Canvas, instead of course
@@ -265,10 +261,6 @@ Analysis conducted: 2026-01-06
 ### Issue #175: Change to generator design
 **Status:** ❌ NOT IMPLEMENTED
 **Recommendation:** Keep open. This is a significant architectural improvement for performance. Would require code review to check if progress has been made.
-
----
-
-
 
 ---
 
