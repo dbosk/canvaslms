@@ -61,7 +61,7 @@ examples:
 	mkdir -p examples
 
 ${EXAMPLES}: intro.nw | examples
-	notangle -R"$@" $< > $@
+	notangle -R"[[$@]]" $< > $@
 	chmod +x $@
 
 
