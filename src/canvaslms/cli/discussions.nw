@@ -133,6 +133,7 @@ def add_command(subp):
     required=True)
   
   add_announce_command(discussions_subp)
+  add_edit_command(discussions_subp)
   add_list_command(discussions_subp)
   add_view_command(discussions_subp)
 
@@ -219,6 +220,57 @@ view_parser.add_argument("--ignore-case", "-i",
   help="Make the regex case-insensitive")
 view_parser.add_argument("--count", "-n", type=int, default=1,
   help="Number of matching items to show (default: 1), set to 0 to show all matches")
+@
+
+
+\section{The edit subcommand}
+
+The [[edit]] subcommand updates existing announcements. Like the pages and
+assignments edit commands, it supports two workflows:
+
+\begin{description}
+\item[Interactive editing] (default): Fetches matching announcements, lets the
+  user select which to edit, opens each in an editor with current content
+  pre-populated, shows a preview, and asks whether to accept changes, edit
+  further, or discard.
+\item[File-based editing] ([[-f]]): Reads content from a Markdown file with
+  YAML front matter and updates directly. If the YAML contains an [[id]] field,
+  the announcement is identified by that ID. Otherwise, title matching is used.
+  This enables a Git-based workflow: view announcements, edit locally, push
+  back with [[edit -f]].
+\end{description}
+
+<<functions>>=
+def add_edit_command(subp):
+  """Adds the edit subcommand"""
+  edit_parser = subp.add_parser("edit",
+    help="Edit existing announcements",
+    description="Edit existing announcements in a course. "
+                "Supports interactive editing and file-based updates.")
+  edit_parser.set_defaults(func=discussions_edit_command)
+  <<add edit arguments>>
+
+@
+
+\subsection{Edit command arguments}
+
+The edit command takes a course filter and optional title/ID filter to select
+which announcements to edit. The [[-t/--title]] option matches against both
+the announcement title and its Canvas ID, following the pattern used elsewhere
+in this CLI.
+<<add edit arguments>>=
+edit_parser.add_argument("-c", "--course", required=True,
+  help="Regex matching courses on title, course code or Canvas ID")
+edit_parser.add_argument("-t", "--title",
+  help="Regex matching announcement title or ID (default: match all)")
+edit_parser.add_argument("-i", "--ignore-case",
+  action="store_true",
+  help="Make the title regex case-insensitive")
+canvaslms.cli.content.add_file_option(edit_parser)
+edit_parser.add_argument("--html",
+  action="store_true",
+  help="Read file as HTML instead of converting from Markdown. "
+       "In interactive mode, edit HTML directly.")
 @
 
 
@@ -374,6 +426,385 @@ for course in course_list:
 if failed_count > 0:
   print(f"Posted to {success_count}/{len(course_list)} courses.", file=sys.stderr)
   sys.exit(1)
+@
+
+\section{The edit command function}
+
+The [[discussions_edit_command]] function handles editing existing announcements.
+It supports two modes: file-based (when [[-f]] is provided) and interactive
+(the default).
+<<functions>>=
+def discussions_edit_command(config, canvas, args):
+  """Edit existing announcements interactively or from file."""
+  if args.file:
+    <<edit announcements from file>>
+  else:
+    <<edit announcements interactively>>
+
+@
+
+\subsection{File-based editing}
+
+When [[-f]] is provided, we read content from the file and update directly.
+This mode is script-friendly and does not require user interaction.
+
+If the YAML front matter contains an [[id]] field, we use it to identify the
+specific announcement to update. This enables a Git-based workflow where the
+announcement can be reliably identified even if the title changes. If no [[id]]
+is in the YAML, we fall back to title-based matching.
+<<edit announcements from file>>=
+<<read and validate announcement content from file>>
+<<update announcement with new content>>
+@
+
+We read the file using the content module's infrastructure and validate the
+attributes.
+<<read and validate announcement content from file>>=
+try:
+  attributes, body_content = canvaslms.cli.content.read_content_from_file(args.file)
+except FileNotFoundError:
+  logger.error(f"File not found: {args.file}")
+  print(f"Error: File not found: {args.file}", file=sys.stderr)
+  return
+except Exception as e:
+  logger.error(f"Error reading file: {e}")
+  print(f"Error reading file: {e}", file=sys.stderr)
+  return
+
+# Validate that at least title is provided (required for announcements)
+if not attributes.get('title'):
+  print("Error: Title is required in YAML front matter", file=sys.stderr)
+  return
+@
+
+\subsection{Updating announcements with new content}
+
+We convert the content to HTML for Canvas (unless [[--html]] is specified) and
+identify the announcement to update.
+<<update announcement with new content>>=
+if args.html:
+  html_content = body_content
+else:
+  try:
+    html_content = pypandoc.convert_text(body_content, 'html', format='md')
+  except Exception as e:
+    logger.warning(f"Failed to convert markdown to HTML: {e}. Using raw content.")
+    html_content = body_content
+
+if 'id' in attributes and attributes['id']:
+  <<update announcement by id>>
+else:
+  <<update announcements by title matching>>
+@
+
+\subsubsection{ID-based announcement identification}
+
+When the YAML contains an [[id]] field, we look up the announcement directly.
+<<update announcement by id>>=
+announcement_id = attributes['id']
+course_list = list(canvaslms.cli.courses.filter_courses(canvas, args.course))
+if not course_list:
+  print(f"Error: No courses found matching pattern: {args.course}", file=sys.stderr)
+  return
+
+# Try to find the announcement in any of the matching courses
+announcement = None
+announcement_course = None
+for course in course_list:
+  try:
+    announcement = course.get_discussion_topic(announcement_id)
+    announcement_course = course
+    break
+  except Exception:
+    continue
+
+if announcement is None:
+  print(f"Error: Announcement with ID '{announcement_id}' not found.", file=sys.stderr)
+  return
+
+<<update existing announcement>>
+@
+
+When updating an existing announcement, we build the update dictionary and call
+the Canvas API's [[update()]] method.
+<<update existing announcement>>=
+update_kwargs = {
+  'title': attributes.get('title', announcement.title),
+  'message': html_content,
+}
+
+<<add optional announcement attributes to update>>
+
+try:
+  announcement.update(**update_kwargs)
+  print(f"Updated announcement: {attributes.get('title', announcement.title)}", file=sys.stderr)
+except Exception as e:
+  logger.error(f"Error updating announcement: {e}")
+  print(f"Error updating announcement: {e}", file=sys.stderr)
+@
+
+We add optional attributes if they are present in the YAML front matter.
+<<add optional announcement attributes to update>>=
+if 'published' in attributes:
+  update_kwargs['published'] = attributes['published']
+
+# Process date attributes
+for attr in ['delayed_post_at', 'lock_at']:
+  parsed = parse_date_attribute(attributes, attr)
+  if parsed:
+    update_kwargs[attr] = parsed
+
+# Process boolean attributes
+for attr in ['require_initial_post', 'allow_rating',
+             'only_graders_can_rate', 'sort_by_rating']:
+  if attr in attributes and attributes[attr] is not None:
+    update_kwargs[attr] = attributes[attr]
+@
+
+\subsubsection{Title-based announcement matching}
+
+When no [[id]] is in the YAML, we use the [[-t/--title]] option to filter
+announcements by title.
+<<update announcements by title matching>>=
+course_list = list(canvaslms.cli.courses.filter_courses(canvas, args.course))
+if not course_list:
+  print(f"Error: No courses found matching pattern: {args.course}", file=sys.stderr)
+  return
+
+# Find announcements matching the title regex
+title_pattern = attributes.get('title', '')
+matched_announcements = get_matching_announcements(
+    course_list, title_pattern, ignore_case=args.ignore_case)
+
+if not matched_announcements:
+  print(f"Error: No announcements found matching title: {title_pattern}", file=sys.stderr)
+  return
+
+if len(matched_announcements) > 1:
+  print(f"Warning: Multiple announcements match. Using first match.", file=sys.stderr)
+
+announcement, announcement_course = matched_announcements[0]
+<<update existing announcement>>
+@
+
+\subsection{Helper function: get matching announcements}
+
+This function fetches all announcements from the given courses that match
+the title/ID regex pattern.
+<<functions>>=
+def get_matching_announcements(course_list, title_regex, ignore_case=False):
+  """
+  Returns a list of (announcement, course) tuples matching the pattern.
+  
+  The pattern is matched against both the title and the Canvas ID.
+  Results are sorted by creation date (newest first).
+  """
+  if not title_regex:
+    title_regex = '.*'  # Match all if no pattern specified
+
+  flags = re.IGNORECASE if ignore_case else 0
+  try:
+    pattern = re.compile(title_regex, flags)
+  except re.error as e:
+    print(f"Error: Invalid regex pattern: {e}", file=sys.stderr)
+    return []
+
+  matched = []
+  for course in course_list:
+    try:
+      announcements = course.get_discussion_topics(only_announcements=True)
+      for announcement in announcements:
+        # Match against title or ID
+        title = getattr(announcement, 'title', '') or ''
+        ann_id = str(getattr(announcement, 'id', ''))
+        if pattern.search(title) or pattern.search(ann_id):
+          matched.append((announcement, course))
+    except Exception as e:
+      logger.warning(f"Error fetching announcements from {course.course_code}: {e}")
+
+  # Sort by creation date (newest first)
+  matched.sort(key=lambda x: getattr(x[0], 'created_at', ''), reverse=True)
+  return matched
+
+@
+
+\subsection{Interactive editing}
+
+When no [[-f]] option is given, we enter interactive mode. This involves:
+\begin{enumerate}
+\item Fetching all announcements matching the course and title filters
+\item Presenting a numbered list for the user to select from
+\item For each selected announcement: open editor, preview, accept/edit/discard
+\item Reporting results at the end
+\end{enumerate}
+<<edit announcements interactively>>=
+<<get announcements for interactive editing>>
+<<select announcements to edit>>
+<<edit each selected announcement>>
+<<report interactive edit results>>
+@
+
+First we fetch matching announcements from the specified courses.
+<<get announcements for interactive editing>>=
+course_list = list(canvaslms.cli.courses.filter_courses(canvas, args.course))
+if not course_list:
+  canvaslms.cli.err(1, f"No courses found matching pattern: {args.course}")
+
+title_pattern = args.title if args.title else '.*'
+all_announcements = get_matching_announcements(
+    course_list, title_pattern, ignore_case=args.ignore_case)
+
+if not all_announcements:
+  canvaslms.cli.err(1, f"No announcements found matching the criteria")
+@
+
+\subsubsection{Selecting announcements to edit}
+
+We present a numbered list of matching announcements and let the user select
+which ones to edit. This prevents accidental edits when the pattern matches
+more than expected.
+<<select announcements to edit>>=
+print(f"Found {len(all_announcements)} matching announcement(s):", file=sys.stderr)
+for idx, (announcement, course) in enumerate(all_announcements, 1):
+  date_str = canvaslms.cli.utils.format_local_time(
+      getattr(announcement, 'created_at', None))
+  print(f"  [{idx}] {course.course_code}: {announcement.title} ({date_str})",
+        file=sys.stderr)
+
+print("\nEnter numbers to edit (e.g., '1,3,5' or '1-3' or 'all'), or 'q' to quit:",
+      file=sys.stderr)
+
+try:
+  selection = input("> ").strip().lower()
+except (EOFError, KeyboardInterrupt):
+  print("\nCancelled.", file=sys.stderr)
+  return
+
+if selection in ['q', 'quit', 'exit', '']:
+  print("Cancelled.", file=sys.stderr)
+  return
+
+selected_indices = parse_selection(selection, len(all_announcements))
+if not selected_indices:
+  print("No valid selection. Cancelled.", file=sys.stderr)
+  return
+
+selected_announcements = [all_announcements[i] for i in selected_indices]
+@
+
+\subsubsection{Parsing user selection}
+
+The [[parse_selection]] function interprets the user's input and returns a list
+of zero-based indices.
+<<functions>>=
+def parse_selection(selection, max_count):
+  """
+  Parse a selection string like '1,3,5' or '1-3' or 'all'.
+  Returns a list of zero-based indices.
+  """
+  if selection == 'all':
+    return list(range(max_count))
+
+  indices = set()
+  parts = selection.replace(' ', '').split(',')
+  for part in parts:
+    if '-' in part:
+      # Range like '1-3'
+      try:
+        start, end = part.split('-', 1)
+        start = int(start) - 1  # Convert to zero-based
+        end = int(end) - 1
+        if 0 <= start <= end < max_count:
+          indices.update(range(start, end + 1))
+      except ValueError:
+        continue
+    else:
+      # Single number
+      try:
+        idx = int(part) - 1  # Convert to zero-based
+        if 0 <= idx < max_count:
+          indices.add(idx)
+      except ValueError:
+        continue
+
+  return sorted(indices)
+
+@
+
+\subsubsection{Editing each selected announcement}
+
+For each selected announcement, we open the editor with current content,
+show a preview, and let the user accept, edit further, or discard changes.
+<<edit each selected announcement>>=
+updated_count = 0
+skipped_count = 0
+
+for announcement, course in selected_announcements:
+  print(f"\nEditing: {course.course_code}: {announcement.title}", file=sys.stderr)
+
+  <<render current announcement content>>
+  <<open editor with announcement content>>
+  <<interactive confirm and update single announcement>>
+@
+
+We extract the current announcement attributes using the content module's schema.
+<<render current announcement content>>=
+current_attrs = canvaslms.cli.content.extract_attributes_from_object(
+    announcement, canvaslms.cli.content.ANNOUNCEMENT_SCHEMA)
+@
+
+We open the editor with the current content. The [[content_attr='message']]
+parameter tells the editor function to extract the message body, convert it
+from HTML to Markdown, and exclude it from the YAML front matter.
+<<open editor with announcement content>>=
+result = canvaslms.cli.content.get_content_from_editor(
+    canvaslms.cli.content.ANNOUNCEMENT_SCHEMA,
+    current_attrs,
+    content_attr='message',
+    html_mode=args.html)
+if result is None:
+  print("Editor cancelled. Skipping this announcement.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+edited_attrs, body_content = result
+@
+
+After editing, we enter the interactive confirm loop.
+<<interactive confirm and update single announcement>>=
+title = edited_attrs.get('title', announcement.title)
+result = canvaslms.cli.content.interactive_confirm_and_edit(
+    title, body_content, edited_attrs,
+    canvaslms.cli.content.ANNOUNCEMENT_SCHEMA, "Announcement")
+
+if result is None:
+  print("Discarded changes.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+final_attrs, final_content = result
+
+# Convert to HTML and update
+if args.html:
+  html_content = final_content
+else:
+  try:
+    html_content = pypandoc.convert_text(final_content, 'html', format='md')
+  except Exception as e:
+    logger.warning(f"Failed to convert markdown to HTML: {e}")
+    html_content = final_content
+
+# Prepare update kwargs using final_attrs
+attributes = final_attrs
+announcement_course = course
+<<update existing announcement>>
+updated_count += 1
+@
+
+Finally, we report the results of the interactive editing session.
+<<report interactive edit results>>=
+print(f"\nEditing complete: {updated_count} updated, {skipped_count} skipped.",
+      file=sys.stderr)
 @
 
 \section{The list command function}
