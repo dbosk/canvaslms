@@ -232,9 +232,12 @@ import time
 from collections import defaultdict, Counter
 from typing import Dict, List, Any
 
+import pypandoc
+
 import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
+import canvaslms.cli.content as content
 import canvaslms.cli.utils
 from rich.console import Console
 from rich.markdown import Markdown
@@ -279,7 +282,16 @@ def add_banks_command(subp):
 \section{The [[quizzes]] command and its subcommands}
 
 We add the parent [[quizzes]] parser with subcommands.
-The [[quizzes analyse]] subcommand can either work with a CSV file or fetch data from Canvas.
+The subcommands are organized by workflow:
+\begin{description}
+\item[Discovery] [[list]] shows available quizzes; [[view]] displays full quiz
+  content including questions (Chapter~\ref{quiz-view}).
+\item[Analysis] [[analyse]] provides statistical summaries and AI-generated
+  insights for quiz/survey responses.
+\item[Management] [[create]], [[edit]], and [[delete]] handle quiz lifecycle.
+\item[Items] [[items]] and [[banks]] manage individual questions and item banks.
+\end{description}
+
 <<add quizzes command to subp>>=
 quizzes_parser = subp.add_parser("quizzes",
     help="Quiz-related commands",
@@ -292,6 +304,7 @@ quizzes_subp = quizzes_parser.add_subparsers(
 
 add_list_command(quizzes_subp)
 add_analyse_command(quizzes_subp)
+add_view_command(quizzes_subp)
 add_create_command(quizzes_subp)
 add_edit_command(quizzes_subp)
 add_delete_command(quizzes_subp)
@@ -2437,15 +2450,180 @@ def create_classic_quiz(course, quiz_params):
 \section{The [[quizzes edit]] subcommand}
 \label{sec:quizzes-edit}
 
-The [[quizzes edit]] command modifies an existing quiz's settings.
-It auto-detects whether the quiz is a New Quiz or Classic Quiz and uses the
-appropriate API.
+The [[quizzes edit]] command modifies an existing quiz's settings and
+instructions. Like [[assignments edit]], it supports two workflows:
+\begin{description}
+\item[Interactive mode] (default) Opens your editor with the quiz content
+  formatted as YAML front matter (settings) plus Markdown body (instructions).
+  After editing, shows a preview and asks whether to accept, edit further, or
+  discard.
+\item[File mode] ([[-f]]) Reads content from a file for scripted workflows.
+  Useful for batch updates or Git-based quiz management.
+\end{description}
+
+The command auto-detects whether the quiz is a New Quiz or Classic Quiz and
+uses the appropriate API. A key challenge is that the two quiz systems use
+different field names and units:
+\begin{description}
+\item[Instructions] New Quizzes use [[instructions]], Classic Quizzes use
+  [[description]].
+\item[Time limit] New Quizzes use seconds, Classic Quizzes use minutes.
+  We normalize to \emph{minutes} in the YAML (more human-friendly) and convert
+  when calling the API.
+\end{description}
+
+
+\subsection{Quiz schema for editing}
+
+We define a schema for quiz properties, similar to [[ASSIGNMENT_SCHEMA]] in
+[[content.nw]]. This schema describes all editable properties and provides
+defaults for the editor template.
+
+\paragraph{Field selection rationale.}
+We include fields that instructors commonly need to adjust:
+\begin{description}
+\item[Identity and content] [[title]], [[id]] (read-only, for identification).
+\item[Timing] [[time_limit]], [[due_at]], [[unlock_at]], [[lock_at]]---the most
+  frequently edited settings when reusing quizzes across semesters.
+\item[Scoring] [[points_possible]], [[allowed_attempts]]---controls grading behavior.
+\item[Presentation] [[shuffle_questions]], [[shuffle_answers]],
+  [[one_question_at_a_time]], [[cant_go_back]]---anti-cheating and UX options.
+\item[Feedback] [[show_correct_answers]], [[hide_results]]---controls what
+  students see after submission.
+\item[Access control] [[access_code]], [[published]]---security and visibility.
+\item[Quiz type] [[quiz_type]]---distinguishes graded quizzes from surveys.
+\end{description}
+We deliberately exclude fields like [[ip_filter]] (rarely used),
+[[scoring_policy]] (complex interactions with other settings), and
+[[assignment_group_id]] (better managed through the assignments command).
+
+<<constants>>=
+QUIZ_SCHEMA = {
+    'title': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'title',
+        'description': 'Quiz title'
+    },
+    'id': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'id',
+        'description': 'Quiz ID (for identification during edit)'
+    },
+    'time_limit': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'time_limit',
+        'description': 'Time limit in minutes (null for unlimited)'
+    },
+    'due_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'due_at',
+        'description': 'Due date (ISO 8601 datetime)'
+    },
+    'unlock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'unlock_at',
+        'description': 'Available from date (ISO 8601 datetime)'
+    },
+    'lock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'lock_at',
+        'description': 'Available until date (ISO 8601 datetime)'
+    },
+    'points_possible': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'points_possible',
+        'description': 'Total points for the quiz'
+    },
+    'published': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'published',
+        'description': 'Whether the quiz is visible to students'
+    },
+    'allowed_attempts': {
+        'default': 1,
+        'required': False,
+        'canvas_attr': 'allowed_attempts',
+        'description': 'Number of attempts allowed (-1 for unlimited)'
+    },
+    'shuffle_questions': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'shuffle_questions',
+        'description': 'Randomize question order'
+    },
+    'shuffle_answers': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'shuffle_answers',
+        'description': 'Randomize answer choice order'
+    },
+    'show_correct_answers': {
+        'default': True,
+        'required': False,
+        'canvas_attr': 'show_correct_answers',
+        'description': 'Show correct answers after submission'
+    },
+    'one_question_at_a_time': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'one_question_at_a_time',
+        'description': 'Show one question per page'
+    },
+    'cant_go_back': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'cant_go_back',
+        'description': 'Prevent going back to previous questions'
+    },
+    'access_code': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'access_code',
+        'description': 'Password required to take the quiz'
+    },
+    'quiz_type': {
+        'default': 'assignment',
+        'required': False,
+        'canvas_attr': 'quiz_type',
+        'description': 'Type: assignment, practice_quiz, graded_survey, survey'
+    },
+    'hide_results': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'hide_results',
+        'description': 'When to hide results: null, always, until_after_last_attempt'
+    },
+}
+@
+
+
+\subsection{Command-line interface}
+
+The edit command takes course and quiz selection options. The [[-f]] option
+is now optional---without it, interactive mode is used. The [[--html]] option
+preserves raw HTML instead of converting to Markdown.
 
 <<add quizzes edit command to subp>>=
 edit_parser = subp.add_parser("edit",
-    help="Edit quiz settings",
-    description="""Edit an existing quiz's settings. The quiz type
-(New or Classic) is auto-detected.""")
+    help="Edit quiz settings and instructions",
+    description="""Edit an existing quiz's settings and instructions.
+
+Without -f: Opens your editor with YAML front matter (settings) and
+Markdown body (instructions). After editing, shows a preview and asks
+whether to accept, edit further, or discard the changes.
+
+With -f: Reads content from a file for scripted workflows. The file
+should have YAML front matter followed by Markdown (or HTML with --html).
+
+The quiz type (New or Classic) is auto-detected.""")
 
 edit_parser.set_defaults(func=edit_command)
 
@@ -2454,54 +2632,297 @@ try:
 except argparse.ArgumentError:
   pass
 
-edit_parser.add_argument("-a", "--assignment",
-    required=True,
-    help="Regex matching quiz title or Canvas ID")
+add_quiz_option(edit_parser, required=True)
 
 edit_parser.add_argument("-f", "--file",
-    help="JSON file containing updated quiz settings",
+    help="Read content from a Markdown/HTML file with YAML front matter",
     type=str,
-    required=True)
+    required=False)
+
+edit_parser.add_argument("--html",
+    action="store_true",
+    help="Edit raw HTML instead of converting to Markdown")
 @
 
 
 \subsection{Processing the edit command}
 
+The edit command has two modes: interactive (default) and file-based.
+In interactive mode, we open the editor for each matching quiz.
+In file mode, we read the content from the specified file.
+
 <<functions>>=
 def edit_command(config, canvas, args):
-  """Edits an existing quiz"""
-  # Find the quiz
-  course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  """Edits quiz settings and instructions"""
+  quiz_list = process_quiz_option(canvas, args)
+  requester = canvas._Canvas__requester
 
-  if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
-  if len(quiz_list) > 1:
-    canvaslms.cli.err(1, f"Multiple quizzes match '{args.assignment}'. "
-                         "Please use a more specific pattern.")
+  if args.file:
+    <<edit quiz from file>>
+  else:
+    <<edit quiz interactively>>
+@
 
-  quiz = quiz_list[0]
+In file mode, we read the YAML front matter and body from the file, then
+apply the changes to the quiz. If the file contains an [[id]] field, we use
+it to identify the quiz directly; otherwise we use the filter match.
 
-  # Read update settings from file
-  try:
-    with open(args.file, 'r', encoding='utf-8') as f:
-      quiz_params = json.load(f)
-  except FileNotFoundError:
-    canvaslms.cli.err(1, f"File not found: {args.file}")
-  except json.JSONDecodeError as e:
-    canvaslms.cli.err(1, f"Invalid JSON in {args.file}: {e}")
+<<edit quiz from file>>=
+try:
+  attributes, body = content.read_content_from_file(args.file)
+except FileNotFoundError:
+  canvaslms.cli.err(1, f"File not found: {args.file}")
+except ValueError as e:
+  canvaslms.cli.err(1, f"Invalid file format: {e}")
+
+# If id is specified, find that specific quiz
+if attributes.get('id'):
+  target_quiz = None
+  for quiz in quiz_list:
+    if str(quiz.id) == str(attributes['id']):
+      target_quiz = quiz
+      break
+  if not target_quiz:
+    canvaslms.cli.err(1, f"Quiz with ID {attributes['id']} not found")
+  quiz_list = [target_quiz]
+
+for quiz in quiz_list:
+  success = apply_quiz_edit(quiz, attributes, body, requester, args.html)
+  if success:
+    print(f"Updated quiz: {quiz.title}")
+  else:
+    canvaslms.cli.warn(f"Failed to update quiz: {quiz.title}")
+@
+
+In interactive mode, we process each quiz one at a time, opening the editor
+and showing a preview before applying changes.
+
+<<edit quiz interactively>>=
+# Confirm if multiple quizzes match
+if len(quiz_list) > 1:
+  print(f"Found {len(quiz_list)} quizzes matching the pattern:")
+  for quiz in quiz_list:
+    quiz_type = "New Quiz" if is_new_quiz(quiz) else "Classic Quiz"
+    print(f"  - {quiz.title} ({quiz_type})")
+  response = input("\nEdit all? [y/N] ").strip().lower()
+  if response != 'y':
+    print("Aborted.")
+    return
+
+updated_count = 0
+skipped_count = 0
+
+for quiz in quiz_list:
+  result = edit_quiz_interactive(quiz, requester, args.html)
+  if result == 'updated':
+    updated_count += 1
+  elif result == 'skipped':
+    skipped_count += 1
+
+print(f"\nSummary: {updated_count} updated, {skipped_count} skipped")
+@
+
+
+\subsection{Interactive editing workflow}
+
+The interactive editing workflow mirrors [[assignments edit]]. We use
+[[content.get_content_from_editor]] with [[content_attr='instructions']] so
+that the instructions are extracted from attributes, converted to Markdown
+(unless HTML mode), and placed as the body after the YAML front matter.
+
+<<functions>>=
+def edit_quiz_interactive(quiz, requester, html_mode=False):
+  """Edit a single quiz interactively
+
+  Args:
+    quiz: Quiz object to edit
+    requester: Canvas API requester
+    html_mode: If True, edit raw HTML instead of Markdown
+
+  Returns:
+    'updated', 'skipped', or 'error'
+  """
+  # Extract current quiz attributes including instructions
+  current_attrs = extract_quiz_attributes(quiz)
+
+  # Get content from editor - instructions becomes the body
+  result = content.get_content_from_editor(
+    schema=QUIZ_SCHEMA,
+    initial_attributes=current_attrs,
+    content_attr='instructions',
+    html_mode=html_mode
+  )
+
+  if result is None:
+    print("Editor cancelled. Skipping this quiz.", file=sys.stderr)
+    return 'skipped'
+
+  attributes, body = result
+
+  # Interactive confirm and edit loop
+  quiz_type = "New Quiz" if is_new_quiz(quiz) else "Classic Quiz"
+  title = attributes.get('title', quiz.title)
+  result = content.interactive_confirm_and_edit(
+    title=f"{title} ({quiz_type})",
+    message=body,
+    attributes=attributes,
+    schema=QUIZ_SCHEMA,
+    content_type="Quiz"
+  )
+
+  if result is None:
+    print("Discarded changes.", file=sys.stderr)
+    return 'skipped'
+
+  final_attrs, final_body = result
+
+  # Apply the changes
+  success = apply_quiz_edit(quiz, final_attrs, final_body, requester, html_mode)
+  return 'updated' if success else 'error'
+@
+
+
+\subsection{Extracting quiz attributes}
+
+To populate the editor with current quiz values, we extract attributes from
+the quiz object. We use [[QUIZ_SCHEMA]] to determine which attributes to
+extract, and also include [[instructions]] separately (since it becomes the
+body content, not a YAML attribute).
+
+<<functions>>=
+def extract_quiz_attributes(quiz):
+  """Extract editable attributes from a quiz object
+
+  Args:
+    quiz: Quiz object (New Quiz or Classic Quiz)
+
+  Returns:
+    Dictionary of attributes matching QUIZ_SCHEMA, plus 'instructions'
+  """
+  attrs = {}
+
+  for key, spec in QUIZ_SCHEMA.items():
+    canvas_attr = spec.get('canvas_attr', key)
+    value = getattr(quiz, canvas_attr, spec.get('default'))
+
+    # Normalize time_limit to minutes
+    if key == 'time_limit' and value is not None:
+      if is_new_quiz(quiz):
+        # New Quizzes store time in seconds
+        value = value // 60 if value else None
+      # Classic Quizzes already use minutes
+
+    if value is not None:
+      attrs[key] = value
+
+  # Add instructions (not in schema, but needed for content_attr)
+  if is_new_quiz(quiz):
+    attrs['instructions'] = getattr(quiz, 'instructions', '') or ''
+  else:
+    attrs['instructions'] = getattr(quiz, 'description', '') or ''
+
+  return attrs
+@
+
+
+\subsection{Applying quiz edits}
+
+After editing, we need to translate the attributes back to API format and
+call the appropriate update function. The key challenges are:
+\begin{itemize}
+\item Converting [[time_limit]] from minutes to seconds for New Quizzes
+\item Using [[instructions]] vs [[description]] for the body
+\item Handling HTML conversion for Markdown input
+\end{itemize}
+
+<<functions>>=
+def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
+  """Apply edited attributes and body to a quiz
+
+  Args:
+    quiz: Quiz object to update
+    attributes: Dictionary of attributes from YAML front matter
+    body: Instructions/description content
+    requester: Canvas API requester
+    html_mode: If True, body is already HTML
+
+  Returns:
+    True on success, False on failure
+  """
+  # Convert body to HTML if needed
+  if html_mode:
+    html_body = body
+  else:
+    if body and body.strip():
+      html_body = pypandoc.convert_text(body, 'html', format='md')
+    else:
+      html_body = ''
+
+  # Build API parameters
+  quiz_params = quiz_attributes_to_api_params(
+    attributes, is_new_quiz(quiz), html_body
+  )
 
   # Update based on quiz type
   if is_new_quiz(quiz):
-    result = update_new_quiz(quiz.course, quiz.id, canvas._Canvas__requester,
-                             quiz_params)
+    return update_new_quiz(quiz.course, quiz.id, requester, quiz_params)
   else:
-    result = update_classic_quiz(quiz, quiz_params)
+    return update_classic_quiz(quiz, quiz_params)
+@
 
-  if result:
-    print(f"Updated quiz: {quiz.title}")
+<<functions>>=
+def quiz_attributes_to_api_params(attributes, is_new, html_body):
+  """Convert schema attributes to Canvas API parameters
+
+  Args:
+    attributes: Dictionary of attributes from YAML
+    is_new: True if this is a New Quiz
+    html_body: HTML content for instructions/description
+
+  Returns:
+    Dictionary suitable for Canvas API
+  """
+  params = {}
+
+  for key, value in attributes.items():
+    if key == 'id':
+      # Don't send ID as an update parameter
+      continue
+
+    if value is None:
+      continue
+
+    # Handle time_limit conversion
+    if key == 'time_limit':
+      if is_new:
+        # New Quizzes want seconds
+        params['time_limit'] = value * 60
+      else:
+        # Classic Quizzes want minutes
+        params['time_limit'] = value
+      continue
+
+    # Skip quiz_type for New Quizzes: New Quizzes are always graded assignments
+    # and don't support the Classic Quiz distinction between assignment,
+    # practice_quiz, graded_survey, and survey types.
+    if key == 'quiz_type' and is_new:
+      continue
+
+    # Skip hide_results for New Quizzes: result visibility is controlled
+    # differently in the New Quizzes interface (through the "Restrict student
+    # result view" setting), not via this API parameter.
+    if key == 'hide_results' and is_new:
+      continue
+
+    params[key] = value
+
+  # Add body with appropriate field name (include even if empty to allow clearing)
+  if is_new:
+    params['instructions'] = html_body
   else:
-    canvaslms.cli.err(1, "Failed to update quiz")
+    params['description'] = html_body
+
+  return params
 @
 
 
@@ -2680,6 +3101,720 @@ def delete_classic_quiz(quiz):
   except Exception as e:
     canvaslms.cli.warn(f"Failed to delete Classic Quiz: {e}")
     return False
+@
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\chapter{Viewing Quiz Content}
+\label{quiz-view}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+When preparing for a course or reviewing quiz content, instructors often need to
+see the full content of a quiz---its instructions, questions, and answer choices.
+While Canvas provides a web interface for this, it requires many clicks and is
+not suitable for quick review or comparison between quizzes.
+
+The [[quizzes view]] command provides a way to view quiz content directly in the
+terminal. It renders the quiz as markdown, which can be:
+\begin{itemize}
+\item Displayed with rich formatting and a pager when output goes to a TTY
+\item Output as plain markdown when piped to a file or another command
+\end{itemize}
+
+This design follows the Unix philosophy: when output is interactive, provide a
+nice user experience; when output is piped, provide raw data for further
+processing.
+
+
+\section{The [[quizzes view]] subcommand}
+
+The [[view]] command takes course and quiz selection options and displays the
+full quiz content. If multiple quizzes match the pattern, all are displayed
+sequentially.
+
+<<add quizzes view command to subp>>=
+view_parser = subp.add_parser("view",
+    help="View quiz content (instructions and questions)",
+    description="""Displays the full content of a quiz including instructions,
+questions, and answer choices. For instructors, correct answers are marked.
+
+Output format depends on terminal:
+- TTY: Rich markdown rendering with pager support
+- Pipe: Plain markdown for further processing""")
+
+view_parser.set_defaults(func=view_command)
+
+try:
+  courses.add_course_option(view_parser, required=True)
+except argparse.ArgumentError:
+  pass
+
+add_quiz_option(view_parser, required=True)
+@
+
+<<functions>>=
+def add_view_command(subp):
+  """Adds the view subcommand to the quizzes command group"""
+  <<add quizzes view command to subp>>
+@
+
+
+\section{Processing the view command}
+
+The view command processes each matching quiz and formats it as markdown.
+We handle both New Quizzes and Classic Quizzes, using the appropriate API
+for each type.
+
+<<functions>>=
+def view_command(config, canvas, args):
+  """View quiz content including questions and answers"""
+  quiz_list = process_quiz_option(canvas, args)
+  requester = canvas._Canvas__requester
+
+  output_parts = []
+
+  for quiz in quiz_list:
+    course = quiz.course if hasattr(quiz, 'course') else None
+    if course is None:
+      # Try to get course from quiz attributes
+      course_id = getattr(quiz, 'course_id', None)
+      if course_id:
+        course = canvas.get_course(course_id)
+
+    if is_new_quiz(quiz):
+      markdown = format_new_quiz_as_markdown(quiz, course, requester)
+    else:
+      markdown = format_classic_quiz_as_markdown(quiz)
+
+    output_parts.append(markdown)
+
+  # Join all quizzes with a separator
+  full_output = "\n\n---\n\n".join(output_parts)
+
+  <<display quiz output respecting terminal type>>
+@
+
+
+\section{Rendering output}
+
+We reuse the pattern established in the [[analyse]] command: when output goes
+to a TTY, we use rich to render markdown with a pager; otherwise, we output
+plain markdown for piping.
+
+<<display quiz output respecting terminal type>>=
+console = Console()
+md = Markdown(full_output)
+
+if sys.stdout.isatty():
+  # Output to terminal with pager
+  pager = ""
+  if "MANPAGER" in os.environ:
+    pager = os.environ["MANPAGER"]
+  elif "PAGER" in os.environ:
+    pager = os.environ["PAGER"]
+
+  styles = False
+  if "less" in pager and ("-R" in pager or "-r" in pager):
+    styles = True
+
+  with console.pager(styles=styles):
+    console.print(md)
+else:
+  # Piped to file, output plain markdown
+  print(full_output)
+@
+
+
+\section{Formatting New Quizzes}
+
+New Quizzes store their content differently from Classic Quizzes. We use the
+[[export_new_quiz_items]] function to fetch the full item data, then format
+each item according to its type.
+
+<<functions>>=
+def format_new_quiz_as_markdown(quiz, course, requester):
+  """Format a New Quiz as markdown
+
+  Args:
+    quiz: NewQuiz object
+    course: Course object
+    requester: Canvas API requester
+
+  Returns:
+    Markdown string with quiz content
+  """
+  lines = []
+
+  # Quiz header
+  title = getattr(quiz, 'title', 'Untitled Quiz')
+  lines.append(f"# {title}")
+  lines.append("")
+
+  # Quiz metadata
+  points = getattr(quiz, 'points_possible', None)
+  if points:
+    lines.append(f"**Points:** {points}")
+
+  time_limit = getattr(quiz, 'time_limit', None)
+  if time_limit:
+    lines.append(f"**Time limit:** {time_limit} minutes")
+
+  if points or time_limit:
+    lines.append("")
+
+  # Instructions
+  instructions = getattr(quiz, 'instructions', None) or getattr(quiz, 'description', None)
+  if instructions:
+    lines.append("## Instructions")
+    lines.append("")
+    # Convert HTML to plain text (basic cleanup)
+    clean_instructions = html_to_markdown(instructions)
+    lines.append(clean_instructions)
+    lines.append("")
+
+  # Fetch and format questions
+  try:
+    export_data = export_new_quiz_items(quiz, requester, include_banks=True)
+    items = export_data.get('items', [])
+
+    if items:
+      lines.append("## Questions")
+      lines.append("")
+
+      for i, item in enumerate(items, 1):
+        item_markdown = format_new_quiz_item(item, i)
+        lines.append(item_markdown)
+        lines.append("")
+
+  except Exception as e:
+    lines.append(f"*Could not fetch questions: {e}*")
+
+  return "\n".join(lines)
+@
+
+
+\subsection{Formatting individual New Quiz items}
+
+New Quiz items come in several types: regular questions, stimuli (reading
+passages), and bank references. We handle each appropriately.
+
+<<functions>>=
+def format_new_quiz_item(item, number):
+  """Format a single New Quiz item as markdown
+
+  Args:
+    item: Item dictionary from export_new_quiz_items
+    number: Question number for display
+
+  Returns:
+    Markdown string for the item
+  """
+  lines = []
+  entry_type = item.get('entry_type', 'Item')
+  entry = item.get('entry', {})
+  points = item.get('points_possible', 0)
+
+  # Handle bank references (without embedded question content)
+  # 'BankEntry (embedded)' contains actual question data with 'item_body',
+  # while pure 'Bank' references only have bank metadata (title, entry_count)
+  is_bank_reference = entry_type in ('Bank', 'BankEntry') and 'item_body' not in entry
+  if is_bank_reference:
+    bank_ref = item.get('bank_reference', {})
+    # Fall back to entry for bank metadata if bank_reference not available
+    if not bank_ref:
+      bank_ref = entry
+    bank_title = bank_ref.get('title', 'Unknown Bank')
+    sample_num = bank_ref.get('sample_num', item.get('properties', {}).get('sample_num', '1'))
+    entry_count = bank_ref.get('entry_count', bank_ref.get('item_entry_count', '?'))
+    lines.append(f"### Question {number} (from Item Bank)")
+    lines.append(f"*Draws {sample_num} random question(s) from: {bank_title}*")
+    lines.append("")
+    lines.append(f"*Bank contains {entry_count} questions. Actual content varies per student.*")
+    return "\n".join(lines)
+
+  # Handle stimulus (reading passage)
+  if entry_type == 'Stimulus':
+    title = entry.get('title', 'Reading Passage')
+    body = entry.get('body', '')
+    lines.append(f"### {title}")
+    lines.append("")
+    lines.append(html_to_markdown(body))
+    return "\n".join(lines)
+
+  # Regular question item
+  interaction_type = entry.get('interaction_type_slug', 'unknown')
+  title = entry.get('title', f'Question {number}')
+  body = entry.get('item_body', '')
+
+  lines.append(f"### Question {number}: {title}")
+  if points:
+    lines.append(f"*({points} points)*")
+  lines.append("")
+  lines.append(html_to_markdown(body))
+  lines.append("")
+
+  # Format answers based on question type
+  <<format new quiz answer choices>>
+
+  return "\n".join(lines)
+@
+
+Different question types have different answer structures.
+Canvas New Quizzes support many interaction types, each with its own data format.
+We use helper functions to keep the formatting logic modular and testable.
+
+<<format new quiz answer choices>>=
+interaction_data = entry.get('interaction_data', {})
+scoring_data = entry.get('scoring_data', {})
+
+format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_data)
+@
+
+The [[format_new_quiz_answers]] function dispatches to type-specific formatters.
+This keeps the main formatting function focused on structure while delegating
+answer rendering to specialized helpers.
+
+<<functions>>=
+def format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_data):
+  """Format answer choices for a New Quiz item
+
+  Args:
+    lines: List to append formatted lines to
+    interaction_type: The question type (choice, true-false, etc.)
+    interaction_data: Question-specific data (choices, stems, etc.)
+    scoring_data: Correct answer information
+  """
+  if interaction_type in ('choice', 'multi-answer'):
+    format_new_quiz_choice_answers(lines, interaction_data, scoring_data)
+  elif interaction_type == 'true-false':
+    format_new_quiz_true_false(lines, scoring_data)
+  elif interaction_type == 'matching':
+    format_new_quiz_matching(lines, interaction_data, scoring_data)
+  elif interaction_type in ('essay', 'rich-text'):
+    lines.append("*(Essay response)*")
+  elif interaction_type == 'numeric':
+    format_new_quiz_numeric(lines, scoring_data)
+  elif interaction_type == 'fill-in-the-blank':
+    format_new_quiz_fill_blank(lines, scoring_data)
+  else:
+    lines.append(f"*(Question type: {interaction_type})*")
+@
+
+\paragraph{Multiple choice and multi-answer questions.}
+These are the most common question types.
+Choices are listed with markers indicating correct answers.
+
+<<functions>>=
+def format_new_quiz_choice_answers(lines, interaction_data, scoring_data):
+  """Format multiple choice or multi-answer question choices"""
+  choices = interaction_data.get('choices', [])
+  correct_ids = scoring_data.get('value', [])
+  if isinstance(correct_ids, str):
+    correct_ids = [correct_ids]
+
+  for choice in choices:
+    choice_id = choice.get('id', '')
+    # Handle both 'itemBody' (classic) and 'item_body' (new) formats
+    choice_text = choice.get('itemBody') or choice.get('item_body', '')
+    choice_text = html_to_markdown(choice_text)
+    is_correct = choice_id in correct_ids
+    marker = "✓" if is_correct else "○"
+    lines.append(f"- {marker} {choice_text}")
+@
+
+\paragraph{True/false questions.}
+A simplified choice between two options.
+
+<<functions>>=
+def format_new_quiz_true_false(lines, scoring_data):
+  """Format true/false question"""
+  correct_value = scoring_data.get('value', '')
+  for option in ['true', 'false']:
+    is_correct = option == correct_value
+    marker = "✓" if is_correct else "○"
+    lines.append(f"- {marker} {option.capitalize()}")
+@
+
+\paragraph{Matching questions.}
+These pair items from two columns.
+The API provides either [[questions]]/[[answers]] or [[stems]]/[[choices]] formats.
+
+<<functions>>=
+def format_new_quiz_matching(lines, interaction_data, scoring_data):
+  """Format matching question"""
+  questions = interaction_data.get('questions', []) or interaction_data.get('stems', [])
+  correct_matches = scoring_data.get('value', {})
+
+  lines.append("**Match the following:**")
+  lines.append("")
+  for q in questions:
+    q_id = q.get('id', '')
+    q_text = html_to_markdown(q.get('item_body', '') or q.get('body', ''))
+    match_text = correct_matches.get(q_id, '?') if isinstance(correct_matches, dict) else '?'
+    lines.append(f"- {q_text} → {match_text}")
+@
+
+\paragraph{Numeric questions.}
+These accept exact values, ranges, or values with margins.
+
+<<functions>>=
+def format_new_quiz_numeric(lines, scoring_data):
+  """Format numeric question answer"""
+  correct_value = scoring_data.get('value', {})
+  if isinstance(correct_value, dict):
+    exact = correct_value.get('exact')
+    margin = correct_value.get('margin')
+    range_min = correct_value.get('start')
+    range_max = correct_value.get('end')
+    if exact is not None:
+      if margin:
+        lines.append(f"**Answer:** {exact} (± {margin})")
+      else:
+        lines.append(f"**Answer:** {exact}")
+    elif range_min is not None and range_max is not None:
+      lines.append(f"**Answer:** between {range_min} and {range_max}")
+  else:
+    lines.append(f"**Answer:** {correct_value}")
+@
+
+\paragraph{Fill-in-the-blank questions.}
+These have one or more blanks, each accepting multiple correct answers.
+
+<<functions>>=
+def format_new_quiz_fill_blank(lines, scoring_data):
+  """Format fill-in-the-blank question answers"""
+  blanks = scoring_data.get('value', {})
+  if blanks:
+    lines.append("**Answers:**")
+    for blank_id, answers in blanks.items():
+      if isinstance(answers, list):
+        lines.append(f"  - {', '.join(answers)}")
+      else:
+        lines.append(f"  - {answers}")
+@
+
+
+\section{Formatting Classic Quizzes}
+
+Classic Quizzes have a more straightforward structure. We use the
+[[export_classic_questions]] function to get all questions with their answers.
+
+<<functions>>=
+def format_classic_quiz_as_markdown(quiz):
+  """Format a Classic Quiz as markdown
+
+  Args:
+    quiz: Quiz object
+
+  Returns:
+    Markdown string with quiz content
+  """
+  lines = []
+
+  # Quiz header
+  title = getattr(quiz, 'title', 'Untitled Quiz')
+  lines.append(f"# {title}")
+  lines.append("")
+
+  # Quiz metadata
+  points = getattr(quiz, 'points_possible', None)
+  if points:
+    lines.append(f"**Points:** {points}")
+
+  time_limit = getattr(quiz, 'time_limit', None)
+  if time_limit:
+    lines.append(f"**Time limit:** {time_limit} minutes")
+
+  question_count = getattr(quiz, 'question_count', None)
+  if question_count:
+    lines.append(f"**Questions:** {question_count}")
+
+  if points or time_limit or question_count:
+    lines.append("")
+
+  # Instructions/description
+  description = getattr(quiz, 'description', None)
+  if description:
+    lines.append("## Instructions")
+    lines.append("")
+    lines.append(html_to_markdown(description))
+    lines.append("")
+
+  # Fetch and format questions
+  try:
+    export_data = export_classic_questions(quiz)
+    questions = export_data.get('questions', [])
+
+    if questions:
+      lines.append("## Questions")
+      lines.append("")
+
+      for i, question in enumerate(questions, 1):
+        question_markdown = format_classic_question(question, i)
+        lines.append(question_markdown)
+        lines.append("")
+
+  except Exception as e:
+    lines.append(f"*Could not fetch questions: {e}*")
+
+  return "\n".join(lines)
+@
+
+
+\subsection{Formatting individual Classic Quiz questions}
+
+Classic Quiz questions have a [[question_type]] field that determines their
+structure. We handle all standard Canvas question types.
+
+<<functions>>=
+def format_classic_question(question, number):
+  """Format a single Classic Quiz question as markdown
+
+  Args:
+    question: Question dictionary from export_classic_questions
+    number: Question number for display
+
+  Returns:
+    Markdown string for the question
+  """
+  lines = []
+
+  question_type = question.get('question_type', 'unknown')
+  question_name = question.get('question_name', f'Question {number}')
+  question_text = question.get('question_text', '')
+  points = question.get('points_possible', 0)
+  answers = question.get('answers', [])
+
+  lines.append(f"### Question {number}: {question_name}")
+  if points:
+    lines.append(f"*({points} points)*")
+  lines.append("")
+  lines.append(html_to_markdown(question_text))
+  lines.append("")
+
+  # Format answers based on question type
+  <<format classic quiz answers>>
+
+  return "\n".join(lines)
+@
+
+<<format classic quiz answers>>=
+format_classic_quiz_answers(lines, question_type, question, answers)
+@
+
+Classic Quiz questions use different type names than New Quizzes
+(e.g., [[multiple_choice_question]] vs [[choice]]).
+We use a similar dispatch pattern to helper functions.
+
+<<functions>>=
+def format_classic_quiz_answers(lines, question_type, question, answers):
+  """Format answer choices for a Classic Quiz question
+
+  Args:
+    lines: List to append formatted lines to
+    question_type: The Canvas question type string
+    question: Full question dictionary (for formulas, etc.)
+    answers: List of answer dictionaries
+  """
+  if question_type in ('multiple_choice_question', 'true_false_question'):
+    format_classic_choice_answers(lines, answers)
+  elif question_type == 'multiple_answers_question':
+    lines.append("*(Select all that apply)*")
+    format_classic_choice_answers(lines, answers)
+  elif question_type == 'matching_question':
+    format_classic_matching(lines, answers)
+  elif question_type == 'fill_in_multiple_blanks_question':
+    format_classic_fill_blanks(lines, answers)
+  elif question_type == 'multiple_dropdowns_question':
+    format_classic_dropdowns(lines, answers)
+  elif question_type == 'short_answer_question':
+    format_classic_short_answer(lines, answers)
+  elif question_type == 'numerical_question':
+    format_classic_numerical(lines, answers)
+  elif question_type == 'essay_question':
+    lines.append("*(Essay response)*")
+  elif question_type == 'file_upload_question':
+    lines.append("*(File upload)*")
+  elif question_type == 'text_only_question':
+    pass  # No answers - just informational text
+  elif question_type == 'calculated_question':
+    format_classic_calculated(lines, question, answers)
+  else:
+    lines.append(f"*(Question type: {question_type})*")
+@
+
+\paragraph{Choice-based questions.}
+Multiple choice, true/false, and multiple answers all use the same answer format.
+The [[weight]] field indicates correct answers (weight > 0 means correct).
+
+<<functions>>=
+def format_classic_choice_answers(lines, answers):
+  """Format choice answers with correct/incorrect markers"""
+  for answer in answers:
+    answer_text = html_to_markdown(answer.get('text', '') or answer.get('html', ''))
+    weight = answer.get('weight', 0)
+    is_correct = weight > 0
+    marker = "✓" if is_correct else "○"
+    lines.append(f"- {marker} {answer_text}")
+@
+
+\paragraph{Matching questions.}
+Each answer has a [[left]] and [[right]] side to match.
+
+<<functions>>=
+def format_classic_matching(lines, answers):
+  """Format matching question pairs"""
+  lines.append("**Match the following:**")
+  lines.append("")
+  for answer in answers:
+    left = html_to_markdown(answer.get('left', ''))
+    right = html_to_markdown(answer.get('right', ''))
+    lines.append(f"- {left} → {right}")
+@
+
+\paragraph{Fill-in-the-blank questions.}
+Multiple blanks, each identified by [[blank_id]], can have several correct answers.
+
+<<functions>>=
+def format_classic_fill_blanks(lines, answers):
+  """Format fill-in-multiple-blanks answers grouped by blank"""
+  blanks = {}
+  for answer in answers:
+    blank_id = answer.get('blank_id', 'default')
+    answer_text = answer.get('text', '')
+    weight = answer.get('weight', 0)
+    if weight > 0:
+      if blank_id not in blanks:
+        blanks[blank_id] = []
+      blanks[blank_id].append(answer_text)
+
+  lines.append("**Answers:**")
+  for blank_id, texts in blanks.items():
+    lines.append(f"  [{blank_id}]: {', '.join(texts)}")
+@
+
+\paragraph{Dropdown questions.}
+Similar to fill-in-blanks but with predefined choices per blank.
+
+<<functions>>=
+def format_classic_dropdowns(lines, answers):
+  """Format multiple dropdowns with choices per blank"""
+  blanks = {}
+  for answer in answers:
+    blank_id = answer.get('blank_id', 'default')
+    answer_text = answer.get('text', '')
+    weight = answer.get('weight', 0)
+    if blank_id not in blanks:
+      blanks[blank_id] = []
+    blanks[blank_id].append((answer_text, weight > 0))
+
+  for blank_id, choices in blanks.items():
+    lines.append(f"**[{blank_id}]:**")
+    for text, is_correct in choices:
+      marker = "✓" if is_correct else "○"
+      lines.append(f"  {marker} {text}")
+@
+
+\paragraph{Short answer questions.}
+List all accepted text responses.
+
+<<functions>>=
+def format_classic_short_answer(lines, answers):
+  """Format short answer accepted responses"""
+  lines.append("**Accepted answers:**")
+  for answer in answers:
+    answer_text = answer.get('text', '')
+    if answer_text:
+      lines.append(f"  - {answer_text}")
+@
+
+\paragraph{Numerical questions.}
+Support exact answers, ranges, and precision-based answers.
+
+<<functions>>=
+def format_classic_numerical(lines, answers):
+  """Format numerical question with exact, range, or precision answers"""
+  for answer in answers:
+    answer_type = answer.get('numerical_answer_type', 'exact_answer')
+    if answer_type == 'exact_answer':
+      exact = answer.get('exact', '')
+      margin = answer.get('margin', 0)
+      if margin:
+        lines.append(f"**Answer:** {exact} (± {margin})")
+      else:
+        lines.append(f"**Answer:** {exact}")
+    elif answer_type == 'range_answer':
+      start = answer.get('start', '')
+      end = answer.get('end', '')
+      lines.append(f"**Answer:** between {start} and {end}")
+    elif answer_type == 'precision_answer':
+      approximate = answer.get('approximate', '')
+      precision = answer.get('precision', '')
+      lines.append(f"**Answer:** {approximate} (precision: {precision})")
+@
+
+\paragraph{Calculated questions.}
+These have formulas and variable substitutions.
+We show the formula and a few example calculations.
+
+<<functions>>=
+def format_classic_calculated(lines, question, answers):
+  """Format calculated question with formula and examples"""
+  formulas = question.get('formulas', [])
+  if formulas:
+    lines.append("**Formula:**")
+    for formula in formulas:
+      lines.append(f"  {formula.get('formula', '')}")
+  # Show sample answers (up to 3 examples)
+  for answer in answers[:3]:
+    variables = answer.get('variables', [])
+    answer_val = answer.get('answer', '')
+    if variables:
+      var_str = ", ".join(f"{v['name']}={v['value']}" for v in variables)
+      lines.append(f"  When {var_str}: {answer_val}")
+@
+
+
+\section{Helper function for HTML to markdown conversion}
+
+Quiz content from Canvas is typically HTML.
+Since we're outputting markdown, we need to convert it.
+
+\paragraph{Why pypandoc instead of regex?}
+A naive approach would strip HTML tags with a regex like [[re.sub(r'<[^>]+>', '', html)]].
+This fails in many cases:
+\begin{itemize}
+\item HTML entities like [[&amp;]], [[&lt;]], [[&nbsp;]] remain unconverted
+\item Nested tags like [[<p><strong>text</strong></p>]] lose structure
+\item Lists, tables, and code blocks lose their formatting
+\item Malformed HTML can cause regex to match incorrectly
+\end{itemize}
+
+Using [[pypandoc]] (a Python wrapper for Pandoc) handles all these cases correctly.
+We fall back to regex stripping only if Pandoc is unavailable or fails---this
+provides degraded but functional output rather than crashing.
+
+<<functions>>=
+def html_to_markdown(html_string):
+  """Convert HTML to markdown using pypandoc
+
+  Args:
+    html_string: String containing HTML content
+
+  Returns:
+    Markdown string
+  """
+  if not html_string:
+    return ""
+
+  try:
+    markdown = pypandoc.convert_text(html_string, 'md', format='html')
+    return markdown.strip()
+  except Exception:
+    # Fallback: return the string with tags stripped if pandoc fails
+    import re
+    text = re.sub(r'<[^>]+>', '', html_string)
+    return text.strip()
 @
 
 
@@ -4396,7 +5531,7 @@ def items_export_command(config, canvas, args):
 
   # Export based on quiz type
   if is_new_quiz(quiz):
-    export = export_new_quiz_items(quiz.course, quiz.id, requester,
+    export = export_new_quiz_items(quiz, requester,
                                     include_banks=include_banks)
     if getattr(args, 'importable', False):
       export = clean_for_import(export, quiz_type='new_quiz')
@@ -4613,26 +5748,114 @@ def clean_classic_quiz_for_import(export):
 @
 
 
+\subsection{Caching quiz items}
+\label{quiz-items-cache}
+
+Fetching quiz items from the Canvas API takes 1--2 seconds per quiz.
+When viewing the same quiz multiple times (for example, when reviewing questions
+or checking formatting), this latency adds up quickly.
+
+We implement caching for quiz items by storing them on the quiz object itself.
+This mirrors how the [[CacheGetMethods]] decorator in [[hacks/canvasapi.nw]]
+attaches caches to Canvas objects (e.g., submissions cached on assignments).
+By storing on the quiz object, the cache persists across CLI invocations
+(since quiz objects are pickled and restored by the main Canvas cache).
+
+Each cache entry stores the export data along with a timestamp, allowing us to
+expire stale entries.
+
+We use a 5-minute TTL---quiz items rarely change during normal use, but we want
+reasonably fresh data when actively editing quizzes.
+This is shorter than the main Canvas object cache (which uses days) because
+quiz content is more likely to be modified during an editing session.
+
+<<constants>>=
+import logging
+from datetime import datetime, timedelta
+
+QUIZ_ITEMS_CACHE_TTL_MINUTES = 5
+
+logger = logging.getLogger(__name__)
+@
+
+The [[get_cached_quiz_items]] function checks the quiz object's cache and
+returns cached data if available and fresh.
+Otherwise, it returns [[None]] to signal that a fetch is needed.
+
+<<functions>>=
+def get_cached_quiz_items(quiz):
+  """Returns cached quiz items if available and fresh, else None"""
+  if not hasattr(quiz, '_items_cache'):
+    return None
+
+  export_data, fetch_time = quiz._items_cache
+  age = datetime.now() - fetch_time
+  if age > timedelta(minutes=QUIZ_ITEMS_CACHE_TTL_MINUTES):
+    logger.info(f"Quiz items cache expired for quiz {quiz.id} "
+                f"(age: {age.total_seconds()/60:.1f} min, "
+                f"TTL: {QUIZ_ITEMS_CACHE_TTL_MINUTES} min)")
+    quiz._items_cache = None
+    return None
+
+  logger.info(f"Quiz items cache hit for quiz {quiz.id} "
+              f"(age: {age.total_seconds():.1f}s)")
+  return export_data
+@
+
+The [[cache_quiz_items]] function stores fetched quiz items on the quiz object.
+
+<<functions>>=
+def cache_quiz_items(quiz, export_data):
+  """Stores quiz items in the quiz's cache"""
+  quiz._items_cache = (export_data, datetime.now())
+  logger.debug(f"Cached quiz items for quiz {quiz.id} "
+               f"({export_data.get('item_count', 0)} items)")
+@
+
+We also provide a function to invalidate the cache for a specific quiz.
+This is useful after editing quiz items, ensuring the next fetch gets fresh data.
+
+<<functions>>=
+def invalidate_quiz_items_cache(quiz):
+  """Removes items from the quiz's cache"""
+  if hasattr(quiz, '_items_cache'):
+    quiz._items_cache = None
+    logger.debug(f"Invalidated quiz items cache for quiz {quiz.id}")
+@
+
+
 \subsection{Exporting New Quiz items}
+\label{sec:export-new-quiz-items}
 
 For New Quizzes, we fetch the full item data (not just the summary) and
 optionally expand item bank references to include the actual bank questions.
 
+The function first checks the cache for previously fetched items
+(see Section~\ref{quiz-items-cache} for caching details).
+If the cache has fresh data, we return it immediately, avoiding the API call.
+
 <<functions>>=
-def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
+def export_new_quiz_items(quiz, requester, include_banks=True):
   """Exports items from a New Quiz
 
   Args:
-    course: Course object
-    assignment_id: Quiz/assignment ID
+    quiz: Quiz object (must have .id and .course attributes)
     requester: Canvas API requester
     include_banks: If True, expand Bank/BankEntry items to include bank questions
 
   Returns:
     Dictionary with quiz metadata and items
   """
+  # Check cache first (only for include_banks=True, the common case)
+  if include_banks:
+    cached = get_cached_quiz_items(quiz)
+    if cached is not None:
+      return cached
+
   import datetime
 
+  course = quiz.course
+  assignment_id = quiz.id
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}/items"
 
   try:
@@ -4710,7 +5933,7 @@ def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
         'entry': entry
       })
 
-  return {
+  export_data = {
     'quiz_type': 'new_quiz',
     'course_id': course.id,
     'assignment_id': assignment_id,
@@ -4720,6 +5943,12 @@ def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
     'items': items,
     'banks': banks
   }
+
+  # Cache the result (only for include_banks=True)
+  if include_banks:
+    cache_quiz_items(quiz, export_data)
+
+  return export_data
 @
 
 
@@ -4930,7 +6159,9 @@ def banks_export_command(config, canvas, args):
 
 We fetch items from an item bank using the [[item_banks]] API endpoint.  This
 endpoint may not be accessible in all Canvas configurations, so we handle
-failures gracefully.
+failures gracefully. Note that many Canvas installations don't expose the
+Item Banks API, so failures are common and expected---we silently return an
+empty list rather than warning the user.
 
 <<functions>>=
 def get_bank_items(requester, bank_id):
@@ -4941,7 +6172,7 @@ def get_bank_items(requester, bank_id):
     bank_id: Item bank ID
 
   Returns:
-    List of item dictionaries
+    List of item dictionaries, or empty list if bank is inaccessible
   """
   endpoint = f"item_banks/{bank_id}/items"
 
@@ -4952,8 +6183,8 @@ def get_bank_items(requester, bank_id):
       _url="new_quizzes"
     )
     return response.json()
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to get bank items: {e}")
+  except Exception:
+    # Item Banks API often isn't accessible - this is expected
     return []
 @
 
