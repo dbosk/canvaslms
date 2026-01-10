@@ -2778,6 +2778,7 @@ SUBMISSION_TTL_MINUTES = 5
 DEFAULT_CACHE_TTL_DAYS = 7
 USER_CACHE_TTL_DAYS = 2
 GROUP_CACHE_TTL_DAYS = 5
+QUIZ_CACHE_TTL_DAYS = 3
 @
 
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
@@ -2851,6 +2852,21 @@ elif attr_name in ["group_all_fetched", "group_category_all_fetched"]:
     age = datetime.now() - getattr(obj, attr_name)
     logger.info(f"Cache invalidation: {attr_name} periodic refresh "
                 f"(age: {age.days} days, threshold: {GROUP_CACHE_TTL_DAYS} days)")
+    setattr(obj, attr_name, None)
+@
+
+Quizzes are similar to assignments in stability, but quiz settings (due dates,
+availability) may be adjusted more frequently during a course.
+We use [[QUIZ_CACHE_TTL_DAYS]] days (3 days by default) as a compromise---shorter
+than the default 7 days but longer than the 2-day user cache.
+<<if statements for resetting [[_all_fetched]] for various attributes>>=
+elif attr_name in ["quiz_all_fetched", "new_quiz_all_fetched"]:
+  if not getattr(obj, attr_name):
+    continue
+  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=QUIZ_CACHE_TTL_DAYS):
+    age = datetime.now() - getattr(obj, attr_name)
+    logger.info(f"Cache invalidation: {attr_name} periodic refresh "
+                f"(age: {age.days} days, threshold: {QUIZ_CACHE_TTL_DAYS} days)")
     setattr(obj, attr_name, None)
 @
 
@@ -3062,6 +3078,14 @@ for attr_name in dir(obj):
       if age > threshold:
         return (f"periodic refresh: {attr_name} "
                 f"(age: {age.days} days, threshold: {GROUP_CACHE_TTL_DAYS} days)")
+  elif attr_name in ["quiz_all_fetched", "new_quiz_all_fetched"]:
+    attr_val = getattr(obj, attr_name, None)
+    if attr_val:
+      age = datetime.now() - attr_val
+      threshold = timedelta(days=QUIZ_CACHE_TTL_DAYS)
+      if age > threshold:
+        return (f"periodic refresh: {attr_name} "
+                f"(age: {age.days} days, threshold: {QUIZ_CACHE_TTL_DAYS} days)")
   elif attr_name.endswith("_all_fetched"):
     attr_val = getattr(obj, attr_name, None)
     if attr_val:
@@ -3466,6 +3490,150 @@ def make_course_groups_cacheable():
     include_singular=False)(canvasapi.course.Course)
   canvasapi.group.GroupCategory = CacheGetMethods("group",
     include_singular=False)(canvasapi.group.GroupCategory)
+@
+
+
+\subsection{Caching quizzes}
+
+Courses contain quizzes, which come in two flavors:
+\begin{description}
+\item[Classic Quizzes] The original Canvas quiz system, accessed via
+  [[get_quiz()]] and [[get_quizzes()]].
+  These return [[Quiz]] objects with attributes like [[quiz_type]].
+\item[New Quizzes (Quizzes.Next)] Canvas's newer assessment engine, accessed via
+  [[get_new_quiz()]] and [[get_new_quizzes()]].
+  These return [[NewQuiz]] objects.
+\end{description}
+
+Quizzes are relatively stable---they're typically created at course design time
+and their structure rarely changes during the course.
+However, quiz settings (due dates, availability windows) may be adjusted more
+frequently than assignments, so we use a shorter TTL of [[QUIZ_CACHE_TTL_DAYS]]
+days rather than the default 7 days.
+
+We cache both quiz types on the [[Course]] class.
+Note that both use irregular plurals (\enquote{quizzes} not \enquote{quizs}), so
+we must specify [[plural_name]].
+<<functions>>=
+def make_course_quizzes_cacheable():
+  """Add caching to Course.get_quiz/get_quizzes and get_new_quiz/get_new_quizzes"""
+  import canvasapi.course
+  canvasapi.course.Course = CacheGetMethods("quiz",
+    plural_name="quizzes")(canvasapi.course.Course)
+  canvasapi.course.Course = CacheGetMethods("new_quiz",
+    plural_name="new_quizzes")(canvasapi.course.Course)
+@
+
+Now let's verify the quiz caching works correctly.
+
+\subsubsection{Verifying quiz caching}
+
+We test that the [[CacheGetMethods]] decorator correctly caches both Classic and
+New Quizzes.
+<<test functions>>=
+class TestQuizCaching:
+    """Test quiz and new_quiz caching on Course objects"""
+
+    def test_quiz_cache_attribute_created(self):
+        """Course instances should have quiz_cache attribute"""
+        class TestCourse:
+            def __init__(self):
+                pass
+            def get_quiz(self, quiz_id):
+                obj = MagicMock()
+                obj.id = quiz_id
+                return obj
+            def get_quizzes(self):
+                return []
+
+        CacheGetMethods("quiz", plural_name="quizzes")(TestCourse)
+        instance = TestCourse()
+
+        assert hasattr(instance, "quiz_cache")
+        assert hasattr(instance, "quiz_all_fetched")
+
+    def test_new_quiz_cache_attribute_created(self):
+        """Course instances should have new_quiz_cache attribute"""
+        class TestCourse:
+            def __init__(self):
+                pass
+            def get_new_quiz(self, quiz_id):
+                obj = MagicMock()
+                obj.id = quiz_id
+                return obj
+            def get_new_quizzes(self):
+                return []
+
+        CacheGetMethods("new_quiz", plural_name="new_quizzes")(TestCourse)
+        instance = TestCourse()
+
+        assert hasattr(instance, "new_quiz_cache")
+        assert hasattr(instance, "new_quiz_all_fetched")
+
+    def test_quiz_cached_on_second_call(self):
+        """Second call to get_quiz should return cached object"""
+        call_count = {"count": 0}
+
+        class TestCourse:
+            def __init__(self):
+                pass
+            def get_quiz(self, quiz_id):
+                call_count["count"] += 1
+                obj = MagicMock()
+                obj.id = quiz_id
+                return obj
+            def get_quizzes(self):
+                return []
+
+        CacheGetMethods("quiz", plural_name="quizzes")(TestCourse)
+        instance = TestCourse()
+
+        result1 = instance.get_quiz(123)
+        result2 = instance.get_quiz(123)
+
+        assert call_count["count"] == 1
+        assert result1 is result2
+
+    def test_quizzes_bulk_fetch_populates_cache(self):
+        """get_quizzes() should populate quiz_cache"""
+        class TestCourse:
+            def __init__(self):
+                pass
+            def get_quiz(self, quiz_id):
+                obj = MagicMock()
+                obj.id = quiz_id
+                return obj
+            def get_quizzes(self):
+                return [MagicMock(id=1), MagicMock(id=2), MagicMock(id=3)]
+
+        CacheGetMethods("quiz", plural_name="quizzes")(TestCourse)
+        instance = TestCourse()
+
+        list(instance.get_quizzes())
+
+        assert 1 in instance.quiz_cache
+        assert 2 in instance.quiz_cache
+        assert 3 in instance.quiz_cache
+
+    def test_new_quizzes_bulk_fetch_populates_cache(self):
+        """get_new_quizzes() should populate new_quiz_cache"""
+        class TestCourse:
+            def __init__(self):
+                pass
+            def get_new_quiz(self, quiz_id):
+                obj = MagicMock()
+                obj.id = quiz_id
+                return obj
+            def get_new_quizzes(self):
+                return [MagicMock(id=10), MagicMock(id=20)]
+
+        CacheGetMethods("new_quiz", plural_name="new_quizzes")(TestCourse)
+        instance = TestCourse()
+
+        list(instance.get_new_quizzes())
+
+        assert 10 in instance.new_quiz_cache
+        assert 20 in instance.new_quiz_cache
 @
 
 
