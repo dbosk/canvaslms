@@ -282,7 +282,16 @@ def add_banks_command(subp):
 \section{The [[quizzes]] command and its subcommands}
 
 We add the parent [[quizzes]] parser with subcommands.
-The [[quizzes analyse]] subcommand can either work with a CSV file or fetch data from Canvas.
+The subcommands are organized by workflow:
+\begin{description}
+\item[Discovery] [[list]] shows available quizzes; [[view]] displays full quiz
+  content including questions (Chapter~\ref{quiz-view}).
+\item[Analysis] [[analyse]] provides statistical summaries and AI-generated
+  insights for quiz/survey responses.
+\item[Management] [[create]], [[edit]], and [[delete]] handle quiz lifecycle.
+\item[Items] [[items]] and [[banks]] manage individual questions and item banks.
+\end{description}
+
 <<add quizzes command to subp>>=
 quizzes_parser = subp.add_parser("quizzes",
     help="Quiz-related commands",
@@ -2470,6 +2479,24 @@ We define a schema for quiz properties, similar to [[ASSIGNMENT_SCHEMA]] in
 [[content.nw]]. This schema describes all editable properties and provides
 defaults for the editor template.
 
+\paragraph{Field selection rationale.}
+We include fields that instructors commonly need to adjust:
+\begin{description}
+\item[Identity and content] [[title]], [[id]] (read-only, for identification).
+\item[Timing] [[time_limit]], [[due_at]], [[unlock_at]], [[lock_at]]---the most
+  frequently edited settings when reusing quizzes across semesters.
+\item[Scoring] [[points_possible]], [[allowed_attempts]]---controls grading behavior.
+\item[Presentation] [[shuffle_questions]], [[shuffle_answers]],
+  [[one_question_at_a_time]], [[cant_go_back]]---anti-cheating and UX options.
+\item[Feedback] [[show_correct_answers]], [[hide_results]]---controls what
+  students see after submission.
+\item[Access control] [[access_code]], [[published]]---security and visibility.
+\item[Quiz type] [[quiz_type]]---distinguishes graded quizzes from surveys.
+\end{description}
+We deliberately exclude fields like [[ip_filter]] (rarely used),
+[[scoring_policy]] (complex interactions with other settings), and
+[[assignment_group_id]] (better managed through the assignments command).
+
 <<constants>>=
 QUIZ_SCHEMA = {
     'title': {
@@ -2875,11 +2902,15 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
         params['time_limit'] = value
       continue
 
-    # Skip quiz_type for New Quizzes (not applicable)
+    # Skip quiz_type for New Quizzes: New Quizzes are always graded assignments
+    # and don't support the Classic Quiz distinction between assignment,
+    # practice_quiz, graded_survey, and survey types.
     if key == 'quiz_type' and is_new:
       continue
 
-    # Skip hide_results for New Quizzes
+    # Skip hide_results for New Quizzes: result visibility is controlled
+    # differently in the New Quizzes interface (through the "Restrict student
+    # result view" setting), not via this API parameter.
     if key == 'hide_results' and is_new:
       continue
 
@@ -3160,7 +3191,7 @@ def view_command(config, canvas, args):
   # Join all quizzes with a separator
   full_output = "\n\n---\n\n".join(output_parts)
 
-  <<render quiz markdown output>>
+  <<display quiz output respecting terminal type>>
 @
 
 
@@ -3170,7 +3201,7 @@ We reuse the pattern established in the [[analyse]] command: when output goes
 to a TTY, we use rich to render markdown with a pager; otherwise, we output
 plain markdown for piping.
 
-<<render quiz markdown output>>=
+<<display quiz output respecting terminal type>>=
 console = Console()
 md = Markdown(full_output)
 
@@ -3328,15 +3359,54 @@ def format_new_quiz_item(item, number):
   return "\n".join(lines)
 @
 
-Different question types have different answer structures. We handle the most
-common types: multiple choice, true/false, matching, and essay.
+Different question types have different answer structures.
+Canvas New Quizzes support many interaction types, each with its own data format.
+We use helper functions to keep the formatting logic modular and testable.
 
 <<format new quiz answer choices>>=
 interaction_data = entry.get('interaction_data', {})
 scoring_data = entry.get('scoring_data', {})
 
-if interaction_type in ('choice', 'multi-answer'):
-  # Multiple choice or multi-answer question
+format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_data)
+@
+
+The [[format_new_quiz_answers]] function dispatches to type-specific formatters.
+This keeps the main formatting function focused on structure while delegating
+answer rendering to specialized helpers.
+
+<<functions>>=
+def format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_data):
+  """Format answer choices for a New Quiz item
+
+  Args:
+    lines: List to append formatted lines to
+    interaction_type: The question type (choice, true-false, etc.)
+    interaction_data: Question-specific data (choices, stems, etc.)
+    scoring_data: Correct answer information
+  """
+  if interaction_type in ('choice', 'multi-answer'):
+    format_new_quiz_choice_answers(lines, interaction_data, scoring_data)
+  elif interaction_type == 'true-false':
+    format_new_quiz_true_false(lines, scoring_data)
+  elif interaction_type == 'matching':
+    format_new_quiz_matching(lines, interaction_data, scoring_data)
+  elif interaction_type in ('essay', 'rich-text'):
+    lines.append("*(Essay response)*")
+  elif interaction_type == 'numeric':
+    format_new_quiz_numeric(lines, scoring_data)
+  elif interaction_type == 'fill-in-the-blank':
+    format_new_quiz_fill_blank(lines, scoring_data)
+  else:
+    lines.append(f"*(Question type: {interaction_type})*")
+@
+
+\paragraph{Multiple choice and multi-answer questions.}
+These are the most common question types.
+Choices are listed with markers indicating correct answers.
+
+<<functions>>=
+def format_new_quiz_choice_answers(lines, interaction_data, scoring_data):
+  """Format multiple choice or multi-answer question choices"""
   choices = interaction_data.get('choices', [])
   correct_ids = scoring_data.get('value', [])
   if isinstance(correct_ids, str):
@@ -3350,17 +3420,28 @@ if interaction_type in ('choice', 'multi-answer'):
     is_correct = choice_id in correct_ids
     marker = "✓" if is_correct else "○"
     lines.append(f"- {marker} {choice_text}")
+@
 
-elif interaction_type == 'true-false':
-  # True/False question
+\paragraph{True/false questions.}
+A simplified choice between two options.
+
+<<functions>>=
+def format_new_quiz_true_false(lines, scoring_data):
+  """Format true/false question"""
   correct_value = scoring_data.get('value', '')
   for option in ['true', 'false']:
     is_correct = option == correct_value
     marker = "✓" if is_correct else "○"
     lines.append(f"- {marker} {option.capitalize()}")
+@
 
-elif interaction_type == 'matching':
-  # Matching question - handle both old format (stems/choices) and new format (questions/answers)
+\paragraph{Matching questions.}
+These pair items from two columns.
+The API provides either [[questions]]/[[answers]] or [[stems]]/[[choices]] formats.
+
+<<functions>>=
+def format_new_quiz_matching(lines, interaction_data, scoring_data):
+  """Format matching question"""
   questions = interaction_data.get('questions', []) or interaction_data.get('stems', [])
   correct_matches = scoring_data.get('value', {})
 
@@ -3369,16 +3450,16 @@ elif interaction_type == 'matching':
   for q in questions:
     q_id = q.get('id', '')
     q_text = html_to_markdown(q.get('item_body', '') or q.get('body', ''))
-    # Get the correct answer - value maps question_id to answer text
     match_text = correct_matches.get(q_id, '?') if isinstance(correct_matches, dict) else '?'
     lines.append(f"- {q_text} → {match_text}")
+@
 
-elif interaction_type in ('essay', 'rich-text'):
-  # Essay question - no answer choices
-  lines.append("*(Essay response)*")
+\paragraph{Numeric questions.}
+These accept exact values, ranges, or values with margins.
 
-elif interaction_type == 'numeric':
-  # Numeric question
+<<functions>>=
+def format_new_quiz_numeric(lines, scoring_data):
+  """Format numeric question answer"""
   correct_value = scoring_data.get('value', {})
   if isinstance(correct_value, dict):
     exact = correct_value.get('exact')
@@ -3394,9 +3475,14 @@ elif interaction_type == 'numeric':
       lines.append(f"**Answer:** between {range_min} and {range_max}")
   else:
     lines.append(f"**Answer:** {correct_value}")
+@
 
-elif interaction_type == 'fill-in-the-blank':
-  # Fill in the blank
+\paragraph{Fill-in-the-blank questions.}
+These have one or more blanks, each accepting multiple correct answers.
+
+<<functions>>=
+def format_new_quiz_fill_blank(lines, scoring_data):
+  """Format fill-in-the-blank question answers"""
   blanks = scoring_data.get('value', {})
   if blanks:
     lines.append("**Answers:**")
@@ -3405,10 +3491,6 @@ elif interaction_type == 'fill-in-the-blank':
         lines.append(f"  - {', '.join(answers)}")
       else:
         lines.append(f"  - {answers}")
-
-else:
-  # Unknown type - just note it
-  lines.append(f"*(Question type: {interaction_type})*")
 @
 
 
@@ -3517,33 +3599,85 @@ def format_classic_question(question, number):
 @
 
 <<format classic quiz answers>>=
-if question_type in ('multiple_choice_question', 'true_false_question'):
+format_classic_quiz_answers(lines, question_type, question, answers)
+@
+
+Classic Quiz questions use different type names than New Quizzes
+(e.g., [[multiple_choice_question]] vs [[choice]]).
+We use a similar dispatch pattern to helper functions.
+
+<<functions>>=
+def format_classic_quiz_answers(lines, question_type, question, answers):
+  """Format answer choices for a Classic Quiz question
+
+  Args:
+    lines: List to append formatted lines to
+    question_type: The Canvas question type string
+    question: Full question dictionary (for formulas, etc.)
+    answers: List of answer dictionaries
+  """
+  if question_type in ('multiple_choice_question', 'true_false_question'):
+    format_classic_choice_answers(lines, answers)
+  elif question_type == 'multiple_answers_question':
+    lines.append("*(Select all that apply)*")
+    format_classic_choice_answers(lines, answers)
+  elif question_type == 'matching_question':
+    format_classic_matching(lines, answers)
+  elif question_type == 'fill_in_multiple_blanks_question':
+    format_classic_fill_blanks(lines, answers)
+  elif question_type == 'multiple_dropdowns_question':
+    format_classic_dropdowns(lines, answers)
+  elif question_type == 'short_answer_question':
+    format_classic_short_answer(lines, answers)
+  elif question_type == 'numerical_question':
+    format_classic_numerical(lines, answers)
+  elif question_type == 'essay_question':
+    lines.append("*(Essay response)*")
+  elif question_type == 'file_upload_question':
+    lines.append("*(File upload)*")
+  elif question_type == 'text_only_question':
+    pass  # No answers - just informational text
+  elif question_type == 'calculated_question':
+    format_classic_calculated(lines, question, answers)
+  else:
+    lines.append(f"*(Question type: {question_type})*")
+@
+
+\paragraph{Choice-based questions.}
+Multiple choice, true/false, and multiple answers all use the same answer format.
+The [[weight]] field indicates correct answers (weight > 0 means correct).
+
+<<functions>>=
+def format_classic_choice_answers(lines, answers):
+  """Format choice answers with correct/incorrect markers"""
   for answer in answers:
     answer_text = html_to_markdown(answer.get('text', '') or answer.get('html', ''))
     weight = answer.get('weight', 0)
     is_correct = weight > 0
     marker = "✓" if is_correct else "○"
     lines.append(f"- {marker} {answer_text}")
+@
 
-elif question_type == 'multiple_answers_question':
-  lines.append("*(Select all that apply)*")
-  for answer in answers:
-    answer_text = html_to_markdown(answer.get('text', '') or answer.get('html', ''))
-    weight = answer.get('weight', 0)
-    is_correct = weight > 0
-    marker = "✓" if is_correct else "○"
-    lines.append(f"- {marker} {answer_text}")
+\paragraph{Matching questions.}
+Each answer has a [[left]] and [[right]] side to match.
 
-elif question_type == 'matching_question':
+<<functions>>=
+def format_classic_matching(lines, answers):
+  """Format matching question pairs"""
   lines.append("**Match the following:**")
   lines.append("")
   for answer in answers:
     left = html_to_markdown(answer.get('left', ''))
     right = html_to_markdown(answer.get('right', ''))
     lines.append(f"- {left} → {right}")
+@
 
-elif question_type == 'fill_in_multiple_blanks_question':
-  # Group answers by blank_id
+\paragraph{Fill-in-the-blank questions.}
+Multiple blanks, each identified by [[blank_id]], can have several correct answers.
+
+<<functions>>=
+def format_classic_fill_blanks(lines, answers):
+  """Format fill-in-multiple-blanks answers grouped by blank"""
   blanks = {}
   for answer in answers:
     blank_id = answer.get('blank_id', 'default')
@@ -3557,9 +3691,14 @@ elif question_type == 'fill_in_multiple_blanks_question':
   lines.append("**Answers:**")
   for blank_id, texts in blanks.items():
     lines.append(f"  [{blank_id}]: {', '.join(texts)}")
+@
 
-elif question_type == 'multiple_dropdowns_question':
-  # Similar to fill in blanks
+\paragraph{Dropdown questions.}
+Similar to fill-in-blanks but with predefined choices per blank.
+
+<<functions>>=
+def format_classic_dropdowns(lines, answers):
+  """Format multiple dropdowns with choices per blank"""
   blanks = {}
   for answer in answers:
     blank_id = answer.get('blank_id', 'default')
@@ -3574,15 +3713,27 @@ elif question_type == 'multiple_dropdowns_question':
     for text, is_correct in choices:
       marker = "✓" if is_correct else "○"
       lines.append(f"  {marker} {text}")
+@
 
-elif question_type == 'short_answer_question':
+\paragraph{Short answer questions.}
+List all accepted text responses.
+
+<<functions>>=
+def format_classic_short_answer(lines, answers):
+  """Format short answer accepted responses"""
   lines.append("**Accepted answers:**")
   for answer in answers:
     answer_text = answer.get('text', '')
     if answer_text:
       lines.append(f"  - {answer_text}")
+@
 
-elif question_type == 'numerical_question':
+\paragraph{Numerical questions.}
+Support exact answers, ranges, and precision-based answers.
+
+<<functions>>=
+def format_classic_numerical(lines, answers):
+  """Format numerical question with exact, range, or precision answers"""
   for answer in answers:
     answer_type = answer.get('numerical_answer_type', 'exact_answer')
     if answer_type == 'exact_answer':
@@ -3600,43 +3751,48 @@ elif question_type == 'numerical_question':
       approximate = answer.get('approximate', '')
       precision = answer.get('precision', '')
       lines.append(f"**Answer:** {approximate} (precision: {precision})")
+@
 
-elif question_type == 'essay_question':
-  lines.append("*(Essay response)*")
+\paragraph{Calculated questions.}
+These have formulas and variable substitutions.
+We show the formula and a few example calculations.
 
-elif question_type == 'file_upload_question':
-  lines.append("*(File upload)*")
-
-elif question_type == 'text_only_question':
-  # No answers - just informational text
-  pass
-
-elif question_type == 'calculated_question':
-  # Show formula if available
+<<functions>>=
+def format_classic_calculated(lines, question, answers):
+  """Format calculated question with formula and examples"""
   formulas = question.get('formulas', [])
   if formulas:
     lines.append("**Formula:**")
     for formula in formulas:
       lines.append(f"  {formula.get('formula', '')}")
-  # Show sample answers
-  for answer in answers[:3]:  # Show up to 3 examples
+  # Show sample answers (up to 3 examples)
+  for answer in answers[:3]:
     variables = answer.get('variables', [])
     answer_val = answer.get('answer', '')
     if variables:
       var_str = ", ".join(f"{v['name']}={v['value']}" for v in variables)
       lines.append(f"  When {var_str}: {answer_val}")
-
-else:
-  lines.append(f"*(Question type: {question_type})*")
 @
 
 
 \section{Helper function for HTML to markdown conversion}
 
-Quiz content from Canvas is typically HTML. Since we're outputting markdown,
-we use [[pypandoc]] to convert HTML to markdown properly. This handles all
-HTML entities, formatting, and structure correctly---unlike a simple regex
-approach that would miss edge cases.
+Quiz content from Canvas is typically HTML.
+Since we're outputting markdown, we need to convert it.
+
+\paragraph{Why pypandoc instead of regex?}
+A naive approach would strip HTML tags with a regex like [[re.sub(r'<[^>]+>', '', html)]].
+This fails in many cases:
+\begin{itemize}
+\item HTML entities like [[&amp;]], [[&lt;]], [[&nbsp;]] remain unconverted
+\item Nested tags like [[<p><strong>text</strong></p>]] lose structure
+\item Lists, tables, and code blocks lose their formatting
+\item Malformed HTML can cause regex to match incorrectly
+\end{itemize}
+
+Using [[pypandoc]] (a Python wrapper for Pandoc) handles all these cases correctly.
+We fall back to regex stripping only if Pandoc is unavailable or fails---this
+provides degraded but functional output rather than crashing.
 
 <<functions>>=
 def html_to_markdown(html_string):
@@ -5669,11 +5825,13 @@ def invalidate_quiz_items_cache(quiz):
 
 
 \subsection{Exporting New Quiz items}
+\label{sec:export-new-quiz-items}
 
 For New Quizzes, we fetch the full item data (not just the summary) and
 optionally expand item bank references to include the actual bank questions.
 
-The function first checks the cache for previously fetched items.
+The function first checks the cache for previously fetched items
+(see Section~\ref{quiz-items-cache} for caching details).
 If the cache has fresh data, we return it immediately, avoiding the API call.
 
 <<functions>>=
