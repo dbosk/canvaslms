@@ -3243,7 +3243,7 @@ def format_new_quiz_as_markdown(quiz, course, requester):
 
   # Fetch and format questions
   try:
-    export_data = export_new_quiz_items(course, quiz.id, requester, include_banks=True)
+    export_data = export_new_quiz_items(quiz, requester, include_banks=True)
     items = export_data.get('items', [])
 
     if items:
@@ -5375,7 +5375,7 @@ def items_export_command(config, canvas, args):
 
   # Export based on quiz type
   if is_new_quiz(quiz):
-    export = export_new_quiz_items(quiz.course, quiz.id, requester,
+    export = export_new_quiz_items(quiz, requester,
                                     include_banks=include_banks)
     if getattr(args, 'importable', False):
       export = clean_for_import(export, quiz_type='new_quiz')
@@ -5599,14 +5599,12 @@ Fetching quiz items from the Canvas API takes 1--2 seconds per quiz.
 When viewing the same quiz multiple times (for example, when reviewing questions
 or checking formatting), this latency adds up quickly.
 
-We implement caching for quiz items by storing them on the course object itself.
+We implement caching for quiz items by storing them on the quiz object itself.
 This mirrors how the [[CacheGetMethods]] decorator in [[hacks/canvasapi.nw]]
-attaches caches to Canvas objects.
-By storing on the course object, the cache persists across CLI invocations
-(since the course object is pickled and restored by the main Canvas cache).
+attaches caches to Canvas objects (e.g., submissions cached on assignments).
+By storing on the quiz object, the cache persists across CLI invocations
+(since quiz objects are pickled and restored by the main Canvas cache).
 
-The cache uses assignment ID as the key, since course ID is implicit (it's the
-course object the cache is attached to).
 Each cache entry stores the export data along with a timestamp, allowing us to
 expire stale entries.
 
@@ -5624,44 +5622,37 @@ QUIZ_ITEMS_CACHE_TTL_MINUTES = 5
 logger = logging.getLogger(__name__)
 @
 
-The [[get_cached_quiz_items]] function checks the course object's cache and
+The [[get_cached_quiz_items]] function checks the quiz object's cache and
 returns cached data if available and fresh.
 Otherwise, it returns [[None]] to signal that a fetch is needed.
 
 <<functions>>=
-def get_cached_quiz_items(course, assignment_id):
+def get_cached_quiz_items(quiz):
   """Returns cached quiz items if available and fresh, else None"""
-  if not hasattr(course, '_quiz_items_cache'):
+  if not hasattr(quiz, '_items_cache'):
     return None
 
-  cache = course._quiz_items_cache
-  if assignment_id not in cache:
-    return None
-
-  export_data, fetch_time = cache[assignment_id]
+  export_data, fetch_time = quiz._items_cache
   age = datetime.now() - fetch_time
   if age > timedelta(minutes=QUIZ_ITEMS_CACHE_TTL_MINUTES):
-    logger.info(f"Quiz items cache expired for quiz {assignment_id} "
+    logger.info(f"Quiz items cache expired for quiz {quiz.id} "
                 f"(age: {age.total_seconds()/60:.1f} min, "
                 f"TTL: {QUIZ_ITEMS_CACHE_TTL_MINUTES} min)")
-    del cache[assignment_id]
+    quiz._items_cache = None
     return None
 
-  logger.info(f"Quiz items cache hit for quiz {assignment_id} "
+  logger.info(f"Quiz items cache hit for quiz {quiz.id} "
               f"(age: {age.total_seconds():.1f}s)")
   return export_data
 @
 
-The [[cache_quiz_items]] function stores fetched quiz items on the course object.
+The [[cache_quiz_items]] function stores fetched quiz items on the quiz object.
 
 <<functions>>=
-def cache_quiz_items(course, assignment_id, export_data):
-  """Stores quiz items in the course's cache"""
-  if not hasattr(course, '_quiz_items_cache'):
-    course._quiz_items_cache = {}
-
-  course._quiz_items_cache[assignment_id] = (export_data, datetime.now())
-  logger.debug(f"Cached quiz items for quiz {assignment_id} "
+def cache_quiz_items(quiz, export_data):
+  """Stores quiz items in the quiz's cache"""
+  quiz._items_cache = (export_data, datetime.now())
+  logger.debug(f"Cached quiz items for quiz {quiz.id} "
                f"({export_data.get('item_count', 0)} items)")
 @
 
@@ -5669,11 +5660,11 @@ We also provide a function to invalidate the cache for a specific quiz.
 This is useful after editing quiz items, ensuring the next fetch gets fresh data.
 
 <<functions>>=
-def invalidate_quiz_items_cache(course, assignment_id):
-  """Removes a quiz from the course's items cache"""
-  if hasattr(course, '_quiz_items_cache') and assignment_id in course._quiz_items_cache:
-    del course._quiz_items_cache[assignment_id]
-    logger.debug(f"Invalidated quiz items cache for quiz {assignment_id}")
+def invalidate_quiz_items_cache(quiz):
+  """Removes items from the quiz's cache"""
+  if hasattr(quiz, '_items_cache'):
+    quiz._items_cache = None
+    logger.debug(f"Invalidated quiz items cache for quiz {quiz.id}")
 @
 
 
@@ -5686,12 +5677,11 @@ The function first checks the cache for previously fetched items.
 If the cache has fresh data, we return it immediately, avoiding the API call.
 
 <<functions>>=
-def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
+def export_new_quiz_items(quiz, requester, include_banks=True):
   """Exports items from a New Quiz
 
   Args:
-    course: Course object
-    assignment_id: Quiz/assignment ID
+    quiz: Quiz object (must have .id and .course attributes)
     requester: Canvas API requester
     include_banks: If True, expand Bank/BankEntry items to include bank questions
 
@@ -5700,12 +5690,14 @@ def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
   """
   # Check cache first (only for include_banks=True, the common case)
   if include_banks:
-    cached = get_cached_quiz_items(course, assignment_id)
+    cached = get_cached_quiz_items(quiz)
     if cached is not None:
       return cached
 
   import datetime
 
+  course = quiz.course
+  assignment_id = quiz.id
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}/items"
 
   try:
@@ -5796,7 +5788,7 @@ def export_new_quiz_items(course, assignment_id, requester, include_banks=True):
 
   # Cache the result (only for include_banks=True)
   if include_banks:
-    cache_quiz_items(course, assignment_id, export_data)
+    cache_quiz_items(quiz, export_data)
 
   return export_data
 @
