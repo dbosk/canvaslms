@@ -237,6 +237,7 @@ import pypandoc
 import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
+import canvaslms.cli.content as content
 import canvaslms.cli.utils
 from rich.console import Console
 from rich.markdown import Markdown
@@ -2440,15 +2441,162 @@ def create_classic_quiz(course, quiz_params):
 \section{The [[quizzes edit]] subcommand}
 \label{sec:quizzes-edit}
 
-The [[quizzes edit]] command modifies an existing quiz's settings.
-It auto-detects whether the quiz is a New Quiz or Classic Quiz and uses the
-appropriate API.
+The [[quizzes edit]] command modifies an existing quiz's settings and
+instructions. Like [[assignments edit]], it supports two workflows:
+\begin{description}
+\item[Interactive mode] (default) Opens your editor with the quiz content
+  formatted as YAML front matter (settings) plus Markdown body (instructions).
+  After editing, shows a preview and asks whether to accept, edit further, or
+  discard.
+\item[File mode] ([[-f]]) Reads content from a file for scripted workflows.
+  Useful for batch updates or Git-based quiz management.
+\end{description}
+
+The command auto-detects whether the quiz is a New Quiz or Classic Quiz and
+uses the appropriate API. A key challenge is that the two quiz systems use
+different field names and units:
+\begin{description}
+\item[Instructions] New Quizzes use [[instructions]], Classic Quizzes use
+  [[description]].
+\item[Time limit] New Quizzes use seconds, Classic Quizzes use minutes.
+  We normalize to \emph{minutes} in the YAML (more human-friendly) and convert
+  when calling the API.
+\end{description}
+
+
+\subsection{Quiz schema for editing}
+
+We define a schema for quiz properties, similar to [[ASSIGNMENT_SCHEMA]] in
+[[content.nw]]. This schema describes all editable properties and provides
+defaults for the editor template.
+
+<<constants>>=
+QUIZ_SCHEMA = {
+    'title': {
+        'default': '',
+        'required': True,
+        'canvas_attr': 'title',
+        'description': 'Quiz title'
+    },
+    'id': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'id',
+        'description': 'Quiz ID (for identification during edit)'
+    },
+    'time_limit': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'time_limit',
+        'description': 'Time limit in minutes (null for unlimited)'
+    },
+    'due_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'due_at',
+        'description': 'Due date (ISO 8601 datetime)'
+    },
+    'unlock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'unlock_at',
+        'description': 'Available from date (ISO 8601 datetime)'
+    },
+    'lock_at': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'lock_at',
+        'description': 'Available until date (ISO 8601 datetime)'
+    },
+    'points_possible': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'points_possible',
+        'description': 'Total points for the quiz'
+    },
+    'published': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'published',
+        'description': 'Whether the quiz is visible to students'
+    },
+    'allowed_attempts': {
+        'default': 1,
+        'required': False,
+        'canvas_attr': 'allowed_attempts',
+        'description': 'Number of attempts allowed (-1 for unlimited)'
+    },
+    'shuffle_questions': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'shuffle_questions',
+        'description': 'Randomize question order'
+    },
+    'shuffle_answers': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'shuffle_answers',
+        'description': 'Randomize answer choice order'
+    },
+    'show_correct_answers': {
+        'default': True,
+        'required': False,
+        'canvas_attr': 'show_correct_answers',
+        'description': 'Show correct answers after submission'
+    },
+    'one_question_at_a_time': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'one_question_at_a_time',
+        'description': 'Show one question per page'
+    },
+    'cant_go_back': {
+        'default': False,
+        'required': False,
+        'canvas_attr': 'cant_go_back',
+        'description': 'Prevent going back to previous questions'
+    },
+    'access_code': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'access_code',
+        'description': 'Password required to take the quiz'
+    },
+    'quiz_type': {
+        'default': 'assignment',
+        'required': False,
+        'canvas_attr': 'quiz_type',
+        'description': 'Type: assignment, practice_quiz, graded_survey, survey'
+    },
+    'hide_results': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'hide_results',
+        'description': 'When to hide results: null, always, until_after_last_attempt'
+    },
+}
+@
+
+
+\subsection{Command-line interface}
+
+The edit command takes course and quiz selection options. The [[-f]] option
+is now optional---without it, interactive mode is used. The [[--html]] option
+preserves raw HTML instead of converting to Markdown.
 
 <<add quizzes edit command to subp>>=
 edit_parser = subp.add_parser("edit",
-    help="Edit quiz settings",
-    description="""Edit an existing quiz's settings. The quiz type
-(New or Classic) is auto-detected.""")
+    help="Edit quiz settings and instructions",
+    description="""Edit an existing quiz's settings and instructions.
+
+Without -f: Opens your editor with YAML front matter (settings) and
+Markdown body (instructions). After editing, shows a preview and asks
+whether to accept, edit further, or discard the changes.
+
+With -f: Reads content from a file for scripted workflows. The file
+should have YAML front matter followed by Markdown (or HTML with --html).
+
+The quiz type (New or Classic) is auto-detected.""")
 
 edit_parser.set_defaults(func=edit_command)
 
@@ -2457,54 +2605,293 @@ try:
 except argparse.ArgumentError:
   pass
 
-edit_parser.add_argument("-a", "--assignment",
-    required=True,
-    help="Regex matching quiz title or Canvas ID")
+add_quiz_option(edit_parser, required=True)
 
 edit_parser.add_argument("-f", "--file",
-    help="JSON file containing updated quiz settings",
+    help="Read content from a Markdown/HTML file with YAML front matter",
     type=str,
-    required=True)
+    required=False)
+
+edit_parser.add_argument("--html",
+    action="store_true",
+    help="Edit raw HTML instead of converting to Markdown")
 @
 
 
 \subsection{Processing the edit command}
 
+The edit command has two modes: interactive (default) and file-based.
+In interactive mode, we open the editor for each matching quiz.
+In file mode, we read the content from the specified file.
+
 <<functions>>=
 def edit_command(config, canvas, args):
-  """Edits an existing quiz"""
-  # Find the quiz
-  course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  """Edits quiz settings and instructions"""
+  quiz_list = process_quiz_option(canvas, args)
+  requester = canvas._Canvas__requester
 
-  if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
-  if len(quiz_list) > 1:
-    canvaslms.cli.err(1, f"Multiple quizzes match '{args.assignment}'. "
-                         "Please use a more specific pattern.")
+  if args.file:
+    <<edit quiz from file>>
+  else:
+    <<edit quiz interactively>>
+@
 
-  quiz = quiz_list[0]
+In file mode, we read the YAML front matter and body from the file, then
+apply the changes to the quiz. If the file contains an [[id]] field, we use
+it to identify the quiz directly; otherwise we use the filter match.
 
-  # Read update settings from file
-  try:
-    with open(args.file, 'r', encoding='utf-8') as f:
-      quiz_params = json.load(f)
-  except FileNotFoundError:
-    canvaslms.cli.err(1, f"File not found: {args.file}")
-  except json.JSONDecodeError as e:
-    canvaslms.cli.err(1, f"Invalid JSON in {args.file}: {e}")
+<<edit quiz from file>>=
+try:
+  attributes, body = content.read_content_from_file(args.file)
+except FileNotFoundError:
+  canvaslms.cli.err(1, f"File not found: {args.file}")
+except ValueError as e:
+  canvaslms.cli.err(1, f"Invalid file format: {e}")
+
+# If id is specified, find that specific quiz
+if attributes.get('id'):
+  target_quiz = None
+  for quiz in quiz_list:
+    if str(quiz.id) == str(attributes['id']):
+      target_quiz = quiz
+      break
+  if not target_quiz:
+    canvaslms.cli.err(1, f"Quiz with ID {attributes['id']} not found")
+  quiz_list = [target_quiz]
+
+for quiz in quiz_list:
+  success = apply_quiz_edit(quiz, attributes, body, requester, args.html)
+  if success:
+    print(f"Updated quiz: {quiz.title}")
+  else:
+    canvaslms.cli.warn(f"Failed to update quiz: {quiz.title}")
+@
+
+In interactive mode, we process each quiz one at a time, opening the editor
+and showing a preview before applying changes.
+
+<<edit quiz interactively>>=
+# Confirm if multiple quizzes match
+if len(quiz_list) > 1:
+  print(f"Found {len(quiz_list)} quizzes matching the pattern:")
+  for quiz in quiz_list:
+    quiz_type = "New Quiz" if is_new_quiz(quiz) else "Classic Quiz"
+    print(f"  - {quiz.title} ({quiz_type})")
+  response = input("\nEdit all? [y/N] ").strip().lower()
+  if response != 'y':
+    print("Aborted.")
+    return
+
+updated_count = 0
+skipped_count = 0
+
+for quiz in quiz_list:
+  result = edit_quiz_interactive(quiz, requester, args.html)
+  if result == 'updated':
+    updated_count += 1
+  elif result == 'skipped':
+    skipped_count += 1
+
+print(f"\nSummary: {updated_count} updated, {skipped_count} skipped")
+@
+
+
+\subsection{Interactive editing workflow}
+
+The interactive editing workflow mirrors [[assignments edit]]. We use
+[[content.get_content_from_editor]] with [[content_attr='instructions']] so
+that the instructions are extracted from attributes, converted to Markdown
+(unless HTML mode), and placed as the body after the YAML front matter.
+
+<<functions>>=
+def edit_quiz_interactive(quiz, requester, html_mode=False):
+  """Edit a single quiz interactively
+
+  Args:
+    quiz: Quiz object to edit
+    requester: Canvas API requester
+    html_mode: If True, edit raw HTML instead of Markdown
+
+  Returns:
+    'updated', 'skipped', or 'error'
+  """
+  # Extract current quiz attributes including instructions
+  current_attrs = extract_quiz_attributes(quiz)
+
+  # Get content from editor - instructions becomes the body
+  result = content.get_content_from_editor(
+    schema=QUIZ_SCHEMA,
+    initial_attributes=current_attrs,
+    content_attr='instructions',
+    html_mode=html_mode
+  )
+
+  if result is None:
+    print("Editor cancelled. Skipping this quiz.", file=sys.stderr)
+    return 'skipped'
+
+  attributes, body = result
+
+  # Interactive confirm and edit loop
+  quiz_type = "New Quiz" if is_new_quiz(quiz) else "Classic Quiz"
+  title = attributes.get('title', quiz.title)
+  result = content.interactive_confirm_and_edit(
+    title=f"{title} ({quiz_type})",
+    message=body,
+    attributes=attributes,
+    schema=QUIZ_SCHEMA,
+    content_type="Quiz"
+  )
+
+  if result is None:
+    print("Discarded changes.", file=sys.stderr)
+    return 'skipped'
+
+  final_attrs, final_body = result
+
+  # Apply the changes
+  success = apply_quiz_edit(quiz, final_attrs, final_body, requester, html_mode)
+  return 'updated' if success else 'error'
+@
+
+
+\subsection{Extracting quiz attributes}
+
+To populate the editor with current quiz values, we extract attributes from
+the quiz object. We use [[QUIZ_SCHEMA]] to determine which attributes to
+extract, and also include [[instructions]] separately (since it becomes the
+body content, not a YAML attribute).
+
+<<functions>>=
+def extract_quiz_attributes(quiz):
+  """Extract editable attributes from a quiz object
+
+  Args:
+    quiz: Quiz object (New Quiz or Classic Quiz)
+
+  Returns:
+    Dictionary of attributes matching QUIZ_SCHEMA, plus 'instructions'
+  """
+  attrs = {}
+
+  for key, spec in QUIZ_SCHEMA.items():
+    canvas_attr = spec.get('canvas_attr', key)
+    value = getattr(quiz, canvas_attr, spec.get('default'))
+
+    # Normalize time_limit to minutes
+    if key == 'time_limit' and value is not None:
+      if is_new_quiz(quiz):
+        # New Quizzes store time in seconds
+        value = value // 60 if value else None
+      # Classic Quizzes already use minutes
+
+    if value is not None:
+      attrs[key] = value
+
+  # Add instructions (not in schema, but needed for content_attr)
+  if is_new_quiz(quiz):
+    attrs['instructions'] = getattr(quiz, 'instructions', '') or ''
+  else:
+    attrs['instructions'] = getattr(quiz, 'description', '') or ''
+
+  return attrs
+@
+
+
+\subsection{Applying quiz edits}
+
+After editing, we need to translate the attributes back to API format and
+call the appropriate update function. The key challenges are:
+\begin{itemize}
+\item Converting [[time_limit]] from minutes to seconds for New Quizzes
+\item Using [[instructions]] vs [[description]] for the body
+\item Handling HTML conversion for Markdown input
+\end{itemize}
+
+<<functions>>=
+def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
+  """Apply edited attributes and body to a quiz
+
+  Args:
+    quiz: Quiz object to update
+    attributes: Dictionary of attributes from YAML front matter
+    body: Instructions/description content
+    requester: Canvas API requester
+    html_mode: If True, body is already HTML
+
+  Returns:
+    True on success, False on failure
+  """
+  # Convert body to HTML if needed
+  if html_mode:
+    html_body = body
+  else:
+    if body and body.strip():
+      html_body = pypandoc.convert_text(body, 'html', format='md')
+    else:
+      html_body = ''
+
+  # Build API parameters
+  quiz_params = quiz_attributes_to_api_params(
+    attributes, is_new_quiz(quiz), html_body
+  )
 
   # Update based on quiz type
   if is_new_quiz(quiz):
-    result = update_new_quiz(quiz.course, quiz.id, canvas._Canvas__requester,
-                             quiz_params)
+    return update_new_quiz(quiz.course, quiz.id, requester, quiz_params)
   else:
-    result = update_classic_quiz(quiz, quiz_params)
+    return update_classic_quiz(quiz, quiz_params)
+@
 
-  if result:
-    print(f"Updated quiz: {quiz.title}")
+<<functions>>=
+def quiz_attributes_to_api_params(attributes, is_new, html_body):
+  """Convert schema attributes to Canvas API parameters
+
+  Args:
+    attributes: Dictionary of attributes from YAML
+    is_new: True if this is a New Quiz
+    html_body: HTML content for instructions/description
+
+  Returns:
+    Dictionary suitable for Canvas API
+  """
+  params = {}
+
+  for key, value in attributes.items():
+    if key == 'id':
+      # Don't send ID as an update parameter
+      continue
+
+    if value is None:
+      continue
+
+    # Handle time_limit conversion
+    if key == 'time_limit':
+      if is_new:
+        # New Quizzes want seconds
+        params['time_limit'] = value * 60
+      else:
+        # Classic Quizzes want minutes
+        params['time_limit'] = value
+      continue
+
+    # Skip quiz_type for New Quizzes (not applicable)
+    if key == 'quiz_type' and is_new:
+      continue
+
+    # Skip hide_results for New Quizzes
+    if key == 'hide_results' and is_new:
+      continue
+
+    params[key] = value
+
+  # Add body with appropriate field name (include even if empty to allow clearing)
+  if is_new:
+    params['instructions'] = html_body
   else:
-    canvaslms.cli.err(1, "Failed to update quiz")
+    params['description'] = html_body
+
+  return params
 @
 
 
