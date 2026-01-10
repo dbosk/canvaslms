@@ -64,6 +64,36 @@ If you installed with the `[llm]` extra, configure your API keys:
 llm keys set openai  # or another provider
 ```
 
+### Managing Quiz Content
+
+View and edit quiz content directly from the command line:
+
+```bash
+# View quiz questions rendered as markdown
+canvaslms quizzes view -c "Course" -a "Quiz Name"
+
+# Edit quiz content interactively
+canvaslms quizzes edit -c "Course" -a "Quiz Name"
+
+# Export quiz items for backup or migration
+canvaslms quizzes items export -c "Course" -a "Quiz Name" --importable
+
+# Add questions to a quiz bank (use --example to see question formats)
+canvaslms quizzes items add -c "Course" -a "Quiz Name" --example
+```
+
+### Editing Announcements and Discussions
+
+Edit existing announcements using the same workflow as pages:
+
+```bash
+# Edit interactively (opens in editor)
+canvaslms discussions edit -c "Course" -t "Announcement Title"
+
+# Edit from a markdown file with YAML front matter
+canvaslms discussions edit -c "Course" -t "Announcement Title" -f announcement.md
+```
+
 ## Installation
 
 Install the PyPI package using `pip` or `pipx`:
