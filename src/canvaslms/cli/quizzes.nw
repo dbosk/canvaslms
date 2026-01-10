@@ -2853,6 +2853,10 @@ and migration of quiz content.""")
   parser.add_argument("--no-banks",
       action="store_true",
       help="Don't expand item bank references")
+
+  parser.add_argument("--importable", "-I",
+      action="store_true",
+      help="Output clean JSON directly usable with 'items add' command")
 @
 
 
@@ -3844,6 +3848,10 @@ We use JSON body for complex nested structures like [[interaction_data]] and
 [[scoring_data]], as the form-encoded approach would require deeply nested
 bracket notation.
 
+When adding items, we automatically generate fresh UUIDs for any choices that
+are missing IDs.  This allows importing questions from exports where UUIDs were
+stripped (via [[--importable]]) or from manually created JSON files.
+
 <<functions>>=
 def add_new_quiz_items(course, assignment_id, requester, items):
   """Adds items to a New Quiz
@@ -3867,13 +3875,16 @@ def add_new_quiz_items(course, assignment_id, requester, items):
 
   for i, item in enumerate(items, 1):
     try:
+      # Ensure UUIDs are present in the entry
+      entry = ensure_uuids_in_entry(item.get('entry', {}))
+
       # Build the request body as JSON
       body = {
         'item': {
           'position': item.get('position', i),
           'points_possible': item.get('points_possible', 1),
           'entry_type': 'Item',
-          'entry': item.get('entry', {})
+          'entry': entry
         }
       }
 
@@ -3886,7 +3897,6 @@ def add_new_quiz_items(course, assignment_id, requester, items):
       response = req_lib.post(endpoint_url, json=body, headers=headers)
       response.raise_for_status()
 
-      entry = item.get('entry', {})
       print(f"  Added: {entry.get('title', f'Question {i}')}")
       success += 1
     except req_lib.exceptions.HTTPError as e:
@@ -3902,6 +3912,70 @@ def add_new_quiz_items(course, assignment_id, requester, items):
       failed += 1
 
   return success, failed
+
+
+def ensure_uuids_in_entry(entry):
+  """Ensures all choices have UUIDs, generating fresh ones if missing
+
+  This allows importing from cleaned exports or manually created JSON.
+  When scoring_data contains position indices (from cleaned exports),
+  they are mapped to the newly generated UUIDs.
+  """
+  import uuid
+  import copy
+
+  entry = copy.deepcopy(entry)
+  interaction_data = entry.get('interaction_data', {})
+  scoring_data = entry.get('scoring_data', {})
+  interaction_type = entry.get('interaction_type_slug', '')
+
+  # Handle choice-based questions (choice, multi-answer)
+  if 'choices' in interaction_data:
+    position_to_uuid = {}  # position -> new_uuid
+    new_choices = []
+
+    for i, choice in enumerate(interaction_data['choices']):
+      old_id = choice.get('id')
+      position = choice.get('position', i + 1)
+
+      # Generate new UUID if missing
+      if not old_id:
+        new_id = str(uuid.uuid4())
+      else:
+        new_id = old_id
+
+      position_to_uuid[position] = new_id
+
+      new_choice = dict(choice)
+      new_choice['id'] = new_id
+      new_choice['position'] = position
+      new_choices.append(new_choice)
+
+    interaction_data['choices'] = new_choices
+    entry['interaction_data'] = interaction_data
+
+    # Update scoring_data to use new UUIDs
+    if scoring_data and 'value' in scoring_data:
+      value = scoring_data['value']
+
+      if interaction_type == 'choice':
+        # Single correct answer - could be position index or UUID
+        if isinstance(value, int) and value in position_to_uuid:
+          scoring_data['value'] = position_to_uuid[value]
+      elif interaction_type == 'multi-answer':
+        # Multiple correct answers - could be position indices or UUIDs
+        if isinstance(value, list):
+          new_value = []
+          for v in value:
+            if isinstance(v, int) and v in position_to_uuid:
+              new_value.append(position_to_uuid[v])
+            else:
+              new_value.append(v)
+          scoring_data['value'] = new_value
+
+      entry['scoring_data'] = scoring_data
+
+  return entry
 @
 
 
@@ -4205,6 +4279,23 @@ This export is useful for:
 \item Analyzing quiz structure and content
 \end{itemize}
 
+\paragraph{The [[--importable]] flag}
+By default, the export includes metadata useful for analysis (quiz type, course
+ID, export date, item IDs, etc.).  When using [[--importable]] or [[-I]], the
+output is cleaned to be directly usable with [[items add]]:
+\begin{minted}{bash}
+# Export for backup/analysis (default)
+canvaslms quizzes items export -c COURSE -a QUIZ > backup.json
+
+# Export for reimporting to another quiz
+canvaslms quizzes items export -c COURSE -a QUIZ --importable > questions.json
+canvaslms quizzes items add -c COURSE -a "New Quiz" -f questions.json
+\end{minted}
+
+The importable format strips metadata and removes UUIDs from choice options.
+When adding questions, fresh UUIDs are automatically generated, avoiding
+conflicts with existing questions.
+
 
 \subsection{The export command}
 
@@ -4226,11 +4317,184 @@ def items_export_command(config, canvas, args):
   if is_new_quiz(quiz):
     export = export_new_quiz_items(quiz.course, quiz.id, requester,
                                     include_banks=include_banks)
+    if getattr(args, 'importable', False):
+      export = clean_for_import(export, quiz_type='new_quiz')
   else:
     export = export_classic_questions(quiz)
+    if getattr(args, 'importable', False):
+      export = clean_for_import(export, quiz_type='classic')
 
   # Output as JSON
   print(json.dumps(export, indent=2, ensure_ascii=False))
+@
+
+
+\subsection{Cleaning export for import}
+
+When the [[--importable]] flag is used, we strip metadata fields that are not
+needed for creating new questions.  This produces a clean JSON file that can be
+directly used with [[items add]].
+
+For New Quizzes, we remove:
+\begin{itemize}
+\item Top-level metadata: [[quiz_type]], [[course_id]], [[assignment_id]],
+  [[export_date]], [[item_count]], [[bank_count]], [[banks]]
+\item Per-item metadata: [[id]], [[entry_type]], [[source]], [[bank_reference]]
+\item Entry metadata: [[calculator_type]], [[answer_feedback]], [[feedback]]
+  (when empty)
+\item Choice IDs: UUIDs in [[interaction_data.choices]] are removed; fresh UUIDs
+  will be generated when adding questions
+\end{itemize}
+
+For Classic Quizzes, we remove the [[id]] field from each question.
+
+<<functions>>=
+def clean_for_import(export, quiz_type='new_quiz'):
+  """Cleans export data to produce import-ready JSON
+
+  Removes metadata fields and UUIDs that should be regenerated on import.
+
+  Args:
+    export: Export dictionary from export_new_quiz_items or export_classic_questions
+    quiz_type: Either 'new_quiz' or 'classic'
+
+  Returns:
+    Clean dictionary ready for use with items add command
+  """
+  if quiz_type == 'new_quiz':
+    return clean_new_quiz_for_import(export)
+  else:
+    return clean_classic_quiz_for_import(export)
+
+
+def clean_new_quiz_for_import(export):
+  """Cleans New Quiz export for import"""
+  clean_items = []
+
+  for item in export.get('items', []):
+    # Skip bank references (can't import these directly)
+    if 'bank_reference' in item:
+      continue
+
+    entry = item.get('entry', {})
+    if not entry:
+      continue
+
+    # Clean the entry
+    clean_entry = {}
+    # Keep essential fields
+    for key in ['title', 'item_body', 'interaction_type_slug',
+                'scoring_algorithm', 'properties']:
+      if key in entry:
+        clean_entry[key] = entry[key]
+
+    # Get original interaction_data before cleaning (need UUIDs for mapping)
+    original_interaction_data = entry.get('interaction_data', {})
+
+    # Clean interaction_data - remove UUIDs from choices
+    if original_interaction_data:
+      clean_entry['interaction_data'] = clean_interaction_data(
+          original_interaction_data)
+
+    # Update scoring_data to use position-based references
+    # Pass original interaction_data to build UUID->position mapping
+    if 'scoring_data' in entry:
+      clean_entry['scoring_data'] = clean_scoring_data(
+          entry['scoring_data'],
+          original_interaction_data,
+          entry.get('interaction_type_slug', ''))
+
+    clean_items.append({
+      'position': item.get('position'),
+      'points_possible': item.get('points_possible'),
+      'entry': clean_entry
+    })
+
+  return {'items': clean_items}
+
+
+def clean_interaction_data(interaction_data):
+  """Removes UUIDs from interaction_data choices"""
+  if not interaction_data:
+    return interaction_data
+
+  clean = dict(interaction_data)
+
+  # Handle choices array (multiple choice, multi-answer)
+  if 'choices' in clean:
+    clean_choices = []
+    for i, choice in enumerate(clean['choices']):
+      clean_choice = {'position': choice.get('position', i + 1)}
+      if 'item_body' in choice:
+        clean_choice['item_body'] = choice['item_body']
+      clean_choices.append(clean_choice)
+    clean['choices'] = clean_choices
+
+  return clean
+
+
+def clean_scoring_data(scoring_data, original_interaction_data, interaction_type):
+  """Cleans scoring_data - converts UUID references to position indices
+
+  Since we remove UUIDs from choices during export, we need to convert
+  scoring_data references from UUIDs to position indices. When importing,
+  fresh UUIDs are generated and the position indices are mapped back.
+  """
+  if not scoring_data:
+    return scoring_data
+
+  # For types that use UUID references in scoring_data.value,
+  # we convert to position indices
+  if interaction_type in ('choice', 'multi-answer'):
+    value = scoring_data.get('value')
+    if value is None:
+      return scoring_data
+
+    # Build UUID to position mapping from original choices
+    uuid_to_position = {}
+    choices = original_interaction_data.get('choices', [])
+    for i, choice in enumerate(choices):
+      choice_id = choice.get('id')
+      if choice_id:
+        uuid_to_position[choice_id] = choice.get('position', i + 1)
+
+    # Convert value(s) from UUIDs to position indices
+    if interaction_type == 'choice':
+      # Single correct answer
+      if value in uuid_to_position:
+        return {'value': uuid_to_position[value]}
+      return scoring_data
+    elif interaction_type == 'multi-answer':
+      # Multiple correct answers
+      if isinstance(value, list):
+        new_value = []
+        for v in value:
+          if v in uuid_to_position:
+            new_value.append(uuid_to_position[v])
+          else:
+            new_value.append(v)
+        return {'value': new_value}
+
+  return scoring_data
+
+
+def clean_classic_quiz_for_import(export):
+  """Cleans Classic Quiz export for import"""
+  clean_questions = []
+
+  for q in export.get('questions', []):
+    clean_q = {}
+    # Keep essential fields, skip 'id'
+    for key in ['question_name', 'question_text', 'question_type',
+                'points_possible', 'answers', 'correct_comments',
+                'incorrect_comments', 'neutral_comments',
+                'matching_answer_incorrect_matches', 'formulas', 'variables',
+                'formula_decimal_places', 'answer_tolerance']:
+      if key in q:
+        clean_q[key] = q[key]
+    clean_questions.append(clean_q)
+
+  return {'questions': clean_questions}
 @
 
 
