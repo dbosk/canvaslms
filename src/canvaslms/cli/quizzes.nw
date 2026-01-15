@@ -326,12 +326,14 @@ subcommands:
 <<[[quizzes.py]]>>=
 import argparse
 import csv
+import difflib
 import json
 import os
 import re
 import statistics
 import sys
 import time
+import yaml
 from collections import defaultdict, Counter
 from typing import Dict, List, Any
 
@@ -2977,23 +2979,203 @@ NEW_QUIZ_RESULT_VIEW_SCHEMA = {
 @
 
 
+\subsection{File formats for quiz editing}
+\label{sec:quiz-file-formats}
+
+The [[quizzes edit]] command supports three file formats, auto-detected from
+the file extension and verified against the content:
+\begin{description}
+\item[JSON format] ([[.json]]) Full quiz structure with [[settings]] and
+  optional [[items]].  This is the same format used by [[quizzes export]] and
+  [[quizzes create]], enabling a round-trip workflow.
+\item[YAML format] ([[.yaml]], [[.yml]]) Same structure as JSON but in YAML
+  syntax.  More readable for hand-editing.
+\item[Front matter format] ([[.md]]) YAML front matter with Markdown body for
+  instructions.  This is the default interactive editing format, focused on
+  editing settings and instructions without touching questions.
+\end{description}
+
+The format is detected by file extension and verified by checking the first
+characters of the file:
+\begin{itemize}
+\item JSON files start with [[{]]
+\item YAML full format starts with [[quiz_type:]] or [[settings:]]
+\item Front matter format starts with [[---]]
+\end{itemize}
+
+<<functions>>=
+def detect_quiz_file_format(filepath):
+    """Detect quiz file format from extension and content
+
+    Args:
+        filepath: Path to the file
+
+    Returns:
+        'json', 'yaml', or 'frontmatter'
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If format cannot be determined or extension mismatches content
+    """
+    # Check extension
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # Read file content
+    with open(filepath, 'r', encoding='utf-8') as f:
+        file_content = f.read()
+
+    content_stripped = file_content.lstrip()
+
+    # Determine expected format from extension
+    if ext == '.json':
+        expected = 'json'
+    elif ext in ('.yaml', '.yml'):
+        expected = 'yaml'
+    elif ext == '.md':
+        expected = 'frontmatter'
+    else:
+        expected = None  # Auto-detect
+
+    # Detect actual format from content
+    if content_stripped.startswith('{'):
+        actual = 'json'
+    elif content_stripped.startswith('---'):
+        actual = 'frontmatter'
+    elif (content_stripped.startswith('quiz_type:') or
+          content_stripped.startswith('settings:')):
+        actual = 'yaml'
+    else:
+        # For YAML, try parsing to see if it's valid
+        try:
+            data = yaml.safe_load(content_stripped)
+            if isinstance(data, dict) and ('settings' in data or 'title' in data):
+                actual = 'yaml'
+            else:
+                raise ValueError(f"Cannot determine format of {filepath}")
+        except yaml.YAMLError:
+            raise ValueError(f"Cannot determine format of {filepath}")
+
+    # Verify match if extension specified a format
+    if expected and expected != actual:
+        raise ValueError(
+            f"File extension suggests {expected} but content looks like {actual}"
+        )
+
+    return actual, file_content
+@
+
+The [[read_quiz_from_file]] function reads quiz data from any supported format
+and returns a unified structure that can be used for updating the quiz.
+
+<<functions>>=
+def read_quiz_from_file(filepath):
+    """Read quiz data from JSON, YAML, or front matter file
+
+    Args:
+        filepath: Path to the quiz file
+
+    Returns:
+        Dictionary with:
+            'format': 'json'|'yaml'|'frontmatter'
+            'settings': dict of quiz settings
+            'instructions': str or None (body for frontmatter format)
+            'items': list or None (questions, for json/yaml)
+            'quiz_type': 'new'|'classic' or None
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file format is invalid
+    """
+    format_type, file_content = detect_quiz_file_format(filepath)
+
+    if format_type == 'json':
+        try:
+            data = json.loads(file_content)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}")
+        return _parse_quiz_full_format(data, 'json')
+
+    elif format_type == 'yaml':
+        try:
+            data = yaml.safe_load(file_content)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML: {e}")
+        return _parse_quiz_full_format(data, 'yaml')
+
+    else:  # frontmatter
+        attributes, body = content.parse_yaml_front_matter(file_content)
+        return {
+            'format': 'frontmatter',
+            'settings': attributes,
+            'instructions': body.strip() if body else None,
+            'items': None,
+            'quiz_type': None
+        }
+
+
+def _parse_quiz_full_format(data, format_type):
+    """Parse full format (JSON or YAML) quiz data
+
+    Handles both the full format with 'settings' key and the simple format
+    where the entire dict is settings.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a dictionary, got {type(data).__name__}")
+
+    if 'settings' in data:
+        settings = data['settings'].copy()
+    else:
+        # Simple format: entire dict is settings (excluding metadata keys)
+        settings = {k: v for k, v in data.items()
+                    if k not in ('quiz_type', 'items', 'questions')}
+
+    # Extract instructions from settings if present
+    instructions = settings.get('instructions')
+
+    return {
+        'format': format_type,
+        'settings': settings,
+        'instructions': instructions,
+        'items': data.get('items') or data.get('questions'),
+        'quiz_type': data.get('quiz_type')
+    }
+@
+
+
 \subsection{Command-line interface}
 
 The edit command takes course and quiz selection options. The [[-f]] option
-is now optional---without it, interactive mode is used. The [[--html]] option
-preserves raw HTML instead of converting to Markdown.
+supports multiple file formats (JSON, YAML, Markdown with front matter), which
+are auto-detected from the file extension.  The [[--full-json]] option enables
+interactive editing in full JSON format (same as [[quizzes export]]).
 
 <<add quizzes edit command to subp>>=
 edit_parser = subp.add_parser("edit",
     help="Edit quiz settings and instructions",
     description="""Edit an existing quiz's settings and instructions.
 
-Without -f: Opens your editor with YAML front matter (settings) and
-Markdown body (instructions). After editing, shows a preview and asks
-whether to accept, edit further, or discard the changes.
+INTERACTIVE MODE (default):
+  Opens your editor with YAML front matter (settings) and Markdown body
+  (instructions). After editing, shows a preview and asks whether to
+  accept, edit further, or discard the changes.
 
-With -f: Reads content from a file for scripted workflows. The file
-should have YAML front matter followed by Markdown (or HTML with --html).
+  Use --full-json to edit as full JSON (same format as 'quizzes export -I').
+  This allows editing all quiz_settings including multiple_attempts and
+  result_view_settings.
+
+FILE MODE (-f):
+  Reads content from a file. Format is auto-detected from extension:
+    .json      - Full JSON format (settings + optional items)
+    .yaml/.yml - Full YAML format (same structure as JSON)
+    .md        - YAML front matter + Markdown body
+
+  The JSON/YAML format is the same as 'quizzes export' output, enabling
+  a round-trip workflow: export, modify, edit.
+
+ITEM HANDLING:
+  By default, items/questions in the file are ignored to protect student
+  submissions. Use --replace-items to replace all questions (with confirmation
+  if submissions exist).
 
 The quiz type (New or Classic) is auto-detected.""")
 
@@ -3007,13 +3189,24 @@ except argparse.ArgumentError:
 add_quiz_option(edit_parser, required=True)
 
 edit_parser.add_argument("-f", "--file",
-    help="Read content from a Markdown/HTML file with YAML front matter",
+    help="Read content from file (format auto-detected: .json, .yaml, .yml, .md)",
     type=str,
     required=False)
 
 edit_parser.add_argument("--html",
     action="store_true",
     help="Edit raw HTML instead of converting to Markdown")
+
+edit_parser.add_argument("--full-json",
+    action="store_true",
+    help="Interactive mode: edit as full JSON instead of YAML+Markdown. "
+         "Allows editing all quiz_settings including multiple_attempts.")
+
+edit_parser.add_argument("--replace-items",
+    action="store_true",
+    help="Replace existing questions with items from file. "
+         "Default: ignore items to preserve student attempts. "
+         "Will prompt for confirmation if quiz has submissions.")
 @
 
 
@@ -3035,31 +3228,70 @@ def edit_command(config, canvas, args):
     <<edit quiz interactively>>
 @
 
-In file mode, we read the YAML front matter and body from the file, then
-apply the changes to the quiz. If the file contains an [[id]] field, we use
-it to identify the quiz directly; otherwise we use the filter match.
+In file mode, we use [[read_quiz_from_file]] to detect the format and parse
+the content appropriately.  The function returns a unified structure that
+works for all three formats (JSON, YAML, or Markdown with front matter).
+
+For JSON and YAML files, the structure may contain [[items]] (questions).
+By default we ignore items to protect student submissions---use
+[[--replace-items]] to replace them (after confirmation if submissions exist).
 
 <<edit quiz from file>>=
 try:
-  attributes, body = content.read_content_from_file(args.file)
+  quiz_data = read_quiz_from_file(args.file)
 except FileNotFoundError:
   canvaslms.cli.err(1, f"File not found: {args.file}")
 except ValueError as e:
   canvaslms.cli.err(1, f"Invalid file format: {e}")
 
-# If id is specified, find that specific quiz
-if attributes.get('id'):
+<<identify target quiz from file data>>
+<<handle item replacement if requested>>
+<<apply settings from file>>
+@
+
+We extract [[id]] from either the top level or the settings:
+
+<<identify target quiz from file data>>=
+settings = quiz_data['settings']
+quiz_id = settings.get('id')
+
+if quiz_id:
   target_quiz = None
   for quiz in quiz_list:
-    if str(quiz.id) == str(attributes['id']):
+    if str(quiz.id) == str(quiz_id):
       target_quiz = quiz
       break
   if not target_quiz:
-    canvaslms.cli.err(1, f"Quiz with ID {attributes['id']} not found")
+    canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found")
   quiz_list = [target_quiz]
+@
+
+If [[--replace-items]] is specified and the file contains items, we replace
+the quiz questions.  But first we check for student submissions and ask for
+confirmation if any exist.
+
+<<handle item replacement if requested>>=
+items = quiz_data.get('items')
+if args.replace_items and items:
+  for quiz in quiz_list:
+    <<check submissions and replace items>>
+elif items:
+  print(f"Note: Ignoring {len(items)} items in file (use --replace-items to update)",
+        file=sys.stderr)
+@
+
+The settings are applied using [[apply_quiz_edit]].  For frontmatter format,
+the body (instructions) is separate; for JSON/YAML it's in settings.
+
+<<apply settings from file>>=
+body = quiz_data.get('instructions') or ''
 
 for quiz in quiz_list:
-  success = apply_quiz_edit(quiz, attributes, body, requester, args.html)
+  # For JSON/YAML, instructions may be in settings; extract it for body
+  if quiz_data['format'] in ('json', 'yaml'):
+    body = settings.get('instructions', '') or ''
+
+  success = apply_quiz_edit(quiz, settings, body, requester, args.html)
   if success:
     print(f"Updated quiz: {quiz.title}")
   else:
@@ -3067,7 +3299,15 @@ for quiz in quiz_list:
 @
 
 In interactive mode, we process each quiz one at a time, opening the editor
-and showing a preview before applying changes.
+and showing a preview before applying changes.  The [[--full-json]] flag
+selects between two editing modes:
+\begin{description}
+\item[YAML+Markdown] (default) Simple front matter with Markdown body for
+  instructions.  Good for quick edits to title, due dates, and instructions.
+\item[Full JSON] (with [[--full-json]]) Complete JSON export format, including
+  [[quiz_settings]] with [[multiple_attempts]] and [[result_view_settings]].
+  Optionally includes items if [[--replace-items]] is also specified.
+\end{description}
 
 <<edit quiz interactively>>=
 # Confirm if multiple quizzes match
@@ -3085,7 +3325,13 @@ updated_count = 0
 skipped_count = 0
 
 for quiz in quiz_list:
-  result = edit_quiz_interactive(quiz, requester, args.html)
+  if args.full_json:
+    result = edit_quiz_interactive_json(
+      quiz, requester, args.html, args.replace_items
+    )
+  else:
+    result = edit_quiz_interactive(quiz, requester, args.html)
+
   if result == 'updated':
     updated_count += 1
   elif result == 'skipped':
@@ -3151,6 +3397,416 @@ def edit_quiz_interactive(quiz, requester, html_mode=False):
   # Apply the changes
   success = apply_quiz_edit(quiz, final_attrs, final_body, requester, html_mode)
   return 'updated' if success else 'error'
+@
+
+
+\subsection{Interactive JSON editing workflow}
+
+The [[--full-json]] mode provides access to all quiz settings, including the
+nested [[quiz_settings]] structure that controls [[multiple_attempts]] and
+[[result_view_settings]].  This uses the same JSON format as [[quizzes export]],
+enabling a round-trip workflow.
+
+The workflow is:
+\begin{enumerate}
+\item Export the quiz to JSON (same format as [[quizzes export -I]])
+\item Open the JSON in the user's editor
+\item Show a diff of the changes and ask for confirmation
+\item Apply the changes (settings only, unless [[--replace-items]])
+\end{enumerate}
+
+<<functions>>=
+def edit_quiz_interactive_json(quiz, requester, html_mode=False,
+                               replace_items=False):
+  """Edit a quiz interactively using full JSON format
+
+  Args:
+    quiz: Quiz object to edit
+    requester: Canvas API requester
+    html_mode: If True, don't convert instructions (not used in JSON mode)
+    replace_items: If True, also update items from the JSON
+
+  Returns:
+    'updated', 'skipped', or 'error'
+  """
+  import tempfile
+
+  # Export current quiz state to JSON
+  if is_new_quiz(quiz):
+    original_data = export_full_new_quiz(quiz, requester, include_banks=True,
+                                         importable=not replace_items)
+  else:
+    original_data = export_full_classic_quiz(quiz, importable=not replace_items)
+
+  # If not replacing items, remove items from the export to simplify editing
+  if not replace_items:
+    original_data.pop('items', None)
+    original_data.pop('questions', None)
+  original_json = json.dumps(original_data, indent=2, ensure_ascii=False)
+
+  # Create temp file with .json extension for editor syntax highlighting
+  with tempfile.NamedTemporaryFile(
+    mode='w', suffix='.json', delete=False, encoding='utf-8'
+  ) as f:
+    f.write(original_json)
+    temp_path = f.name
+
+  try:
+    while True:
+      # Open editor
+      edited_json = open_in_editor(temp_path)
+      if edited_json is None:
+        print("Editor cancelled.", file=sys.stderr)
+        return 'skipped'
+
+      # Parse the edited JSON
+      try:
+        edited_data = json.loads(edited_json)
+      except json.JSONDecodeError as e:
+        print(f"Invalid JSON: {e}", file=sys.stderr)
+        response = input("Edit again? [Y/n] ").strip().lower()
+        if response == 'n':
+          return 'skipped'
+        continue
+
+      # Show diff and confirm
+      result = show_json_diff_and_confirm(
+        original_json, edited_json, quiz.title
+      )
+
+      if result == 'accept':
+        break
+      elif result == 'edit':
+        # Update temp file with edited content for next iteration
+        with open(temp_path, 'w', encoding='utf-8') as f:
+          f.write(edited_json)
+        continue
+      else:  # discard
+        print("Discarded changes.", file=sys.stderr)
+        return 'skipped'
+  finally:
+    # Clean up temp file
+    try:
+      os.unlink(temp_path)
+    except OSError:
+      pass
+
+  # Apply the changes
+  success = apply_quiz_from_dict(
+    quiz, edited_data, requester, replace_items=replace_items
+  )
+  return 'updated' if success else 'error'
+@
+
+\paragraph{Opening the editor.}
+We use the [[EDITOR]] environment variable, falling back to common editors.
+
+<<functions>>=
+def open_in_editor(filepath):
+  """Open a file in the user's preferred editor
+
+  Args:
+    filepath: Path to the file to edit
+
+  Returns:
+    The edited file content, or None if editor failed/was cancelled
+  """
+  import subprocess
+
+  editor = os.environ.get('EDITOR', os.environ.get('VISUAL', 'vi'))
+
+  try:
+    subprocess.run([editor, filepath], check=True)
+  except subprocess.CalledProcessError:
+    return None
+  except FileNotFoundError:
+    print(f"Editor '{editor}' not found. Set EDITOR environment variable.",
+          file=sys.stderr)
+    return None
+
+  try:
+    with open(filepath, 'r', encoding='utf-8') as f:
+      return f.read()
+  except IOError:
+    return None
+@
+
+\paragraph{Showing the diff and confirming.}
+We show a unified diff of the changes and ask the user to accept, edit again,
+or discard.
+
+<<functions>>=
+def show_json_diff_and_confirm(original, edited, title):
+  """Show a diff between original and edited JSON, ask for confirmation
+
+  Args:
+    original: Original JSON string
+    edited: Edited JSON string
+    title: Quiz title for display
+
+  Returns:
+    'accept', 'edit', or 'discard'
+  """
+  if original.strip() == edited.strip():
+    print("No changes detected.")
+    return 'discard'
+
+  # Generate unified diff
+  original_lines = original.splitlines(keepends=True)
+  edited_lines = edited.splitlines(keepends=True)
+
+  diff = list(difflib.unified_diff(
+    original_lines, edited_lines,
+    fromfile='original', tofile='edited',
+    lineterm=''
+  ))
+
+  if not diff:
+    print("No changes detected.")
+    return 'discard'
+
+  # Display diff with colors if terminal supports it
+  print(f"\n--- Changes to: {title} ---")
+  for line in diff:
+    line = line.rstrip('\n')
+    if line.startswith('+') and not line.startswith('+++'):
+      print(f"\033[32m{line}\033[0m")  # Green for additions
+    elif line.startswith('-') and not line.startswith('---'):
+      print(f"\033[31m{line}\033[0m")  # Red for deletions
+    elif line.startswith('@@'):
+      print(f"\033[36m{line}\033[0m")  # Cyan for line numbers
+    else:
+      print(line)
+  print()
+
+  # Prompt for action
+  while True:
+    response = input("[A]ccept, [E]dit, [D]iscard? ").strip().lower()
+    if response in ('a', 'accept'):
+      return 'accept'
+    elif response in ('e', 'edit'):
+      return 'edit'
+    elif response in ('d', 'discard'):
+      return 'discard'
+    print("Please enter A, E, or D.")
+@
+
+\paragraph{Applying changes from JSON.}
+We extract settings from the edited JSON and apply them.  If
+[[replace_items]] is True and items are present, we also update questions.
+
+<<functions>>=
+def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
+  """Apply quiz changes from a dictionary (parsed JSON/YAML)
+
+  Args:
+    quiz: Quiz object to update
+    data: Dictionary with settings and optional items
+    requester: Canvas API requester
+    replace_items: If True, replace quiz items
+
+  Returns:
+    True on success, False on failure
+  """
+  # Extract settings - handle both 'settings' key and flat structure
+  if 'settings' in data:
+    settings = data['settings'].copy()
+  else:
+    # Flat structure: everything except 'items' and 'quiz_type' is settings
+    settings = {k: v for k, v in data.items()
+                if k not in ('items', 'questions', 'quiz_type')}
+
+  # Extract instructions/body
+  body = settings.get('instructions', '') or ''
+
+  # Apply settings
+  success = apply_quiz_edit(quiz, settings, body, requester, html_mode=True)
+
+  if not success:
+    return False
+
+  # Handle items if requested
+  items = data.get('items') or data.get('questions')
+  if replace_items and items:
+    item_success = replace_quiz_items(quiz, items, requester)
+    if not item_success:
+      canvaslms.cli.warn("Settings updated but failed to replace items")
+      return False
+
+  return True
+@
+
+
+\subsection{Submission checking and item replacement}
+
+Before replacing quiz items, we should check if students have already started
+the quiz.  Replacing items after students have submitted could invalidate their
+work, so we warn and ask for confirmation.
+
+<<functions>>=
+def get_quiz_submission_count(quiz, requester):
+  """Get the number of student submissions for a quiz
+
+  Args:
+    quiz: Quiz object
+    requester: Canvas API requester (unused for New Quizzes)
+
+  Returns:
+    Number of submissions, or -1 if unable to determine
+  """
+  try:
+    if is_new_quiz(quiz):
+      # New Quizzes are assignments - use standard Canvas API.
+      # The quiz.id is actually the assignment_id.
+      # Note: canvasapi returns NewQuiz.id as string (bug/inconsistency),
+      # but get_assignment() requires int.
+      assignment = quiz.course.get_assignment(int(quiz.id))
+      submissions = list(assignment.get_submissions())
+      # Count submissions that have been submitted (not just placeholder records)
+      return sum(1 for s in submissions if s.workflow_state == 'submitted' 
+                 or s.workflow_state == 'graded'
+                 or getattr(s, 'submitted_at', None) is not None)
+    else:
+      # Classic Quiz: use canvasapi
+      submissions = list(quiz.get_submissions())
+      # Count only actual submissions (not just generated records)
+      return sum(1 for s in submissions if s.workflow_state != 'settings_only')
+  except Exception as e:
+    canvaslms.cli.warn(f"Could not check submissions: {e}")
+    return -1
+@
+
+The [[replace_quiz_items]] function handles the complete process of replacing
+quiz items.  It first checks for submissions, then deletes existing items,
+and finally creates the new items.
+
+<<functions>>=
+def replace_quiz_items(quiz, items, requester):
+  """Replace all items in a quiz with new ones
+
+  Args:
+    quiz: Quiz object
+    items: List of item dictionaries (from export format)
+    requester: Canvas API requester
+
+  Returns:
+    True on success, False on failure
+  """
+  # Check for submissions first
+  submission_count = get_quiz_submission_count(quiz, requester)
+
+  if submission_count > 0:
+    print(f"\nWarning: This quiz has {submission_count} student submission(s).",
+          file=sys.stderr)
+    print("Replacing items will invalidate existing responses!", file=sys.stderr)
+    response = input("Continue anyway? [y/N] ").strip().lower()
+    if response != 'y':
+      print("Item replacement cancelled.")
+      return False
+  elif submission_count < 0:
+    print("\nWarning: Could not determine submission count.", file=sys.stderr)
+    response = input("Continue with item replacement? [y/N] ").strip().lower()
+    if response != 'y':
+      print("Item replacement cancelled.")
+      return False
+
+  # Delete existing items
+  if is_new_quiz(quiz):
+    delete_success = delete_all_new_quiz_items(quiz, requester)
+  else:
+    delete_success = delete_all_classic_quiz_questions(quiz)
+
+  if not delete_success:
+    canvaslms.cli.warn("Failed to delete existing items")
+    return False
+
+  # Create new items
+  if is_new_quiz(quiz):
+    create_success = add_new_quiz_items(quiz.course, quiz.id, requester, items)
+  else:
+    create_success = add_classic_questions(quiz, items)
+
+  return create_success
+@
+
+\paragraph{Deleting New Quiz items.}
+We first fetch all existing items, then delete each one.
+
+<<functions>>=
+def delete_all_new_quiz_items(quiz, requester):
+  """Delete all items from a New Quiz
+
+  Args:
+    quiz: Quiz object
+    requester: Canvas API requester
+
+  Returns:
+    True on success, False on failure
+  """
+  try:
+    # Fetch existing items
+    endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}/items"
+    response = requester.request(
+      method='GET',
+      endpoint=endpoint,
+      _url="new_quizzes"
+    )
+    items = response.json()
+
+    if not items:
+      return True  # Nothing to delete
+
+    # Delete each item
+    for item in items:
+      item_id = item.get('id')
+      if item_id:
+        delete_endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}/items/{item_id}"
+        requester.request(
+          method='DELETE',
+          endpoint=delete_endpoint,
+          _url="new_quizzes"
+        )
+
+    return True
+  except Exception as e:
+    canvaslms.cli.warn(f"Failed to delete New Quiz items: {e}")
+    return False
+@
+
+\paragraph{Deleting Classic Quiz questions.}
+For Classic Quizzes, we use the canvasapi library.
+
+<<functions>>=
+def delete_all_classic_quiz_questions(quiz):
+  """Delete all questions from a Classic Quiz
+
+  Args:
+    quiz: Classic Quiz object
+
+  Returns:
+    True on success, False on failure
+  """
+  try:
+    questions = list(quiz.get_questions())
+
+    for question in questions:
+      question.delete()
+
+    return True
+  except Exception as e:
+    canvaslms.cli.warn(f"Failed to delete Classic Quiz questions: {e}")
+    return False
+@
+
+The chunk [[<<check submissions and replace items>>]] combines submission
+checking with item replacement for the file-based workflow:
+
+<<check submissions and replace items>>=
+item_success = replace_quiz_items(quiz, items, requester)
+if item_success:
+  print(f"Replaced items for quiz: {quiz.title}")
+else:
+  canvaslms.cli.warn(f"Failed to replace items for quiz: {quiz.title}")
 @
 
 
@@ -6036,21 +6692,33 @@ def ensure_uuids_in_entry(entry):
     new_choices = []
 
     for i, choice in enumerate(interaction_data['choices']):
-      old_id = choice.get('id')
-      position = choice.get('position', i + 1)
-
-      # Generate new UUID if missing
-      if not old_id:
-        new_id = str(uuid.uuid4())
+      # Handle both dict choices (choice, multi-answer) and string choices (ordering)
+      if isinstance(choice, str):
+        # Ordering questions have choices as plain UUIDs/strings
+        # The string itself is the ID - keep it or generate new if invalid
+        if choice and len(choice) > 10:  # Looks like a UUID
+          new_id = choice
+        else:
+          new_id = str(uuid.uuid4())
+        position_to_uuid[i + 1] = new_id
+        new_choices.append(new_id)
       else:
-        new_id = old_id
+        # Regular choice dict
+        old_id = choice.get('id')
+        position = choice.get('position', i + 1)
 
-      position_to_uuid[position] = new_id
+        # Generate new UUID if missing
+        if not old_id:
+          new_id = str(uuid.uuid4())
+        else:
+          new_id = old_id
 
-      new_choice = dict(choice)
-      new_choice['id'] = new_id
-      new_choice['position'] = position
-      new_choices.append(new_choice)
+        position_to_uuid[position] = new_id
+
+        new_choice = dict(choice)
+        new_choice['id'] = new_id
+        new_choice['position'] = position
+        new_choices.append(new_choice)
 
     interaction_data['choices'] = new_choices
     entry['interaction_data'] = interaction_data
