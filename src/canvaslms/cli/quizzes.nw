@@ -61,6 +61,63 @@ canvaslms quizzes create -c "My Course" -f template.json
 The [[--example]] flag outputs complete examples for both New Quizzes and
 Classic Quizzes, including all supported settings and question types.
 
+\subsection{Advanced New Quiz settings}
+\label{sec:advanced-quiz-settings}
+
+New Quizzes support additional settings for controlling multiple attempts and
+result visibility.  These are specified in the [[quiz_settings]] object within
+[[settings]]:
+\begin{verbatim}
+{
+  "quiz_type": "new",
+  "settings": {
+    "title": "Practice Quiz",
+    "quiz_settings": {
+      "multiple_attempts": { ... },
+      "result_view_settings": { ... }
+    }
+  }
+}
+\end{verbatim}
+
+\paragraph{Multiple attempts with waiting periods.}
+To allow students multiple attempts with a cooling period between attempts:
+\begin{verbatim}
+"multiple_attempts": {
+  "multiple_attempts_enabled": true,
+  "attempt_limit": null,
+  "score_to_keep": "latest",
+  "cooling_period": true,
+  "cooling_period_seconds": 3600
+}
+\end{verbatim}
+Here, [[attempt_limit]] of [[null]] means unlimited attempts.  The
+[[score_to_keep]] can be [[highest]] (default) or [[latest]].  Setting
+[[cooling_period]] to [[true]] requires [[cooling_period_seconds]] to specify
+the wait time (3600 seconds = 1 hour).  Using [[latest]] with a cooling period
+lets students ``build on their last result''---they see which questions they
+got wrong and can retry without losing progress.
+
+\paragraph{Controlling what students see after submission.}
+To show students their score but hide the correct answers:
+\begin{verbatim}
+"result_view_settings": {
+  "display_items": true,
+  "display_item_response": true,
+  "display_item_correct_answer": false,
+  "display_item_feedback": false,
+  "display_points_awarded": true,
+  "display_points_possible": true
+}
+\end{verbatim}
+With these settings, students see their responses and points but cannot see
+which answers were correct.  This is useful for practice quizzes where you want
+students to keep trying without revealing the answers.
+
+You can also schedule when correct answers become visible using
+[[display_correct_answer_at]] and [[hide_correct_answer_at]] with ISO 8601
+timestamps.
+
 \subsection{Adding questions separately}
 
 You can also create an empty quiz and add questions separately:
@@ -2366,6 +2423,10 @@ SETTINGS FOR NEW QUIZZES (time_limit in seconds):
   title, instructions, time_limit, allowed_attempts, shuffle_questions,
   shuffle_answers, points_possible, due_at, unlock_at, lock_at
 
+ADVANCED SETTINGS FOR NEW QUIZZES (in settings.quiz_settings):
+  multiple_attempts: attempt_limit, score_to_keep, cooling_period_seconds
+  result_view_settings: display_item_correct_answer, display_item_feedback, etc.
+
 SETTINGS FOR CLASSIC QUIZZES (time_limit in minutes):
   title, description, quiz_type (assignment/practice_quiz/graded_survey/survey),
   time_limit, allowed_attempts, shuffle_questions, shuffle_answers,
@@ -2551,6 +2612,13 @@ def create_command(config, canvas, args):
 The New Quizzes API uses a different endpoint than Classic Quizzes.
 We make a direct POST request to [[/api/quiz/v1/courses/:id/quizzes]].
 
+The API expects nested parameters for [[quiz_settings]], which contains
+[[multiple_attempts]] and [[result_view_settings]] sub-structures.  We need
+to flatten these into the format the API expects:
+\begin{verbatim}
+quiz[quiz_settings][multiple_attempts][cooling_period_seconds]=3600
+\end{verbatim}
+
 <<functions>>=
 def create_new_quiz(course, requester, quiz_params):
   """Creates a New Quiz via the New Quizzes API
@@ -2558,17 +2626,15 @@ def create_new_quiz(course, requester, quiz_params):
   Args:
     course: Course object
     requester: Canvas API requester for direct HTTP calls
-    quiz_params: Dictionary of quiz parameters
+    quiz_params: Dictionary of quiz parameters, may include nested quiz_settings
 
   Returns:
     Dictionary with created quiz data, or None on failure
   """
   endpoint = f"courses/{course.id}/quizzes"
 
-  # Build the request parameters
-  params = {}
-  for key, value in quiz_params.items():
-    params[f'quiz[{key}]'] = value
+  # Build the request parameters, handling nested quiz_settings
+  params = build_new_quiz_api_params(quiz_params)
 
   try:
     response = requester.request(
@@ -2581,6 +2647,53 @@ def create_new_quiz(course, requester, quiz_params):
   except Exception as e:
     canvaslms.cli.warn(f"Failed to create New Quiz: {e}")
     return None
+@
+
+The [[build_new_quiz_api_params]] function handles the conversion of our
+nested dictionary structure into the flat parameter format required by the
+Canvas API.  It recursively processes [[quiz_settings]] and its sub-structures.
+
+<<functions>>=
+def build_new_quiz_api_params(quiz_params):
+  """Converts quiz parameters to Canvas API format
+
+  Handles nested structures like quiz_settings.multiple_attempts by
+  flattening them into the format:
+    quiz[quiz_settings][multiple_attempts][key]=value
+
+  Args:
+    quiz_params: Dictionary with quiz parameters, may include nested dicts
+
+  Returns:
+    Dictionary suitable for passing to requester.request()
+  """
+  params = {}
+
+  for key, value in quiz_params.items():
+    if value is None:
+      continue
+
+    if key == 'quiz_settings' and isinstance(value, dict):
+      # Handle nested quiz_settings structure
+      for settings_key, settings_value in value.items():
+        if settings_value is None:
+          continue
+
+        if isinstance(settings_value, dict):
+          # Handle doubly-nested structures like multiple_attempts, result_view_settings
+          for nested_key, nested_value in settings_value.items():
+            if nested_value is not None:
+              param_key = f'quiz[quiz_settings][{settings_key}][{nested_key}]'
+              params[param_key] = nested_value
+        else:
+          # Direct quiz_settings value (e.g., shuffle_answers)
+          param_key = f'quiz[quiz_settings][{settings_key}]'
+          params[param_key] = settings_value
+    else:
+      # Top-level quiz parameter
+      params[f'quiz[{key}]'] = value
+
+  return params
 @
 
 
@@ -2767,6 +2880,103 @@ QUIZ_SCHEMA = {
 @
 
 
+\subsection{New Quiz settings schema}
+\label{sec:new-quiz-settings-schema}
+
+New Quizzes use a more sophisticated settings structure than Classic Quizzes.
+The [[quiz_settings]] object contains nested structures for multiple attempts
+and result visibility.  These settings are particularly important for formative
+assessments where students should be able to:
+\begin{itemize}
+\item Retry the quiz multiple times (with optional waiting periods)
+\item See their score but not the correct answers
+\item Build on their previous attempt rather than starting fresh
+\end{itemize}
+
+\paragraph{Multiple attempts settings.}
+The [[multiple_attempts]] structure controls how many times students can take
+the quiz and what happens between attempts:
+
+<<constants>>=
+NEW_QUIZ_MULTIPLE_ATTEMPTS_SCHEMA = {
+    'multiple_attempts_enabled': {
+        'default': False,
+        'description': 'Whether multiple attempts are allowed'
+    },
+    'attempt_limit': {
+        'default': True,
+        'description': 'Whether there is a maximum number of attempts (False = unlimited)'
+    },
+    'max_attempts': {
+        'default': 1,
+        'description': 'Maximum number of attempts (only used if attempt_limit is True)'
+    },
+    'score_to_keep': {
+        'default': 'highest',
+        'description': 'Which score to keep: average, first, highest, or latest'
+    },
+    'cooling_period': {
+        'default': False,
+        'description': 'Whether to require a waiting period between attempts'
+    },
+    'cooling_period_seconds': {
+        'default': None,
+        'description': 'Required waiting time between attempts in seconds (e.g., 3600 = 1 hour)'
+    },
+}
+@
+
+\paragraph{Result view settings.}
+The [[result_view_settings]] structure controls what students see after
+submitting the quiz.  This is crucial for formative assessments where you want
+students to know their score but not memorize correct answers:
+
+<<constants>>=
+NEW_QUIZ_RESULT_VIEW_SCHEMA = {
+    'result_view_restricted': {
+        'default': False,
+        'description': 'Whether to restrict what students see in results'
+    },
+    'display_points_awarded': {
+        'default': True,
+        'description': 'Show points earned (requires result_view_restricted=True)'
+    },
+    'display_points_possible': {
+        'default': True,
+        'description': 'Show total points possible (requires result_view_restricted=True)'
+    },
+    'display_items': {
+        'default': True,
+        'description': 'Show questions in results (requires result_view_restricted=True)'
+    },
+    'display_item_response': {
+        'default': True,
+        'description': 'Show student responses (requires display_items=True)'
+    },
+    'display_item_response_qualifier': {
+        'default': 'always',
+        'description': 'When to show responses: always, once_per_attempt, after_last_attempt, once_after_last_attempt'
+    },
+    'display_item_response_correctness': {
+        'default': True,
+        'description': 'Show whether answers are correct/incorrect (requires display_item_response=True)'
+    },
+    'display_item_response_correctness_qualifier': {
+        'default': 'always',
+        'description': 'When to show correctness: always, after_last_attempt'
+    },
+    'display_item_correct_answer': {
+        'default': True,
+        'description': 'Show the correct answer (requires display_item_response_correctness=True)'
+    },
+    'display_item_feedback': {
+        'default': True,
+        'description': 'Show item feedback (requires display_items=True)'
+    },
+}
+@
+
+
 \subsection{Command-line interface}
 
 The edit command takes course and quiz selection options. The [[-f]] option
@@ -2905,7 +3115,7 @@ def edit_quiz_interactive(quiz, requester, html_mode=False):
     'updated', 'skipped', or 'error'
   """
   # Extract current quiz attributes including instructions
-  current_attrs = extract_quiz_attributes(quiz)
+  current_attrs = extract_quiz_attributes(quiz, requester)
 
   # Get content from editor - instructions becomes the body
   result = content.get_content_from_editor(
@@ -2951,15 +3161,20 @@ the quiz object. We use [[QUIZ_SCHEMA]] to determine which attributes to
 extract, and also include [[instructions]] separately (since it becomes the
 body content, not a YAML attribute).
 
+For New Quizzes, we also extract [[quiz_settings]] which contains the
+important [[multiple_attempts]] and [[result_view_settings]] structures.
+
 <<functions>>=
-def extract_quiz_attributes(quiz):
+def extract_quiz_attributes(quiz, requester=None):
   """Extract editable attributes from a quiz object
 
   Args:
     quiz: Quiz object (New Quiz or Classic Quiz)
+    requester: Canvas API requester (needed for New Quiz settings)
 
   Returns:
     Dictionary of attributes matching QUIZ_SCHEMA, plus 'instructions'
+    and 'quiz_settings' (for New Quizzes)
   """
   attrs = {}
 
@@ -2980,10 +3195,45 @@ def extract_quiz_attributes(quiz):
   # Add instructions (not in schema, but needed for content_attr)
   if is_new_quiz(quiz):
     attrs['instructions'] = getattr(quiz, 'instructions', '') or ''
+    # Fetch quiz_settings for New Quizzes
+    if requester:
+      quiz_settings = fetch_new_quiz_settings(quiz, requester)
+      if quiz_settings:
+        attrs['quiz_settings'] = quiz_settings
   else:
     attrs['instructions'] = getattr(quiz, 'description', '') or ''
 
   return attrs
+@
+
+\paragraph{Fetching New Quiz settings.}
+The New Quizzes API returns [[quiz_settings]] as part of the quiz object,
+but the [[canvasapi]] library may not expose all fields.  We make a direct
+API call to get the complete settings.
+
+<<functions>>=
+def fetch_new_quiz_settings(quiz, requester):
+  """Fetch quiz_settings from the New Quizzes API
+
+  Args:
+    quiz: Quiz object (must have .id and .course attributes)
+    requester: Canvas API requester
+
+  Returns:
+    Dictionary with quiz_settings, or None if unavailable
+  """
+  try:
+    endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}"
+    response = requester.request(
+      method='GET',
+      endpoint=endpoint,
+      _url="new_quizzes"
+    )
+    data = response.json()
+    return data.get('quiz_settings', None)
+  except Exception as e:
+    canvaslms.cli.warn(f"Failed to fetch New Quiz settings: {e}")
+    return None
 @
 
 
@@ -3042,7 +3292,7 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
     html_body: HTML content for instructions/description
 
   Returns:
-    Dictionary suitable for Canvas API
+    Dictionary suitable for Canvas API (nested for New Quizzes)
   """
   params = {}
 
@@ -3071,9 +3321,17 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
       continue
 
     # Skip hide_results for New Quizzes: result visibility is controlled
-    # differently in the New Quizzes interface (through the "Restrict student
-    # result view" setting), not via this API parameter.
+    # through quiz_settings.result_view_settings, not this parameter.
     if key == 'hide_results' and is_new:
+      continue
+
+    # Pass through quiz_settings as-is for New Quizzes
+    if key == 'quiz_settings' and is_new:
+      params['quiz_settings'] = value
+      continue
+
+    # Skip instructions - handled separately as body
+    if key == 'instructions':
       continue
 
     params[key] = value
@@ -3090,6 +3348,9 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
 
 \subsection{Updating a New Quiz}
 
+Updating a New Quiz uses the same nested parameter structure as creation.
+We reuse the [[build_new_quiz_api_params]] function to handle the conversion.
+
 <<functions>>=
 def update_new_quiz(course, assignment_id, requester, quiz_params):
   """Updates a New Quiz via the New Quizzes API
@@ -3098,16 +3359,15 @@ def update_new_quiz(course, assignment_id, requester, quiz_params):
     course: Course object
     assignment_id: The quiz/assignment ID
     requester: Canvas API requester
-    quiz_params: Dictionary of parameters to update
+    quiz_params: Dictionary of parameters to update, may include nested quiz_settings
 
   Returns:
     True on success, False on failure
   """
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}"
 
-  params = {}
-  for key, value in quiz_params.items():
-    params[f'quiz[{key}]'] = value
+  # Build the request parameters, handling nested quiz_settings
+  params = build_new_quiz_api_params(quiz_params)
 
   try:
     requester.request(
@@ -3369,8 +3629,10 @@ def export_command(config, canvas, args):
 \subsection{Exporting a complete New Quiz}
 
 For New Quizzes, we extract settings from the quiz object and combine them
-with the items export.  The [[--importable]] flag triggers cleaning of
-Canvas-specific metadata.
+with the items export.  We also fetch and include [[quiz_settings]] which
+contains the important [[multiple_attempts]] and [[result_view_settings]]
+structures.  The [[--importable]] flag triggers cleaning of Canvas-specific
+metadata.
 
 <<functions>>=
 def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
@@ -3383,21 +3645,23 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     importable: If True, clean output for direct import
 
   Returns:
-    Dictionary with quiz_type, settings, and items
+    Dictionary with quiz_type, settings (including quiz_settings), and items
   """
-  # Extract settings
+  # Extract basic settings
   settings = {
     'title': getattr(quiz, 'title', ''),
     'instructions': getattr(quiz, 'instructions', '') or '',
     'time_limit': getattr(quiz, 'time_limit', None),
-    'allowed_attempts': getattr(quiz, 'allowed_attempts', 1),
-    'shuffle_questions': getattr(quiz, 'shuffle_questions', False),
-    'shuffle_answers': getattr(quiz, 'shuffle_answers', False),
     'points_possible': getattr(quiz, 'points_possible', None),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
   }
+
+  # Fetch quiz_settings from the API (contains multiple_attempts, result_view_settings, etc.)
+  quiz_settings = fetch_new_quiz_settings(quiz, requester)
+  if quiz_settings:
+    settings['quiz_settings'] = quiz_settings
 
   # Get items
   items_export = export_new_quiz_items(quiz, requester, include_banks=include_banks)
@@ -5269,8 +5533,23 @@ field so [[quizzes create]] knows which API to use:
 \item[[[quiz_type]]] Either [[new]] (New Quizzes) or [[classic]] (Classic
   Quizzes)
 \item[[[settings]]] Quiz settings like title, time limit, instructions
+\item[[[quiz_settings]]] For New Quizzes: nested object with [[multiple_attempts]]
+  and [[result_view_settings]] for controlling attempts and what students see
 \item[[[items]]] For New Quizzes: array of question items
 \item[[[questions]]] For Classic Quizzes: array of questions
+\end{description}
+
+\paragraph{New Quiz settings structure.}
+The [[quiz_settings]] object within [[settings]] controls advanced quiz behavior:
+\begin{description}
+\item[[[multiple_attempts]]] Controls multiple attempts, waiting periods between
+  attempts, and which score to keep (see [[NEW_QUIZ_MULTIPLE_ATTEMPTS_SCHEMA]])
+\item[[[result_view_settings]]] Controls what students see after submission,
+  including whether to show correct answers (see [[NEW_QUIZ_RESULT_VIEW_SCHEMA]])
+\item[[[shuffle_answers]]] Whether to randomize answer order
+\item[[[shuffle_questions]]] Whether to randomize question order
+\item[[[has_time_limit]]] Whether the quiz has a time limit
+\item[[[session_time_limit_in_seconds]]] Time limit in seconds
 \end{description}
 
 <<constants>>=
@@ -5278,15 +5557,38 @@ EXAMPLE_FULL_NEW_QUIZ_JSON = {
   "quiz_type": "new",
   "settings": {
     "title": "Example New Quiz",
-    "instructions": "<p>Answer all questions carefully. You have 60 minutes.</p>",
+    "instructions": "<p>Answer all questions carefully. You may retry this "
+                    "quiz multiple times with a waiting period between attempts.</p>",
     "time_limit": 3600,
-    "allowed_attempts": 2,
-    "shuffle_questions": True,
-    "shuffle_answers": True,
     "points_possible": 100,
     "due_at": None,
     "unlock_at": None,
-    "lock_at": None
+    "lock_at": None,
+    "quiz_settings": {
+      "shuffle_answers": True,
+      "shuffle_questions": True,
+      "has_time_limit": True,
+      "session_time_limit_in_seconds": 3600,
+      "multiple_attempts": {
+        "multiple_attempts_enabled": True,
+        "attempt_limit": False,
+        "max_attempts": None,
+        "score_to_keep": "latest",
+        "cooling_period": True,
+        "cooling_period_seconds": 3600
+      },
+      "result_view_settings": {
+        "result_view_restricted": True,
+        "display_points_awarded": True,
+        "display_points_possible": True,
+        "display_items": True,
+        "display_item_response": True,
+        "display_item_response_qualifier": "always",
+        "display_item_response_correctness": False,
+        "display_item_correct_answer": False,
+        "display_item_feedback": False
+      }
+    }
   },
   "items": [
     {
@@ -5421,10 +5723,29 @@ def print_full_quiz_example_json():
   print()
   print("This is the same format produced by 'quizzes export -I'.")
   print()
-  print("Settings (time_limit in SECONDS for New Quizzes):")
+  print("Basic settings (time_limit in SECONDS for New Quizzes):")
   print("  title, instructions, time_limit, allowed_attempts,")
   print("  shuffle_questions, shuffle_answers, points_possible,")
   print("  due_at, unlock_at, lock_at")
+  print()
+  print("Advanced settings (in 'settings.quiz_settings'):")
+  print()
+  print("  multiple_attempts - Controls retake behavior:")
+  print("    multiple_attempts_enabled: true/false")
+  print("    attempt_limit: number or null for unlimited")
+  print("    score_to_keep: 'highest' or 'latest'")
+  print("    cooling_period: true/false (require wait between attempts)")
+  print("    cooling_period_seconds: seconds to wait (e.g., 3600 = 1 hour)")
+  print()
+  print("  result_view_settings - Controls what students see after submit:")
+  print("    display_items: show questions (true/false)")
+  print("    display_item_response: show student's answers (true/false)")
+  print("    display_item_correct_answer: show correct answers (true/false)")
+  print("    display_item_feedback: show per-question feedback (true/false)")
+  print("    display_points_awarded: show points per question (true/false)")
+  print("    display_points_possible: show max points (true/false)")
+  print("    display_correct_answer_at: ISO date to reveal answers (or null)")
+  print("    hide_correct_answer_at: ISO date to hide answers (or null)")
   print()
   print("Note: UUIDs in choices must be unique. Generate with:")
   print("  python -c 'import uuid; print(uuid.uuid4())'")
