@@ -39,6 +39,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import pkgutil
 import re
 import sys
 
@@ -55,13 +56,27 @@ The command requires two arguments: course and assignment.
 We also want the option to filter on users.
 We can add these by using [[add_assignment_option]], however, we don't need the 
 ungraded flag as we want to export results (\ie graded material).
-Also, we can just add the [[add_user_or_group_option]] to be able to filter on 
+Also, we can just add the [[add_user_or_group_option]] to be able to filter on
 users or groups.
+
+The epilog contains a formatted list of available grading modules.
+We use [[RawDescriptionHelpFormatter]] to preserve the whitespace formatting in
+the epilog while still allowing argument help text to wrap normally.
+
+However, we must be careful about how we construct the epilog string.
+When [[black]] formats the generated Python, triple-quoted strings passed as
+arguments get indented on continuation lines.
+Since [[RawDescriptionHelpFormatter]] preserves this whitespace literally, we'd
+end up with oddly indented prose text in the help output.
+
+To avoid this, we build the epilog via the [[format_results_epilog]] function,
+which joins individual lines without introducing unwanted indentation.
 <<add results command to subp>>=
 results_parser = subp.add_parser("results",
     help="Lists results of a course",
     description="""<<results command description>>""",
-    epilog="""<<results command epilog>>""")
+    epilog=format_results_epilog(),
+    formatter_class=argparse.RawDescriptionHelpFormatter)
 results_parser.set_defaults(func=results_command)
 assignments.add_assignment_option(results_parser, ungraded=False)
 users.add_user_or_group_option(results_parser)
@@ -83,13 +98,10 @@ prevent the student from getting a grade. Output format, CSV:
   <course code> <component code> <student ID> <missing assignment> <reason>
 
 The reason can be "not submitted" or "not graded".
-<<results command epilog>>=
-If you specify an assignment group, the results of the assignments in that 
-group will be summarized. You can supply your own function for summarizing 
-grades through the -S option. See `pydoc3 canvaslms.grades` for different 
-options.
-@ We will cover the option for and loading of the custom summary module later, 
+@ We will cover the option for and loading of the custom summary module later,
 in \cref{custom-summary-modules}.
+We will also cover the [[format_grading_modules_help]] function, which
+dynamically discovers available modules in the [[canvaslms.grades]] package.
 
 Now, that [[results_command]] function must take three arguments: [[config]], 
 [[canvas]] and [[args]].
@@ -395,18 +407,120 @@ if grade is None or grade_date is None \
   continue
 @
 
+\subsection{Discovering available grading modules}
+\label{grading-module-discovery}
+
+When users install [[canvaslms]] via pipx, the package resides in an isolated
+virtual environment.
+This means the traditional approach of using [[pydoc3 canvaslms.grades]] to
+discover available modules no longer works---pydoc searches the system Python
+path, not pipx's isolated environment.
+
+To solve this, we dynamically discover available modules at runtime using
+[[pkgutil.iter_modules]].
+This works regardless of installation method because we introspect from within
+the package itself.
+If a module fails to import (for example, due to missing dependencies), we
+simply skip it rather than failing the entire discovery process.
+
+We provide two helper functions: one to list the modules with their
+descriptions, and one to format them for display in help text.
+<<functions>>=
+def list_grading_modules():
+  """
+  Discover available grading modules in canvaslms.grades package.
+  Returns a list of (module_name, description) tuples.
+  """
+  import canvaslms.grades
+
+  modules = []
+  # These are internal modules, not user-facing grading strategies
+  excluded = {"__init__", "grades"}
+
+  for importer, modname, ispkg in pkgutil.iter_modules(canvaslms.grades.__path__):
+    if modname in excluded:
+      continue
+    try:
+      module = importlib.import_module(f"canvaslms.grades.{modname}")
+      doc = module.__doc__
+      if doc:
+        # Take only the first line of the docstring
+        first_line = doc.strip().split('\n')[0]
+      else:
+        first_line = "(no description)"
+      modules.append((modname, first_line))
+    except ImportError:
+      continue
+
+  return sorted(modules)
+
+def format_grading_modules_help():
+  """Format the list of grading modules for help text display."""
+  modules = list_grading_modules()
+  if not modules:
+    return "  (no modules found)"
+
+  lines = []
+  for name, desc in modules:
+    lines.append(f"  canvaslms.grades.{name}: {desc}")
+  return "\n\n".join(lines)
+
+def format_results_epilog():
+  """
+  Build the epilog for results command help.
+
+  We construct the epilog by joining lines explicitly rather than using a
+  triple-quoted string. This avoids indentation issues when black formats
+  the generated Python code---triple-quoted strings in function arguments
+  get continuation-line indentation that RawDescriptionHelpFormatter
+  would preserve literally.
+  """
+  parts = [
+    "If you specify an assignment group, the results of the assignments in that",
+    "group will be summarized. You can supply your own function for summarizing",
+    "grades through the -S option.",
+    "",
+    "Available grading modules:",
+    format_grading_modules_help(),
+    "",
+    "You can also provide a path to your own Python file with a summarize_group",
+    "function."
+  ]
+  return "\n".join(parts)
+@
+
+The [[list_grading_modules]] function uses [[pkgutil.iter_modules]] to iterate
+over all submodules in the [[canvaslms.grades]] package.
+We exclude [[__init__]] (the package initializer) and [[grades]] (an internal
+module) since these are not user-facing grading strategies.
+
+For each module, we import it and extract the first line of its docstring as a
+brief description.
+This gives users immediate visibility into what each module does, right in the
+help output.
+
+The [[format_grading_modules_help]] function joins module entries with blank
+lines between them (double newline) for visual separation in the help output.
+This makes the list easier to scan when module descriptions vary in length.
+
+The [[format_results_epilog]] function builds the complete epilog by joining
+individual lines.
+This approach avoids the pitfall where [[black]] indents continuation lines in
+triple-quoted strings, which [[RawDescriptionHelpFormatter]] would preserve
+literally, resulting in oddly indented prose in the help output.
+
+
 \subsection{Loading a custom summary module}
 \label{custom-summary-modules}
 
-Different teachers have different policies for merging several assignments into 
+Different teachers have different policies for merging several assignments into
 one grade.
 We now want to provide a way to override the default function.
 <<summary module option doc>>=
-Name of Python module or file containing module to load with a custom 
-summarization function to summarize assignment groups. The default module is 
-part of the `canvaslms` package: `{default_summary_module}`. But it could be 
-any Python file in the file system or other built-in modules. See `pydoc3 
-canvaslms.grades` for alternative modules or how to build your own.
+Name of Python module or file to load with a custom summarization function.
+Default: `{default_summary_module}`. Available modules: """ + \
+", ".join(m[0] for m in list_grading_modules()) + """. \
+Or provide a path to your own Python file.
 <<add option for custom summary module>>=
 default_summary_module = "canvaslms.grades.conjunctavg"
 results_parser.add_argument("-S", "--summary-module",
