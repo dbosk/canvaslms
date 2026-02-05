@@ -381,6 +381,8 @@ and pushed back without losing any formatting.
 view_parser = assignments_subp.add_parser("view",
     help="View assignment details",
     description="Views detailed information about assignments. "
+      "When piped (not a TTY), outputs YAML front matter with a 'regex' field "
+      "for stable identification, followed by the description as Markdown. "
       "Use --html to preserve HTML instead of converting to Markdown.")
 view_parser.set_defaults(func=assignments_view_command)
 add_assignment_option(view_parser)
@@ -418,16 +420,24 @@ edit_parser = assignments_subp.add_parser("edit",
     description="Edit assignment content. Without -f, opens each matching "
       "assignment in your editor for interactive editing with preview. "
       "With -f, reads from a Markdown file with YAML front matter and updates "
-      "directly (script-friendly). If the YAML contains an 'id' field, the "
-      "command uses it to identify the assignment; use --create to create a new "
-      "assignment if the ID is not found. Use --html to read/edit HTML directly "
-      "without Markdown conversion.")
+      "directly (script-friendly). "
+      "Assignment matching workflow: "
+      "(1) If the YAML contains a 'regex' field, it matches assignments by "
+      "name or Canvas numeric ID. The regex is tested against both. "
+      "This provides stable identification: export an assignment with "
+      "'assignments view -a \"Lab 1.*\" > lab.md', edit locally, and push "
+      "back with 'assignments edit -f lab.md'---the regex stays constant "
+      "even if the name changes slightly. "
+      "(2) If no 'regex' is present but 'name' is, exact name matching is "
+      "used. "
+      "(3) Otherwise, falls back to -a, -A, and -M filters. "
+      "Use --html to read/edit HTML directly without Markdown conversion.")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
 edit_parser.add_argument("--create",
     action="store_true",
-    help="Create a new assignment if the ID in the YAML is not found")
+    help="Create a new assignment if no match is found")
 edit_parser.add_argument("--html",
     action="store_true",
     help="Read file as HTML instead of converting from Markdown. "
@@ -633,11 +643,14 @@ contain this assignment. When editing:
 <<output assignment in editable format>>=
 <<get current modules for assignment>>
 <<get rubric for assignment>>
+<<determine regex for assignment>>
 output = canvaslms.cli.content.render_to_markdown(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     content_attr='description',
-    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
+    extra_attributes={'modules': assignment_modules,
+                      'rubric': assignment_rubric,
+                      'regex': assignment_regex})
 print(output)
 @
 
@@ -655,6 +668,19 @@ in the Canvas API).
 <<get current modules for assignment>>=
 assignment_modules = modules.get_item_modules(
     assignment.course, 'Assignment', assignment.id)
+@
+
+When determining the regex for export, we follow the same approach as for pages.
+If the user specified a non-default [[-a]] pattern, we use that regex verbatim
+(capturing their intent). Otherwise, we generate an exact-match regex from the
+assignment name by escaping special characters and adding anchors.
+<<determine regex for assignment>>=
+if hasattr(args, 'assignment') and args.assignment not in (None, '.*'):
+  # User specified a -a filter, use it verbatim
+  assignment_regex = args.assignment
+else:
+  # Generate exact-match regex from name
+  assignment_regex = '^' + re.escape(assignment.name) + '$'
 @
 
 \subsection{HTML output format}
@@ -691,11 +717,14 @@ and pushed back using [[assignments edit --html -f]].
 <<output assignment in html format>>=
 <<get current modules for assignment>>
 <<get rubric for assignment>>
+<<determine regex for assignment>>
 output = canvaslms.cli.content.render_to_html(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     content_attr='description',
-    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric})
+    extra_attributes={'modules': assignment_modules,
+                      'rubric': assignment_rubric,
+                      'regex': assignment_regex})
 print(output)
 @
 
@@ -1051,50 +1080,84 @@ if errors:
 \subsection{Updating assignment with new content}
 
 We convert the content to HTML for Canvas (unless [[--html]] is specified, in
-which case the content is already HTML). If the YAML front matter contains an
-[[id]] field, we use it to identify the specific assignment to update. This
-enables a Git-based workflow where the assignment can be reliably identified
-even if the name changes. If the ID is not found and [[--create]] is specified,
-we create a new assignment instead.
+which case the content is already HTML).
 
-If no [[id]] is in the YAML, we fall back to the filter-based matching using
-[[-a]], [[-A]], and [[-M]] options (the existing behavior).
+The matching strategy prioritizes reliability and safety:
+\begin{enumerate}
+\item If the YAML contains a [[regex]] field, we compile it and match against
+  assignment names and Canvas numeric IDs. This provides stable identification
+  even when names change, as long as the new name still matches the pattern.
+\item If no [[regex]] is in the YAML but a [[name]] is present, we use exact
+  name matching. This is safe because it won't accidentally match multiple
+  assignments.
+\item As a last resort (for backward compatibility), we fall back to
+  filter-based matching using [[-a]], [[-A]], and [[-M]] options only if no
+  name is specified.
+\end{enumerate}
 <<update assignment with new content>>=
 if args.html:
   html_content = body_content  # Already HTML, no conversion needed
 else:
   html_content = pypandoc.convert_text(body_content, 'html', format='md')
 
-if 'id' in attributes and attributes['id']:
-  <<update or create assignment by id>>
+if 'regex' in attributes and attributes['regex']:
+  <<update or create assignment by regex>>
 else:
   <<update assignments by filter matching>>
 @
 
-\subsubsection{ID-based assignment identification}
+\subsubsection{Regex-based assignment identification}
 
-When the YAML contains an [[id]] field, we look up the assignment directly by
-its Canvas ID. This is more reliable than filter matching because it identifies
-exactly one assignment even if multiple assignments have similar names.
-<<update or create assignment by id>>=
-assignment_id = attributes['id']
+When the YAML contains a [[regex]] field, we compile it and search for
+assignments whose name or Canvas numeric ID matches. The regex is matched
+against both fields to provide maximum flexibility: an assignment can be
+identified by a pattern in its name (\enquote{Lab 1.*}) or by its numeric ID
+(\verb|^12345$|).
+
+If exactly one assignment matches, we update it. If no assignments match and
+[[--create]] is specified, we create a new one. If multiple assignments match,
+we report an error with the list of matching names---the user should make the
+regex more specific.
+
+This mirrors the regex-based page identification in the pages module
+(\cref{sec:content-schemas}), providing a consistent workflow across content
+types.
+<<update or create assignment by regex>>=
+regex_pattern = attributes['regex']
 course_list = courses.process_course_option(canvas, args)
 if not course_list:
-  print("Error: No courses found matching criteria", file=sys.stderr)
-  return
+  canvaslms.cli.err(1, "No courses found matching criteria")
 
 course = course_list[0]
+
 try:
-  assignment = course.get_assignment(assignment_id)
-  assignment.course = course
+  pattern = re.compile(regex_pattern)
+except re.error as e:
+  canvaslms.cli.err(1, f"Invalid regex pattern '{regex_pattern}': {e}")
+
+matching_assignments = []
+for a in course.get_assignments():
+  if pattern.search(a.name) or pattern.search(str(a.id)):
+    a.course = course
+    matching_assignments.append(a)
+
+if len(matching_assignments) == 1:
+  assignment = matching_assignments[0]
   <<update existing assignment>>
-except Exception as e:
+elif len(matching_assignments) == 0:
   if args.create:
     <<create new assignment>>
   else:
-    print(f"Error: Assignment with ID '{assignment_id}' not found. "
-          f"Use --create to create a new assignment.", file=sys.stderr)
-    return
+    canvaslms.cli.err(1,
+      f"No assignments match regex '{regex_pattern}'. "
+      f"Use --create to create a new assignment.")
+else:
+  names = [a.name for a in matching_assignments]
+  logger.error(f"Regex '{regex_pattern}' matches "
+    f"{len(matching_assignments)} assignments:")
+  for name in names:
+    logger.error(f"  - {name}")
+  canvaslms.cli.err(1, "Please make the regex more specific.")
 @
 
 When updating an existing assignment, we build the update dictionary and call
@@ -1115,8 +1178,8 @@ try:
   logger.info(f"Updated assignment: {assignment.name}")
   <<update assignment module membership>>
 except Exception as e:
-  logger.error(f"Error updating assignment '{assignment.name}': {e}")
-  print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+  canvaslms.cli.err(1,
+    f"Error updating assignment '{assignment.name}': {e}")
 @
 
 \subsubsection{Creating new assignments}
@@ -1142,11 +1205,11 @@ if 'published' in attributes:
 try:
   new_assignment = course.create_assignment(assignment=create_params)
   new_assignment.course = course
-  print(f"Created assignment: {new_assignment.name} (id: {new_assignment.id})", file=sys.stderr)
+  logger.info(f"Created assignment: {new_assignment.name} "
+    f"(id: {new_assignment.id})")
   <<update new assignment module membership>>
 except Exception as e:
-  logger.error(f"Error creating assignment: {e}")
-  print(f"Error creating assignment: {e}", file=sys.stderr)
+  canvaslms.cli.err(1, f"Error creating assignment: {e}")
 @
 
 For newly created assignments, we also process module membership if specified.
@@ -1161,14 +1224,66 @@ if 'modules' in attributes:
 
 \subsubsection{Filter-based assignment matching}
 
-When no ID is specified in the YAML, we use the filter options ([[-a]], [[-A]],
-[[-M]]) to find matching assignments. This maintains backwards compatibility
-with the original behavior.
-<<update assignments by filter matching>>=
-assignment_list = process_assignment_option(canvas, args)
+When no [[regex]] is specified in the YAML, we check whether a [[name]] is
+present. If so, we use exact name matching to find the assignment---this is
+critical for safety. Without it, the command would fall back to filter-based
+matching with the default [[-a '.*']] pattern, which matches \emph{all}
+assignments in the course. The result would be catastrophic: every assignment
+would be overwritten with the content from the file.
 
-for assignment in assignment_list:
+If no [[name]] is present either, we fall back to filter-based matching using
+the [[-a]], [[-A]], and [[-M]] options (the original behavior). To prevent
+accidental mass-updates, we refuse to proceed if the filter matches more than
+one assignment.
+<<update assignments by filter matching>>=
+if 'name' in attributes and attributes['name']:
+  <<update or create assignment by name>>
+else:
+  assignment_list = process_assignment_option(canvas, args)
+  if len(assignment_list) > 1:
+    canvaslms.cli.err(1,
+      f"{len(assignment_list)} assignments match filter. "
+      f"Add 'name' or 'regex' to YAML, or use -a to narrow selection.")
+  for assignment in assignment_list:
+    <<update existing assignment>>
+@
+
+\subsubsection{Name-based assignment identification}
+
+When no [[regex]] is specified in the YAML but a [[name]] is present, we use
+the name to find the assignment by exact match. We iterate over all assignments
+in the course and compare names exactly. If exactly one matches, we update it.
+If none match and [[--create]] is specified, we create a new assignment.
+If multiple assignments share the same name, we report an error---the user
+should add a [[regex]] field to disambiguate.
+<<update or create assignment by name>>=
+name = attributes['name']
+course_list = courses.process_course_option(canvas, args)
+if not course_list:
+  canvaslms.cli.err(1, "No courses found matching criteria")
+
+course = course_list[0]
+
+matching_assignments = []
+for a in course.get_assignments():
+  if a.name == name:
+    a.course = course
+    matching_assignments.append(a)
+
+if len(matching_assignments) == 1:
+  assignment = matching_assignments[0]
   <<update existing assignment>>
+elif len(matching_assignments) == 0:
+  if args.create:
+    <<create new assignment>>
+  else:
+    canvaslms.cli.err(1,
+      f"No assignments match name '{name}'. "
+      f"Use --create to create a new assignment.")
+else:
+  canvaslms.cli.err(1,
+    f"Multiple assignments named '{name}'. "
+    f"Add a 'regex' field to the YAML to disambiguate.")
 @
 
 We add optional attributes only if they are present in the YAML front matter.
