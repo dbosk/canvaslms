@@ -569,33 +569,46 @@ The available summary functions and the default one can be found in
 \subsection{Producing a list of missing assignments}
 
 Now we want to look at the missing option.
-If the user supplies this option, we want to produce a list of missing 
-assignments.
-Similarly to summarizing a group, we also want to use different modules to 
-produce the missing assignments.
-We'll use an option missing which takes an optional name of such a module.
+If the user supplies this option, we want to produce a list of missing
+assignments instead of grades.
+
+Previously, this option could take an optional module name, creating a confusing
+interface where both [[--missing module]] and [[-S module]] could specify
+modules.
+We simplify this: [[--missing]] is now a simple flag, and the module specified
+via [[-S]] provides the [[missing_assignments]] function if it has one.
+If the [[-S]] module doesn't provide [[missing_assignments]], we fall back to
+the default implementation in this module.
+
+This design follows the principle that each grading module knows best what
+\enquote{missing} means for its grading policy:
+\begin{description}
+\item[Conjunctive modules] (all must pass): Any assignment without a passing
+  grade is missing.
+\item[Disjunctive modules] (at least one must pass): Assignments are only
+  \enquote{missing} if the student has NO passing grades at all.
+\end{description}
 <<add option for missing assignments>>=
-<<define [[default_missing_module]]>>
 results_parser.add_argument("--missing",
-  required=False, nargs="?",
-  const=default_missing_module, default=None,
+  action="store_true",
   help="Produce a list of missing assignments instead of grades. "
-       "You can supply a custom module to this option, the module must "
-       "contain a "
-       "function `missing_assignments(assignments_list, users_list). "
+       "Uses the summary module's missing_assignments() if available, "
+       "otherwise uses the default implementation. "
        <<missing module behaviour>>
        "This option only has effect when working with assignment groups.")
 @
 
-This lets us load the module and use it to produce the missing assignments, in 
-a similar fashion as above.
+Since [[--missing]] is now a simple flag, we use the summary module (specified
+via [[-S]]) to provide the [[missing_assignments]] function.
+If the summary module doesn't have one, we fall back to this module's default.
 <<load the correct missing module as [[missing]]>>=
 if args.missing:
-  try:
-    missing = load_module(args.missing)
-  except Exception as err:
-    canvaslms.cli.err(1, f"Error loading missing module "
-      f"'{args.missing}': {err}")
+  <<load the correct summary module as [[summary]]>>
+  if hasattr(summary, 'missing_assignments'):
+    missing = summary
+  else:
+    import canvaslms.cli.results
+    missing = canvaslms.cli.results
 @
 
 Now, to the main part of the problem.
@@ -624,8 +637,18 @@ for user, assignment, reason in missing_results:
 \subsubsection{The default missing module}
 
 We'll now cover a default function for the missing assignments.
-We'll put it in the same module as the [[results]] CLI command, not in a 
+We'll put it in the same module as the [[results]] CLI command, not in a
 separate module.
+
+The function accepts an optional [[is_passing]] callback that determines whether
+a grade counts as passing.
+This allows grading modules to reuse this shared implementation while providing
+their own definition of what \enquote{passing} means.
+For example, [[conjunctavg]] considers only A--E and P as passing, while
+[[conjunctavgsurvey]] also accepts numeric grades.
+
+If no [[is_passing]] callback is provided, we fall back to regex matching
+against [[passing_regex]].
 <<functions>>=
 def missing_assignments(assignments_list, users_list,
                         <<optional [[missing_assignments]] args>>):
@@ -638,8 +661,6 @@ def missing_assignments(assignments_list, users_list,
     for assignment in assignments_list:
       <<skip if [[assignment]] is optional>>
       <<if [[assignment]] is missing for [[user]], yield it>>
-<<define [[default_missing_module]]>>=
-default_missing_module = "canvaslms.cli.results"
 @
 
 We'll add [[<<optional [[missing_assignments]] args>>]] to the function to make 
@@ -663,10 +684,13 @@ We don't want to make it sound like an optional assignment is mandatory.
 @
 
 This gives us something like this.
+We check if the grade passes using either the [[is_passing]] callback (if
+provided) or the [[passing_regex]].
 <<if [[assignment]] is missing for [[user]], yield it>>=
 try:
   submission = assignment.get_submission(user)
 except canvasapi.exceptions.ResourceDoesNotExist:
+  yield user, assignment, "no submission exists"
   continue
 
 if submission is None:
@@ -677,45 +701,61 @@ elif submission.grade is None:
           f"submitted on {canvaslms.cli.utils.format_local_time(submission.submitted_at)}, but not graded"
   else:
     yield user, assignment, "not done"
-elif not filter_grade(submission.grade, passing_regex):
-  if hasattr(submission, 'submitted_at') and submission.submitted_at and \
-        hasattr(submission, 'graded_at') and submission.graded_at and \
-        submission.submitted_at > submission.graded_at:
-    yield user, assignment, \
-          f"not a passing grade ({submission.grade}), resubmission not graded"
-  else:
-    yield user, assignment, \
-          f"not a passing grade ({submission.grade})"
+else:
+  <<check if grade passes using callback or regex>>
+  if not grade_passes:
+    if hasattr(submission, 'submitted_at') and submission.submitted_at and \
+          hasattr(submission, 'graded_at') and submission.graded_at and \
+          submission.submitted_at > submission.graded_at:
+      yield user, assignment, \
+            f"not a passing grade ({submission.grade}), resubmission not graded"
+    else:
+      yield user, assignment, \
+            f"not a passing grade ({submission.grade})"
+<<check if grade passes using callback or regex>>=
+if is_passing is not None:
+  grade_passes = is_passing(submission.grade)
+else:
+  grade_passes = filter_grade(submission.grade, passing_regex)
 @
 
-Now, we need that [[passing_regex]], so we can add it to the optional 
+Now, we need that [[passing_regex]], so we can add it to the optional
 arguments, with a default value (same as above).
 We add the most common grading scales.
-But we also add number scores, which can be used for mandatory surveys and the 
+But we also add number scores, which can be used for mandatory surveys and the
 like.
 <<optional [[missing_assignments]] args>>=
 passing_regex=PASSING_REGEX,
 @
 
-Next, if we want to be able to skip optional assignments, we can add an 
+Next, if we want to be able to skip optional assignments, we can add an
 optional argument for that.
 <<optional [[missing_assignments]] args>>=
-optional_assignments = None,
+optional_assignments=None,
+@
+
+Finally, we add the [[is_passing]] callback.
+If provided, this function takes a grade and returns [[True]] if it's passing.
+This lets grading modules define their own semantics for what constitutes a
+passing grade.
+<<optional [[missing_assignments]] args>>=
+is_passing=None,
 @
 
 This allows us to make the call to the function as follows.
-We check if it's the default function or not, if it is we can pass additional 
-arguments from the CLI arguments.
+We check if it's the default function or not.
+If it is, we pass additional arguments from the CLI.
+If not, the module provides its own implementation with module-specific
+semantics (which may or may not use these arguments).
+
+We always pass [[passing_regex]] and [[optional_assignments]] since these are
+CLI-level concerns that any module might want to honor.
 <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>=
-if missing.missing_assignments == missing_assignments:
-  missing_results = missing.missing_assignments(
-                                  assignments_list, users_list,
-                                  passing_regex=args.filter_grades,
-                                  optional_assignments=args.optional_assignments
-                                )
-else:
-  missing_results = missing.missing_assignments(
-    assignments_list, users_list)
+missing_results = missing.missing_assignments(
+  assignments_list, users_list,
+  passing_regex=args.filter_grades,
+  optional_assignments=args.optional_assignments
+)
 @
 
 All that is missing now is the optional assignments argument for the parser.
