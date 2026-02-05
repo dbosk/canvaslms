@@ -1061,20 +1061,16 @@ try:
   # body_content is Markdown or HTML depending on args.html
   attributes, body_content = canvaslms.cli.content.read_content_from_file(args.file)
 except FileNotFoundError:
-  logger.error(f"File not found: {args.file}")
-  print(f"Error: File not found: {args.file}", file=sys.stderr)
-  return
+  canvaslms.cli.err(1, f"File not found: {args.file}")
 except Exception as e:
-  logger.error(f"Error reading file: {e}")
-  print(f"Error reading file: {e}", file=sys.stderr)
-  return
+  canvaslms.cli.err(1, f"Error reading file: {e}")
 
 errors = canvaslms.cli.content.validate_attributes(
     attributes, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
 if errors:
   for error in errors:
-    print(f"Validation error: {error}", file=sys.stderr)
-  return
+    logger.error(f"Validation error: {error}")
+  canvaslms.cli.err(1, "File validation failed")
 @
 
 \subsection{Updating assignment with new content}
@@ -1108,20 +1104,19 @@ else:
 
 \subsubsection{Regex-based assignment identification}
 
-When the YAML contains a [[regex]] field, we compile it and search for
-assignments whose name or Canvas numeric ID matches. The regex is matched
-against both fields to provide maximum flexibility: an assignment can be
-identified by a pattern in its name (\enquote{Lab 1.*}) or by its numeric ID
-(\verb|^12345$|).
+When the YAML contains a [[regex]] field, we use [[match_item_by_regex]] from
+the content module to find the matching assignment. The function handles the
+three-way dispatch (one match, zero matches, multiple matches) and raises
+[[EmptyListError]] or [[MultipleMatchesError]] as appropriate.
+
+We match the regex against both assignment names and Canvas numeric IDs,
+providing flexibility: an assignment can be identified by a pattern in its name
+(\enquote{Lab 1.*}) or by its numeric ID (\verb|^12345$|).
 
 If exactly one assignment matches, we update it. If no assignments match and
 [[--create]] is specified, we create a new one. If multiple assignments match,
-we report an error with the list of matching names---the user should make the
-regex more specific.
-
-This mirrors the regex-based page identification in the pages module
-(\cref{sec:content-schemas}), providing a consistent workflow across content
-types.
+the exception message lists the matching names so the user can make the regex
+more specific.
 <<update or create assignment by regex>>=
 regex_pattern = attributes['regex']
 course_list = courses.process_course_option(canvas, args)
@@ -1130,34 +1125,27 @@ if not course_list:
 
 course = course_list[0]
 
+all_assignments = list(course.get_assignments())
+for a in all_assignments:
+  a.course = course
+
 try:
-  pattern = re.compile(regex_pattern)
-except re.error as e:
-  canvaslms.cli.err(1, f"Invalid regex pattern '{regex_pattern}': {e}")
-
-matching_assignments = []
-for a in course.get_assignments():
-  if pattern.search(a.name) or pattern.search(str(a.id)):
-    a.course = course
-    matching_assignments.append(a)
-
-if len(matching_assignments) == 1:
-  assignment = matching_assignments[0]
+  assignment = canvaslms.cli.content.match_item_by_regex(
+      all_assignments, regex_pattern,
+      [lambda a: a.name, lambda a: str(a.id)],
+      item_type="assignment",
+      name_func=lambda a: a.name)
   <<update existing assignment>>
-elif len(matching_assignments) == 0:
+except re.error as e:
+  canvaslms.cli.err(
+      1, f"Invalid regex pattern '{regex_pattern}': {e}")
+except canvaslms.cli.EmptyListError:
   if args.create:
     <<create new assignment>>
   else:
     canvaslms.cli.err(1,
       f"No assignments match regex '{regex_pattern}'. "
       f"Use --create to create a new assignment.")
-else:
-  names = [a.name for a in matching_assignments]
-  logger.error(f"Regex '{regex_pattern}' matches "
-    f"{len(matching_assignments)} assignments:")
-  for name in names:
-    logger.error(f"  - {name}")
-  canvaslms.cli.err(1, "Please make the regex more specific.")
 @
 
 When updating an existing assignment, we build the update dictionary and call
@@ -1251,11 +1239,13 @@ else:
 \subsubsection{Name-based assignment identification}
 
 When no [[regex]] is specified in the YAML but a [[name]] is present, we use
-the name to find the assignment by exact match. We iterate over all assignments
-in the course and compare names exactly. If exactly one matches, we update it.
-If none match and [[--create]] is specified, we create a new assignment.
-If multiple assignments share the same name, we report an error---the user
-should add a [[regex]] field to disambiguate.
+[[match_item_by_name]] from the content module for exact name matching. This
+avoids the catastrophic scenario where the default [[-a '.*']] pattern matches
+all assignments and overwrites them all with the file content.
+
+If exactly one assignment matches, we update it. If none match and [[--create]]
+is specified, we create a new assignment. If multiple assignments share the same
+name, the exception tells the user to add a [[regex]] field to disambiguate.
 <<update or create assignment by name>>=
 name = attributes['name']
 course_list = courses.process_course_option(canvas, args)
@@ -1264,26 +1254,23 @@ if not course_list:
 
 course = course_list[0]
 
-matching_assignments = []
-for a in course.get_assignments():
-  if a.name == name:
-    a.course = course
-    matching_assignments.append(a)
+all_assignments = list(course.get_assignments())
+for a in all_assignments:
+  a.course = course
 
-if len(matching_assignments) == 1:
-  assignment = matching_assignments[0]
+try:
+  assignment = canvaslms.cli.content.match_item_by_name(
+      all_assignments, name,
+      lambda a: a.name,
+      item_type="assignment")
   <<update existing assignment>>
-elif len(matching_assignments) == 0:
+except canvaslms.cli.EmptyListError:
   if args.create:
     <<create new assignment>>
   else:
     canvaslms.cli.err(1,
       f"No assignments match name '{name}'. "
       f"Use --create to create a new assignment.")
-else:
-  canvaslms.cli.err(1,
-    f"Multiple assignments named '{name}'. "
-    f"Add a 'regex' field to the YAML to disambiguate.")
 @
 
 We add optional attributes only if they are present in the YAML front matter.

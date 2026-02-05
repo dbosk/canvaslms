@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 <<schema functions>>
 <<rendering functions>>
 <<file input functions>>
+<<matching functions>>
 <<editor functions>>
 <<preview functions>>
 <<interactive functions>>
@@ -78,6 +79,7 @@ output.
 <<content imports>>=
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,8 @@ import pypandoc
 import rich.console
 import rich.markdown
 import yaml
+
+import canvaslms.cli
 @
 
 \section{Testing overview}
@@ -98,12 +102,14 @@ import pytest
 import tempfile
 import os
 
+import canvaslms.cli
 import canvaslms.cli.content as content
 
 <<test yaml functions>>
 <<test schema functions>>
 <<test rendering functions>>
 <<test file input functions>>
+<<test matching functions>>
 @
 
 
@@ -868,6 +874,239 @@ File content here""")
             assert "Just plain content" in markdown
         finally:
             os.unlink(temp_path)
+
+@
+
+
+\section{Matching items by regex or name}
+\label{sec:matching-items}
+
+Both the pages and assignments edit commands share the same matching pattern:
+given a list of Canvas items and a regex (or exact name), find exactly one
+match. If zero match, raise [[EmptyListError]]. If multiple match, raise
+[[MultipleMatchesError]]. This section extracts that common logic into
+reusable functions.
+
+Why not leave the matching inline? Because the pattern is identical across
+content types---only the field accessors differ. Pages match against
+[[page.title]] and [[page.url]]; assignments match against
+[[assignment.name]] and [[str(assignment.id)]]. Extracting the logic
+eliminates duplication and ensures consistent error messages.
+
+\subsection{Regex-based matching}
+
+The [[match_item_by_regex]] function compiles a regex pattern and tests
+it against one or more string fields on each item. Callers specify which
+fields to check via [[field_funcs]]---a list of callables that extract
+a string from an item. For example, pages pass
+\verb|[lambda p: p.title, lambda p: p.url]|.
+
+The function returns exactly one matching item. If zero or multiple items
+match, it raises the appropriate exception. The [[item_type]] parameter
+(e.g., \enquote{page} or \enquote{assignment}) is used in error messages.
+The [[name_func]] callable extracts a display name for error reporting.
+
+<<matching functions>>=
+def match_item_by_regex(items, regex_pattern, field_funcs,
+                        item_type="item", name_func=str):
+    """Find exactly one item matching a regex pattern.
+
+    Args:
+        items: Iterable of items to search
+        regex_pattern: Regex string to compile and match
+        field_funcs: List of callables, each takes an item
+            and returns a string to match against
+        item_type: Label for error messages (e.g., 'page')
+        name_func: Callable to extract display name from item
+
+    Returns:
+        The single matching item
+
+    Raises:
+        canvaslms.cli.EmptyListError: No items match
+        canvaslms.cli.MultipleMatchesError: Multiple items match
+        re.error: Invalid regex pattern
+    """
+    pattern = re.compile(regex_pattern)
+
+    matches = []
+    for item in items:
+        for field_func in field_funcs:
+            if pattern.search(field_func(item)):
+                matches.append(item)
+                break
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) == 0:
+        raise canvaslms.cli.EmptyListError(
+            f"No {item_type}s match regex "
+            f"'{regex_pattern}'.")
+    else:
+        names = [name_func(m) for m in matches]
+        names_str = ", ".join(f"'{n}'" for n in names)
+        raise canvaslms.cli.MultipleMatchesError(
+            f"Regex '{regex_pattern}' matches "
+            f"{len(matches)} {item_type}s: "
+            f"{names_str}. "
+            f"Please make the regex more specific.")
+
+@
+
+\subsection{Name-based matching}
+
+The [[match_item_by_name]] function performs exact name matching. This is
+the middle-tier safety fallback: when no regex is specified in the YAML
+but a name/title is present, we use exact matching to avoid accidental
+mass-updates.
+
+The interface mirrors [[match_item_by_regex]]: it returns exactly one
+match or raises an exception. This consistency allows callers to handle
+all matching modes uniformly.
+
+<<matching functions>>=
+def match_item_by_name(items, name, name_func,
+                       item_type="item"):
+    """Find exactly one item with an exact name match.
+
+    Args:
+        items: Iterable of items to search
+        name: Exact name to match
+        name_func: Callable to extract name from item
+        item_type: Label for error messages (e.g., 'page')
+
+    Returns:
+        The single matching item
+
+    Raises:
+        canvaslms.cli.EmptyListError: No items match
+        canvaslms.cli.MultipleMatchesError: Multiple items match
+    """
+    matches = [item for item in items
+               if name_func(item) == name]
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) == 0:
+        raise canvaslms.cli.EmptyListError(
+            f"No {item_type}s match name '{name}'.")
+    else:
+        raise canvaslms.cli.MultipleMatchesError(
+            f"Multiple {item_type}s named '{name}'. "
+            f"Add a 'regex' field to the YAML "
+            f"to disambiguate.")
+
+@
+
+\subsection{Verifying matching functions}
+
+Let's verify that the matching functions correctly handle the three
+cases: exactly one match, zero matches, and multiple matches.
+
+<<test matching functions>>=
+class TestMatchItemByRegex:
+    """Tests for match_item_by_regex function."""
+
+    def test_single_match_returns_item(self):
+        """Single match returns the matching item."""
+        items = ["alpha", "beta", "gamma"]
+        result = content.match_item_by_regex(
+            items, "^bet",
+            [lambda x: x],
+            item_type="word")
+        assert result == "beta"
+
+    def test_no_match_raises_empty_list_error(self):
+        """No matches raise EmptyListError."""
+        items = ["alpha", "beta"]
+        with pytest.raises(
+            canvaslms.cli.EmptyListError,
+            match="No words match regex"
+        ):
+            content.match_item_by_regex(
+                items, "^zzz",
+                [lambda x: x],
+                item_type="word")
+
+    def test_multiple_matches_raises_error(self):
+        """Multiple matches raise MultipleMatchesError."""
+        items = ["alpha", "aleph", "gamma"]
+        with pytest.raises(
+            canvaslms.cli.MultipleMatchesError,
+            match="matches 2 words"
+        ):
+            content.match_item_by_regex(
+                items, "^al",
+                [lambda x: x],
+                item_type="word")
+
+    def test_matches_any_field(self):
+        """Item matches if any field function matches."""
+        class Item:
+            def __init__(self, name, code):
+                self.name = name
+                self.code = code
+
+        items = [Item("Foo", "abc"), Item("Bar", "xyz")]
+        result = content.match_item_by_regex(
+            items, "xyz",
+            [lambda i: i.name, lambda i: i.code],
+            item_type="item",
+            name_func=lambda i: i.name)
+        assert result.name == "Bar"
+
+    def test_invalid_regex_raises_error(self):
+        """Invalid regex pattern raises re.error."""
+        import re
+        with pytest.raises(re.error):
+            content.match_item_by_regex(
+                ["a"], "[invalid",
+                [lambda x: x])
+
+
+class TestMatchItemByName:
+    """Tests for match_item_by_name function."""
+
+    def test_single_match_returns_item(self):
+        """Single exact match returns the item."""
+        items = ["alpha", "beta", "gamma"]
+        result = content.match_item_by_name(
+            items, "beta",
+            lambda x: x,
+            item_type="word")
+        assert result == "beta"
+
+    def test_no_match_raises_empty_list_error(self):
+        """No matches raise EmptyListError."""
+        items = ["alpha", "beta"]
+        with pytest.raises(
+            canvaslms.cli.EmptyListError,
+            match="No words match name"
+        ):
+            content.match_item_by_name(
+                items, "zzz",
+                lambda x: x,
+                item_type="word")
+
+    def test_multiple_matches_raises_error(self):
+        """Multiple items with same name raise error."""
+        items = ["alpha", "alpha", "gamma"]
+        with pytest.raises(
+            canvaslms.cli.MultipleMatchesError,
+            match="Multiple words named"
+        ):
+            content.match_item_by_name(
+                items, "alpha",
+                lambda x: x,
+                item_type="word")
+
+    def test_partial_match_does_not_count(self):
+        """Partial name match is not an exact match."""
+        items = ["alpha", "alphabet"]
+        result = content.match_item_by_name(
+            items, "alpha",
+            lambda x: x)
+        assert result == "alpha"
 
 @
 
