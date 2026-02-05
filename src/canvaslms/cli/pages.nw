@@ -37,6 +37,7 @@ import canvaslms.cli.modules
 
 logger = logging.getLogger(__name__)
 
+<<exception classes>>
 <<functions>>
 
 def add_command(subp):
@@ -53,6 +54,16 @@ def add_command(subp):
   <<add pages list subcommand>>
   <<add pages view subcommand>>
   <<add pages edit subcommand>>
+@
+
+
+\section{Exception classes}
+
+We define custom exceptions for error cases specific to page matching.
+<<exception classes>>=
+class MultipleMatchesError(Exception):
+  """Raised when a regex pattern matches multiple pages."""
+  pass
 @
 
 
@@ -171,7 +182,12 @@ pushed back without losing any formatting.
 view_parser = pages_subp.add_parser("view",
     help="View page content",
     description="View wiki page content. When piped, outputs editable format "
-      "with YAML front matter. Use --html to preserve HTML instead of "
+      "with YAML front matter including a 'regex' field for stable page "
+      "identification. If you used -p to filter pages, that regex is preserved "
+      "in the output. Otherwise, an exact-match regex is generated from the title. "
+      "This enables a Git-based workflow: 'pages view -p \"Week 1.*\" > page.md', "
+      "edit locally, then 'pages edit -f page.md' to push back. The regex stays "
+      "constant even if the title changes. Use --html to preserve HTML instead of "
       "converting to Markdown.")
 view_parser.set_defaults(func=pages_view_command)
 add_page_options(view_parser)
@@ -219,13 +235,20 @@ contain this page. Users can edit this list to control module membership:
   the patterns (added to matching, removed from non-matching)
 \end{description}
 
+The [[regex]] field provides stable page identification across title changes.
+When the user selected a page using [[-p]], we use that regex verbatim. When
+the page was selected by other means (title, module, etc.), we generate an
+exact-match regex by escaping the title and adding anchors. This regex will be
+used for matching on subsequent [[edit]] operations.
+
 <<output page in editable format>>=
 <<get current modules for page>>
+<<determine regex for page>>
 output = canvaslms.cli.content.render_to_markdown(
     full_page,
     canvaslms.cli.content.PAGE_SCHEMA,
     content_attr='body',
-    extra_attributes={'modules': page_modules})
+    extra_attributes={'modules': page_modules, 'regex': page_regex})
 print(output)
 @
 
@@ -234,6 +257,19 @@ modules module. Pages are identified by their URL slug.
 <<get current modules for page>>=
 page_modules = canvaslms.cli.modules.get_item_modules(
     full_page.course, 'Page', full_page.url)
+@
+
+When determining the regex for export, we check how the page was selected. If
+the user used [[-p]] with a non-default pattern, we use that regex verbatim
+(capturing their intent). Otherwise, we generate an exact-match regex from the
+page title by escaping special characters and adding anchors.
+<<determine regex for page>>=
+if hasattr(args, 'page') and args.page != '.*':
+  # User specified a -p filter, use it verbatim
+  page_regex = args.page
+else:
+  # Generate exact-match regex from title
+  page_regex = '^' + re.escape(full_page.title) + '$'
 @
 
 \subsection{HTML output format}
@@ -268,14 +304,16 @@ with console.pager(styles=True):
 
 For piped output, we use [[render_to_html]] from the content module to produce
 YAML front matter with the raw HTML body. This can be saved to a file, edited,
-and pushed back using [[pages edit --html -f]].
+and pushed back using [[pages edit --html -f]]. We include the same regex
+determination logic as for Markdown output.
 <<output page in html format>>=
 <<get current modules for page>>
+<<determine regex for page>>
 output = canvaslms.cli.content.render_to_html(
     full_page,
     canvaslms.cli.content.PAGE_SCHEMA,
     content_attr='body',
-    extra_attributes={'modules': page_modules})
+    extra_attributes={'modules': page_modules, 'regex': page_regex})
 print(output)
 @
 
@@ -334,16 +372,25 @@ edit_parser = pages_subp.add_parser("edit",
     description="Edit wiki page content. Without -f, opens each matching "
       "page in your editor for interactive editing with preview. "
       "With -f, reads from a Markdown file with YAML front matter and updates "
-      "directly (script-friendly). If the YAML contains a 'url' field, the "
-      "command uses it to identify the page; use --create to create a new page "
-      "if the URL is not found. Use --html to read/edit HTML directly without "
-      "Markdown conversion.")
+      "directly (script-friendly). "
+      "\n\n"
+      "Page matching workflow: "
+      "(1) If the YAML contains a 'regex' field, it matches pages by title or URL. "
+      "The regex is tested against both the page title and Canvas URL slug. "
+      "This provides stable identification: export a page with 'pages view -p "
+      "\"Week 1.*\" > page.md', edit locally, and push back with 'pages edit -f "
+      "page.md'---the regex stays constant even if the title changes slightly. "
+      "(2) If no 'regex' is present but 'title' is, exact title matching is used. "
+      "(3) Otherwise, falls back to -p and -M filters. "
+      "\n\n"
+      "Use --create to create a new page if no matches are found. "
+      "Use --html to read/edit HTML directly without Markdown conversion.")
 edit_parser.set_defaults(func=pages_edit_command)
 add_page_options(edit_parser, required=True)
 canvaslms.cli.content.add_file_option(edit_parser)
 edit_parser.add_argument("--create",
     action="store_true",
-    help="Create a new page if the URL in the YAML is not found")
+    help="Create a new page if no matches are found")
 edit_parser.add_argument("--html",
     action="store_true",
     help="Read file as HTML instead of converting from Markdown. "
@@ -398,50 +445,84 @@ We convert the content to HTML for Canvas (unless [[--html]] is specified, in
 which case the content is already HTML) and build the update dictionary. The
 Canvas API expects page updates with a [[wiki_page]] wrapper.
 
-If the YAML front matter contains a [[url]] field, we use it to identify the
-specific page to update. This enables a Git-based workflow where the page can
-be reliably identified even if the title changes. If the URL is not found and
-[[--create]] is specified, we create a new page instead.
+The matching strategy prioritizes reliability and safety:
+\begin{enumerate}
+\item If the YAML contains a [[regex]] field, we use it to match pages by title
+  or URL slug. This provides stable identification even when titles change,
+  as long as the new title still matches the pattern.
+\item If no [[regex]] is in the YAML but a [[title]] is present, we use exact
+  title matching. This is safe because it won't accidentally match multiple pages.
+\item As a last resort (for backward compatibility), we fall back to filter-based
+  matching using [[-p]] and [[-M]] options only if no title is specified.
+\end{enumerate}
 
-If no [[url]] is in the YAML, we try title-based matching first (using the
-[[title]] field from the front matter), then fall back to filter-based matching
-using [[-p]] and [[-M]] options only if no title is specified.
 <<update pages with new content>>=
 if args.html:
   html_content = body_content  # Already HTML, no conversion needed
 else:
   html_content = pypandoc.convert_text(body_content, 'html', format='md')
 
-if 'url' in attributes and attributes['url']:
-  <<update or create page by url>>
+if 'regex' in attributes and attributes['regex']:
+  <<update or create page by regex>>
 else:
   <<update pages by filter matching>>
 @
 
-\subsubsection{URL-based page identification}
+\subsubsection{Regex-based page identification}
 
-When the YAML contains a [[url]] field, we look up the page directly by its URL
-slug. This is more reliable than filter matching because it identifies exactly
-one page even if multiple pages have similar titles.
-<<update or create page by url>>=
-page_url = attributes['url']
+When the YAML contains a [[regex]] field, we compile it and search for pages
+whose title or URL slug matches. The regex is matched against both fields to
+provide maximum flexibility: a page can be identified by a pattern in its title
+(\enquote{Week 1.*}) or by its URL slug (\verb|^week-1-overview$|).
+
+If exactly one page matches, we update it. If no pages match and [[--create]]
+is specified, we create a new page. If multiple pages match, we report an error
+with the list of matching page titles---the user should make the regex more
+specific.
+
+This approach provides the stability of URL-based matching (regex doesn't change
+when title changes slightly) with the flexibility of pattern matching (one regex
+can match a family of related pages if desired).
+
+<<update or create page by regex>>=
+regex_pattern = attributes['regex']
 course_list = canvaslms.cli.courses.process_course_option(canvas, args)
 if not course_list:
   print("Error: No courses found matching criteria", file=sys.stderr)
   return
 
 course = course_list[0]
+
 try:
-  full_page = course.get_page(page_url)
+  pattern = re.compile(regex_pattern)
+except re.error as e:
+  print(f"Error: Invalid regex pattern '{regex_pattern}': {e}", file=sys.stderr)
+  return
+
+matching_pages = []
+for page in course.get_pages():
+  if pattern.search(page.title) or pattern.search(page.url):
+    matching_pages.append(page)
+
+if len(matching_pages) == 1:
+  full_page = course.get_page(matching_pages[0].url)
   full_page.course = course
   <<update existing page>>
-except Exception as e:
+elif len(matching_pages) == 0:
   if args.create:
     <<create new page>>
   else:
-    print(f"Error: Page '{page_url}' not found. "
+    print(f"Error: No pages match regex '{regex_pattern}'. "
           f"Use --create to create a new page.", file=sys.stderr)
     return
+else:
+  page_titles = [p.title for p in matching_pages]
+  print(f"Error: Regex '{regex_pattern}' matches {len(matching_pages)} pages:",
+        file=sys.stderr)
+  for title in page_titles:
+    print(f"  - {title}", file=sys.stderr)
+  print("Please make the regex more specific.", file=sys.stderr)
+  return
 @
 
 When updating an existing page, we build the update dictionary and call the
