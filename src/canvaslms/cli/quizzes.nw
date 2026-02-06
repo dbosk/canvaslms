@@ -3204,6 +3204,11 @@ def _parse_quiz_full_format(data, format_type):
 
     if 'settings' in data:
         settings = data['settings'].copy()
+        # Allow metadata (like id/regex) at the top level.
+        # This makes the format more forgiving for hand-edited files.
+        for k in ('id', 'regex', 'title'):
+            if k in data and k not in settings:
+                settings[k] = data[k]
     else:
         # Simple format: entire dict is settings (excluding metadata keys)
         settings = {k: v for k, v in data.items()
@@ -3252,6 +3257,13 @@ FILE MODE (-f):
   The JSON/YAML format is the same as 'quizzes export' output, enabling
   a round-trip workflow: export, modify, edit.
 
+  When using -f, the -a/--assignment selector is optional if the file provides
+  enough information to identify the quiz. We use the first available of:
+    - settings.id (exact ID match)
+    - settings.regex (regex matching title or ID)
+    - settings.title (exact title match; errors if duplicate titles exist
+      within a course)
+
 ITEM HANDLING:
   By default, items/questions in the file are ignored to protect student
   submissions. Use --replace-items to replace all questions (with confirmation
@@ -3266,7 +3278,13 @@ try:
 except argparse.ArgumentError:
   pass
 
-add_quiz_option(edit_parser, required=True)
+# NOTE: We intentionally do not call add_quiz_option(required=False) here.
+# That helper defaults to '.*', which would select all quizzes if -a is
+# omitted. For quizzes edit, -a is required only in interactive mode.
+edit_parser.add_argument("-a", "--assignment",
+    required=False,
+    default=None,
+    help="Regex matching quiz title or Canvas ID")
 
 edit_parser.add_argument("-f", "--file",
     help="Read content from file (format auto-detected: .json, .yaml, .yml, .md)",
@@ -3299,12 +3317,14 @@ In file mode, we read the content from the specified file.
 <<functions>>=
 def edit_command(config, canvas, args):
   """Edits quiz settings and instructions"""
-  quiz_list = process_quiz_option(canvas, args)
   requester = canvas._Canvas__requester
 
   if args.file:
     <<edit quiz from file>>
   else:
+    if not getattr(args, 'assignment', None):
+      canvaslms.cli.err(1, "-a/--assignment is required unless -f/--file is used")
+    quiz_list = process_quiz_option(canvas, args)
     <<edit quiz interactively>>
 @
 
@@ -3329,21 +3349,80 @@ except ValueError as e:
 <<apply settings from file>>
 @
 
-We extract [[id]] from either the top level or the settings:
+We can identify the target quiz in two ways:
+\begin{description}
+\item[By command-line selector] If [[-a/--assignment]] is provided, we select
+  quizzes using that regex (matching quiz title or ID), just like interactive
+  mode.
+\item[By file metadata] If [[-a]] is omitted, the file must provide one of
+  [[settings.id]], [[settings.regex]], or [[settings.title]].  This is the same
+  idea as the [[regex]] field used by [[pages]] and [[assignments]]: we preserve
+  the user's selection expression so scripted edits stay stable.
+\end{description}
 
 <<identify target quiz from file data>>=
-settings = quiz_data['settings']
-quiz_id = settings.get('id')
+settings = quiz_data.get('settings') or {}
+course_list = courses.process_course_option(canvas, args)
 
-if quiz_id:
-  target_quiz = None
+if getattr(args, 'assignment', None):
+  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  if not quiz_list:
+    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
+else:
+  quiz_id = settings.get('id')
+  quiz_regex = settings.get('regex')
+  quiz_title = settings.get('title')
+
+  if quiz_id is not None and str(quiz_id).strip() != "":
+    quiz_list = []
+    for course in course_list:
+      for quiz in fetch_all_quizzes(course):
+        if str(quiz.id) == str(quiz_id):
+          quiz.course = course
+          quiz_list.append(quiz)
+    if not quiz_list:
+      canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found")
+    if len(quiz_list) > 1:
+      canvaslms.cli.err(1, f"Multiple quizzes match ID {quiz_id}")
+  elif quiz_regex is not None and str(quiz_regex).strip() != "":
+    quiz_list = list(filter_quizzes(course_list, str(quiz_regex)))
+    if not quiz_list:
+      canvaslms.cli.err(1, f"No quiz found matching file regex: {quiz_regex}")
+  elif quiz_title is not None and str(quiz_title).strip() != "":
+    quiz_list = []
+    title = str(quiz_title)
+    for course in course_list:
+      matches = [q for q in fetch_all_quizzes(course)
+                 if getattr(q, 'title', None) == title]
+      for q in matches:
+        q.course = course
+      if len(matches) > 1:
+        canvaslms.cli.err(
+          1,
+          f"Multiple quizzes titled '{title}' in course {course.course_code}. "
+          "Use settings.regex (or -a) to disambiguate."
+        )
+      if matches:
+        quiz_list.extend(matches)
+
+    if not quiz_list:
+      canvaslms.cli.err(1, f"No quiz found with title: {title}")
+  else:
+    canvaslms.cli.err(
+      1,
+      "File mode without -a requires one of settings.id, settings.regex, "
+      "or settings.title"
+    )
+
+if len(quiz_list) > 1:
+  print(f"Found {len(quiz_list)} quizzes to update:")
   for quiz in quiz_list:
-    if str(quiz.id) == str(quiz_id):
-      target_quiz = quiz
-      break
-  if not target_quiz:
-    canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found")
-  quiz_list = [target_quiz]
+    course_code = quiz.course.course_code if hasattr(quiz, 'course') else "?"
+    print(f"  - {course_code}: {quiz.title} (ID: {quiz.id})")
+  response = input("\nEdit all? [y/N] ").strip().lower()
+  if response != 'y':
+    print("Aborted.")
+    return
 @
 
 If [[--replace-items]] is specified and the file contains items, we replace
@@ -4056,7 +4135,7 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
   params = {}
 
   for key, value in attributes.items():
-    if key == 'id':
+    if key in ('id', 'regex', 'modules'):
       # Don't send ID as an update parameter
       continue
 
@@ -4374,6 +4453,10 @@ def export_command(config, canvas, args):
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
 
+  if len(quiz_list) > 1:
+    canvaslms.cli.err(1, f"Multiple quizzes match '{args.assignment}'. "
+                         "Please use a more specific pattern.")
+
   quiz = quiz_list[0]
   requester = canvas._Canvas__requester
   include_banks = args.include_banks and not args.no_banks
@@ -4384,6 +4467,9 @@ def export_command(config, canvas, args):
     export = export_full_new_quiz(quiz, requester, include_banks, importable)
   else:
     export = export_full_classic_quiz(quiz, importable)
+
+  # Preserve the user's selection expression for round-trip syncing.
+  export.setdefault('settings', {})['regex'] = args.assignment
 
   # Output as JSON
   print(json.dumps(export, indent=2, ensure_ascii=False))
