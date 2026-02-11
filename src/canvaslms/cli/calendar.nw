@@ -35,6 +35,8 @@ import arrow
 import re
 import textwrap
 
+DEFAULT_COURSE_REGEX = '.*'
+
 <<functions>>
 
 def add_command(subp):
@@ -77,7 +79,10 @@ def add_calendar_list_command(subp):
   calendar_list_parser = subp.add_parser("list",
     help="Lists calendar events",
     description="Lists calendar events. Output, CSV-format: "
-      "<event-id> <title> <start-time> <end-time> <context-type> <context-name>")
+      "<title> <start-time> <end-time> <participants> "
+      "[<context-code> <context-name>] (add with --show-context). "
+      "With -b/--bookings, output is one line per booked student and one line "
+      "for free slots.")
   calendar_list_parser.set_defaults(func=calendar_list_command)
   courses.add_course_option(calendar_list_parser)
   <<add calendar list arguments>>
@@ -102,6 +107,10 @@ We add options to filter events.
 calendar_list_parser.add_argument("--type",
   choices=["event", "assignment"],
   help="Filter by event type")
+
+calendar_list_parser.add_argument("--show-context",
+  action="store_true", default=False,
+  help="Include context columns (context code and name) in output")
 @
 
 When we add time filtering arguments, we allow either a single date/time 
@@ -172,8 +181,14 @@ end_time = utils.format_canvas_time(end_time)
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
+
+The course option defaults to the regex [[.*]].
+We treat this default as \emph{no explicit course filter} and omit any
+context-code parameter, letting Canvas decide which calendars to include.
 <<process course option for calendar list>>=
-course_list = courses.process_course_option(canvas, args)
+course_list = None
+if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+  course_list = courses.process_course_option(canvas, args)
 @
 
 
@@ -181,11 +196,43 @@ course_list = courses.process_course_option(canvas, args)
 
 We fetch the calendar events and output them in CSV format.
 
+The Canvas API supports filtering by context codes, but the REST parameter
+[[context_codes[]]] is limited to 10 values per request.
+Since [[-c/--course]] is a regex, it may match more than 10 courses.
+In that case Canvas would silently ignore additional context codes, so we
+instead fail fast and ask the user to narrow the regex.
+
 The \texttt{args.type} parameter is optional and may be \texttt{None} by default.
 When \texttt{None}, the Canvas API includes all event types (both 
 \enquote{event} and \enquote{assignment}).
 When specified, it filters to only the requested type.
 <<functions>>=
+def event_in_any_context(event, context_set):
+  """Returns True if the event belongs to any of the contexts in context_set.
+
+  For appointment reservations, Canvas may return context_code as a user
+  calendar, while still listing the course context in all_context_codes or
+  effective_context_code.
+  """
+  if not context_set:
+    return True
+
+  code = getattr(event, 'context_code', None)
+  if code in context_set:
+    return True
+
+  code = getattr(event, 'effective_context_code', None)
+  if code in context_set:
+    return True
+
+  all_codes = getattr(event, 'all_context_codes', None)
+  if all_codes:
+    for code in all_codes.split(','):
+      if code.strip() in context_set:
+        return True
+
+  return False
+
 def get_calendar_events(canvas, course_list=None,
                         start_time=None, end_time=None, event_type=None):
   """Fetches calendar events from Canvas with optional filters"""
@@ -194,15 +241,26 @@ def get_calendar_events(canvas, course_list=None,
     context_codes = [f"course_{course.id}" for course in course_list]
   else:
     context_codes = None
-  if context_codes:
-    params['context_codes'] = context_codes
   if start_time:
     params['start_date'] = start_time
   if end_time:
     params['end_date'] = end_time
   if event_type:
     params['type'] = event_type
-    
+
+  if context_codes:
+    if len(context_codes) > 10:
+      canvaslms.cli.err(
+        1,
+        "-c/--course matches more than 10 courses, but the Canvas API only "
+        "accepts up to 10 context codes per request; narrow the regex "
+        "(e.g. '^...$') or match a specific Canvas ID"
+      )
+
+    # canvasapi flattens sequences into repeated `context_codes[]` params.
+    # Passing `context_codes[]` here would become `context_codes[][]`.
+    params['context_codes'] = context_codes
+
   return canvas.get_calendar_events(**params)
 <<get and output calendar events>>=
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
@@ -214,8 +272,14 @@ try:
     end_time=end_time,
     event_type=args.type
   )
+
+  context_set = None
+  if course_list:
+    context_set = {f"course_{course.id}" for course in course_list}
   
   for event in events:
+    if not event_in_any_context(event, context_set):
+      continue
     <<output calendar event data>>
     
 except canvasapi.exceptions.CanvasException as e:
@@ -254,29 +318,47 @@ if args.bookings:
     pass
   else:
     if event.available_slots:
-      output.writerow([
+      row = [
         event.title,
         start_at,
         end_at,
         f"{event.available_slots} free slots"
-      ])
+      ]
+      if args.show_context:
+        row.extend([
+          getattr(event, 'context_code', ''),
+          getattr(event, 'context_name', ''),
+        ])
+      output.writerow(row)
     if slots:
       for slot in slots:
         user_name = slot["user"]["name"]
         user_uname = slot["user"]["login_id"]
-        output.writerow([
+        row = [
           slot["title"],
           canvaslms.cli.utils.format_local_time(slot["start_at"]),
           canvaslms.cli.utils.format_local_time(slot["end_at"]),
           f"{user_name} ({user_uname})"
-        ])
+        ]
+        if args.show_context:
+          row.extend([
+            getattr(event, 'context_code', ''),
+            getattr(event, 'context_name', ''),
+          ])
+        output.writerow(row)
 else:
-  output.writerow([
+  row = [
     event.title,
     start_at,
     end_at,
     participants,
-  ])
+  ]
+  if args.show_context:
+    row.extend([
+      getattr(event, 'context_code', ''),
+      getattr(event, 'context_name', ''),
+    ])
+  output.writerow(row)
 @
 
 
@@ -327,26 +409,23 @@ We fetch events in the requested date window, filter them by regex (if provided)
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
 
-# Prepare parameters for API call
-params = {}
-
-# Process course option
-context_codes = []
-course_list = courses.process_course_option(canvas, args)
-if course_list:
-  context_codes = [f"course_{course.id}" for course in course_list]
-if context_codes:
-  params['context_codes'] = context_codes
-
-if start_time:
-  params['start_date'] = start_time
-if end_time:
-  params['end_date'] = end_time
-
 try:
-  events = canvas.get_calendar_events(**params)
+  course_list = None
+  if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+    course_list = courses.process_course_option(canvas, args)
+
+  events = get_calendar_events(
+    canvas,
+    course_list=course_list,
+    start_time=start_time,
+    end_time=end_time,
+  )
 except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to get calendar events: {e}")
+
+if course_list:
+  context_set = {f"course_{course.id}" for course in course_list}
+  events = [e for e in events if event_in_any_context(e, context_set)]
 
 <<let [[filtered]] be the events filtered by regex>>
 
@@ -661,4 +740,3 @@ while current_start + slot_duration <= end:
   params["appointment_group"]["new_appointments"][str(slot_num)] = slot
   current_start += slot_duration
   slot_num += 1
-
