@@ -831,6 +831,14 @@ We provide the following functions:
 \end{itemize}
 We return the assignments for a list of courses, since we can match several 
 courses with a regular expression (using [[filter_courses]]).
+
+Classic Quizzes in Canvas are available both via the Quizzes API and may appear 
+as assignments with [[submission_types]] including [[online_quiz]].
+However, to ensure we capture all quizzes, especially those that might not be 
+automatically included in [[get_assignments()]], we also fetch quizzes via 
+[[get_quizzes()]] when processing a course.
+For quizzes that have an [[assignment_id]], they will appear in both lists, so 
+we deduplicate by tracking assignment IDs.
 <<functions>>=
 def list_assignments(assignments_containers, ungraded=False):
   """Lists all assignments in all assignments containers (courses or 
@@ -838,30 +846,86 @@ def list_assignments(assignments_containers, ungraded=False):
   for container in assignments_containers:
     if isinstance(container, canvasapi.course.Course):
       course = container
+      <<yield assignments from course>>
+      <<yield classic quizzes as assignments>>
     elif isinstance(container, canvasapi.assignment.AssignmentGroup):
       assignment_group = container
       course = assignment_group.course
-
-    if ungraded:
-      assignments = container.get_assignments(bucket="ungraded")
-    else:
-      assignments = container.get_assignments()
-
-    for assignment in assignments:
-      try:
-        assignment.course = course
-      except NameError:
-        pass
-
-      try:
-        assignment.assignment_group = assignment_group
-      except NameError:
-        pass
-
-      yield assignment
+      <<yield assignments from assignment group>>
 
 def list_ungraded_assignments(assignments_containers):
   return list_assignments(assignments_containers, ungraded=True)
+@
+
+We get all regular assignments first, keeping track of their IDs to avoid 
+duplicates when we also fetch quizzes.
+<<yield assignments from course>>=
+seen_assignment_ids = set()
+
+if ungraded:
+  assignments = course.get_assignments(bucket="ungraded")
+else:
+  assignments = course.get_assignments()
+
+for assignment in assignments:
+  assignment.course = course
+  seen_assignment_ids.add(assignment.id)
+  yield assignment
+@
+
+For assignment groups, we don't need to fetch quizzes separately since they only 
+contain regular assignments.
+<<yield assignments from assignment group>>=
+if ungraded:
+  assignments = assignment_group.get_assignments(bucket="ungraded")
+else:
+  assignments = assignment_group.get_assignments()
+
+for assignment in assignments:
+  assignment.course = course
+  assignment.assignment_group = assignment_group
+  yield assignment
+@
+
+Now we also fetch Classic Quizzes from the course.
+Classic Quizzes that are graded have a corresponding [[assignment_id]].
+These quizzes should appear in [[get_assignments()]], but to be thorough and 
+handle cases where they might not be included (e.g., due to API pagination or 
+filtering), we explicitly fetch them via [[get_quizzes()]] and check if we've 
+already seen their assignment.
+Quizzes without an [[assignment_id]] are practice/ungraded quizzes and don't 
+need to be included in the assignments list.
+<<yield classic quizzes as assignments>>=
+try:
+  for quiz in course.get_quizzes():
+    <<yield quiz assignment if not already seen>>
+except AttributeError:
+  # Some course objects might not support get_quizzes
+  pass
+@
+
+For each quiz with an [[assignment_id]], we check if we've already seen that 
+assignment.
+If not, we fetch the assignment object and yield it.
+This ensures Classic Quizzes are included even if they somehow didn't appear in 
+the initial [[get_assignments()]] call.
+<<yield quiz assignment if not already seen>>=
+try:
+  quiz_assignment_id = quiz.assignment_id
+  if quiz_assignment_id is not None and \
+     quiz_assignment_id not in seen_assignment_ids:
+    # This quiz's assignment wasn't in the regular assignments list
+    # Fetch it explicitly
+    assignment = course.get_assignment(quiz_assignment_id)
+    assignment.course = course
+    seen_assignment_ids.add(assignment.id)
+    yield assignment
+except AttributeError:
+  # Quiz doesn't have assignment_id (practice/ungraded quiz), skip it
+  pass
+except Exception:
+  # If we can't get the assignment for some reason, skip this quiz
+  pass
 @
 
 We also want to filter out assignments on the title based on regex.
