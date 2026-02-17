@@ -1,0 +1,393 @@
+\chapter{The [[syllabus]] command}
+\chapterprecis{%
+  This chapter provides commands for viewing and editing the course syllabus.
+}
+
+The syllabus is a special piece of course content in Canvas: unlike pages,
+assignments, or announcements, which are separate API objects with their own
+endpoints, the syllabus is simply an attribute on the Course object itself
+([[course.syllabus_body]]). This difference has two important consequences for
+the implementation:
+
+\begin{description}
+\item[Simpler selection] There is exactly one syllabus per course, so we
+  never need regex matching, title filtering, or list commands. The [[-c]]
+  course option is sufficient to identify the syllabus.
+\item[Different update pattern] Pages use [[page.edit()]], assignments use
+  [[assignment.edit()]], but the syllabus requires
+  [[course.update(course={'syllabus_body': html})]]. This is the first command
+  in the CLI that modifies a course object rather than a content object.
+\end{description}
+
+Despite these differences, the editing \emph{workflow} is the same as for
+pages and assignments: export to Markdown with YAML front matter, edit locally
+(perhaps in a Git repository), and push back to Canvas. We reuse the content
+module's infrastructure for YAML parsing, rendering, and editor integration.
+
+
+\section{Module outline}
+
+We structure the module following the standard CLI pattern. The syllabus
+command has two subcommands: [[view]] and [[edit]].
+<<[[syllabus.py]]>>=
+import logging
+import sys
+
+import pypandoc
+import rich.console
+import rich.markdown
+import rich.syntax
+
+import canvaslms.cli
+import canvaslms.cli.content
+import canvaslms.cli.courses
+
+logger = logging.getLogger(__name__)
+
+<<syllabus schema>>
+<<functions>>
+
+def add_command(subp):
+  """Adds the syllabus command with subcommands to argparse parser."""
+  syllabus_parser = subp.add_parser("syllabus",
+    help="View and edit the course syllabus",
+    description="View and edit the course syllabus. "
+      "The syllabus is a per-course attribute, "
+      "so only the -c option is needed for selection.")
+
+  syllabus_subp = syllabus_parser.add_subparsers(
+    title="syllabus commands",
+    dest="syllabus_command",
+    required=True)
+
+  <<add syllabus view subcommand>>
+  <<add syllabus edit subcommand>>
+@
+
+
+\section{The syllabus schema}
+
+The syllabus has essentially no editable metadata beyond the body content
+itself. We define a minimal schema with just a [[course]] field for
+identification in the exported YAML. This field is informational
+only---it tells the user which course the syllabus belongs to when they
+see the file, but course selection always uses the [[-c]] option.
+
+We do not add this schema to [[content.nw]] because it is specific to this
+command and unlikely to be reused. The announcement, assignment, and page
+schemas in [[content.nw]] are shared across multiple commands; the syllabus
+schema is not.
+<<syllabus schema>>=
+SYLLABUS_SCHEMA = {
+    'course': {
+        'default': '',
+        'required': False,
+        'canvas_attr': None,
+        'description': 'Course code (informational, for identification)'
+    },
+}
+@
+
+
+\section{Fetching the syllabus}
+
+The [[get_courses()]] call used by [[process_course_option]] does not include
+the syllabus body by default---it would be wasteful to fetch potentially large
+HTML content for every course in every command. We must re-fetch the specific
+course with [[include=['syllabus_body']]] to get the content.
+
+Why not just access [[course.syllabus_body]] directly? Because the attribute
+simply will not exist on course objects returned by [[get_courses()]] unless
+explicitly requested via the [[include]] parameter. The Canvas API treats
+[[syllabus_body]] as an optional expansion, similar to how page listings
+exclude the [[body]] attribute.
+<<functions>>=
+def get_course_with_syllabus(canvas, course):
+  """Re-fetch a course with the syllabus_body attribute included.
+
+  Args:
+      canvas: Canvas API instance
+      course: Course object (from get_courses, lacks syllabus_body)
+
+  Returns:
+      Course object with syllabus_body attribute populated
+  """
+  full_course = canvas.get_course(course.id,
+    include=['syllabus_body'])
+  return full_course
+@
+
+
+\section{The [[syllabus view]] subcommand}
+
+The [[view]] subcommand displays the course syllabus. It follows the same
+output conventions as [[pages view]]:
+
+\begin{description}
+\item[TTY output] Rich-rendered Markdown with a pager for comfortable reading
+\item[Piped output] YAML front matter plus Markdown, suitable for saving to a
+  file and editing
+\item[The [[--html]] option] Preserves the original HTML instead of converting
+  to Markdown, for syllabi with embedded elements that don't convert well
+\end{description}
+<<add syllabus view subcommand>>=
+view_parser = syllabus_subp.add_parser("view",
+    help="View the course syllabus",
+    description="View the course syllabus. "
+      "When piped, outputs YAML front matter plus Markdown "
+      "suitable for editing and pushing back with 'syllabus edit -f'. "
+      "Use --html to preserve HTML instead of converting to Markdown.")
+view_parser.set_defaults(func=syllabus_view_command)
+canvaslms.cli.courses.add_course_option(view_parser, required=True)
+view_parser.add_argument("--html",
+    action="store_true",
+    help="Output raw HTML instead of converting to Markdown")
+@
+
+<<functions>>=
+def syllabus_view_command(config, canvas, args):
+  """View the course syllabus."""
+  course_list = canvaslms.cli.courses.process_course_option(
+      canvas, args)
+  course = course_list[0]
+  full_course = get_course_with_syllabus(canvas, course)
+
+  syllabus_body = getattr(full_course, 'syllabus_body', None) or ''
+
+  if sys.stdout.isatty():
+    <<display syllabus in terminal>>
+  else:
+    <<output syllabus in editable format>>
+@
+
+\subsection{Terminal display}
+
+In TTY mode we render the syllabus as Markdown with Rich, showing a header
+with the course name for context. When [[--html]] is specified, we show
+syntax-highlighted HTML instead.
+<<display syllabus in terminal>>=
+console = rich.console.Console()
+if args.html:
+  <<display syllabus html in tty>>
+else:
+  <<display syllabus markdown in tty>>
+@
+
+<<display syllabus markdown in tty>>=
+text = f"# Syllabus: {full_course.course_code}\n\n"
+if syllabus_body:
+  try:
+    markdown_content = pypandoc.convert_text(
+        syllabus_body, 'md', format='html')
+    text += markdown_content
+  except Exception:
+    text += syllabus_body
+else:
+  text += "(No syllabus content)"
+
+with console.pager(styles=False, links=True):
+  console.print(rich.markdown.Markdown(text, code_theme="manni"))
+@
+
+<<display syllabus html in tty>>=
+header = f"# Syllabus: {full_course.course_code}\n\n"
+header += "## Content (HTML)\n\n"
+
+with console.pager(styles=True):
+  console.print(rich.markdown.Markdown(header))
+  if syllabus_body:
+    syntax = rich.syntax.Syntax(
+        syllabus_body, "html", theme="monokai",
+        word_wrap=True)
+    console.print(syntax)
+  else:
+    console.print("(No syllabus content)")
+@
+
+\subsection{Editable output format}
+
+When piped, we output YAML front matter plus the body converted to Markdown.
+This format can be saved, edited, and pushed back with [[syllabus edit -f]].
+
+The [[course]] field in the front matter is informational: it shows which course
+the syllabus belongs to, but course selection on import always uses [[-c]].
+We use [[render_to_markdown]] from [[content.nw]], passing the course object
+with [[content_attr='syllabus_body']]. Since [[SYLLABUS_SCHEMA]] has no
+[[canvas_attr]] mappings (the [[course]] field has [[canvas_attr=None]]), we
+pass the course code via [[extra_attributes]].
+<<output syllabus in editable format>>=
+if args.html:
+  output = canvaslms.cli.content.render_to_html(
+      full_course,
+      SYLLABUS_SCHEMA,
+      content_attr='syllabus_body',
+      extra_attributes={'course': full_course.course_code})
+else:
+  output = canvaslms.cli.content.render_to_markdown(
+      full_course,
+      SYLLABUS_SCHEMA,
+      content_attr='syllabus_body',
+      extra_attributes={'course': full_course.course_code})
+print(output)
+@
+
+
+\section{The [[syllabus edit]] subcommand}
+
+The [[edit]] subcommand updates the syllabus. Like [[pages edit]], it supports
+two modes:
+
+\begin{description}
+\item[File mode ([[-f]])] Reads content from a Markdown file with YAML front
+  matter and updates directly. This enables a Git-based workflow: export the
+  syllabus with [[view]], edit locally, push back with [[edit -f]].
+\item[Interactive mode] (default) Opens the current syllabus in your editor,
+  shows a preview, and asks whether to accept, edit further, or discard.
+\end{description}
+<<add syllabus edit subcommand>>=
+edit_parser = syllabus_subp.add_parser("edit",
+    help="Edit the course syllabus",
+    description="Edit the course syllabus interactively or from a file. "
+      "Without -f, opens the syllabus in your editor for interactive "
+      "editing with preview. "
+      "With -f, reads from a Markdown file with YAML front matter "
+      "and updates directly (script-friendly). "
+      "Use --html to read/edit HTML directly without Markdown conversion.")
+edit_parser.set_defaults(func=syllabus_edit_command)
+canvaslms.cli.courses.add_course_option(edit_parser, required=True)
+canvaslms.cli.content.add_file_option(edit_parser)
+edit_parser.add_argument("--html",
+    action="store_true",
+    help="Read file as HTML instead of converting from Markdown. "
+         "In interactive mode, edit HTML directly.")
+@
+
+<<functions>>=
+def syllabus_edit_command(config, canvas, args):
+  """Edit the course syllabus interactively or from file."""
+  if args.file:
+    <<edit syllabus from file>>
+  else:
+    <<edit syllabus interactively>>
+@
+
+\subsection{File-based editing}
+
+When [[-f]] is provided, we read the file, convert content to HTML (unless
+[[--html]] is specified), and update the course syllabus via the Canvas API.
+
+The update uses [[course.update()]] rather than an [[edit()]] method on a
+content object. This is the key difference from pages and assignments:
+we modify a course attribute directly.
+<<edit syllabus from file>>=
+<<read syllabus content from file>>
+<<update syllabus on canvas>>
+@
+
+<<read syllabus content from file>>=
+try:
+  attributes, body_content = \
+      canvaslms.cli.content.read_content_from_file(args.file)
+except FileNotFoundError:
+  canvaslms.cli.err(1, f"File not found: {args.file}")
+except Exception as e:
+  canvaslms.cli.err(1, f"Error reading file: {e}")
+@
+
+<<update syllabus on canvas>>=
+if args.html:
+  html_content = body_content
+else:
+  html_content = pypandoc.convert_text(
+      body_content, 'html', format='md')
+
+course_list = canvaslms.cli.courses.process_course_option(
+    canvas, args)
+course = course_list[0]
+
+try:
+  course.update(course={'syllabus_body': html_content})
+  logger.info(
+      f"Updated syllabus for {course.course_code}")
+except Exception as e:
+  canvaslms.cli.err(
+      1, f"Error updating syllabus for "
+      f"'{course.course_code}': {e}")
+@
+
+\subsection{Interactive editing}
+
+Interactive mode fetches the current syllabus, opens it in the user's editor
+with YAML front matter, shows a preview, and enters the accept/edit/discard
+loop from [[content.nw]].
+<<edit syllabus interactively>>=
+course_list = canvaslms.cli.courses.process_course_option(
+    canvas, args)
+course = course_list[0]
+full_course = get_course_with_syllabus(canvas, course)
+
+<<prepare syllabus for editor>>
+<<open editor with syllabus>>
+<<confirm and update syllabus>>
+@
+
+We extract the current syllabus body and build the initial attributes for
+the editor template. The [[content_attr='syllabus_body']] parameter tells
+[[get_content_from_editor]] to extract the body from the attributes, convert
+it from HTML to Markdown, and place it after the YAML front matter.
+<<prepare syllabus for editor>>=
+current_attrs = canvaslms.cli.content.extract_attributes_from_object(
+    full_course, SYLLABUS_SCHEMA)
+current_attrs['syllabus_body'] = getattr(
+    full_course, 'syllabus_body', '') or ''
+@
+
+<<open editor with syllabus>>=
+result = canvaslms.cli.content.get_content_from_editor(
+    SYLLABUS_SCHEMA,
+    current_attrs,
+    content_attr='syllabus_body',
+    extra_attributes={'course': full_course.course_code},
+    html_mode=args.html)
+if result is None:
+  print("Editor cancelled.", file=sys.stderr)
+  return
+
+attributes, body_content = result
+@
+
+After editing, we enter the interactive confirmation loop. If the user
+accepts, we convert to HTML and update the course.
+<<confirm and update syllabus>>=
+result = canvaslms.cli.content.interactive_confirm_and_edit(
+    f"Syllabus: {full_course.course_code}",
+    body_content, attributes,
+    SYLLABUS_SCHEMA, "Syllabus",
+    content_attr='syllabus_body')
+
+if result is None:
+  print("Discarded changes.", file=sys.stderr)
+  return
+
+final_attrs, final_content = result
+
+if args.html:
+  html_content = final_content
+else:
+  try:
+    html_content = pypandoc.convert_text(
+        final_content, 'html', format='md')
+  except Exception as e:
+    logger.warning(
+        f"Failed to convert markdown to HTML: {e}")
+    html_content = final_content
+
+try:
+  course.update(course={'syllabus_body': html_content})
+  logger.info(
+      f"Updated syllabus for {full_course.course_code}")
+except Exception as e:
+  canvaslms.cli.err(
+      1, f"Error updating syllabus for "
+      f"'{full_course.course_code}': {e}")
+@
