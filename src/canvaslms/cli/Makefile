@@ -16,6 +16,7 @@ MODULES+=	quizzes.py quizzes.tex
 MODULES+=	cache.py cache.tex
 MODULES+=	content.py content.tex
 MODULES+=	pages.py pages.tex
+MODULES+=	syllabus.py syllabus.tex
 
 .PHONY: all
 all: ${MODULES}
