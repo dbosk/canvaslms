@@ -28,6 +28,7 @@ canvaslms.pdf: ${EXAMPLES}
 
 canvaslms.pdf: ${SRC_DIR}/hacks/canvasapi.tex
 canvaslms.pdf: ${SRC_DIR}/hacks/attachment_cache.tex
+canvaslms.pdf: ${SRC_DIR}/canvaslms.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cli.tex
 canvaslms.pdf: ${SRC_DIR}/cli/login.tex
 canvaslms.pdf: ${SRC_DIR}/cli/courses.tex
