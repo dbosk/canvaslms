@@ -583,10 +583,15 @@ make distclean     # Removes build/, dist/, *.egg-info
 
 ### Module-level Builds
 
-Each module directory (`src/canvaslms/cli/`, `src/canvaslms/grades/`) has its own Makefile:
+Each literate source area has its own Makefile. The package root
+(`src/canvaslms/`) also has one for the top-level package module:
 
 ```bash
 # Regenerate Python from .nw in a specific module
+cd src/canvaslms
+make all           # Generates top-level __init__.py and canvaslms.tex
+
+# Regenerate CLI modules from .nw
 cd src/canvaslms/cli
 make all           # Generates all .py and .tex files from .nw sources
 make clean         # Removes generated files
@@ -597,6 +602,7 @@ make clean         # Removes generated files
 - Uses Make with custom makefiles from `makefiles/` directory
 - `noweb.mk` provides suffix rules for weaving (.nw → .tex) and tangling (.nw → .py)
 - Each module's Makefile lists files in `MODULES` variable
+- `src/canvaslms/__init__.py` is generated from `src/canvaslms/canvaslms.nw` via intermediate `init.py`
 - `cli/__init__.py` is generated from `cli.nw` via intermediate `cli.py`
 
 ## Code Structure
@@ -605,6 +611,7 @@ make clean         # Removes generated files
 
 ```
 src/canvaslms/
+├── canvaslms.nw       # Top-level package API (generates __init__.py)
 ├── cli/              # CLI subcommands (.nw sources)
 │   ├── cli.nw        # Main entry point (generates __init__.py)
 │   ├── login.nw      # Authentication
@@ -620,7 +627,8 @@ src/canvaslms/
 │   ├── fbf.nw        # Feedback functionality
 │   └── utils.nw      # Shared utilities
 ├── grades/           # Grading algorithms (.nw sources)
-└── hacks/            # Canvas API extensions
+├── hacks/            # Canvas API extensions
+└── __init__.py       # Generated from canvaslms.nw
 ```
 
 ### CLI Module Pattern

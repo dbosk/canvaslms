@@ -1,0 +1,381 @@
+\chapter{The top-level [[canvaslms]] package}
+\label{chap:canvaslms-package}
+
+The command-line interface is the most visible entry point, but the package also
+serves Python programs.
+We therefore expose a top-level [[canvas]] object so that a script can write
+[[import canvaslms; canvaslms.canvas.get_courses()]] and receive the same cached
+Canvas client that the command uses.
+This also gives other command-line tools a simple integration point: they can
+import [[canvaslms]] and reuse the same authentication, configuration, and
+encrypted cache as the [[canvaslms]] command instead of rebuilding that setup.
+
+The intended use is easiest to grasp from a tiny script:
+
+\begin{minted}{python}
+import canvaslms
+
+for course in canvaslms.canvas.get_courses():
+    print(course.name)
+\end{minted}
+
+Importing [[canvaslms]] itself stays cheap.
+The first access to [[canvaslms.canvas]] loads the configured Canvas client,
+restoring the encrypted cache when possible, and a normal process exit saves the
+warmed cache back to disk automatically.
+
+This convenience API has two constraints that pull in different directions.
+On the one hand, importing [[canvaslms]] should stay cheap---many programs may
+import the package without immediately talking to Canvas.
+On the other hand, once a program does ask for [[canvas]], it should reuse the
+encrypted cache and save any warmed caches back to disk automatically.
+
+We reconcile these constraints with lazy loading.
+The package stores no Canvas object at import time.
+Instead, the module-level [[__getattr__]] hook loads the client on first access
+to [[canvas]], memoizes it for the rest of the process, and registers an
+[[atexit]] handler so callers do not have to remember to save the cache.
+
+\section{Module outline}
+
+The package-level module is intentionally small.
+It delegates Canvas construction to [[canvaslms.cli.cache]], because that
+module already owns encrypted persistence and retry configuration.
+The top-level package merely adds a public facade and process-local singleton
+management.
+
+<<[[init.py]]>>=
+"""Top-level convenience API for lazy Canvas access."""
+
+import atexit
+import appdirs
+
+dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
+
+__all__ = [
+    "CanvasCredentialsError",
+    "canvas",
+    "get_canvas",
+    "reload_canvas",
+    "save_canvas",
+]
+
+_canvas = None
+_canvas_hostname = None
+_canvas_token = None
+_canvas_config_file = None
+_canvas_atexit_registered = False
+
+<<functions>>
+@
+
+To keep imports light, we do not read configuration eagerly.
+We only need the default path when a caller asks for a Canvas object without
+specifying a configuration file explicitly.
+
+<<functions>>=
+def default_config_file():
+  """Return the default configuration file path."""
+  return f"{dirs.user_config_dir}/config.json"
+@
+
+We normalise the configuration-file argument before comparing it to the cached
+singleton state.
+This way [[None]] and an explicit default path refer to the same logical
+configuration.
+
+<<functions>>=
+def resolve_config_file(config_file=None):
+  """Return the effective configuration file path."""
+  return config_file or default_config_file()
+@
+
+The actual work of loading credentials, restoring encrypted cache state, and
+configuring retry policy already lives in the CLI cache module.
+We reuse it here so the command-line tool and Python programs observe the same
+behaviour.
+
+We keep that import local to avoid turning [[import canvaslms]] into an eager
+Canvas setup step.
+
+<<functions>>=
+def load_canvas_from_configuration(config_file=None, use_cache=True):
+  """Load a configured Canvas object and its cache metadata."""
+  import canvaslms.cli
+  import canvaslms.cli.cache
+
+  config_file = resolve_config_file(config_file)
+  config = canvaslms.cli.read_configuration(config_file)
+  canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
+      config,
+      use_cache=use_cache,
+  )
+  return config_file, canvas, hostname, token
+@
+
+Once we have loaded a cached Canvas object, we remember both the object and the
+credentials needed to save it again.
+The top-level package only memoizes the cached mode.
+Callers that request [[use_cache=False]] receive a fresh object each time.
+
+<<functions>>=
+def remember_canvas(canvas, hostname, token, config_file):
+  """Store the loaded Canvas singleton and its cache metadata."""
+  global _canvas, _canvas_hostname, _canvas_token, _canvas_config_file
+
+  _canvas = canvas
+  _canvas_hostname = hostname
+  _canvas_token = token
+  _canvas_config_file = config_file
+@
+
+The singleton can be reset explicitly.
+This is useful for tests and for programs that change credentials or
+configuration during the same process.
+
+<<functions>>=
+def clear_canvas_state():
+  """Forget the cached Canvas singleton."""
+  global _canvas, _canvas_hostname, _canvas_token, _canvas_config_file
+
+  _canvas = None
+  _canvas_hostname = None
+  _canvas_token = None
+  _canvas_config_file = None
+@
+
+Automatic persistence is the main difference between the package-level API and
+the lower-level loader.
+We register the save hook exactly once so that any process using
+[[canvaslms.canvas]] saves its cache on normal interpreter shutdown.
+
+<<functions>>=
+def register_canvas_atexit():
+  """Register the package-level Canvas cache save hook once."""
+  global _canvas_atexit_registered
+
+  if not _canvas_atexit_registered:
+    atexit.register(save_canvas)
+    _canvas_atexit_registered = True
+@
+
+The public [[save_canvas]] function remains available for callers that want an
+immediate flush, but the common case is handled by [[atexit]].
+We return a boolean so tests and callers can tell whether anything was saved.
+
+<<functions>>=
+def save_canvas():
+  """Persist the memoized Canvas object if one has been loaded."""
+  if _canvas is None:
+    return False
+
+  import canvaslms.cli.cache
+
+  canvaslms.cli.cache.save_canvas_cache(_canvas, _canvas_token, _canvas_hostname)
+  return True
+@
+
+The public accessor distinguishes between two modes.
+With [[use_cache=True]] we provide the memoized singleton and register the
+automatic save hook.
+With [[use_cache=False]] we still construct a correctly configured Canvas
+object, but we do not replace the singleton state.
+
+<<functions>>=
+def get_canvas(config_file=None, use_cache=True):
+  """Return a configured Canvas client.
+
+  When ``use_cache`` is true, this returns a process-local singleton backed by
+  the encrypted on-disk cache.
+  """
+  config_file = resolve_config_file(config_file)
+
+  if use_cache and _canvas is not None and _canvas_config_file == config_file:
+    return _canvas
+
+  config_file, canvas, hostname, token = load_canvas_from_configuration(
+      config_file,
+      use_cache=use_cache,
+  )
+
+  if use_cache:
+    remember_canvas(canvas, hostname, token, config_file)
+    register_canvas_atexit()
+
+  return canvas
+@
+
+Reloading is just the explicit form of invalidating the memoized singleton.
+The caller may use it after changing credentials, clearing the cache, or when a
+long-running process wants to discard warmed state.
+
+<<functions>>=
+def reload_canvas(config_file=None, use_cache=True):
+  """Reload and return the configured Canvas client."""
+  if use_cache:
+    clear_canvas_state()
+  return get_canvas(config_file=config_file, use_cache=use_cache)
+@
+
+The module-level [[__getattr__]] hook turns [[canvaslms.canvas]] into a lazy
+attribute instead of an eagerly created global.
+The same hook also exposes [[CanvasCredentialsError]] from the shared cache
+module without eagerly constructing a Canvas client.
+Any other missing attribute should still produce the normal [[AttributeError]].
+
+<<functions>>=
+def canvas_credentials_error_class():
+  """Return the shared missing-credentials exception class."""
+  import canvaslms.cli.cache
+
+  return canvaslms.cli.cache.CanvasCredentialsError
+
+
+def __getattr__(name):
+  """Lazily expose the package-level Canvas singleton."""
+  if name == "canvas":
+    return get_canvas()
+  if name == "CanvasCredentialsError":
+    return canvas_credentials_error_class()
+  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+@
+
+Now let us verify that the package really behaves like a lazy singleton facade.
+The tests focus on the public API rather than on the internal storage details.
+
+<<test [[canvaslms.py]]>>=
+"""Tests for the top-level canvaslms convenience API."""
+
+import canvaslms
+import pytest
+
+<<test functions>>
+@
+
+Each test starts from a clean singleton state so the memoized object from one
+case cannot influence the next.
+
+<<test functions>>=
+@pytest.fixture(autouse=True)
+def reset_canvas_state():
+  """Reset the package-level Canvas singleton around each test."""
+  canvaslms.clear_canvas_state()
+  canvaslms._canvas_atexit_registered = False
+  yield
+  canvaslms.clear_canvas_state()
+  canvaslms._canvas_atexit_registered = False
+@
+
+The central promise is memoization: repeated access with the same configuration
+should only load the Canvas object once.
+
+<<test functions>>=
+def test_get_canvas_memoizes_cached_instance(monkeypatch):
+  """Cached package access should reuse the same Canvas object."""
+  loaded = []
+  expected = object()
+
+  def fake_loader(config_file=None, use_cache=True):
+    loaded.append((config_file, use_cache))
+    return config_file, expected, "https://canvas.example", "token"
+
+  monkeypatch.setattr(canvaslms, "load_canvas_from_configuration", fake_loader)
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+
+  first = canvaslms.get_canvas(config_file="/tmp/config.json")
+  second = canvaslms.get_canvas(config_file="/tmp/config.json")
+
+  assert first is expected
+  assert second is expected
+  assert loaded == [("/tmp/config.json", True)]
+@
+
+When a caller requests an explicit reload, we must discard the remembered object
+and ask the lower-level loader again.
+
+<<test functions>>=
+def test_reload_canvas_replaces_singleton(monkeypatch):
+  """Reloading should replace the memoized Canvas object."""
+  canvases = [object(), object()]
+
+  def fake_loader(config_file=None, use_cache=True):
+    return config_file, canvases.pop(0), "https://canvas.example", "token"
+
+  monkeypatch.setattr(canvaslms, "load_canvas_from_configuration", fake_loader)
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+
+  first = canvaslms.get_canvas(config_file="/tmp/config.json")
+  second = canvaslms.reload_canvas(config_file="/tmp/config.json")
+
+  assert first is not second
+@
+
+Programs using the top-level package should not have to remember the encrypted
+cache details.
+The public save helper therefore forwards the stored metadata to the CLI cache
+module.
+
+<<test functions>>=
+def test_save_canvas_persists_loaded_singleton(monkeypatch):
+  """Saving should forward the memoized Canvas and credentials."""
+  saved = []
+  expected = object()
+
+  canvaslms.remember_canvas(
+      expected,
+      "https://canvas.example",
+      "token",
+      "/tmp/config.json",
+  )
+
+  import canvaslms.cli.cache as canvas_cache
+
+  monkeypatch.setattr(
+      canvas_cache,
+      "save_canvas_cache",
+      lambda canvas, token, hostname: saved.append((canvas, token, hostname)),
+  )
+
+  assert canvaslms.save_canvas() is True
+  assert saved == [(expected, "token", "https://canvas.example")]
+@
+
+Finally, the lazy attribute itself should simply delegate to the public loader.
+This keeps the attribute syntax and the function syntax equivalent.
+
+<<test functions>>=
+def test_canvas_attribute_uses_public_loader(monkeypatch):
+  """The lazy [[canvas]] attribute should use [[get_canvas()]]."""
+  expected = object()
+
+  monkeypatch.setattr(canvaslms, "get_canvas", lambda: expected)
+
+  assert canvaslms.canvas is expected
+@
+
+Missing credentials are part of the public contract.
+We surface the dedicated exception instead of returning [[None]], because that
+fails immediately and tells callers how to fix the environment.
+
+<<test functions>>=
+def test_lazy_exception_attribute_returns_shared_type():
+  """The package should lazily expose the shared credentials error."""
+  assert canvaslms.CanvasCredentialsError is canvaslms.canvas_credentials_error_class()
+@
+
+<<test functions>>=
+def test_get_canvas_raises_for_missing_credentials(monkeypatch):
+  """Missing credentials should raise a dedicated runtime error."""
+  monkeypatch.setattr(
+      canvaslms,
+      "load_canvas_from_configuration",
+      lambda config_file=None, use_cache=True: (_ for _ in ()).throw(
+          canvaslms.canvas_credentials_error_class()(
+              "No hostname or token, run `canvaslms login`"
+          )
+      ),
+  )
+
+  with pytest.raises(canvaslms.canvas_credentials_error_class()):
+    canvaslms.get_canvas(config_file="/tmp/config.json")
+@
