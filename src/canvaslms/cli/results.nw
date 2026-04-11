@@ -55,10 +55,12 @@ We define the test file structure early, but place each test after the
 functionality it verifies.
 
 <<test [[results.py]]>>=
-"""Tests for student identifier selection in results."""
+"""Tests for the canvaslms.cli.results module."""
 
 import argparse
 from types import SimpleNamespace
+
+import canvasapi.exceptions
 
 import canvaslms.cli.results as results_module
 
@@ -194,7 +196,15 @@ The first helper decides which attribute name applies to the current command,
 and the second reads that attribute from the user object.
 <<functions>>=
 def result_identifier_attribute(args):
-  """Return the user attribute name used as identifier."""
+  """Return the user attribute name to use as the row identifier.
+
+  Precedence:
+  1. ``args.identifier`` if explicitly set (e.g. via ``--identifier``);
+  2. ``DEFAULT_MISSING_IDENTIFIER`` (``login_id``) when ``args.missing``
+     is truthy, since missing-assignment reports are contact-oriented;
+  3. ``DEFAULT_RESULTS_IDENTIFIER`` (``integration_id``) otherwise, which
+     feeds administrative systems such as LADOK.
+  """
   if getattr(args, "identifier", None) is not None:
     return args.identifier
   if getattr(args, "missing", False):
@@ -204,11 +214,16 @@ def result_identifier_attribute(args):
 
 <<functions>>=
 def result_identifier(user, args):
-  """Return the selected identifier value for ``user``."""
+  """Return the identifier value for ``user`` selected by ``args``.
+
+  Reads the attribute chosen by :func:`result_identifier_attribute` off
+  of ``user`` and returns its value (not the attribute name).
+  """
   return getattr(user, result_identifier_attribute(args))
 @
 
-Let's verify both implicit defaults and the explicit override.
+Let's verify the two implicit defaults, the explicit override, and that
+[[result_identifier]] reads the selected attribute from the user object.
 
 <<test functions>>=
 def test_result_identifier_attribute_defaults_to_integration_id():
@@ -282,9 +297,38 @@ def filter_grade(grade, regex):
 \section{Summarizing assignment results}
 
 In this case, we want to have one assignment per row in the output.
-We want to output course, assignment, student identifier, grade, submission
-date and
-those who participated in the grading.
+Like the assignment-group and module summarizers, this path supports two
+sub-cases: a normal grade export and a missing-assignments report.
+The command dispatches here whenever the user gives
+[[-a]]/[[--assignment]] without an assignment group or module, and the
+[[--missing]] flag selects which of the two sub-cases runs.
+
+Previously, the missing sub-case was only implemented for assignment groups
+and modules, so [[--missing]] was a silent no-op on the [[-a]] path.
+That became observable once the row identifier was made configurable: the
+default identifier flipped to [[login_id]] on [[--missing]] even though the
+output was still a graded-row export.
+We now plumb [[--missing]] through the [[-a]] path too, so that
+[[canvaslms results -a 'Homework 1' --missing]] produces the same shape of
+output you would get from [[-A]] on an assignment group that contains only
+[[Homework 1]].
+
+<<functions>>=
+def summarize_assignments(canvas, args):
+  """
+  Turn submissions into grade rows, or into missing-assignment rows when
+  ``args.missing`` is set:
+  - canvas is a Canvas object,
+  - args is the command-line arguments, as parsed by argparse.
+  """
+
+  if args.missing:
+    <<produce a list of missing assignments for assignment filter>>
+  else:
+    <<produce a list of graded rows for assignment filter>>
+@
+
+\subsection{Producing a list of grades}
 
 We first get the list of courses.
 We do this to then get the list of all users in all courses.
@@ -295,39 +339,32 @@ LADOK for example.
 Then we get the list of assignments in all courses.
 We get the submissions for each assignment.
 These submissions are filtered by user.
-We do this because this attaches a [[user]] attribute to each submissions with 
+We do this because this attaches a [[user]] attribute to each submissions with
 the details of each user.
 This gives a trivial [[yield]] statement at the end.
-<<functions>>=
-def summarize_assignments(canvas, args):
-  """
-  Turn submissions into results:
-  - canvas is a Canvas object,
-  - args is the command-line arguments, as parsed by argparse.
-  """
+<<produce a list of graded rows for assignment filter>>=
+<<create [[submissions_list]]>>
 
-  <<create [[submissions_list]]>>
-
-  for submission in submissions_list:
-    if submission.grade is not None:
-      if filter_grade(submission.grade, args.filter_grades):
-        yield [
-          submission.assignment.course.course_code,
-          submission.assignment.name,
-          result_identifier(submission.user, args),
-          submission.grade,
-          round_to_day(submission.submitted_at or submission.graded_at),
-          *all_graders(submission)
-        ]
+for submission in submissions_list:
+  if submission.grade is not None:
+    if filter_grade(submission.grade, args.filter_grades):
+      yield [
+        submission.assignment.course.course_code,
+        submission.assignment.name,
+        result_identifier(submission.user, args),
+        submission.grade,
+        round_to_day(submission.submitted_at or submission.graded_at),
+        *all_graders(submission)
+      ]
 @
 
-To create the list of submissions, [[submissions_list]], we have to do the 
+To create the list of submissions, [[submissions_list]], we have to do the
 following.
 First need to list the courses.
 For each course we need to get all the users (students).
 Then, for each course, we also need all the assignments.
 When we have the assignments, we can get the submissions.
-Fortunately, we can use the filtering functions provided by the [[courses]], 
+Fortunately, we can use the filtering functions provided by the [[courses]],
 [[assignments]] and [[submissions]] modules.
 They will parse the CLI arguments and generate the lists.
 <<create [[submissions_list]]>>=
@@ -339,6 +376,87 @@ submissions_list = submissions.filter_submissions(
                                include=["submission_history"]),
   users_list)
 @
+
+\subsection{Producing a list of missing assignments}
+\label{sec:summarize-assignments-missing}
+
+The missing path mirrors the [[-A]] path, but without the outer
+course/group loop: [[process_assignment_option]] already returns a flat
+list of assignments with their [[course]] attached, so we can hand that
+list directly to [[missing.missing_assignments]].
+We wrap the users in a [[set]] the same way [[summarize_assignment_groups]]
+does, to avoid duplicate rows when a user appears under several filters.
+
+The row shape matches the other missing paths:
+[[(course code, component, identifier, missing assignment, reason)]].
+Here the \enquote{component} column is the matched assignment's own name,
+so on each row columns~2 and~4 hold the same value when the [[-a]] filter
+matches a single assignment.
+That coincidence is intentional: downstream tools already consume the
+five-column contract from the [[-A]] path, and keeping column~2 stable
+lets them treat [[-a --missing]] and [[-A --missing]] identically.
+<<produce a list of missing assignments for assignment filter>>=
+assignments_list = list(assignments.process_assignment_option(canvas, args))
+users_list = set(users.process_user_or_group_option(canvas, args))
+
+<<load the correct missing module as [[missing]]>>
+<<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
+for user, assignment, reason in missing_results:
+  yield [
+    assignment.course.course_code,
+    assignment.name,
+    result_identifier(user, args),
+    assignment.name,
+    reason
+  ]
+@
+
+Let's pin the behaviour of the default [[missing_assignments]] helper that
+this path now depends on.
+The [[-a --missing]] dispatch inherits two guarantees from it: missing
+submissions are reported with a reason, and assignments matching
+[[args.optional_assignments]] are skipped before any submission lookup.
+
+<<test functions>>=
+def test_missing_assignments_default_reports_not_submitted():
+  user = SimpleNamespace(id=1)
+
+  class _Assignment:
+    def __init__(self, name):
+      self.name = name
+
+    def get_submission(self, user):
+      raise canvasapi.exceptions.ResourceDoesNotExist(
+        "no submission")
+
+  assignment = _Assignment("Homework 1")
+
+  rows = list(results_module.missing_assignments(
+    [assignment], [user]))
+
+  assert rows == [(user, assignment, "no submission exists")]
+
+
+def test_missing_assignments_honours_optional_assignments():
+  user = SimpleNamespace(id=1)
+
+  class _Assignment:
+    def __init__(self, name):
+      self.name = name
+
+    def get_submission(self, user):
+      raise AssertionError(
+        "optional assignments must be skipped before submission lookup")
+
+  optional = _Assignment("Optional: extra reading")
+
+  rows = list(results_module.missing_assignments(
+    [optional], [user],
+    optional_assignments=[r"^Optional:"]))
+
+  assert rows == []
+@
+
 
 \section{Fixing the dates}
 
@@ -702,8 +820,8 @@ results_parser.add_argument("--missing",
        "Uses the summary module's missing_assignments() if available, "
        "otherwise uses the default implementation. "
        <<missing module behaviour>>
-       "This option only has effect when working with assignment groups "
-       "or modules.")
+       "Works with -a (single assignments), -A (assignment groups), and "
+       "-m (modules).")
 @
 
 Since [[--missing]] is now a simple flag, we use the summary module (specified
