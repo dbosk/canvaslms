@@ -10,6 +10,7 @@ We outline the module:
 import argparse
 import arrow
 import canvaslms.cli
+import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 import csv
 import datetime
@@ -132,14 +133,14 @@ the moment the user happened to be enrolled in such a course.
 Canvas omits fields for several legitimate reasons: deleted courses,
 courses the user has only restricted access to, courses in older terms
 whose metadata has been stripped, and so on.
-Rather than guess which fields will always be present, we defensively
-wrap every optional attribute read with
-[[getattr(course, 'field', None)]] and treat a missing attribute as
-equivalent to a [[None]] value.
-We will apply this same pattern throughout the chapter---in
-[[is_current_course]] below, in \cref{sec:output-course-data} when we
-write the CSV row, and in \cref{filter-courses} when we match the
-regex against a course's name and code.
+Rather than repeat [[getattr(..., None)]] at every use site, we
+normalize each course once when it enters the CLI through
+[[filter_courses()]]. That helper calls
+[[canvaslms.cli.utils.ensure_course_attrs(course)]], which creates the
+missing attributes we care about and gives them value [[None]].
+The rest of the chapter can then read [[course.start_at]],
+[[course.end_at]], [[course.name]], and [[course.course_code]]
+directly.
 
 \subsection{Deciding whether a course is current}
 
@@ -174,8 +175,9 @@ def is_current_course(course):
   when its end date is unknown but its start date is less than one
   year in the past, or when its end date lies in the future.
   """
-  start_at = getattr(course, 'start_at', None)
-  end_at = getattr(course, 'end_at', None)
+  course = canvaslms.cli.utils.ensure_course_attrs(course)
+  start_at = course.start_at
+  end_at = course.end_at
   if start_at is None:
     return True
   if end_at is None:
@@ -203,11 +205,9 @@ if not course_list:
 
 We have the course data in a [[course]] object.
 Now we just print the interesting data about it.
-Each field is wrapped in [[getattr]] for the reasons explained in
-\cref{sec:filter-courses-defensive}: a course may be returned without
-any of [[sis_course_id]], [[course_code]], [[name]], [[start_at]], or
-[[end_at]], and we want to emit an empty CSV cell in that case rather
-than crash.
+Because [[filter_courses()]] already normalized the listed course
+objects, the attributes we use here always exist. Missing Canvas data is
+represented as [[None]], which the CSV writer emits as an empty cell.
 <<columns in CSV output>>=
 <canvas ID>* <SIS course ID>* <course-code> <course-name> \
   <start-time> <end-time>
@@ -216,12 +216,12 @@ row = []
 if args.id:
   row.append(course.id)
 if args.ladok:
-  row.append(getattr(course, 'sis_course_id', None))
+  row.append(course.sis_course_id)
 row.extend([
-  getattr(course, 'course_code', None),
-  getattr(course, 'name', None),
-  getattr(course, 'start_at', None),
-  getattr(course, 'end_at', None)
+  course.course_code,
+  course.name,
+  course.start_at,
+  course.end_at
 ])
 output.writerow(row)
 @
@@ -241,6 +241,10 @@ def filter_courses(canvas, regex):
     <<yield course matching regex>>
 @
 
+We normalize each course before matching.
+That turns omitted Canvas fields into explicit [[None]] values, so the
+matching code only needs to coerce [[None]] to the empty string.
+
 We yield a course whenever the regex (compiled into [[p]]) matches any
 of three identifying fields: the course's [[name]], its [[course_code]],
 or its Canvas [[id]].
@@ -255,12 +259,11 @@ string in either case.
 An empty string will not match any user-supplied regex that
 corresponds to a real course name or code, so a missing attribute
 simply falls through to the next alternative rather than producing a
-spurious match or an [[AttributeError]].
-The Canvas [[id]] is always present on any object returned by the
-API---it is the primary key---so we can read it directly.
+spurious match.
 <<yield course matching regex>>=
-name = getattr(course, 'name', None) or ''
-course_code = getattr(course, 'course_code', None) or ''
+course = canvaslms.cli.utils.ensure_course_attrs(course)
+name = course.name or ''
+course_code = course.course_code or ''
 if p.search(name):
   yield course
 elif p.search(course_code):
@@ -402,7 +405,7 @@ entirely and let the tests pass whether the fix is in place or not.
 
 <<test functions>>=
     def test_course_missing_name_attribute(self, mock_canvas):
-        """filter_courses must not crash when a course lacks 'name'"""
+        """filter_courses must normalize a missing 'name' attribute"""
         course = MagicMock(spec=['id', 'course_code'])  # no 'name'
         course.id = 5000
         course.course_code = "MISSING-NAME"
@@ -412,9 +415,10 @@ entirely and let the tests pass whether the fix is in place or not.
         result = list(filter_courses(mock_canvas, "MISSING-NAME"))
 
         assert len(result) == 1
+        assert result[0].name is None
 
     def test_course_missing_course_code_attribute(self, mock_canvas):
-        """filter_courses must not crash when a course lacks 'course_code'"""
+        """filter_courses must normalize a missing course_code"""
         course = MagicMock(spec=['id', 'name'])  # no 'course_code'
         course.id = 5001
         course.name = "Orphan Course"
@@ -423,6 +427,7 @@ entirely and let the tests pass whether the fix is in place or not.
         result = list(filter_courses(mock_canvas, "Orphan"))
 
         assert len(result) == 1
+        assert result[0].course_code is None
 @
 
 We also exercise [[is_current_course]] directly against a course with
@@ -559,4 +564,3 @@ These tests validate that the [[add_XXX_option]]/[[process_XXX_option]] pattern 
 \end{enumerate}
 
 Since this pattern is reused for assignments, users, submissions, and more, confidence in these tests extends across the entire codebase.
-
