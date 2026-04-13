@@ -77,15 +77,18 @@ Tests are distributed throughout this chapter, appearing immediately after each 
 We define the test file structure early, but the actual test implementations appear after their corresponding functionality:
 
 <<test [[submissions.py]]>>=
-"""
-Tests for patiencediff integration in submissions.
-
-These tests verify that the code correctly uses patiencediff when available,
-and falls back to standard difflib when not available.
-"""
+"""Tests for patiencediff integration and helpers in submissions."""
 import pytest
+from unittest.mock import Mock
 
-from canvaslms.cli.submissions import format_submission_short, speedgrader
+from canvaslms.cli.submissions import (
+    format_submission_short,
+    get_course_user,
+    is_submission_ungraded,
+    list_submissions,
+    list_ungraded_submissions,
+    speedgrader,
+)
 
 <<test functions>>
 @
@@ -248,9 +251,15 @@ if args.history:
   to_include += ["submission_history"]
 
 if args.ungraded:
-  submissions = list_ungraded_submissions(assignment_list, include=to_include)
+  submissions = list_ungraded_submissions(
+    assignment_list,
+    include=to_include,
+    check_bulk_refresh=True)
 else:
-  submissions = list_submissions(assignment_list, include=to_include)
+  check_bulk_refresh = not (args.user or args.category or args.group)
+  submissions = list_submissions(assignment_list,
+    include=to_include,
+    check_bulk_refresh=check_bulk_refresh)
 <<add options for history>>=
 list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
@@ -791,15 +800,18 @@ def add_view_options(parser):
 def process_submission_options(canvas, args):
   assignment_list = assignments.process_assignment_option(canvas, args)
   user_list = users.process_user_or_group_option(canvas, args)
+  check_bulk_refresh = False
 
   if args.ungraded:
     submissions = list_ungraded_submissions(assignment_list,
       include=["submission_history", "submission_comments",
-      "rubric_assessment"])
+      "rubric_assessment"],
+      check_bulk_refresh=check_bulk_refresh)
   else:
     submissions = list_submissions(assignment_list,
       include=["submission_history", "submission_comments",
-      "rubric_assessment"])
+      "rubric_assessment"],
+      check_bulk_refresh=check_bulk_refresh)
 
   submission_list = list(filter_submissions(submissions, user_list))
   if not submission_list:
@@ -819,23 +831,177 @@ We provide the following functions:
 \end{itemize}
 We return the submissions for a list of assignments, since we can match several 
 assignments with a regular expression (using [[filter_assignments]]).
+
+Canvas offers [[bucket="ungraded"]] as a server-side filter, but the
+submission cache in [[canvaslms.hacks.canvasapi]] treats
+[[get_submissions()]] as a cache of the complete collection. A bucketed fetch
+can therefore poison later unfiltered calls by making a partial result look
+complete. We instead fetch the full submission list and apply the ungraded
+predicate locally.
+
+The same predicate is reused by the assignments command so that both commands
+agree on what \enquote{ungraded} means, including resubmissions that were
+graded once but changed afterwards.
 <<functions>>=
-def list_submissions(assignments, include=["submission_comments"]):
+def is_submission_ungraded(submission):
+  """Return True when ``submission`` still needs grading."""
+  return bool(submission.submitted_at) and (
+    submission.graded_at is None or
+    not submission.grade_matches_current_submission)
+@
+
+The general listing helper keeps caller-controlled bulk refresh optional. Some
+callers inspect every submission and can benefit from a collection-wide
+refresh, while narrower flows can stay with per-submission refreshes.
+<<functions>>=
+def list_submissions(assignments, include=["submission_comments"],
+                     check_bulk_refresh=False):
   for assignment in assignments:
-    submissions = assignment.get_submissions(include=include)
+    submissions = assignment.get_submissions(
+      include=include,
+      check_bulk_refresh=check_bulk_refresh)
     for submission in submissions:
+      submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
       yield submission
 
-def list_ungraded_submissions(assignments, include=["submisson_comments"]):
+def list_ungraded_submissions(assignments, include=["submission_comments"],
+                              check_bulk_refresh=False):
   for assignment in assignments:
-    submissions = assignment.get_submissions(bucket="ungraded",
-      include=include)
+    submissions = assignment.get_submissions(
+      include=include,
+      check_bulk_refresh=check_bulk_refresh)
     for submission in submissions:
-      if submission.submitted_at and (submission.graded_at is None or
-          not submission.grade_matches_current_submission):
-        submission.assignment = assignment
+      submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+      submission.assignment = assignment
+      if is_submission_ungraded(submission):
         yield submission
+@
+
+\subsection{Verifying submission normalization}
+
+The submission listing helpers are the main ingress point for submission
+objects, so they normalize the optional attributes before any later code reads
+them.
+
+<<test functions>>=
+class TestListSubmissions:
+    """Test submission ingress normalization."""
+
+    def test_normalizes_missing_submission_attrs(self):
+        """Missing submission attrs should be added as None."""
+        assignment = Mock()
+        submission = Mock(spec=['id'])
+        submission.id = 17
+        assignment.get_submissions.return_value = [submission]
+
+        result = list(list_submissions([assignment]))
+
+        assert result[0].assignment is assignment
+        assert result[0].submitted_at is None
+        assert result[0].grader_id is None
+
+    def test_forwards_bulk_refresh_flag(self):
+        """The listing helper should forward bulk-refresh opt-in."""
+        assignment = Mock()
+        assignment.get_submissions.return_value = []
+
+        list(list_submissions(
+            [assignment],
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        ))
+
+        assignment.get_submissions.assert_called_once_with(
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        )
+@
+
+\subsection{Verifying local ungraded filtering}
+
+The cache fix depends on two details: the ungraded predicate must stay
+consistent across commands, and [[list_ungraded_submissions()]] must fetch the
+full submission set instead of delegating the filter to Canvas.
+
+<<test functions>>=
+class TestListUngradedSubmissions:
+    """Test local ungraded submission filtering."""
+
+    @pytest.mark.parametrize(
+        ("submitted_at", "graded_at", "matches_current", "expected"),
+        [
+            ("2024-01-01T10:00:00Z", None, None, True),
+            ("2024-01-01T10:00:00Z", "2024-01-01T12:00:00Z", False, True),
+            ("2024-01-01T10:00:00Z", "2024-01-01T12:00:00Z", True, False),
+            (None, None, None, False),
+        ],
+    )
+    def test_uses_shared_ungraded_predicate(
+        self, submitted_at, graded_at, matches_current, expected
+    ):
+        """Ungraded means either never graded or changed after grading."""
+        submission = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        submission.submitted_at = submitted_at
+        submission.graded_at = graded_at
+        submission.grade_matches_current_submission = matches_current
+
+        assert is_submission_ungraded(submission) is expected
+
+    def test_fetches_full_collection_without_bucket(self):
+        """Ungraded listing should filter locally after a plain fetch."""
+        assignment = Mock()
+
+        graded = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        graded.submitted_at = "2024-01-01T10:00:00Z"
+        graded.graded_at = "2024-01-01T12:00:00Z"
+        graded.grade_matches_current_submission = True
+
+        never_graded = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        never_graded.submitted_at = "2024-01-01T10:05:00Z"
+        never_graded.graded_at = None
+        never_graded.grade_matches_current_submission = None
+
+        resubmitted = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        resubmitted.submitted_at = "2024-01-01T10:10:00Z"
+        resubmitted.graded_at = "2024-01-01T12:10:00Z"
+        resubmitted.grade_matches_current_submission = False
+
+        assignment.get_submissions.return_value = [
+            graded,
+            never_graded,
+            resubmitted,
+        ]
+
+        result = list(list_ungraded_submissions(
+            [assignment],
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        ))
+
+        assignment.get_submissions.assert_called_once_with(
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        )
+        assert result == [never_graded, resubmitted]
+        assert never_graded.assignment is assignment
+        assert resubmitted.assignment is assignment
 @
 
 
@@ -955,7 +1121,18 @@ Markdown version of the output.
 We want this to be able to recursively use [[format_submission]] to format the 
 submission history.
 This must then be passed to the recursive call and the section formatting.
+
+When we fetch a single user directly from a course, that lookup bypasses
+[[list_users()]]. We therefore normalize the returned object here as well.
 <<functions>>=
+def get_course_user(course, user_id):
+  """Fetch a course user and ensure common user attrs exist."""
+  if user_id is None:
+    return None
+
+  user = course.get_user(user_id)
+  return canvaslms.cli.utils.ensure_user_attrs(user)
+
 def format_submission(submission, history=False, json_format=False,
                       md_title_level="#",
                       <<[[format_submission]] args>>):
@@ -971,7 +1148,8 @@ def format_submission(submission, history=False, json_format=False,
 
   <<[[format_submission]] doc>>
   """
-  student = submission.assignment.course.get_user(submission.user_id)
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+  student = get_course_user(submission.assignment.course, submission.user_id)
 
   if json_format:
     formatted_submission = {}
@@ -992,6 +1170,36 @@ def format_submission(submission, history=False, json_format=False,
     <<add attachments to output>>
 
   return formatted_submission
+@
+
+\subsection{Verifying direct user fetches}
+
+Formatting a single submission still performs direct user lookups for the
+student and grader, so those lookups need their own normalization helper.
+
+<<test functions>>=
+class TestGetCourseUser:
+    """Test normalization of direct course user fetches."""
+
+    def test_normalizes_missing_user_attrs(self):
+        """Directly fetched users should gain missing attrs."""
+        course = Mock()
+        user = Mock(spec=['id', 'name'])
+        user.id = 23
+        user.name = "Alice"
+        course.get_user.return_value = user
+
+        result = get_course_user(course, 23)
+
+        assert result is user
+        assert result.login_id is None
+
+    def test_skips_lookup_when_user_id_is_none(self):
+        """None user IDs should not trigger a Canvas lookup."""
+        course = Mock()
+
+        assert get_course_user(course, None) is None
+        course.get_user.assert_not_called()
 @
 
 \subsection{Some helper functions}
@@ -1070,12 +1278,11 @@ def resolve_grader(submission):
   Returns a user object if the submission was graded by a human.
   Otherwise returns None if ungraded or a descriptive string.
   """
-  try:
-    if submission.grader_id is None:
-      return None
-  except AttributeError:
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+
+  if submission.grader_id is None:
     return None
-    
+     
   if submission.grader_id < 0:
     return "autograded"
 
@@ -1097,7 +1304,7 @@ But as mentioned, right now we can only do it through the course.
 This isn't a problem as long as none of the teachers or teaching assistants are 
 removed.
 <<resolve the grader's user ID from Canvas>>=
-return submission.assignment.course.get_user(submission.grader_id)
+return get_course_user(submission.assignment.course, submission.grader_id)
 @
 
 
@@ -2655,4 +2862,3 @@ except canvasapi.exceptions.CanvasException as err:
     f"for {submission.user}. "
     f"Canvas error: {err}")
 @
-

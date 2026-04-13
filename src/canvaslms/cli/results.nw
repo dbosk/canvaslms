@@ -51,6 +51,24 @@ def add_command(subp):
   <<add results command to subp>>
 @
 
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing after the helpers they
+verify.
+
+<<test [[results.py]]>>=
+"""Tests for canvaslms.cli.results."""
+import argparse
+from types import SimpleNamespace
+
+import canvasapi.exceptions
+
+from canvaslms.cli.results import *
+
+<<test functions>>
+@
+
 We add the subparser for [[results]].
 The command requires two arguments: course and assignment.
 We also want the option to filter on users.
@@ -174,6 +192,84 @@ def filter_grade(grade, regex):
 @
 
 
+\section{Choosing result identifiers}
+
+The two result modes have different sensible defaults for student identifiers.
+Grade exports usually want [[integration_id]] for downstream systems such as
+LADOK, while missing-assignment reports are typically used to contact students
+and therefore default to [[login_id]].
+
+Rather than hard-coding those attribute names at each output site, we
+centralize the choice in helper functions. That keeps grade and missing outputs
+consistent, and still lets tests or future callers override the identifier
+explicitly.
+<<constants>>=
+DEFAULT_RESULTS_IDENTIFIER = "integration_id"
+DEFAULT_MISSING_IDENTIFIER = "login_id"
+@
+
+<<functions>>=
+def result_identifier_attribute(args):
+  """Return the user attribute used as the result identifier."""
+  identifier = getattr(args, "identifier", None)
+  if identifier is not None:
+    return identifier
+  if getattr(args, "missing", False):
+    return DEFAULT_MISSING_IDENTIFIER
+  return DEFAULT_RESULTS_IDENTIFIER
+
+def result_identifier(user, args):
+  """Return the selected identifier value from ``user``."""
+  return getattr(user, result_identifier_attribute(args))
+@
+
+\subsection{Verifying identifier selection}
+
+The identifier helper needs two defaults: grade exports should keep using
+[[integration_id]], while missing-assignment reports should default to the more
+actionable [[login_id]]. An explicit override must win in either mode.
+
+<<test functions>>=
+class TestResultIdentifier:
+    """Test result identifier selection helpers."""
+
+    def test_result_identifier_attribute_defaults_to_integration_id(self):
+        """Grade exports should default to integration IDs."""
+        args = argparse.Namespace(identifier=None, missing=False)
+
+        assert result_identifier_attribute(args) == \
+            DEFAULT_RESULTS_IDENTIFIER
+
+    def test_result_identifier_attribute_defaults_to_login_id_for_missing(self):
+        """Missing-assignment exports should default to login IDs."""
+        args = argparse.Namespace(identifier=None, missing=True)
+
+        assert result_identifier_attribute(args) == \
+            DEFAULT_MISSING_IDENTIFIER
+
+    def test_result_identifier_attribute_honors_explicit_override(self):
+        """An explicit identifier should override the mode default."""
+        args = argparse.Namespace(identifier="sis_user_id", missing=True)
+
+        assert result_identifier_attribute(args) == "sis_user_id"
+
+    def test_result_identifier_reads_selected_attribute(self):
+        """The helper should read whichever identifier attribute was selected."""
+        user = SimpleNamespace(
+            integration_id="ladok-id",
+            login_id="abc123",
+            sis_user_id="sis-42",
+            id=7,
+        )
+
+        missing_args = argparse.Namespace(identifier=None, missing=True)
+        explicit_args = argparse.Namespace(identifier="id", missing=False)
+
+        assert result_identifier(user, missing_args) == "abc123"
+        assert result_identifier(user, explicit_args) == 7
+@
+
+
 \section{Summarizing assignment results}
 
 In this case, we want to have one assignment per row in the output.
@@ -182,8 +278,8 @@ those who participated in the grading.
 
 We first get the list of courses.
 We do this to then get the list of all users in all courses.
-We need these to get the integration ID, that can be used for LADOK for 
-example.
+We need these to get the user identifier used in the output. Grade exports
+default to [[integration_id]], which can be used for LADOK for example.
 
 Then we get the list of assignments in all courses.
 We get the submissions for each assignment.
@@ -207,7 +303,7 @@ def summarize_assignments(canvas, args):
         yield [
           submission.assignment.course.course_code,
           submission.assignment.name,
-          submission.user.integration_id,
+          result_identifier(submission.user, args),
           submission.grade,
           round_to_day(submission.submitted_at or submission.graded_at),
           *all_graders(submission)
@@ -334,7 +430,7 @@ for user, grade, grade_date, *graders in summary.summarize_group(
     yield [
       course.course_code,
       assignment_group.name,
-      user.integration_id,
+      result_identifier(user, args),
       grade,
       grade_date,
       *graders
@@ -378,7 +474,7 @@ for user, grade, grade_date, *graders in summary.summarize_group(
     yield [
       course.course_code,
       module.name,
-      user.integration_id,
+      result_identifier(user, args),
       grade,
       grade_date,
       *graders
@@ -392,7 +488,7 @@ for user, assignment, reason in missing_results:
   yield [
     course.course_code,
     module.name,
-    user.login_id,
+    result_identifier(user, args),
     assignment.name,
     reason
   ]
@@ -621,6 +717,8 @@ graded} or \enquote{failed}.
 We output the user's login ID instead of the integration ID, since the login ID 
 can be used to contact the student (which is probably what we want this data 
 for).
+We still route this through [[result_identifier()]] so the defaults and any
+explicit override stay centralized.
 <<produce a list of missing assignments>>=
 <<load the correct missing module as [[missing]]>>
 <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
@@ -628,7 +726,7 @@ for user, assignment, reason in missing_results:
   yield [
     course.course_code,
     assignment_group.name,
-    user.login_id,
+    result_identifier(user, args),
     assignment.name,
     reason
   ]
@@ -693,10 +791,13 @@ except canvasapi.exceptions.ResourceDoesNotExist:
   yield user, assignment, "no submission exists"
   continue
 
+if submission is not None:
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+
 if submission is None:
   yield user, assignment, "not submitted"
 elif submission.grade is None:
-  if hasattr(submission, 'submitted_at') and submission.submitted_at:
+  if submission.submitted_at:
     yield user, assignment, \
           f"submitted on {canvaslms.cli.utils.format_local_time(submission.submitted_at)}, but not graded"
   else:
@@ -704,8 +805,7 @@ elif submission.grade is None:
 else:
   <<check if grade passes using callback or regex>>
   if not grade_passes:
-    if hasattr(submission, 'submitted_at') and submission.submitted_at and \
-          hasattr(submission, 'graded_at') and submission.graded_at and \
+    if submission.submitted_at and submission.graded_at and \
           submission.submitted_at > submission.graded_at:
       yield user, assignment, \
             f"not a passing grade ({submission.grade}), resubmission not graded"

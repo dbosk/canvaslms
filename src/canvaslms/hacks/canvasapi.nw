@@ -2783,6 +2783,16 @@ GROUP_CACHE_TTL_DAYS = 5
 QUIZ_CACHE_TTL_DAYS = 3
 @
 
+Some query arguments are additive, such as [[include]], and fit naturally in a
+generic cache that merges earlier requests into later ones. Restrictive
+arguments such as [[bucket="ungraded"]] behave differently: they describe a
+subset, not a richer version of the same collection.
+
+The generic cache in this module intentionally does not try to model those
+restrictive semantics. Callers that need an ungraded subset must therefore
+fetch the full collection and filter locally, which is what
+[[canvaslms.cli.submissions]] and [[canvaslms.cli.assignments]] now do.
+
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
 flag.
 If we set it to [[None]], then we'll fetch all objects again.
@@ -3766,11 +3776,32 @@ We introduce a new attribute.
 self.__all_fetched = None
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
+
+Most callers only need the cached collection as-is, but the broad listing
+commands inspect every submission and can sometimes save API calls by choosing
+between many individual refreshes and one bulk refresh. We expose that extra
+scan as an explicit [[check_bulk_refresh]] opt-in instead of making every call
+pay for it.
+<<functions>>=
+def should_bulk_refresh_submissions(cache, to_include, threshold):
+  """Return True when enough cached submissions need refresh."""
+  num_needs_refresh = 0
+  for submission, _ in cache.values():
+    if must_refresh(submission.user_id, to_include, cache):
+      num_needs_refresh += 1
+      if num_needs_refresh > threshold:
+        return True
+  return False
+@
+
+Then the collection getter can choose whether to run that pre-check.
 <<return a list of all submissions>>=
 if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
+
+check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 
 # Collect everything to include from before.
 for _, included in self.__cache.values():
@@ -3780,25 +3811,20 @@ if self.__all_fetched:
   cache_age = datetime.now() - self.__all_fetched
   logger.info(f"Using cached submissions for assignment id={self.id}: "
               f"{len(self.__cache)} submissions cached "
-              f"(age: {cache_age.total_seconds()/60:.1f} minutes), "
-              f"checking staleness to decide refresh strategy")
-  num_needs_refresh = 0
-  for submission, included in self.__cache.values():
-    if must_refresh(submission.user_id, to_include, self.__cache):
-      num_needs_refresh += 1
-      if num_needs_refresh > THRESHOLD_INDIVIDUAL_REFRESH:
-        break
+              f"(age: {cache_age.total_seconds()/60:.1f} minutes)")
 
-  if num_needs_refresh <= THRESHOLD_INDIVIDUAL_REFRESH:
-    logger.info(f"Refreshing {num_needs_refresh} individual submissions "
-                f"for assignment id={self.id}")
+  if check_bulk_refresh and should_bulk_refresh_submissions(
+      self.__cache, to_include, THRESHOLD_INDIVIDUAL_REFRESH):
+    logger.info(f"Refreshing all submissions for assignment id={self.id} "
+                f"because more than {THRESHOLD_INDIVIDUAL_REFRESH} cached "
+                f"submissions need refresh")
+    <<bulk refresh all submissions>>
+  else:
+    logger.info(f"Refreshing cached submissions individually for assignment "
+                f"id={self.id}")
     for submission, _ in self.__cache.values():
       # Use the cached method above to trigger any individual refreshes.
       self.get_submission(submission.user_id, include=list(to_include))
-  else:
-    logger.info(f"Refreshing all submissions for assignment id={self.id} "
-                f"due to {num_needs_refresh} needing refresh")
-    <<bulk refresh all submissions>>
 else:
 
   logger.info(f"Fetching all submissions for assignment id={self.id}")
@@ -3828,3 +3854,64 @@ all at once.
 THRESHOLD_INDIVIDUAL_REFRESH = 6
 @
 
+Let's verify that the bulk-refresh pre-check stays optional and only flips to a
+bulk refresh when enough cached submissions would otherwise be refreshed one by
+one.
+
+<<test functions>>=
+class TestAssignmentSubmissionRefreshStrategy:
+    """Test the assignment submission bulk-refresh decision helper."""
+
+    def make_submission(self, user_id, *, grade="B"):
+        """Create a cached submission with refresh metadata."""
+        submission = MagicMock()
+        submission.user_id = user_id
+        submission.grade = grade
+        submission._fetched_at = datetime.now() - timedelta(minutes=6)
+        return submission
+
+    def test_no_bulk_refresh_when_threshold_not_exceeded(self):
+        """Exactly-threshold stale submissions should stay on individual refreshes."""
+        cache = {
+            user_id: (self.make_submission(user_id), set())
+            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH)
+        }
+
+        result = should_bulk_refresh_submissions(
+            cache,
+            set(),
+            THRESHOLD_INDIVIDUAL_REFRESH,
+        )
+
+        assert result is False
+
+    def test_bulk_refresh_when_threshold_exceeded(self):
+        """More-than-threshold stale submissions should trigger bulk refresh."""
+        cache = {
+            user_id: (self.make_submission(user_id), set())
+            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH + 1)
+        }
+
+        result = should_bulk_refresh_submissions(
+            cache,
+            set(),
+            THRESHOLD_INDIVIDUAL_REFRESH,
+        )
+
+        assert result is True
+
+    def test_new_include_also_counts_towards_bulk_refresh(self):
+        """Bulk refresh should trigger when many cached entries miss an include."""
+        cache = {
+            user_id: (self.make_submission(user_id, grade="A"), set())
+            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH + 1)
+        }
+
+        result = should_bulk_refresh_submissions(
+            cache,
+            {"submission_comments"},
+            THRESHOLD_INDIVIDUAL_REFRESH,
+        )
+
+        assert result is True
+@

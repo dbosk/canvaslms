@@ -35,6 +35,7 @@ We outline the module structure:
 <<[[modules.py]]>>=
 import argparse
 import canvasapi
+import canvaslms.cli.utils
 import canvaslms.cli.courses as courses
 import csv
 import re
@@ -152,7 +153,7 @@ responses), and we want robust output rather than a failed command.
 
 <<process module items with error handling>>=
 try:
-  items = list(module.get_module_items())
+  items = list_module_items(module)
   if not items:
     # Show module even if it has no items
     row = [course.course_code, module.name, "No items", ""]
@@ -187,7 +188,7 @@ module:
 <<write module information to output>>=
 # Get module items count
 try:
-  items = list(module.get_module_items())
+  items = list_module_items(module)
   item_count = len(items)
 except:
   item_count = 0
@@ -197,7 +198,7 @@ except:
 output.writerow([
   course.course_code,
   module.name,
-  module.unlock_at if hasattr(module, 'unlock_at') else None,
+  module.unlock_at,
   progress_mode,
   item_count
 ])
@@ -213,9 +214,7 @@ sequence.
 This follows the Unix philosophy of making output immediately understandable.
 
 <<format progress mode descriptively>>=
-sequential = (module.require_sequential_progress
-              if hasattr(module, 'require_sequential_progress')
-              else False)
+sequential = bool(module.require_sequential_progress)
 progress_mode = "sequential" if sequential else "any-order"
 @
 
@@ -245,7 +244,7 @@ cleaner output without IDs.
 
 <<extract completion requirement>>=
 completion_req = ""
-if hasattr(item, 'completion_requirement') and item.completion_requirement:
+if item.completion_requirement:
   req = item.completion_requirement
   if 'type' in req:
     completion_req = req['type']
@@ -264,14 +263,14 @@ fields.
 row = [
   course.course_code,
   module.name,
-  item.type if hasattr(item, 'type') else "Unknown",
-  item.title if hasattr(item, 'title') else "No title"
+  item.type or "Unknown",
+  item.title or "No title"
 ]
 
 if args.show_id:
-  if hasattr(item, 'content_id'):
+  if item.content_id is not None:
     row.append(item.content_id)
-  elif hasattr(item, 'id'):
+  elif item.id is not None:
     row.append(item.id)
   else:
     row.append("")
@@ -304,6 +303,13 @@ The [[add_module_option]] function attempts to add the course option, but
 catches [[ArgumentError]] if the course option was already added by other code.
 If the [[required]] parameter is [[True]], we make the module option required.
 <<functions>>=
+def list_module_items(module):
+  """Return module items with the CLI's expected attributes ensured."""
+  return [
+      canvaslms.cli.utils.ensure_module_item_attrs(item)
+      for item in module.get_module_items()
+  ]
+
 def add_module_option(parser, required=False):
   """Adds module selection option to parser"""
   try:
@@ -354,9 +360,10 @@ This dual-matching approach is useful because:
 def filter_modules(course, regex):
   """Returns all modules of course whose name matches regex"""
   name = re.compile(regex)
-  return filter(
-    lambda module: name.search(module.name) or name.search(str(module.id)),
-    course.get_modules())
+  for module in course.get_modules():
+    module = canvaslms.cli.utils.ensure_module_attrs(module)
+    if name.search(module.name or '') or name.search(str(module.id)):
+      yield module
 @
 
 
@@ -380,8 +387,8 @@ def filter_assignments_by_module(module, assignments):
   # Get all module items that are assignments
   assignment_ids = set()
   try:
-    for item in module.get_module_items():
-      if hasattr(item, 'type') and item.type == "Assignment":
+    for item in list_module_items(module):
+      if item.type == "Assignment" and item.content_id is not None:
         assignment_ids.add(item.content_id)
   except AttributeError:
     # Handle cases where module items don't have expected attributes
@@ -412,8 +419,8 @@ def filter_assignments_by_module_list(modules, assignments):
   all_assignment_ids = set()
   for module in modules:
     try:
-      for item in module.get_module_items():
-        if hasattr(item, 'type') and item.type == "Assignment":
+      for item in list_module_items(module):
+        if item.type == "Assignment" and item.content_id is not None:
           all_assignment_ids.add(item.content_id)
     except AttributeError:
       pass
@@ -434,8 +441,8 @@ def filter_pages_by_module_list(modules, pages):
   all_page_urls = set()
   for module in modules:
     try:
-      for item in module.get_module_items():
-        if hasattr(item, 'type') and item.type == "Page":
+      for item in list_module_items(module):
+        if item.type == "Page" and item.page_url:
           all_page_urls.add(item.page_url)
     except AttributeError:
       pass
@@ -497,8 +504,9 @@ def get_item_modules(course, item_type, item_id):
   modules = []
   for module in course.get_modules():
     try:
-      for item in module.get_module_items():
-        if not hasattr(item, 'type') or item.type != item_type:
+      module = canvaslms.cli.utils.ensure_module_attrs(module)
+      for item in list_module_items(module):
+        if item.type != item_type:
           continue
         <<check if item matches and add module to list>>
     except Exception:
@@ -514,11 +522,11 @@ redirect old URLs to new ones, so we need to resolve the URL before comparing
 (see [[<<check if page item matches by resolving url>>]]).
 <<check if item matches and add module to list>>=
 if item_type == 'Assignment':
-  if hasattr(item, 'content_id') and item.content_id == item_id:
+  if item.content_id == item_id:
     modules.append(module.name)
     break
 elif item_type == 'Page':
-  if hasattr(item, 'page_url'):
+  if item.page_url:
     if item.page_url == item_id:
       modules.append(module.name)
       break
@@ -570,7 +578,10 @@ First, we compile all regex patterns and find which modules match.
 We match against both module name and Canvas ID, consistent with
 [[filter_modules]].
 <<find modules matching regex patterns>>=
-all_modules = list(course.get_modules())
+all_modules = [
+    canvaslms.cli.utils.ensure_module_attrs(module)
+    for module in course.get_modules()
+]
 
 matching_module_ids = set()
 for pattern in module_regexes:
@@ -619,15 +630,15 @@ if item_type == 'Page':
     canonical_page_url = item_id
 
 try:
-  for item in module.get_module_items():
-    if not hasattr(item, 'type') or item.type != item_type:
+  for item in list_module_items(module):
+    if item.type != item_type:
       continue
     if item_type == 'Assignment':
-      if hasattr(item, 'content_id') and item.content_id == item_id:
+      if item.content_id == item_id:
         current_item = item
         break
     elif item_type == 'Page':
-      if hasattr(item, 'page_url'):
+      if item.page_url:
         <<check if page item matches by resolving url>>
 except Exception:
   pass
