@@ -51,20 +51,17 @@ def add_command(subp):
   <<add results command to subp>>
 @
 
-
-\section{Testing}
-
-Tests are distributed throughout this chapter, appearing after the helpers they
-verify.
+We define the test file structure early, but place each test after the
+functionality it verifies.
 
 <<test [[results.py]]>>=
-"""Tests for canvaslms.cli.results."""
+"""Tests for the canvaslms.cli.results module."""
 import argparse
 from types import SimpleNamespace
 
 import canvasapi.exceptions
 
-from canvaslms.cli.results import *
+import canvaslms.cli.results as results_module
 
 <<test functions>>
 @
@@ -98,6 +95,7 @@ results_parser = subp.add_parser("results",
 results_parser.set_defaults(func=results_command)
 assignments.add_assignment_option(results_parser, ungraded=False)
 users.add_user_or_group_option(results_parser)
+<<add option for selecting student identifier>>
 <<add option to include Fs>>
 <<add option for custom summary module>>
 <<add option for missing assignments>>
@@ -108,14 +106,19 @@ Let's summarize what we want to do.
 Lists results of a course for export, for instance to the `ladok report` 
 command. Output format, CSV:
 
-  <course code> <component code> <student ID> <grade> <grade date> <graders ...>
+  <course code> <component code> <student identifier> <grade> <grade date> <graders ...>
 
 Can also export a list of missing assignment results (--missing option) that 
 prevent the student from getting a grade. Output format, CSV:
 
-  <course code> <component code> <student ID> <missing assignment> <reason>
+  <course code> <component code> <student identifier> <missing assignment> <reason>
 
-The reason can be "not submitted" or "not graded".
+The default identifier is `integration_id`. With `--missing`, the default
+changes to `login_id`, unless `--identifier` selects another attribute.
+
+The reason describes why the assignment is still missing, for example
+``no submission exists'', ``not submitted'', ``not done'',
+``submitted on ... but not graded'', or ``not a passing grade (...)''.
 @ We will cover the option for and loading of the custom summary module later,
 in \cref{custom-summary-modules}.
 We will also cover the [[format_grading_modules_help]] function, which
@@ -160,6 +163,106 @@ for result in results:
 @
 
 
+\section{Selecting the student identifier}
+
+The same export supports two slightly different workflows.
+Normal grade exports usually feed administrative systems such as LADOK, so
+[[integration_id]] remains the natural default there.
+Missing-assignment reports are more contact-oriented, so they default to
+[[login_id]] instead.
+
+The [[-i]]/[[--identifier]] option lets the user override either default with a
+specific user attribute.
+<<add option for selecting student identifier>>=
+results_parser.add_argument("-i", "--identifier",
+  choices=RESULTS_IDENTIFIER_CHOICES,
+  default=None,
+  help="Student identifier attribute to output. Defaults to "
+       "integration_id, except with --missing it defaults to "
+       "login_id.")
+<<constants>>=
+RESULTS_IDENTIFIER_CHOICES = [
+  "integration_id",
+  "login_id",
+  "sis_user_id",
+  "id",
+]
+DEFAULT_RESULTS_IDENTIFIER = "integration_id"
+DEFAULT_MISSING_IDENTIFIER = "login_id"
+@
+
+We centralize this choice so that assignment, assignment-group, module, and
+missing-assignment exports all obey the same rule.
+The first helper decides which attribute name applies to the current command,
+and the second reads that attribute from the user object.
+<<functions>>=
+def result_identifier_attribute(args):
+  """Return the user attribute name to use as the row identifier.
+
+  Precedence:
+  1. ``args.identifier`` if explicitly set (e.g. via ``--identifier``);
+  2. ``DEFAULT_MISSING_IDENTIFIER`` (``login_id``) when ``args.missing``
+     is truthy, since missing-assignment reports are contact-oriented;
+  3. ``DEFAULT_RESULTS_IDENTIFIER`` (``integration_id``) otherwise, which
+     feeds administrative systems such as LADOK.
+  """
+  if getattr(args, "identifier", None) is not None:
+    return args.identifier
+  if getattr(args, "missing", False):
+    return DEFAULT_MISSING_IDENTIFIER
+  return DEFAULT_RESULTS_IDENTIFIER
+@
+
+<<functions>>=
+def result_identifier(user, args):
+  """Return the identifier value for ``user`` selected by ``args``.
+
+  Reads the attribute chosen by :func:`result_identifier_attribute` off
+  of ``user`` and returns its value (not the attribute name).
+  """
+  return getattr(user, result_identifier_attribute(args))
+@
+
+Let's verify the two implicit defaults, the explicit override, and that
+[[result_identifier]] reads the selected attribute from the user object.
+
+<<test functions>>=
+def test_result_identifier_attribute_defaults_to_integration_id():
+  args = argparse.Namespace(identifier=None, missing=False)
+
+  assert results_module.result_identifier_attribute(args) == \
+         results_module.DEFAULT_RESULTS_IDENTIFIER
+
+
+def test_result_identifier_attribute_defaults_to_login_id_for_missing():
+  args = argparse.Namespace(identifier=None, missing=True)
+
+  assert results_module.result_identifier_attribute(args) == \
+         results_module.DEFAULT_MISSING_IDENTIFIER
+
+
+def test_result_identifier_attribute_honors_explicit_override():
+  args = argparse.Namespace(identifier="sis_user_id", missing=True)
+
+  assert results_module.result_identifier_attribute(args) == "sis_user_id"
+
+
+def test_result_identifier_reads_selected_attribute():
+  user = SimpleNamespace(
+    integration_id="ladok-id",
+    login_id="abc123",
+    sis_user_id="sis-42",
+    id=7,
+  )
+
+  missing_args = argparse.Namespace(identifier=None, missing=True)
+  explicit_args = argparse.Namespace(identifier="id", missing=False)
+
+  assert results_module.result_identifier(user, missing_args) == "abc123"
+  assert results_module.result_identifier(user, explicit_args) == 7
+@
+
+
 \section{Filtering grades in output}
 
 We also want to let the user choose to not include Fs (or other grades) in the 
@@ -192,131 +295,78 @@ def filter_grade(grade, regex):
 @
 
 
-\section{Choosing result identifiers}
-
-The two result modes have different sensible defaults for student identifiers.
-Grade exports usually want [[integration_id]] for downstream systems such as
-LADOK, while missing-assignment reports are typically used to contact students
-and therefore default to [[login_id]].
-
-Rather than hard-coding those attribute names at each output site, we
-centralize the choice in helper functions. That keeps grade and missing outputs
-consistent, and still lets tests or future callers override the identifier
-explicitly.
-<<constants>>=
-DEFAULT_RESULTS_IDENTIFIER = "integration_id"
-DEFAULT_MISSING_IDENTIFIER = "login_id"
-@
-
-<<functions>>=
-def result_identifier_attribute(args):
-  """Return the user attribute used as the result identifier."""
-  identifier = getattr(args, "identifier", None)
-  if identifier is not None:
-    return identifier
-  if getattr(args, "missing", False):
-    return DEFAULT_MISSING_IDENTIFIER
-  return DEFAULT_RESULTS_IDENTIFIER
-
-def result_identifier(user, args):
-  """Return the selected identifier value from ``user``."""
-  return getattr(user, result_identifier_attribute(args))
-@
-
-\subsection{Verifying identifier selection}
-
-The identifier helper needs two defaults: grade exports should keep using
-[[integration_id]], while missing-assignment reports should default to the more
-actionable [[login_id]]. An explicit override must win in either mode.
-
-<<test functions>>=
-class TestResultIdentifier:
-    """Test result identifier selection helpers."""
-
-    def test_result_identifier_attribute_defaults_to_integration_id(self):
-        """Grade exports should default to integration IDs."""
-        args = argparse.Namespace(identifier=None, missing=False)
-
-        assert result_identifier_attribute(args) == \
-            DEFAULT_RESULTS_IDENTIFIER
-
-    def test_result_identifier_attribute_defaults_to_login_id_for_missing(self):
-        """Missing-assignment exports should default to login IDs."""
-        args = argparse.Namespace(identifier=None, missing=True)
-
-        assert result_identifier_attribute(args) == \
-            DEFAULT_MISSING_IDENTIFIER
-
-    def test_result_identifier_attribute_honors_explicit_override(self):
-        """An explicit identifier should override the mode default."""
-        args = argparse.Namespace(identifier="sis_user_id", missing=True)
-
-        assert result_identifier_attribute(args) == "sis_user_id"
-
-    def test_result_identifier_reads_selected_attribute(self):
-        """The helper should read whichever identifier attribute was selected."""
-        user = SimpleNamespace(
-            integration_id="ladok-id",
-            login_id="abc123",
-            sis_user_id="sis-42",
-            id=7,
-        )
-
-        missing_args = argparse.Namespace(identifier=None, missing=True)
-        explicit_args = argparse.Namespace(identifier="id", missing=False)
-
-        assert result_identifier(user, missing_args) == "abc123"
-        assert result_identifier(user, explicit_args) == 7
-@
-
-
 \section{Summarizing assignment results}
 
 In this case, we want to have one assignment per row in the output.
-We want to output course, assignment, student ID, grade, submission date and 
-those who participated in the grading.
+Like the assignment-group and module summarizers, this path supports two
+sub-cases: a normal grade export and a missing-assignments report.
+The command dispatches here whenever no assignment-group or module filter
+is active.
+The [[-a]]/[[--assignment]] option narrows the assignments within this path,
+and [[--missing]] selects which of the two sub-cases runs.
 
-We first get the list of courses.
-We do this to then get the list of all users in all courses.
-We need these to get the user identifier used in the output. Grade exports
-default to [[integration_id]], which can be used for LADOK for example.
+Previously, the missing sub-case was only implemented for assignment groups
+and modules, so [[--missing]] was a silent no-op on the [[-a]] path.
+That became observable once the row identifier was made configurable: the
+default identifier flipped to [[login_id]] on [[--missing]] even though the
+output was still a graded-row export.
+We now plumb [[--missing]] through the [[-a]] path too, so that
+[[canvaslms results -a 'Homework 1' --missing]] produces the same shape of
+output you would get from [[-A]] on an assignment group that contains only
+[[Homework 1]].
 
-Then we get the list of assignments in all courses.
-We get the submissions for each assignment.
-These submissions are filtered by user.
-We do this because this attaches a [[user]] attribute to each submissions with 
-the details of each user.
-This gives a trivial [[yield]] statement at the end.
 <<functions>>=
 def summarize_assignments(canvas, args):
   """
-  Turn submissions into results:
+  Turn submissions into grade rows, or into missing-assignment rows when
+  ``args.missing`` is set:
   - canvas is a Canvas object,
   - args is the command-line arguments, as parsed by argparse.
   """
 
-  <<create [[submissions_list]]>>
-
-  for submission in submissions_list:
-    if submission.grade is not None:
-      if filter_grade(submission.grade, args.filter_grades):
-        yield [
-          submission.assignment.course.course_code,
-          submission.assignment.name,
-          result_identifier(submission.user, args),
-          submission.grade,
-          round_to_day(submission.submitted_at or submission.graded_at),
-          *all_graders(submission)
-        ]
+  if args.missing:
+    <<produce a list of missing assignments for assignment filter>>
+  else:
+    <<produce a list of graded rows for assignment filter>>
 @
 
-To create the list of submissions, [[submissions_list]], we have to do the 
+\subsection{Producing a list of grades}
+
+We first get the list of courses.
+We do this to then get the list of all users in all courses.
+We need these so that each row can include the selected student identifier.
+For grade exports, the default is [[integration_id]], which can be used for
+LADOK for example.
+
+Then we get the list of assignments in all courses.
+We get the submissions for each assignment.
+These submissions are filtered by user.
+We do this because this attaches a [[user]] attribute to each submissions with
+the details of each user.
+This gives a trivial [[yield]] statement at the end.
+<<produce a list of graded rows for assignment filter>>=
+<<create [[submissions_list]]>>
+
+for submission in submissions_list:
+  if submission.grade is not None:
+    if filter_grade(submission.grade, args.filter_grades):
+      yield [
+        submission.assignment.course.course_code,
+        submission.assignment.name,
+        result_identifier(submission.user, args),
+        submission.grade,
+        round_to_day(submission.submitted_at or submission.graded_at),
+        *all_graders(submission)
+      ]
+@
+
+To create the list of submissions, [[submissions_list]], we have to do the
 following.
 First need to list the courses.
 For each course we need to get all the users (students).
 Then, for each course, we also need all the assignments.
 When we have the assignments, we can get the submissions.
-Fortunately, we can use the filtering functions provided by the [[courses]], 
+Fortunately, we can use the filtering functions provided by the [[courses]],
 [[assignments]] and [[submissions]] modules.
 They will parse the CLI arguments and generate the lists.
 <<create [[submissions_list]]>>=
@@ -328,6 +378,87 @@ submissions_list = submissions.filter_submissions(
                                include=["submission_history"]),
   users_list)
 @
+
+\subsection{Producing a list of missing assignments}
+\label{sec:summarize-assignments-missing}
+
+The missing path mirrors the [[-A]] path, but without the outer
+course/group loop: [[process_assignment_option]] already returns a flat
+list of assignments with their [[course]] attached, so we can hand that
+list directly to [[missing.missing_assignments]].
+We wrap the users in a [[set]] the same way [[summarize_assignment_groups]]
+does, to avoid duplicate rows when a user appears under several filters.
+
+The row shape matches the other missing paths:
+[[(course code, component, identifier, missing assignment, reason)]].
+Here the \enquote{component} column is the matched assignment's own name,
+so on each row columns~2 and~4 hold the same value when the [[-a]] filter
+matches a single assignment.
+That coincidence is intentional: downstream tools already consume the
+five-column contract from the [[-A]] path, and keeping column~2 stable
+lets them treat [[-a --missing]] and [[-A --missing]] identically.
+<<produce a list of missing assignments for assignment filter>>=
+assignments_list = list(assignments.process_assignment_option(canvas, args))
+users_list = set(users.process_user_or_group_option(canvas, args))
+
+<<load the correct missing module as [[missing]]>>
+<<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
+for user, assignment, reason in missing_results:
+  yield [
+    assignment.course.course_code,
+    assignment.name,
+    result_identifier(user, args),
+    assignment.name,
+    reason
+  ]
+@
+
+Let's pin the behaviour of the default [[missing_assignments]] helper that
+this path now depends on.
+The [[-a --missing]] dispatch inherits two guarantees from it: missing
+submissions are reported with a reason, and assignments matching
+[[args.optional_assignments]] are skipped before any submission lookup.
+
+<<test functions>>=
+def test_missing_assignments_default_reports_not_submitted():
+  user = SimpleNamespace(id=1)
+
+  class _Assignment:
+    def __init__(self, name):
+      self.name = name
+
+    def get_submission(self, user):
+      raise canvasapi.exceptions.ResourceDoesNotExist(
+        "no submission")
+
+  assignment = _Assignment("Homework 1")
+
+  rows = list(results_module.missing_assignments(
+    [assignment], [user]))
+
+  assert rows == [(user, assignment, "no submission exists")]
+
+
+def test_missing_assignments_honours_optional_assignments():
+  user = SimpleNamespace(id=1)
+
+  class _Assignment:
+    def __init__(self, name):
+      self.name = name
+
+    def get_submission(self, user):
+      raise AssertionError(
+        "optional assignments must be skipped before submission lookup")
+
+  optional = _Assignment("Optional: extra reading")
+
+  rows = list(results_module.missing_assignments(
+    [optional], [user],
+    optional_assignments=[r"^Optional:"]))
+
+  assert rows == []
+@
+
 
 \section{Fixing the dates}
 
@@ -386,8 +517,8 @@ if grader:
 \section{Summarizing assignment group results}
 
 In this case, we want to have one assignment group per row in the output.
-We want to output course, assignment group, student ID, summarized grade based 
-on all assignments in the group and the latest submission date.
+We want to output course, assignment group, student identifier, summarized
+grade based on all assignments in the group and the latest submission date.
 
 Unlike the previous case, here we must maintain the structure of which 
 assignments belong to which assignment group so that we can check easily that a 
@@ -691,7 +822,8 @@ results_parser.add_argument("--missing",
        "Uses the summary module's missing_assignments() if available, "
        "otherwise uses the default implementation. "
        <<missing module behaviour>>
-       "This option only has effect when working with assignment groups.")
+       "Works with -a (single assignments), -A (assignment groups), and "
+       "-M (modules).")
 @
 
 Since [[--missing]] is now a simple flag, we use the summary module (specified
@@ -714,11 +846,11 @@ and a reason why the assignment is missing.
 For instance, the reason could be \enquote{not submitted} or \enquote{not 
 graded} or \enquote{failed}.
 
-We output the user's login ID instead of the integration ID, since the login ID 
-can be used to contact the student (which is probably what we want this data 
-for).
-We still route this through [[result_identifier()]] so the defaults and any
-explicit override stay centralized.
+By default, missing reports use the user's [[login_id]], since that identifier
+can be used to contact the student.
+We still route this through [[result_identifier()]] so the default stays
+centralized and [[--identifier]] can override it when a workflow needs a
+different attribute.
 <<produce a list of missing assignments>>=
 <<load the correct missing module as [[missing]]>>
 <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
@@ -774,7 +906,9 @@ The default module checks if all things are graded or submitted.
 For each assignment that a student is not done with, we yield a tuple of the
 user, the assignment and the reason why the assignment is missing.
 
-The reason can be "not submitted" or "not graded" or "not a passing grade".
+The reason describes why the assignment is still missing, for example
+``no submission exists'', ``not submitted'', ``not done'',
+``submitted on ... but not graded'', or ``not a passing grade (...)''.
 
 The only reason to use a different module is if you have optional assignments.
 We only want to remind the students of the things they need to pass the course.
