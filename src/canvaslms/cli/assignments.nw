@@ -77,7 +77,7 @@ the helpers they verify.
 
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 from canvasapi.assignment import Assignment
 from canvasapi.course import Course
@@ -236,8 +236,8 @@ filter out the assignments.
 
 \subsection{Sequential filter application for AND logic}
 
-To support combinable filters with AND logic, we apply filters \emph{sequentially}
-rather than using mutually exclusive branches.
+To support combinable filters with AND logic, we apply the cheap structural
+filters first and postpone the ungraded check until the end.
 The algorithm is:
 \begin{enumerate}
 \item Start with all assignments matching the [[-a]] regex (defaults to [[.*]],
@@ -246,6 +246,8 @@ The algorithm is:
   matching assignment groups
 \item If [[-M]] is specified, filter the result to keep only assignments in
   matching modules
+\item If [[-U]] is specified, inspect only the remaining assignments'
+  submissions
 \item Return the final filtered list
 \end{enumerate}
 
@@ -259,6 +261,12 @@ or modules.
 For example, if [[-M "Module [12]"]] matches both Module 1 and Module 2, we
 return assignments from either module---but they must still match the other
 filters (assignment name and assignment group, if specified).
+
+The first three filters work only on assignment metadata that is already
+available on the assignment objects. The ungraded check is different: it may
+need to fetch submissions and refresh the submission cache. By running it last,
+we avoid touching assignments that already fail the cheaper name, group, or
+module filters.
 
 <<process options for selecting assignments to assignments list>>=
 assignments_list = []
@@ -281,14 +289,15 @@ except AttributeError:
 We start by filtering assignments by name using the [[-a]] option.
 Then, if assignment group or module filters are specified, we apply them
 sequentially to progressively narrow the results.
+Only after that do we inspect submissions for the optional ungraded filter.
 <<apply sequential filters to get filtered assignments>>=
 filtered_assignments = list(filter_assignments([course],
-  args.assignment,
-  ungraded=ungraded))
+  args.assignment))
 
 <<get filter options from args>>
 <<apply assignment group filter if specified>>
 <<apply module filter if specified>>
+<<apply ungraded filter if specified>>
 @
 
 We extract the filter options from [[args]], defaulting to empty strings if the
@@ -324,6 +333,88 @@ if module_regex:
   course_modules = modules.filter_modules(course, module_regex)
   filtered_assignments = list(modules.filter_assignments_by_module_list(
       course_modules, filtered_assignments))
+@
+
+The ungraded filter is the only step that needs submission data. We therefore
+apply it after the structural filters have already narrowed the assignment
+list.
+<<apply ungraded filter if specified>>=
+if ungraded:
+  filtered_assignments = [
+      assignment for assignment in filtered_assignments
+      if has_ungraded_submissions(assignment)
+  ]
+@
+
+
+\subsection{Verifying that [[-a]] runs before [[-U]]}
+
+The user-visible regression here was not incorrect grading semantics, but work
+done too early. We verify that [[process_assignment_option()]] narrows the
+assignment list by name before it touches submissions, so unrelated assignments
+never trigger fetches.
+
+<<test functions>>=
+class TestProcessAssignmentOption:
+    """Test command-line assignment selection order."""
+
+    def make_course(self):
+        """Create a real Canvas course instance for isinstance checks."""
+        return Course(MagicMock(), {"id": 11, "name": "Course"})
+
+    def make_assignment(self, assignment_id, name):
+        """Create a real Canvas assignment instance for process tests."""
+        return Assignment(MagicMock(), {"id": assignment_id, "name": name})
+
+    def make_submission(self, *, graded_at, matches):
+        """Create a submission stub with grading metadata."""
+        submission = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        submission.submitted_at = "2024-01-01T10:00:00Z"
+        submission.graded_at = graded_at
+        submission.grade_matches_current_submission = matches
+        return submission
+
+    def test_name_filter_runs_before_ungraded_scan(self):
+        """Ungraded checks should skip assignments filtered out by name."""
+        course = self.make_course()
+        unrelated = self.make_assignment(1, "Lab 1")
+        graded_match = self.make_assignment(2, "INL1Written Draft")
+        ungraded_match = self.make_assignment(3, "INL1Written Final")
+        course.get_assignments = Mock(
+            return_value=[unrelated, graded_match, ungraded_match]
+        )
+
+        unrelated.get_submissions = Mock(return_value=[])
+        graded_match.get_submissions = Mock(return_value=[
+            self.make_submission(
+                graded_at="2024-01-01T12:00:00Z",
+                matches=True,
+            )
+        ])
+        ungraded_match.get_submissions = Mock(return_value=[
+            self.make_submission(
+                graded_at="2024-01-01T12:00:00Z",
+                matches=False,
+            )
+        ])
+        args = argparse.Namespace(
+            assignment="^INL1Written",
+            assignment_group="",
+            module="",
+            ungraded=True,
+        )
+
+        with patch.object(courses, "process_course_option", return_value=[course]):
+            result = process_assignment_option(MagicMock(), args)
+
+        assert result == [ungraded_match]
+        unrelated.get_submissions.assert_not_called()
+        graded_match.get_submissions.assert_called_once_with()
+        ungraded_match.get_submissions.assert_called_once_with()
 @
 
 
