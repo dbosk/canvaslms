@@ -23,17 +23,19 @@ dates such as due dates, unlock dates, and lock dates.
 \section{Module outline}
 
 We outline the module:
-<<assignments.py>>=
+<<[[assignments.py]]>>=
 import argparse
 import arrow
 import canvasapi
 import canvaslms.cli
+import canvaslms.cli.content
 import canvaslms.cli.courses as courses
 import canvaslms.cli.modules as modules
 import canvaslms.cli.submissions as submissions
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 import csv
+from datetime import datetime
 import json
 import logging
 import os
@@ -41,6 +43,7 @@ import pypandoc
 import re
 import rich.console
 import rich.markdown
+import rich.syntax
 import sys
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,29 @@ def add_assignments_command(subp):
 def add_assignment_command(subp):
   """Adds the assignment (singular) command as an alias for assignments view"""
   <<add assignment command to subp>>
+@
+
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after each
+implementation to verify correctness.
+
+\subsection{Test structure}
+
+We define the test file structure early, but the concrete tests appear next to
+the helpers they verify.
+
+<<test [[assignments.py]]>>=
+"""Tests for assignment listing and filtering helpers."""
+from unittest.mock import MagicMock, Mock, patch
+
+from canvasapi.assignment import Assignment
+from canvasapi.course import Course
+
+from canvaslms.cli.assignments import *
+
+<<test functions>>
 @
 
 
@@ -95,6 +121,12 @@ def add_assignment_option(parser, ungraded=True, required=False, suppress_help=F
 
 def process_assignment_option(canvas, args):
   course_list = courses.process_course_option(canvas, args)
+  # If required filters were requested (set-dates passes required=True), ensure at least one provided.
+  if hasattr(args, 'assignment') and hasattr(args, 'assignment_group') and hasattr(args, 'module'):
+    if (args.assignment is None or args.assignment == '') and \
+       (args.assignment_group is None or args.assignment_group == '') and \
+       (args.module is None or args.module == ''):
+      raise canvaslms.cli.EmptyListError("At least one of -a, -A or -M must be specified")
   <<process options for selecting assignments to assignments list>>
   assignments_list = list(assignments_list)
   if not assignments_list:
@@ -162,20 +194,23 @@ if ungraded:
 <<add filter options: required or combinable>>
 @
 
-When filters are required, we maintain the mutually exclusive group to keep the
-interface simple.
-When filters are optional, we allow combination by adding them directly to the
-parser (not to a mutually exclusive group).
+When filters are required, we still allow combination; we only enforce that at
+least one of -a, -A or -M is specified. When filters are optional, all three can
+be combined exactly the same way. The difference is only the validation that at
+least one filter was provided.
 <<add filter options: required or combinable>>=
 if required:
-  filter_group = parser.add_mutually_exclusive_group(required=True)
-  filter_group.add_argument("-a", "--assignment",
+  # Required mode: allow combining filters; we just validate later that at least one was provided.
+  parser.add_argument("-a", "--assignment",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching assignment title or Canvas identifier")
-  filter_group.add_argument("-A", "--assignment-group",
+  parser.add_argument("-A", "--assignment-group",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching assignment group title or Canvas identifier")
-  filter_group.add_argument("-M", "--module",
+  parser.add_argument("-M", "--module",
+    required=False,
     help=argparse.SUPPRESS if suppress_help else
       "Regex matching module title or Canvas identifier")
 else:
@@ -201,8 +236,8 @@ filter out the assignments.
 
 \subsection{Sequential filter application for AND logic}
 
-To support combinable filters with AND logic, we apply filters \emph{sequentially}
-rather than using mutually exclusive branches.
+To support combinable filters with AND logic, we apply the cheap structural
+filters first and postpone the ungraded check until the end.
 The algorithm is:
 \begin{enumerate}
 \item Start with all assignments matching the [[-a]] regex (defaults to [[.*]],
@@ -211,6 +246,8 @@ The algorithm is:
   matching assignment groups
 \item If [[-M]] is specified, filter the result to keep only assignments in
   matching modules
+\item If [[-U]] is specified, inspect only the remaining assignments'
+  submissions
 \item Return the final filtered list
 \end{enumerate}
 
@@ -224,6 +261,12 @@ or modules.
 For example, if [[-M "Module [12]"]] matches both Module 1 and Module 2, we
 return assignments from either module---but they must still match the other
 filters (assignment name and assignment group, if specified).
+
+The first three filters work only on assignment metadata that is already
+available on the assignment objects. The ungraded check is different: it may
+need to fetch submissions and refresh the submission cache. By running it last,
+we avoid touching assignments that already fail the cheaper name, group, or
+module filters.
 
 <<process options for selecting assignments to assignments list>>=
 assignments_list = []
@@ -246,14 +289,15 @@ except AttributeError:
 We start by filtering assignments by name using the [[-a]] option.
 Then, if assignment group or module filters are specified, we apply them
 sequentially to progressively narrow the results.
+Only after that do we inspect submissions for the optional ungraded filter.
 <<apply sequential filters to get filtered assignments>>=
 filtered_assignments = list(filter_assignments([course],
-  args.assignment,
-  ungraded=ungraded))
+  args.assignment))
 
 <<get filter options from args>>
 <<apply assignment group filter if specified>>
 <<apply module filter if specified>>
+<<apply ungraded filter if specified>>
 @
 
 We extract the filter options from [[args]], defaulting to empty strings if the
@@ -289,6 +333,88 @@ if module_regex:
   course_modules = modules.filter_modules(course, module_regex)
   filtered_assignments = list(modules.filter_assignments_by_module_list(
       course_modules, filtered_assignments))
+@
+
+The ungraded filter is the only step that needs submission data. We therefore
+apply it after the structural filters have already narrowed the assignment
+list.
+<<apply ungraded filter if specified>>=
+if ungraded:
+  filtered_assignments = [
+      assignment for assignment in filtered_assignments
+      if has_ungraded_submissions(assignment)
+  ]
+@
+
+
+\subsection{Verifying that [[-a]] runs before [[-U]]}
+
+The user-visible regression here was not incorrect grading semantics, but work
+done too early. We verify that [[process_assignment_option()]] narrows the
+assignment list by name before it touches submissions, so unrelated assignments
+never trigger fetches.
+
+<<test functions>>=
+class TestProcessAssignmentOption:
+    """Test command-line assignment selection order."""
+
+    def make_course(self):
+        """Create a real Canvas course instance for isinstance checks."""
+        return Course(MagicMock(), {"id": 11, "name": "Course"})
+
+    def make_assignment(self, assignment_id, name):
+        """Create a real Canvas assignment instance for process tests."""
+        return Assignment(MagicMock(), {"id": assignment_id, "name": name})
+
+    def make_submission(self, *, graded_at, matches):
+        """Create a submission stub with grading metadata."""
+        submission = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        submission.submitted_at = "2024-01-01T10:00:00Z"
+        submission.graded_at = graded_at
+        submission.grade_matches_current_submission = matches
+        return submission
+
+    def test_name_filter_runs_before_ungraded_scan(self):
+        """Ungraded checks should skip assignments filtered out by name."""
+        course = self.make_course()
+        unrelated = self.make_assignment(1, "Lab 1")
+        graded_match = self.make_assignment(2, "INL1Written Draft")
+        ungraded_match = self.make_assignment(3, "INL1Written Final")
+        course.get_assignments = Mock(
+            return_value=[unrelated, graded_match, ungraded_match]
+        )
+
+        unrelated.get_submissions = Mock(return_value=[])
+        graded_match.get_submissions = Mock(return_value=[
+            self.make_submission(
+                graded_at="2024-01-01T12:00:00Z",
+                matches=True,
+            )
+        ])
+        ungraded_match.get_submissions = Mock(return_value=[
+            self.make_submission(
+                graded_at="2024-01-01T12:00:00Z",
+                matches=False,
+            )
+        ])
+        args = argparse.Namespace(
+            assignment="^INL1Written",
+            assignment_group="",
+            module="",
+            ungraded=True,
+        )
+
+        with patch.object(courses, "process_course_option", return_value=[course]):
+            result = process_assignment_option(MagicMock(), args)
+
+        assert result == [ungraded_match]
+        unrelated.get_submissions.assert_not_called()
+        graded_match.get_submissions.assert_called_once_with()
+        ungraded_match.get_submissions.assert_called_once_with()
 @
 
 
@@ -331,6 +457,7 @@ add_assignment_option(assignments_parser, suppress_help=True)
 <<add assignments list subcommand>>
 <<add assignments view subcommand>>
 <<add assignments set-dates subcommand>>
+<<add assignments edit subcommand>>
 @
 
 The [[list]] subcommand shows assignments in a tabular format suitable for 
@@ -345,15 +472,38 @@ list_parser.set_defaults(func=assignments_list_command)
 add_assignment_option(list_parser)
 @
 
-The [[view]] subcommand provides detailed information about assignments in 
+The [[view]] subcommand provides detailed information about assignments in
 a human-readable format with rich formatting when displayed in a terminal.
+
+\subsection{The [[--html]] option}
+
+By default, [[view]] converts assignment descriptions from HTML to Markdown for
+easier reading and editing. However, some assignments contain elements that
+don't convert well to Markdown: embedded videos, iframes, complex tables, or
+custom HTML formatting. The [[--html]] option preserves the original HTML
+content.
+
+When [[--html]] is specified:
+\begin{description}
+\item[TTY output] Shows syntax-highlighted HTML in the pager
+\item[Piped output] Outputs YAML front matter plus raw HTML body
+\end{description}
+
+This enables a round-trip workflow where HTML assignments can be viewed, edited,
+and pushed back without losing any formatting.
 <<add assignments view subcommand>>=
-# Add view subcommand (was the old "assignment" command)  
+# Add view subcommand (was the old "assignment" command)
 view_parser = assignments_subp.add_parser("view",
     help="View assignment details",
-    description="Views detailed information about assignments")
+    description="Views detailed information about assignments. "
+      "When piped (not a TTY), outputs YAML front matter with a 'regex' field "
+      "for stable identification, followed by the description as Markdown. "
+      "Use --html to preserve HTML instead of converting to Markdown.")
 view_parser.set_defaults(func=assignments_view_command)
 add_assignment_option(view_parser)
+view_parser.add_argument("--html",
+    action="store_true",
+    help="Output raw HTML instead of converting to Markdown")
 @
 
 The [[set-dates]] subcommand allows modification of assignment timing with 
@@ -367,6 +517,46 @@ set_dates_parser = assignments_subp.add_parser("set-dates",
 set_dates_parser.set_defaults(func=assignments_set_dates_command)
 add_assignment_option(set_dates_parser, ungraded=False, required=True)
 <<set up date options for set-dates>>
+@
+
+The [[edit]] subcommand updates assignment content. It supports two modes:
+\begin{description}
+\item[Interactive mode] (default): Opens matching assignments one by one in your
+  editor, shows a preview, and asks whether to accept, edit further, or discard.
+  This is the default when no [[-f]] option is given.
+\item[File mode] ([[-f]]): Reads content from a Markdown file with YAML front
+  matter and updates directly without preview. This enables a Git-based workflow:
+  export assignment content with [[view]] (piped to a file), edit locally, and
+  push changes back with [[edit -f]].
+\end{description}
+<<add assignments edit subcommand>>=
+edit_parser = assignments_subp.add_parser("edit",
+    help="Edit assignment content interactively or from a file",
+    description="Edit assignment content. Without -f, opens each matching "
+      "assignment in your editor for interactive editing with preview. "
+      "With -f, reads from a Markdown file with YAML front matter and updates "
+      "directly (script-friendly). "
+      "Assignment matching workflow: "
+      "(1) If the YAML contains a 'regex' field, it matches assignments by "
+      "name or Canvas numeric ID. The regex is tested against both. "
+      "This provides stable identification: export an assignment with "
+      "'assignments view -a \"Lab 1.*\" > lab.md', edit locally, and push "
+      "back with 'assignments edit -f lab.md'---the regex stays constant "
+      "even if the name changes slightly. "
+      "(2) If no 'regex' is present but 'name' is, exact name matching is "
+      "used. "
+      "(3) Otherwise, falls back to -a, -A, and -M filters. "
+      "Use --html to read/edit HTML directly without Markdown conversion.")
+edit_parser.set_defaults(func=assignments_edit_command)
+add_assignment_option(edit_parser, ungraded=False, required=True)
+canvaslms.cli.content.add_file_option(edit_parser)
+edit_parser.add_argument("--create",
+    action="store_true",
+    help="Create a new assignment if no match is found")
+edit_parser.add_argument("--html",
+    action="store_true",
+    help="Read file as HTML instead of converting from Markdown. "
+         "In interactive mode, edit HTML directly.")
 @
 
 
@@ -452,9 +642,11 @@ We want to filter out the assignment groups that match a regex.
 def filter_assignment_groups(course, regex):
   """Returns all assignment groups of course whose name matches regex"""
   name = re.compile(regex)
-  return filter(
-    lambda group: name.search(group.name),
-    course.get_assignment_groups())
+  for group in course.get_assignment_groups():
+    group = canvaslms.cli.utils.ensure_assignment_group_attrs(group)
+    group.course = course
+    if name.search(group.name or ''):
+      yield group
 @
 
 We also want to filter out the assignments of a course that belong to a given
@@ -513,16 +705,21 @@ def assignments_view_command(config, canvas, args):
 
   assignment_list = process_assignment_option(canvas, args)
   for assignment in assignment_list:
-    output = format_assignment(assignment)
-
     if sys.stdout.isatty():
-      <<check if we should use styles>>
-      with console.pager(styles=styles, links=True):
-        console.print(rich.markdown.Markdown(output,
-                                             code_theme="manni"))
+      if args.html:
+        <<output assignment html in tty>>
+      else:
+        output = format_assignment(assignment)
+        <<check if we should use styles>>
+        with console.pager(styles=styles, links=True):
+          console.print(rich.markdown.Markdown(output,
+                                               code_theme="manni"))
     else:
-      print(output)
-@ Note that we use the theme [[manni]] for the code, as this works in both dark 
+      if args.html:
+        <<output assignment in html format>>
+      else:
+        <<output assignment in editable format>>
+@ Note that we use the theme [[manni]] for the code, as this works in both dark
 and light terminals.
 
 \subsection{Check if we should use styles}
@@ -545,6 +742,109 @@ if "less" in pager and ("-R" in pager or "-r" in pager):
   styles = True
 @
 
+\subsection{Editable output format}
+
+When output is piped (not a TTY), we output the assignment in an editable
+format: YAML front matter with attributes followed by the description
+converted to Markdown. This format can be saved to a file, edited, and
+pushed back to Canvas using [[assignments edit -f]].
+
+The front matter includes a [[modules]] field listing which modules currently
+contain this assignment. When editing:
+\begin{description}
+\item[Leave unset] Module membership is not changed
+\item[Set to empty list] Assignment is removed from all modules
+\item[Set to list of regexes] Assignment is placed in exactly those modules
+  matching the patterns---added to matching modules, removed from non-matching
+\end{description}
+<<output assignment in editable format>>=
+<<get current modules for assignment>>
+<<get rubric for assignment>>
+<<determine regex for assignment>>
+output = canvaslms.cli.content.render_to_markdown(
+    assignment,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    content_attr='description',
+    extra_attributes={'modules': assignment_modules,
+                      'rubric': assignment_rubric,
+                      'regex': assignment_regex})
+print(output)
+@
+
+We fetch the rubric if it exists. The rubric is available as an attribute on
+the assignment object when the assignment has a rubric attached.
+<<get rubric for assignment>>=
+assignment_rubric = None
+if hasattr(assignment, 'rubric') and assignment.rubric:
+  assignment_rubric = assignment.rubric
+@
+
+We fetch the current module membership using [[get_item_modules]] from the
+modules module. Assignments are identified by their numeric ID ([[content_id]]
+in the Canvas API).
+<<get current modules for assignment>>=
+assignment_modules = modules.get_item_modules(
+    assignment.course, 'Assignment', assignment.id)
+@
+
+When determining the regex for export, we follow the same approach as for pages.
+If the user specified a non-default [[-a]] pattern, we use that regex verbatim
+(capturing their intent). Otherwise, we generate an exact-match regex from the
+assignment name by escaping special characters and adding anchors.
+<<determine regex for assignment>>=
+if hasattr(args, 'assignment') and args.assignment not in (None, '.*'):
+  # User specified a -a filter, use it verbatim
+  assignment_regex = args.assignment
+else:
+  # Generate exact-match regex from name
+  assignment_regex = '^' + re.escape(assignment.name) + '$'
+@
+
+\subsection{HTML output format}
+
+When [[--html]] is specified, we preserve the original HTML content instead of
+converting to Markdown. This is the counterpart to the editable format above.
+
+For TTY output, we display the HTML with syntax highlighting. We show a header
+with metadata first (same as the Markdown view), then the raw HTML body with
+syntax highlighting for readability.
+<<output assignment html in tty>>=
+header = f"# {assignment.name}\n\n"
+header += f"## Metadata\n\n"
+header += f"- Course: {assignment.course.course_code}\n"
+header += f"- Unlocks: {canvaslms.cli.utils.format_local_time(assignment.unlock_at) if assignment.unlock_at else 'None'}\n"
+header += f"- Due: {canvaslms.cli.utils.format_local_time(assignment.due_at) if assignment.due_at else 'None'}\n"
+header += f"- Locks: {canvaslms.cli.utils.format_local_time(assignment.lock_at) if assignment.lock_at else 'None'}\n"
+header += f"- URL: {assignment.html_url}\n"
+header += "\n## Description (HTML)\n\n"
+
+with console.pager(styles=True):
+  console.print(rich.markdown.Markdown(header))
+  if hasattr(assignment, 'description') and assignment.description:
+    syntax = rich.syntax.Syntax(assignment.description, "html", theme="monokai",
+                                word_wrap=True)
+    console.print(syntax)
+  else:
+    console.print("(No description)")
+@
+
+For piped output, we use [[render_to_html]] from the content module to produce
+YAML front matter with the raw HTML body. This can be saved to a file, edited,
+and pushed back using [[assignments edit --html -f]].
+<<output assignment in html format>>=
+<<get current modules for assignment>>
+<<get rubric for assignment>>
+<<determine regex for assignment>>
+output = canvaslms.cli.content.render_to_html(
+    assignment,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    content_attr='description',
+    extra_attributes={'modules': assignment_modules,
+                      'rubric': assignment_rubric,
+                      'regex': assignment_regex})
+print(output)
+@
+
 
 \section{Formatting assignments}
 
@@ -559,7 +859,7 @@ def format_assignment(assignment):
 
 """
 
-  if assignment.description:
+  if hasattr(assignment, 'description') and assignment.description:
     instruction = pypandoc.convert_text(
       assignment.description, "md", format="html")
     text += f"## Instruction\n\n{instruction}\n\n"
@@ -600,6 +900,8 @@ except AttributeError:
 
 We'll do this with [[format_rubric]].
 It should output a markdown representation of the rubric.
+Some criteria may lack ratings (for instance, free-form criteria where the
+grader enters a custom point value), so we guard against [[None]] ratings.
 <<functions>>=
 def format_rubric(rubric):
   """
@@ -613,10 +915,14 @@ def format_rubric(rubric):
     text += f"- {criterion['description']}\n"
     text += f"  - Points: {criterion['points']}\n"
     text += f"  - Ratings: "
-    text += "; ".join([
-      f"{rating['description'].strip()} ({rating['points']})"
-      for rating in criterion["ratings"]
-    ]) + "\n"
+    ratings = criterion.get("ratings") or []
+    if ratings:
+      text += "; ".join([
+        f"{rating['description'].strip()} ({rating['points']})"
+        for rating in ratings
+      ]) + "\n"
+    else:
+      text += "(free-form)\n"
     text += f"\n```\n{criterion['long_description']}\n```\n\n"
 
   return text
@@ -649,21 +955,15 @@ We provide the following functions:
 We return the assignments for a list of courses, since we can match several
 courses with a regular expression (using [[filter_courses]]).
 
-For [[list_ungraded_assignments]], we filter locally rather than using Canvas's
-[[bucket="ungraded"]] parameter.
-This avoids cache inconsistencies (the caching system doesn't track the bucket
-parameter).
-The filtering logic checks each assignment for ungraded submissions by
-examining [[submitted_at]], [[graded_at]], and
-[[grade_matches_current_submission]] attributes using the
-[[submissions.is_ungraded]] helper function.
-While this requires fetching submission data, the [[LazySubmission]] wrapper
-and caching system minimize API calls.
+Here too, the tempting server-side [[bucket="ungraded"]] filter is unsafe.
+The submission cache does not track that restrictive query, so an ungraded-only
+fetch can make later plain assignment work look empty. We therefore fetch the
+ordinary assignment list and, when needed, inspect submissions locally using
+the shared [[submissions.is_submission_ungraded()]] predicate.
 
-Note that we set [[assignment.course]] and [[assignment.assignment_group]] for
-\emph{all} assignments before filtering.
-This ensures that all assignments in the cache have these attributes set
-consistently, regardless of which filtering path is used to access them later.
+We still attach [[assignment.course]] and [[assignment.assignment_group]]
+before filtering so cached assignment objects expose the same attributes
+regardless of which listing path fetched them.
 <<functions>>=
 def list_assignments(assignments_containers, ungraded=False):
   """Lists all assignments in all assignments containers (courses or
@@ -678,6 +978,7 @@ def list_assignments(assignments_containers, ungraded=False):
     assignments = container.get_assignments()
 
     for assignment in assignments:
+      assignment = canvaslms.cli.utils.ensure_assignment_attrs(assignment)
       try:
         assignment.course = course
       except NameError:
@@ -688,19 +989,109 @@ def list_assignments(assignments_containers, ungraded=False):
       except NameError:
         pass
 
-      if ungraded:
-        has_ungraded = False
-        for submission in assignment.get_submissions():
-          if submissions.is_ungraded(submission):
-            has_ungraded = True
-            break
-        if not has_ungraded:
-          continue
+      if ungraded and not has_ungraded_submissions(assignment):
+        continue
 
       yield assignment
 
 def list_ungraded_assignments(assignments_containers):
   return list_assignments(assignments_containers, ungraded=True)
+@
+
+We determine whether an assignment is ungraded by looking at its submissions,
+not at summary counters. That keeps the assignment command aligned with the
+submission command's resubmission semantics.
+<<functions>>=
+def has_ungraded_submissions(assignment):
+  """Return True when ``assignment`` has at least one ungraded submission."""
+  for submission in assignment.get_submissions():
+    submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+    if submissions.is_submission_ungraded(submission):
+      return True
+  return False
+@
+
+\subsection{Verifying local ungraded assignment filtering}
+
+The regression fix here has two observable effects: [[list_assignments()]] must
+stop passing [[bucket="ungraded"]], and the local filter must still treat
+resubmitted work as ungraded.
+
+<<test functions>>=
+class TestListAssignments:
+    """Test assignment listing helpers."""
+
+    def make_course(self):
+        """Create a real Canvas course instance for isinstance checks."""
+        return Course(MagicMock(), {"id": 11, "name": "Course"})
+
+    def make_assignment(self, assignment_id, name):
+        """Create a real Canvas assignment instance for helper tests."""
+        return Assignment(MagicMock(), {"id": assignment_id, "name": name})
+
+    def test_ungraded_listing_uses_plain_assignment_fetch(self):
+        """Ungraded assignment listing should not use Canvas bucket filters."""
+        course = self.make_course()
+        first = self.make_assignment(1, "Lab 1")
+        second = self.make_assignment(2, "Lab 2")
+        course.get_assignments = Mock(return_value=[first, second])
+
+        first.get_submissions = Mock(return_value=[])
+        second.get_submissions = Mock(return_value=[])
+
+        list(list_ungraded_assignments([course]))
+
+        course.get_assignments.assert_called_once_with()
+
+    def test_filters_assignments_by_submission_state(self):
+        """Assignments should stay when any submission still needs grading."""
+        course = self.make_course()
+        graded_assignment = self.make_assignment(1, "Lab 1")
+        ungraded_assignment = self.make_assignment(2, "Lab 2")
+        course.get_assignments = Mock(
+            return_value=[graded_assignment, ungraded_assignment]
+        )
+
+        graded_submission = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        graded_submission.submitted_at = "2024-01-01T10:00:00Z"
+        graded_submission.graded_at = "2024-01-01T12:00:00Z"
+        graded_submission.grade_matches_current_submission = True
+
+        resubmitted = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        resubmitted.submitted_at = "2024-01-01T10:00:00Z"
+        resubmitted.graded_at = "2024-01-01T12:00:00Z"
+        resubmitted.grade_matches_current_submission = False
+
+        graded_assignment.get_submissions = Mock(return_value=[graded_submission])
+        ungraded_assignment.get_submissions = Mock(return_value=[resubmitted])
+
+        result = list(list_ungraded_assignments([course]))
+
+        assert result == [ungraded_assignment]
+        assert ungraded_assignment.course is course
+
+    def test_has_ungraded_submissions_reuses_submission_predicate(self):
+        """Assignment-level ungraded checks should mirror submission semantics."""
+        assignment = self.make_assignment(3, "Lab 3")
+        stale = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        stale.submitted_at = "2024-01-01T10:00:00Z"
+        stale.graded_at = "2024-01-01T12:00:00Z"
+        stale.grade_matches_current_submission = False
+        assignment.get_submissions = Mock(return_value=[stale])
+
+        assert has_ungraded_submissions(assignment) is True
 @
 
 We also want to filter out assignments on the title based on regex.
@@ -709,10 +1100,16 @@ ungraded assignments.
 <<functions>>=
 def filter_assignments(assignments_containers, regex, ungraded=False):
   """Returns all assignments from assignments_container whose
-  title matches regex"""
+  title matches regex.
+
+  We normalize a missing regex (None or empty string) to '.*' to match all.
+  This handles required-filter contexts where -M/-A are used without -a.
+  """
+  if regex is None or regex == "":
+    regex = ".*"
   p = re.compile(regex)
   for assignment in list_assignments(assignments_containers, ungraded=ungraded):
-    if p.search(assignment.name):
+    if p.search(assignment.name or ''):
       yield assignment
     elif p.search(str(assignment.id)):
       yield assignment
@@ -831,8 +1228,523 @@ for assignment in assignment_list:
 
   try:
     assignment.edit(**updates)
+    <<update assignment cache after edit>>
     logger.info(f"Updated dates for assignment '{assignment.name}'")
   except Exception as e:
     logger.error(f"Error updating assignment '{assignment.name}' (ID: {assignment.id}): {e}")
 @
 
+\subsection{Updating the cache after editing}
+
+After successfully editing an assignment, we must update the cache entry to
+prevent unnecessary re-fetches.
+The Canvas API's [[edit()]] method updates the object in-place, but the
+[[_fetched_at]] timestamp (used for staleness checks) isn't automatically set.
+<<update assignment cache after edit>>=
+assignment._fetched_at = datetime.now()
+if hasattr(assignment.course, 'assignment_cache'):
+  assignment.course.assignment_cache[assignment.id] = (assignment, {})
+@
+
+
+\section{The [[assignments edit]] command}
+
+The [[edit]] command updates assignment content. It supports two workflows:
+
+\begin{description}
+\item[Interactive editing] When no [[-f]] option is given, the command opens
+  each matching assignment in your editor with the current content pre-populated.
+  After editing, it shows a preview and asks whether to accept the changes, edit
+  further, or discard. This enables quick edits without leaving the terminal.
+\item[File-based editing] When [[-f]] is provided, the command reads content
+  from a Markdown file with YAML front matter and updates directly. This enables
+  a Git-based workflow: export with [[view]], edit locally, push back with
+  [[edit -f]].
+\end{description}
+
+The command uses the content module's schema-based approach, allowing the same
+infrastructure to work across announcements, assignments, and pages.
+<<functions>>=
+def assignments_edit_command(config, canvas, args):
+  """Edit assignment content interactively or from file."""
+  if args.file:
+    <<edit assignments from file>>
+  else:
+    <<edit assignments interactively>>
+
+@
+
+\subsection{File-based editing}
+
+When [[-f]] is provided, we read from the file, validate, and update directly.
+This mode is script-friendly and does not require user interaction.
+<<edit assignments from file>>=
+<<read and validate assignment content from file>>
+<<update assignment with new content>>
+@
+
+We read the file using the content module's infrastructure, then validate the
+attributes against the assignment schema. The body content may be Markdown
+(default) or HTML (when [[--html]] is specified).
+<<read and validate assignment content from file>>=
+try:
+  # body_content is Markdown or HTML depending on args.html
+  attributes, body_content = canvaslms.cli.content.read_content_from_file(args.file)
+except FileNotFoundError:
+  canvaslms.cli.err(1, f"File not found: {args.file}")
+except Exception as e:
+  canvaslms.cli.err(1, f"Error reading file: {e}")
+
+errors = canvaslms.cli.content.validate_attributes(
+    attributes, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+if errors:
+  for error in errors:
+    logger.error(f"Validation error: {error}")
+  canvaslms.cli.err(1, "File validation failed")
+@
+
+\subsection{Updating assignment with new content}
+
+We convert the content to HTML for Canvas (unless [[--html]] is specified, in
+which case the content is already HTML).
+
+The matching strategy prioritizes reliability and safety:
+\begin{enumerate}
+\item If the YAML contains a [[regex]] field, we compile it and match against
+  assignment names and Canvas numeric IDs. This provides stable identification
+  even when names change, as long as the new name still matches the pattern.
+\item If no [[regex]] is in the YAML but a [[name]] is present, we use exact
+  name matching. This is safe because it won't accidentally match multiple
+  assignments.
+\item As a last resort (for backward compatibility), we fall back to
+  filter-based matching using [[-a]], [[-A]], and [[-M]] options only if no
+  name is specified.
+\end{enumerate}
+<<update assignment with new content>>=
+if args.html:
+  html_content = body_content  # Already HTML, no conversion needed
+else:
+  html_content = pypandoc.convert_text(body_content, 'html', format='md')
+
+if 'regex' in attributes and attributes['regex']:
+  <<update or create assignment by regex>>
+else:
+  <<update assignments by filter matching>>
+@
+
+\subsubsection{Regex-based assignment identification}
+
+When the YAML contains a [[regex]] field, we use [[match_item_by_regex]] from
+the content module to find the matching assignment. The function handles the
+three-way dispatch (one match, zero matches, multiple matches) and raises
+[[EmptyListError]] or [[MultipleMatchesError]] as appropriate.
+
+We match the regex against both assignment names and Canvas numeric IDs,
+providing flexibility: an assignment can be identified by a pattern in its name
+(\enquote{Lab 1.*}) or by its numeric ID (\verb|^12345$|).
+
+If exactly one assignment matches, we update it. If no assignments match and
+[[--create]] is specified, we create a new one. If multiple assignments match,
+the exception message lists the matching names so the user can make the regex
+more specific.
+<<update or create assignment by regex>>=
+regex_pattern = attributes['regex']
+course_list = courses.process_course_option(canvas, args)
+if not course_list:
+  canvaslms.cli.err(1, "No courses found matching criteria")
+
+course = course_list[0]
+
+all_assignments = list(list_assignments([course]))
+
+try:
+  assignment = canvaslms.cli.content.match_item_by_regex(
+      all_assignments, regex_pattern,
+      [lambda a: a.name or '', lambda a: str(a.id)],
+      item_type="assignment",
+      name_func=lambda a: a.name or '')
+  <<update existing assignment>>
+except re.error as e:
+  canvaslms.cli.err(
+      1, f"Invalid regex pattern '{regex_pattern}': {e}")
+except canvaslms.cli.EmptyListError:
+  if args.create:
+    <<create new assignment>>
+  else:
+    canvaslms.cli.err(1,
+      f"No assignments match regex '{regex_pattern}'. "
+      f"Use --create to create a new assignment.")
+@
+
+When updating an existing assignment, we build the update dictionary and call
+the Canvas API.
+<<update existing assignment>>=
+update_data = {
+  'assignment': {
+    'name': attributes.get('name', assignment.name),
+    'description': html_content,
+  }
+}
+
+<<add optional assignment attributes to update>>
+
+try:
+  assignment.edit(**update_data)
+  <<update assignment cache after edit>>
+  logger.info(f"Updated assignment: {assignment.name}")
+  <<update assignment module membership>>
+except Exception as e:
+  canvaslms.cli.err(1,
+    f"Error updating assignment '{assignment.name}': {e}")
+@
+
+\subsubsection{Creating new assignments}
+
+When [[--create]] is specified and the assignment doesn't exist, we create a
+new one. We use the Canvas API's [[create_assignment]] method.
+<<create new assignment>>=
+create_params = {
+  'name': attributes.get('name', 'Untitled Assignment'),
+  'description': html_content,
+}
+if 'due_at' in attributes and attributes['due_at'] is not None:
+  create_params['due_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
+if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
+  create_params['unlock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
+if 'lock_at' in attributes and attributes['lock_at'] is not None:
+  create_params['lock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
+if 'points_possible' in attributes and attributes['points_possible'] is not None:
+  create_params['points_possible'] = attributes['points_possible']
+if 'published' in attributes:
+  create_params['published'] = attributes['published']
+
+try:
+  new_assignment = course.create_assignment(assignment=create_params)
+  new_assignment.course = course
+  logger.info(f"Created assignment: {new_assignment.name} "
+    f"(id: {new_assignment.id})")
+  <<update new assignment module membership>>
+except Exception as e:
+  canvaslms.cli.err(1, f"Error creating assignment: {e}")
+@
+
+For newly created assignments, we also process module membership if specified.
+<<update new assignment module membership>>=
+if 'modules' in attributes:
+  module_regexes = attributes['modules']
+  added, removed = modules.update_item_modules(
+      new_assignment.course, 'Assignment', new_assignment.id, module_regexes)
+  if added:
+    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+@
+
+\subsubsection{Filter-based assignment matching}
+
+When no [[regex]] is specified in the YAML, we check whether a [[name]] is
+present. If so, we use exact name matching to find the assignment---this is
+critical for safety. Without it, the command would fall back to filter-based
+matching with the default [[-a '.*']] pattern, which matches \emph{all}
+assignments in the course. The result would be catastrophic: every assignment
+would be overwritten with the content from the file.
+
+If no [[name]] is present either, we fall back to filter-based matching using
+the [[-a]], [[-A]], and [[-M]] options (the original behavior). To prevent
+accidental mass-updates, we refuse to proceed if the filter matches more than
+one assignment.
+<<update assignments by filter matching>>=
+if 'name' in attributes and attributes['name']:
+  <<update or create assignment by name>>
+else:
+  assignment_list = process_assignment_option(canvas, args)
+  if len(assignment_list) > 1:
+    canvaslms.cli.err(1,
+      f"{len(assignment_list)} assignments match filter. "
+      f"Add 'name' or 'regex' to YAML, or use -a to narrow selection.")
+  for assignment in assignment_list:
+    <<update existing assignment>>
+@
+
+\subsubsection{Name-based assignment identification}
+
+When no [[regex]] is specified in the YAML but a [[name]] is present, we use
+[[match_item_by_name]] from the content module for exact name matching. This
+avoids the catastrophic scenario where the default [[-a '.*']] pattern matches
+all assignments and overwrites them all with the file content.
+
+If exactly one assignment matches, we update it. If none match and [[--create]]
+is specified, we create a new assignment. If multiple assignments share the same
+name, the exception tells the user to add a [[regex]] field to disambiguate.
+<<update or create assignment by name>>=
+name = attributes['name']
+course_list = courses.process_course_option(canvas, args)
+if not course_list:
+  canvaslms.cli.err(1, "No courses found matching criteria")
+
+course = course_list[0]
+
+all_assignments = list(list_assignments([course]))
+
+try:
+  assignment = canvaslms.cli.content.match_item_by_name(
+      all_assignments, name,
+      lambda a: a.name or '',
+      item_type="assignment")
+  <<update existing assignment>>
+except canvaslms.cli.EmptyListError:
+  if args.create:
+    <<create new assignment>>
+  else:
+    canvaslms.cli.err(1,
+      f"No assignments match name '{name}'. "
+      f"Use --create to create a new assignment.")
+@
+
+We add optional attributes only if they are present in the YAML front matter.
+This allows users to update just the description without changing dates, or to
+update dates along with content.
+
+Date attributes require special handling: YAML's [[safe_load]] automatically
+parses date-like strings (e.g.~\verb|due_at: 2026-03-06 19:00|) into Python
+[[datetime.datetime]] objects, but the Canvas API expects ISO~8601 UTC strings
+ending with~``Z''. We use [[format_canvas_time]] to perform this conversion; it
+already handles both string and [[datetime]] inputs.
+<<add optional assignment attributes to update>>=
+if 'due_at' in attributes and attributes['due_at'] is not None:
+  update_data['assignment']['due_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
+if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
+  update_data['assignment']['unlock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
+if 'lock_at' in attributes and attributes['lock_at'] is not None:
+  update_data['assignment']['lock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
+if 'points_possible' in attributes and attributes['points_possible'] is not None:
+  update_data['assignment']['points_possible'] = attributes['points_possible']
+if 'published' in attributes:
+  update_data['assignment']['published'] = attributes['published']
+@
+
+\subsection{Processing module membership}
+
+After updating the assignment content, we process the [[modules]] attribute if
+it's present in the front matter. This attribute controls which modules contain
+the assignment:
+\begin{description}
+\item[Absent] Module membership is not modified
+\item[Empty list] Assignment is removed from all modules
+\item[List of regexes] Assignment is placed in exactly those modules matching
+  the patterns---added to matching modules, removed from non-matching ones
+\end{description}
+
+We use the [[update_item_modules]] utility from the modules module. Assignments
+use their numeric ID as the item identifier.
+<<update assignment module membership>>=
+if 'modules' in attributes:
+  module_regexes = attributes['modules']
+  added, removed = modules.update_item_modules(
+      assignment.course, 'Assignment', assignment.id, module_regexes)
+  if added:
+    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+  if removed:
+    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+@
+
+In the interactive editing context, the attributes are stored in [[final_attrs]]
+rather than [[attributes]], so we provide a separate chunk for that scope.
+<<update assignment module membership interactively>>=
+if 'modules' in final_attrs:
+  module_regexes = final_attrs['modules']
+  added, removed = modules.update_item_modules(
+      assignment.course, 'Assignment', assignment.id, module_regexes)
+  if added:
+    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+  if removed:
+    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+@
+
+\subsection{Interactive editing}
+
+When no [[-f]] is given, we enter interactive mode. This involves:
+\begin{enumerate}
+\item Fetching all matching assignments
+\item Showing a confirmation dialog listing what will be edited
+\item For each assignment: open editor, preview, accept/edit/discard
+\item Reporting results at the end
+\end{enumerate}
+
+This workflow allows batch editing with human review---users can match multiple
+assignments with a regex and then review each one before committing changes.
+<<edit assignments interactively>>=
+<<get assignments for interactive editing>>
+<<confirm assignments to edit>>
+<<edit each assignment interactively>>
+<<report interactive assignment edit results>>
+@
+
+First we fetch the matching assignments. We use [[process_assignment_option]]
+which handles the course and assignment filtering.
+<<get assignments for interactive editing>>=
+try:
+  assignment_list = process_assignment_option(canvas, args)
+except canvaslms.cli.EmptyListError as e:
+  print(f"Error: {e}", file=sys.stderr)
+  return
+@
+
+Before starting the edit loop, we show the user what will be edited and ask for
+confirmation. This prevents accidentally editing many assignments when the
+pattern matches more than expected.
+<<confirm assignments to edit>>=
+print(f"Will edit {len(assignment_list)} assignment(s):", file=sys.stderr)
+for assignment in assignment_list:
+  course_code = assignment.course.course_code if hasattr(assignment, 'course') else "?"
+  print(f"  - {course_code}: {assignment.name}", file=sys.stderr)
+
+try:
+  confirm = input("Continue? [y/N] ").strip().lower()
+except (EOFError, KeyboardInterrupt):
+  print("\nCancelled.", file=sys.stderr)
+  return
+
+if confirm not in ['y', 'yes']:
+  print("Cancelled.", file=sys.stderr)
+  return
+@
+
+Now we edit each assignment one by one. For each assignment, we:
+\begin{enumerate}
+\item Render current content to Markdown with YAML front matter
+\item Open the editor with this content pre-populated
+\item Show preview and enter accept/edit/discard loop
+\item On accept, update the assignment in Canvas
+\end{enumerate}
+<<edit each assignment interactively>>=
+updated_count = 0
+skipped_count = 0
+
+for assignment in assignment_list:
+  course_code = assignment.course.course_code if hasattr(assignment, 'course') else "?"
+  print(f"\nEditing: {course_code}: {assignment.name}", file=sys.stderr)
+
+  <<render current assignment content>>
+  <<open editor with assignment content>>
+  <<interactive confirm and update single assignment>>
+@
+
+We extract the current assignment attributes using the content module's schema.
+We also fetch the current module membership and rubric so they can be viewed
+and edited. The description (HTML body) is not part of the schema---it becomes
+the Markdown body rather than a YAML front matter attribute---but
+[[get_content_from_editor]] needs it in [[current_attrs]] to convert from HTML.
+We add it manually, following the same pattern used by [[syllabus.nw]].
+<<render current assignment content>>=
+current_attrs = canvaslms.cli.content.extract_attributes_from_object(
+    assignment, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+current_attrs['description'] = getattr(
+    assignment, 'description', '') or ''
+assignment_modules = modules.get_item_modules(
+    assignment.course, 'Assignment', assignment.id)
+assignment_rubric = None
+if hasattr(assignment, 'rubric') and assignment.rubric:
+  assignment_rubric = assignment.rubric
+@
+
+We open the user's editor with the current content. By specifying
+[[content_attr='description']], the editor function automatically extracts the
+description from the attributes, converts HTML to Markdown for the body, and
+excludes it from the YAML front matter. We include the [[modules]] and
+[[rubric]] attributes so users can view and edit them.
+
+When [[--html]] is specified, we pass [[html_mode=True]] to skip the
+HTML-to-Markdown conversion and use a \verb|.html| file suffix. This preserves
+embedded elements that would be lost during Markdown round-tripping.
+<<open editor with assignment content>>=
+result = canvaslms.cli.content.get_content_from_editor(
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA,
+    current_attrs,
+    content_attr='description',
+    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric},
+    html_mode=args.html)
+if result is None:
+  print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+# body_content is Markdown or HTML depending on args.html
+attributes, body_content = result
+@
+
+After editing, we enter the interactive confirm loop. The user can preview the
+content, accept it (which triggers the update), edit further, or discard changes.
+<<interactive confirm and update single assignment>>=
+title = attributes.get('name', assignment.name)
+result = canvaslms.cli.content.interactive_confirm_and_edit(
+    title, body_content, attributes,
+    canvaslms.cli.content.ASSIGNMENT_SCHEMA, "Assignment",
+    content_attr='description')
+
+if result is None:
+  print("Discarded changes for this assignment.", file=sys.stderr)
+  skipped_count += 1
+  continue
+
+final_attrs, final_content = result
+<<update single assignment from interactive edit>>
+@
+
+When the user accepts, we convert the Markdown to HTML and update the assignment.
+If the user is working in HTML mode, we skip the conversion since the content
+is already HTML.
+<<update single assignment from interactive edit>>=
+if args.html:
+  html_content = final_content
+else:
+  try:
+    html_content = pypandoc.convert_text(final_content, 'html', format='md')
+  except Exception as e:
+    logger.warning(f"Failed to convert markdown to HTML: {e}")
+    html_content = final_content
+
+update_data = {
+  'assignment': {
+    'name': final_attrs.get('name', assignment.name),
+    'description': html_content,
+  }
+}
+
+# Add optional attributes (format dates for Canvas API)
+if 'due_at' in final_attrs and final_attrs['due_at'] is not None:
+  update_data['assignment']['due_at'] = \
+    canvaslms.cli.utils.format_canvas_time(final_attrs['due_at'])
+if 'unlock_at' in final_attrs and final_attrs['unlock_at'] is not None:
+  update_data['assignment']['unlock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(final_attrs['unlock_at'])
+if 'lock_at' in final_attrs and final_attrs['lock_at'] is not None:
+  update_data['assignment']['lock_at'] = \
+    canvaslms.cli.utils.format_canvas_time(final_attrs['lock_at'])
+if 'points_possible' in final_attrs and final_attrs['points_possible'] is not None:
+  update_data['assignment']['points_possible'] = final_attrs['points_possible']
+if 'published' in final_attrs:
+  update_data['assignment']['published'] = final_attrs['published']
+
+try:
+  assignment.edit(**update_data)
+  <<update assignment cache after edit>>
+  logger.info(f"Updated assignment: {assignment.name}")
+  <<update assignment module membership interactively>>
+  updated_count += 1
+except Exception as e:
+  logger.error(f"Error updating assignment '{assignment.name}': {e}")
+  print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
+  skipped_count += 1
+@
+
+Finally, we report a summary of what was done.
+<<report interactive assignment edit results>>=
+print(f"\nDone. Updated {updated_count}/{len(assignment_list)} assignment(s).", file=sys.stderr)
+if skipped_count > 0:
+  print(f"Skipped {skipped_count} assignment(s).", file=sys.stderr)
+@

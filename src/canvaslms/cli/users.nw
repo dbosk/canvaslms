@@ -16,13 +16,14 @@ For selecting the course for which to list the users, we use the
 [[canvaslms.cli.courses]] module.
 
 We outline the module:
-<<users.py>>=
+<<[[users.py]]>>=
 import argparse
 import canvasapi.course
 import canvasapi.exceptions
 import canvasapi.group
 import canvaslms.cli
 import canvaslms.cli.courses as courses
+import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 import csv
 import operator
@@ -35,6 +36,20 @@ def add_command(subp):
   """Adds the subcommands users and groups to argparse subparser subp"""
   add_users_command(subp)
   add_groups_command(subp)
+@
+
+We define the test file structure early, but the actual test implementations
+appear after their corresponding functionality:
+
+<<test [[users.py]]>>=
+"""Tests for user caching and role filtering"""
+
+import pytest
+from unittest.mock import Mock, MagicMock
+import canvaslms.cli.users as users_module
+
+<<test user fixtures>>
+<<test functions>>
 @
 
 
@@ -331,7 +346,8 @@ def filter_group_categories(course_list, regex):
 
   for course in course_list:
     for category in course.get_group_categories():
-      if name.search(category.name):
+      category = canvaslms.cli.utils.ensure_group_category_attrs(category)
+      if name.search(category.name or ''):
         category.course = course
         yield category
 @
@@ -355,7 +371,8 @@ def filter_groups(items, regex):
 
   for item in items:
     for group in item.get_groups():
-      if name.search(group.name):
+      group = canvaslms.cli.utils.ensure_group_attrs(group)
+      if name.search(group.name or ''):
         if isinstance(item, canvasapi.course.Course):
           group.course = item
         elif isinstance(item, canvasapi.group.GroupCategory):
@@ -377,25 +394,80 @@ We provide the following functions:
   roles.
 \end{itemize}
 
-First, we provide [[list_users]], which takes a list of courses and a list of 
+First, we provide [[list_users]], which takes a list of courses and a list of
 Canvas roles as arguments.
 Here we must be careful.
 For some courses we can't list the users, because of lacking permissions.
-Whenever we're searching for a particular user, we might look in all courses, 
+Whenever we're searching for a particular user, we might look in all courses,
 and then we must skip those where we can't list the users.
-This way we can search through all other courses instead of stopping at the 
+This way we can search through all other courses instead of stopping at the
 first error.
+
+\subsection{Fetching vs.\ filtering: enrollment types}
+
+Canvas provides an [[enrollment_type]] parameter to [[get_users()]] that
+filters users by role (student, teacher, TA, etc.).
+However, we treat this as a \emph{client-side filtering operation} rather than
+a server-side fetch scope parameter.
+
+The reason is caching efficiency.
+If we pass [[enrollment_type]] to Canvas, each role filter creates a separate
+cache entry.
+When the user queries different roles (for instance, first students, then TAs),
+each query invalidates the cache and triggers a new API call.
+
+Instead, we fetch all users once (without [[enrollment_type]]) and filter
+locally:
+\begin{enumerate}
+\item Fetch all users with [[include=["enrollments"]]] to get role data.
+\item Cache all users together (single cache entry per course).
+\item Filter by role in Python when [[roles]] parameter is specified.
+\end{enumerate}
+
+This is practical because:
+\begin{itemize}
+\item Course user lists are small (typically 30--300 users).
+\item User enrollments are static (roles rarely change during a course).
+\item One bulk fetch is faster than $N$ role-specific fetches.
+\item Local filtering is instant (no network latency).
+\end{itemize}
+
+The trade-off is slightly larger cache entries (storing all users instead of
+just students), but this is negligible compared to the API call savings when
+querying multiple roles.
+
+\subsubsection{Enrollment data structure}
+
+Each [[User]] object has an [[enrollments]] attribute when fetched with
+[[include=["enrollments"]]].
+This is a list of enrollment dictionaries, where each enrollment has a [[type]]
+field containing strings like [["StudentEnrollment"]], [["TaEnrollment"]], or
+[["TeacherEnrollment"]].
+
+We filter by checking if the requested role name (for example, [[student]])
+appears in the enrollment type string (case-insensitive).
+This handles Canvas's naming convention where role types are CamelCase with
+[[Enrollment]] suffix.
 <<functions>>=
 def list_users(courses, roles):
-  """List users in courses with roles"""
+  """
+  List users in courses with roles.
+
+  Fetches all users from Canvas without enrollment_type filtering,
+  then filters locally by role. This allows efficient caching:
+  all users are fetched once and cached, then filtered in-memory
+  for subsequent calls with different roles.
+  """
   users = list()
 
   for course in courses:
     try:
-      course_users = list(course.get_users(enrollment_type=roles))
+      <<fetch all users with enrollment data>>
+      <<filter users by role if specified>>
     except canvasapi.exceptions.CanvasException as err:
       canvaslms.cli.warn(f"skipped {course}: {err}")
       continue
+
     for user in course_users:
       user.course = course
     users.extend(course_users)
@@ -403,7 +475,324 @@ def list_users(courses, roles):
   return users
 @
 
-Second, we provide the most general function, [[filter_users]], which takes a 
+We fetch all users with [[include=["enrollments"]]] to ensure we have role data
+for filtering.
+This is the single API call that will be cached.
+<<fetch all users with enrollment data>>=
+course_users = list(course.get_users(include=["enrollments"]))
+for user in course_users:
+  canvaslms.cli.utils.ensure_user_attrs(user)
+@
+
+Now we filter locally by role if the [[roles]] parameter is specified.
+If no roles are specified, we return all users.
+<<filter users by role if specified>>=
+if roles:
+  filtered_users = []
+  for user in course_users:
+    <<check if user has matching enrollment>>
+  course_users = filtered_users
+@
+
+To check if a user matches the requested roles, we iterate through their
+enrollments and look for role names that match.
+The [[enrollment['type']]] field contains strings like [["StudentEnrollment"]],
+so we convert both the enrollment type and requested role to lowercase and check
+if the role appears in the enrollment type.
+We use [[break]] to avoid adding the same user multiple times if they have
+multiple matching enrollments.
+<<check if user has matching enrollment>>=
+if user.enrollments:
+  for enrollment in user.enrollments:
+    enrollment_type = enrollment.get('type', '').lower()
+    if any(role.lower() in enrollment_type for role in roles):
+      filtered_users.append(user)
+      break
+@
+
+\subsubsection{Test fixtures for user filtering}
+
+We create mock users with different enrollment types to simulate Canvas API
+responses and test the filtering logic.
+
+<<test user fixtures>>=
+@pytest.fixture
+def mock_course():
+    """Create a mock course object"""
+    course = Mock()
+    course.id = 12345
+    course.name = "Test Course"
+    return course
+
+@pytest.fixture
+def mock_student():
+    """Create a mock student user"""
+    user = Mock()
+    user.id = 100
+    user.name = "Alice Student"
+    user.login_id = "alice@example.com"
+    user.enrollments = [
+        {"type": "StudentEnrollment", "role": "StudentEnrollment"}
+    ]
+    return user
+
+@pytest.fixture
+def mock_ta():
+    """Create a mock TA user"""
+    user = Mock()
+    user.id = 200
+    user.name = "Bob TA"
+    user.login_id = "bob@example.com"
+    user.enrollments = [
+        {"type": "TaEnrollment", "role": "TaEnrollment"}
+    ]
+    return user
+
+@pytest.fixture
+def mock_teacher():
+    """Create a mock teacher user"""
+    user = Mock()
+    user.id = 300
+    user.name = "Carol Teacher"
+    user.login_id = "carol@example.com"
+    user.enrollments = [
+        {"type": "TeacherEnrollment", "role": "TeacherEnrollment"}
+    ]
+    return user
+
+@pytest.fixture
+def mock_multi_role_user():
+    """Create a user with multiple enrollments"""
+    user = Mock()
+    user.id = 400
+    user.name = "Dave Multi"
+    user.login_id = "dave@example.com"
+    user.enrollments = [
+        {"type": "StudentEnrollment", "role": "StudentEnrollment"},
+        {"type": "TaEnrollment", "role": "TaEnrollment"}
+    ]
+    return user
+@
+
+\subsubsection{Testing user fetching with enrollment data}
+
+We verify that [[list_users]] fetches all users with enrollment data included,
+which is the key to the caching optimization.
+
+<<test functions>>=
+def test_list_users_fetches_with_enrollments(
+    mock_course, mock_student, mock_ta
+):
+    """Test that list_users fetches all users with enrollment data"""
+    # Setup mock course to return users
+    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
+    
+    # Call list_users without role filter
+    result = users_module.list_users([mock_course], roles=[])
+    
+    # Verify get_users was called with include=['enrollments']
+    mock_course.get_users.assert_called_once_with(include=["enrollments"])
+    
+    # Verify all users are returned when no roles specified
+    assert len(result) == 2
+@
+
+\subsubsection{Testing role filtering}
+
+We test the local filtering logic to ensure it correctly identifies users
+by their enrollment types.
+
+<<test functions>>=
+def test_list_users_filters_by_student_role(
+    mock_course, mock_student, mock_ta, mock_teacher
+):
+    """Test that filtering by student role works correctly"""
+    # Setup mock course to return all user types
+    mock_course.get_users = Mock(
+        return_value=[mock_student, mock_ta, mock_teacher]
+    )
+    
+    # Call list_users with student role filter
+    result = users_module.list_users([mock_course], roles=["student"])
+    
+    # Verify only student is returned
+    assert len(result) == 1
+    assert result[0].id == 100  # Alice Student
+@
+
+<<test functions>>=
+def test_list_users_filters_by_ta_role(
+    mock_course, mock_student, mock_ta, mock_teacher
+):
+    """Test that filtering by TA role works correctly"""
+    # Setup mock course to return all user types
+    mock_course.get_users = Mock(
+        return_value=[mock_student, mock_ta, mock_teacher]
+    )
+    
+    # Call list_users with TA role filter
+    result = users_module.list_users([mock_course], roles=["ta"])
+    
+    # Verify only TA is returned
+    assert len(result) == 1
+    assert result[0].id == 200  # Bob TA
+@
+
+<<test functions>>=
+def test_list_users_filters_with_multiple_roles(
+    mock_course, mock_student, mock_ta, mock_teacher
+):
+    """Test that filtering with multiple roles returns matching users"""
+    # Setup mock course to return all user types
+    mock_course.get_users = Mock(
+        return_value=[mock_student, mock_ta, mock_teacher]
+    )
+    
+    # Call list_users with both student and TA roles
+    result = users_module.list_users(
+        [mock_course], 
+        roles=["student", "ta"]
+    )
+    
+    # Verify both student and TA are returned
+    assert len(result) == 2
+    user_ids = [u.id for u in result]
+    assert 100 in user_ids  # Alice Student
+    assert 200 in user_ids  # Bob TA
+    assert 300 not in user_ids  # Carol Teacher excluded
+@
+
+<<test functions>>=
+def test_list_users_returns_all_when_no_roles_specified(
+    mock_course, mock_student, mock_ta, mock_teacher
+):
+    """Test that all users are returned when no roles specified"""
+    # Setup mock course to return all user types
+    mock_course.get_users = Mock(
+        return_value=[mock_student, mock_ta, mock_teacher]
+    )
+    
+    # Call list_users without role filter (empty list)
+    result = users_module.list_users([mock_course], roles=[])
+    
+    # Verify all users are returned
+    assert len(result) == 3
+@
+
+<<test functions>>=
+def test_list_users_handles_multi_role_user(
+    mock_course, mock_multi_role_user
+):
+    """Test that users with multiple enrollments are not duplicated"""
+    # Setup mock course
+    mock_course.get_users = Mock(return_value=[mock_multi_role_user])
+    
+    # Call list_users filtering by student role
+    result = users_module.list_users([mock_course], roles=["student"])
+    
+    # Verify user appears only once (break statement prevents duplicates)
+    assert len(result) == 1
+    assert result[0].id == 400
+@
+
+<<test functions>>=
+def test_list_users_handles_user_without_enrollments(mock_course):
+    """Test that users without enrollment attribute are skipped"""
+    # Create user without enrollments attribute using spec
+    user_no_enrollments = Mock(spec=['id', 'name', 'login_id'])
+    user_no_enrollments.id = 500
+    user_no_enrollments.name = "Eve NoEnroll"
+    user_no_enrollments.login_id = "eve@example.com"
+    # Note: spec explicitly excludes 'enrollments' attribute
+    
+    mock_course.get_users = Mock(return_value=[user_no_enrollments])
+    
+    # Call list_users with role filter
+    result = users_module.list_users([mock_course], roles=["student"])
+    
+    # Verify user is skipped (hasattr check fails)
+    assert len(result) == 0
+@
+
+<<test functions>>=
+def test_list_users_case_insensitive_matching(mock_course):
+    """Test that role matching is case-insensitive"""
+    # Create user with enrollment
+    user = Mock()
+    user.id = 600
+    user.enrollments = [{"type": "StudentEnrollment"}]
+    
+    mock_course.get_users = Mock(return_value=[user])
+    
+    # Try matching with different case variations
+    result_lower = users_module.list_users([mock_course], roles=["student"])
+    assert len(result_lower) == 1
+    
+    mock_course.get_users = Mock(return_value=[user])
+    result_upper = users_module.list_users([mock_course], roles=["STUDENT"])
+    assert len(result_upper) == 1
+    
+    mock_course.get_users = Mock(return_value=[user])
+    result_mixed = users_module.list_users([mock_course], roles=["Student"])
+    assert len(result_mixed) == 1
+@
+
+<<test functions>>=
+def test_list_users_sets_course_attribute(
+    mock_course, mock_student
+):
+    """Test that returned users have course attribute set"""
+    mock_course.get_users = Mock(return_value=[mock_student])
+    
+    result = users_module.list_users([mock_course], roles=[])
+    
+    # Verify course attribute is set
+    assert len(result) == 1
+    assert result[0].course == mock_course
+@
+
+\subsubsection{Testing [[process_user_option]] with role filtering}
+
+This is a regression test for a bug where [[args.role]] (a string) was passed 
+directly to [[filter_users]], causing character-by-character iteration that 
+matched all enrollment types.
+
+We need to verify that [[process_user_option]] correctly converts the single 
+role string from argparse into a list before passing it to [[filter_users]].
+<<test functions>>=
+def test_process_user_option_filters_by_role(
+    mock_course, mock_student, mock_ta
+):
+    """Test that process_user_option correctly filters users by role"""
+    # Setup mock course and canvas
+    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
+    mock_canvas = Mock()
+    mock_canvas.get_courses = Mock(return_value=[mock_course])
+    
+    # Setup args with role="student" (as a string, like argparse provides)
+    mock_args = Mock()
+    mock_args.course = ".*"
+    mock_args.user = ".*"
+    mock_args.role = "student"  # Single string, not a list
+    
+    # Call process_user_option
+    result = users_module.process_user_option(mock_canvas, mock_args)
+    
+    # Verify only student is returned, not TA
+    assert len(result) == 1
+    assert result[0].id == 100  # Alice Student
+    
+    # Now test with TA role
+    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
+    mock_args.role = "ta"
+    result = users_module.process_user_option(mock_canvas, mock_args)
+    
+    # Verify only TA is returned
+    assert len(result) == 1
+    assert result[0].id == 200  # Bob TA
+@
+
+Second, we provide the most general function, [[filter_users]], which takes a
 list of courses, a list of Canvas roles and a regex as arguments.
 It returns the matching users.
 
@@ -435,37 +824,28 @@ enough name.
 But if we give the integration ID, we wouldn't try to give part of it; it's not 
 predicable how much of it will give a unique match, and it doesn't make sense 
 to look for students with a common prefix of their integration IDs.
-Also, some attributes might not exist, so we must try-except them and issue a warning 
-if they don't exist.
+The ingress helpers normalize missing attributes to [[None]], so the matching
+logic only needs to distinguish real values from [[None]].
 <<yield [[user]] if match>>=
 if str(user.id) == regex:
   yield user
   continue
 
-if pattern.search(user.name):
+if pattern.search(user.name or ''):
   yield user
   continue
 
-try:
-  if pattern.search(user.login_id):
-    yield user
-    continue
-except AttributeError:
-  canvaslms.cli.warn(f"{user} has no login_id")
+if pattern.search(user.login_id or ''):
+  yield user
+  continue
 
-try:
-  if user.integration_id == regex:
-    yield user
-    continue
-except AttributeError:
-  canvaslms.cli.warn(f"{user} has no integration_id")
+if user.integration_id == regex:
+  yield user
+  continue
 
-try:
-  if user.sis_user_id == regex:
-    yield user
-    continue
-except AttributeError:
-  canvaslms.cli.warn(f"{user} has no sis_user_id")
+if user.sis_user_id == regex:
+  yield user
+  continue
 @
 
 Now, we can define the function~[[list_students]] in terms of [[list_users]].
@@ -494,7 +874,8 @@ order of preference.
 @
 
 This yields the following function.
-Try returning the attributes in that order, try the next when failed.
+Try returning the attributes in that order, and continue when an
+attribute is either absent or present with value [[None]].
 <<functions>>=
 def get_uid(user):
   """
@@ -513,13 +894,34 @@ def get_uid(user):
 To return the attribute, we simply fetch it.
 We'll use [[attrgetter]].
 <<return the uid attribute of user>>=
-return operator.attrgetter(attribute)(user)
+value = operator.attrgetter(attribute)(user)
+if value is not None:
+  return value
 @
 
 If no attribute existed (all failed), which should not happen, then we raise an 
 exception.
 <<raise error if no attribute existed>>=
 raise AttributeError(f"no unique user attribute existed, tried: {attributes}")
+@
+
+\subsection{Verifying [[get_uid]] fallbacks}
+
+Normalizing users means the preferred identifier attributes may now exist with
+value [[None]]. The fallback logic must therefore continue past [[None]] values
+rather than treating them as successful lookups.
+
+<<test functions>>=
+class TestGetUid:
+    """Test unique-ID fallback semantics."""
+
+    def test_falls_back_when_preferred_attr_is_none(self):
+        """A ``None`` login_id should fall through to integration_id."""
+        user = Mock(spec=['login_id', 'integration_id'])
+        user.login_id = None
+        user.integration_id = "abc123"
+
+        assert users_module.get_uid(user) == "abc123"
 @
 
 
@@ -591,13 +993,35 @@ When processing this option, we need to filter by course first, so we use the
 processing from the [[courses]] module to get the list of courses matching the 
 courses options.
 Then we simply filter all users.
+
+\subsubsection{Converting role string to list}
+
+The [[--role]] option (defined in [[add_user_roles_option]]) accepts a single 
+role string like [["student"]] or [["ta"]] via argparse.
+However, [[filter_users]] and [[list_users]] expect a list of role names, 
+since they need to iterate over roles when checking if any role matches a 
+user's enrollments.
+
+If we mistakenly pass a string directly to [[filter_users]], Python will 
+iterate over individual characters (for example, [["student"]] becomes 
+[['s']], [['t']], [['u']], [['d']], [['e']], [['n']], [['t']]) when checking 
+roles.
+This causes all enrollment types to match, since characters like [['t']], 
+[['a']], [['e']], [['n']] appear in [["StudentEnrollment"]], 
+[["TaEnrollment"]], [["TeacherEnrollment"]], and so on.
+
+Therefore, we must convert [[args.role]] to a single-element list before 
+passing it to [[filter_users]].
 <<functions>>=
 def process_user_option(canvas, args):
   """Processes the user option from command line, returns a list of users"""
+  # args.role is a single string (e.g., "student"), but filter_users expects
+  # a list of role names. Convert it to a single-element list.
+  roles_list = [args.role] if args.role else []
   user_list = list(filter_users(
     courses.process_course_option(canvas, args),
     args.user,
-    roles=args.role))
+    roles=roles_list))
   if not user_list:
     raise canvaslms.cli.EmptyListError("No users found matching the criteria")
   return user_list
@@ -737,7 +1161,10 @@ def process_user_or_group_option(canvas, args):
   if args.group or args.category:
     users = list()
     for group in process_group_options(canvas, args):
-      users.extend(group.get_users())
+      group_users = list(group.get_users())
+      for user in group_users:
+        canvaslms.cli.utils.ensure_user_attrs(user)
+      users.extend(group_users)
 
     if not users:
       raise canvaslms.cli.EmptyListError("No users found in the specified groups")
@@ -745,4 +1172,3 @@ def process_user_or_group_option(canvas, args):
 
   return process_user_option(canvas, args)
 @
-

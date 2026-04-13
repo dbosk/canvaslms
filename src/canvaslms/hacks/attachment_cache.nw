@@ -1,0 +1,666 @@
+\chapter{Caching submission attachments}
+\chapterprecis{Written by Dan-Claude and lightly reviewed by Daniel Bosk.}
+
+When working with submission attachments, we want to avoid downloading the same
+file multiple times.
+This is particularly important when computing diffs between submission
+versions: if a student submits version N+1, we already have the attachments
+from versions N, N-1, \ldots cached locally.
+Computing the new diff then only requires downloading version N+1.
+
+\section{Design decisions}
+
+We face several design choices for caching attachment files:
+
+\subsection{Where to store cached files}
+
+We use a platform-specific cache directory provided by the [[appdirs]] package.
+This follows the conventions of the host operating system:
+\begin{itemize}
+\item Linux: [[~/.cache/canvaslms/attachments/]]
+\item macOS: [[~/Library/Caches/canvaslms/attachments/]]
+\item Windows: [[C:\Users\<user>\AppData\Local\canvaslms\attachments\]]
+\end{itemize}
+
+This is superior to storing files in the pickle cache because:
+\begin{itemize}
+\item Pickle files remain small (metadata only)
+\item Users can manage cache size and location using OS tools
+\item Cache cleanup doesn't affect submission metadata
+\end{itemize}
+
+\subsection{Content-addressed storage}
+
+We use \emph{content-addressed storage}: files are identified by the SHA-256
+hash of their content, not by Canvas attachment ID or filename.
+This provides perfect deduplication---if multiple students submit the same
+file, or if a student resubmits an unchanged file, we store it only once.
+
+The storage structure is:
+\begin{description}
+\item[Content files] [[<cache_dir>/attachments/<sha256>.dat]]
+\item[Metadata index] [[<cache_dir>/attachments/index.json]] mapping attachment
+  IDs to hashes
+\end{description}
+
+The index maps Canvas attachment IDs to cached file metadata:
+\begin{minted}{python}
+{
+  "12345": {
+    "hash": "a1b2c3...",
+    "filename": "report.pdf",
+    "size": 102400,
+    "content_type": "application/pdf",
+    "last_access": "2025-11-24T10:30:00"
+  }
+}
+\end{minted}
+
+\subsection{When attachments become stale}
+
+Attachments for a particular submission version are immutable---once submitted,
+they never change.
+Therefore, we cache attachment files forever (no time-to-live expiration).
+
+The only cleanup is \emph{age-based}: we remove files that haven't been
+accessed in a configurable number of days (default: 90 days).
+This prevents unbounded cache growth while keeping frequently-used files.
+
+\section{Implementation}
+
+We implement cache operations with comprehensive logging to help users understand
+cache performance.
+Following the pattern established in [[cache.nw]], we log cache operations at
+INFO level so users can see cache hits/misses, deduplication, and timing
+information with the [[-v]] flag.
+
+This makes cache behavior transparent and helps diagnose performance issues:
+users can see when the cache saves time by reusing existing files, and when
+new downloads are needed.
+
+We define the test file structure early, but the actual test implementations
+appear after their corresponding functionality:
+
+<<test [[attachment_cache.py]]>>=
+"""Tests for attachment cache module"""
+
+import pytest
+import pathlib
+import json
+import time
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+import canvaslms.hacks.attachment_cache as attachment_cache
+
+<<test fixtures>>
+<<test functions>>
+@
+
+<<[[attachment_cache.py]]>>=
+"""Content-addressed cache for Canvas submission attachments"""
+
+import appdirs
+import hashlib
+import json
+import logging
+import pathlib
+import shutil
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+<<cache directory initialization>>
+<<cache operations>>
+@
+
+\subsection{Cache directory initialization}
+
+We use [[appdirs]] to get the platform-specific cache directory, and create the
+necessary subdirectories on first use.
+
+<<cache directory initialization>>=
+CACHE_DIR = pathlib.Path(appdirs.user_cache_dir("canvaslms")) / "attachments"
+INDEX_FILE = CACHE_DIR / "index.json"
+
+def _ensure_cache_dir():
+    """Create cache directory if it doesn't exist"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _load_index() -> Dict[str, Dict[str, Any]]:
+    """Load the metadata index from disk"""
+    _ensure_cache_dir()
+    if INDEX_FILE.exists():
+        with open(INDEX_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def _save_index(index: Dict[str, Dict[str, Any]]):
+    """Save the metadata index to disk"""
+    _ensure_cache_dir()
+    with open(INDEX_FILE, 'w') as f:
+        json.dump(index, f, indent=2)
+@
+
+\subsubsection{Test fixtures}
+
+We need pytest fixtures to provide temporary cache directories and test files.
+These fixtures enable tests to run in isolation without interfering with the
+user's actual cache.
+
+The [[tmp_cache]] fixture creates a temporary cache directory and patches the
+module-level [[CACHE_DIR]] and [[INDEX_FILE]] variables to use it.
+
+<<test fixtures>>=
+@pytest.fixture
+def tmp_cache(tmp_path):
+    """Provide a temporary cache directory for testing"""
+    cache_dir = tmp_path / "attachments"
+    cache_dir.mkdir()
+    index_file = cache_dir / "index.json"
+    
+    # Patch module-level constants
+    with patch.object(attachment_cache, 'CACHE_DIR', cache_dir), \
+         patch.object(attachment_cache, 'INDEX_FILE', index_file):
+        yield cache_dir
+@
+
+The [[test_file]] fixture creates a temporary file with known content for
+testing hash computation and caching.
+
+<<test fixtures>>=
+@pytest.fixture
+def test_file(tmp_path):
+    """Create a test file with known content"""
+    test_file = tmp_path / "test.txt"
+    content = b"This is test content for attachment caching"
+    test_file.write_bytes(content)
+    return test_file
+@
+
+\subsubsection{Testing cache directory initialization}
+
+Let's verify that the cache directory initialization works correctly.
+
+<<test functions>>=
+def test_ensure_cache_dir_creates_directory(tmp_cache):
+    """Test that _ensure_cache_dir creates the cache directory"""
+    # Remove the directory to test creation
+    tmp_cache.rmdir()
+    assert not tmp_cache.exists()
+    
+    attachment_cache._ensure_cache_dir()
+    
+    assert tmp_cache.exists()
+    assert tmp_cache.is_dir()
+@
+
+\subsubsection{Testing index operations}
+
+We verify that loading and saving the index works correctly, including
+handling missing index files.
+
+<<test functions>>=
+def test_load_index_creates_empty_dict_if_missing(tmp_cache):
+    """Test that _load_index returns empty dict if index doesn't exist"""
+    index = attachment_cache._load_index()
+    assert index == {}
+@
+
+<<test functions>>=
+def test_save_and_load_index(tmp_cache):
+    """Test that index can be saved and loaded correctly"""
+    test_index = {
+        "12345": {
+            "hash": "abc123",
+            "filename": "test.pdf",
+            "size": 1024,
+            "content_type": "application/pdf",
+            "last_access": "2025-11-24T10:30:00"
+        }
+    }
+    
+    attachment_cache._save_index(test_index)
+    loaded_index = attachment_cache._load_index()
+    
+    assert loaded_index == test_index
+@
+
+\subsection{Computing content hashes}
+
+We use SHA-256 to compute content hashes because it provides:
+\begin{itemize}
+\item Strong collision resistance (extremely unlikely two different files hash
+  to the same value)
+\item Reasonable performance for typical attachment sizes
+\item Wide availability in Python's standard library
+\end{itemize}
+
+<<cache operations>>=
+def _compute_hash(file_path: pathlib.Path) -> str:
+    """Compute SHA-256 hash of file content"""
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+@
+
+\subsubsection{Testing hash computation}
+
+The hash computation is critical for content-addressed storage, so we verify
+it produces consistent results.
+
+<<test functions>>=
+def test_compute_hash_consistent(tmp_cache, test_file):
+    """Test that _compute_hash produces consistent results"""
+    hash1 = attachment_cache._compute_hash(test_file)
+    hash2 = attachment_cache._compute_hash(test_file)
+    
+    assert hash1 == hash2
+    assert len(hash1) == 64  # SHA-256 produces 64 hex characters
+@
+
+<<test functions>>=
+def test_compute_hash_different_content(tmp_cache, tmp_path):
+    """Test that different content produces different hashes"""
+    file1 = tmp_path / "file1.txt"
+    file2 = tmp_path / "file2.txt"
+    file1.write_bytes(b"content 1")
+    file2.write_bytes(b"content 2")
+    
+    hash1 = attachment_cache._compute_hash(file1)
+    hash2 = attachment_cache._compute_hash(file2)
+    
+    assert hash1 != hash2
+@
+
+\subsection{Retrieving cached attachments}
+
+When we need an attachment, we first check if it's in the cache.
+If found, we update the [[last_access]] timestamp to prevent premature cleanup,
+and return the path to the cached file.
+
+We log cache hits and misses at INFO level (consistent with [[cache.nw]]) so
+users can see cache effectiveness with the [[-v]] flag.
+This helps users understand when cached files are being reused, and when new
+downloads are required.
+
+<<cache operations>>=
+def get_cached_attachment(attachment_id: int) -> Optional[pathlib.Path]:
+    """
+    Get cached file path for attachment, or None if not cached.
+
+    Updates last_access timestamp on cache hit.
+    """
+    index = _load_index()
+    attachment_key = str(attachment_id)
+
+    if attachment_key not in index:
+        logger.info(f"Attachment cache miss: {attachment_id}")
+        return None
+
+    entry = index[attachment_key]
+    file_hash = entry["hash"]
+    cached_file = CACHE_DIR / f"{file_hash}.dat"
+
+    if not cached_file.exists():
+        # Index entry exists but file missing - remove stale entry
+        logger.info(f"Attachment cache: stale entry removed: {attachment_id}")
+        del index[attachment_key]
+        _save_index(index)
+        return None
+
+    # Update last access time
+    entry["last_access"] = datetime.now().isoformat()
+    _save_index(index)
+
+    logger.info(f"Attachment cache hit: {attachment_id} "
+                f"({entry['filename']}, {entry['size'] / 1024:.1f}KB)")
+
+    return cached_file
+@
+
+\subsubsection{Testing cache retrieval}
+
+We verify that retrieving cached attachments works correctly, including both
+cache hits and misses.
+
+<<test functions>>=
+def test_get_cached_attachment_returns_none_for_missing(tmp_cache):
+    """Test that get_cached_attachment returns None for uncached attachments"""
+    cached_path = attachment_cache.get_cached_attachment(99999)
+    assert cached_path is None
+@
+
+\subsubsection{Testing stale entry handling}
+
+When an index entry exists but the actual file is missing, we should detect
+and handle this gracefully.
+
+<<test functions>>=
+def test_get_cached_attachment_handles_missing_file(tmp_cache, tmp_path):
+    """Test that missing .dat file is detected and index cleaned up"""
+    # Create and cache a file
+    test_file = tmp_path / "test.txt"
+    test_file.write_bytes(b"test content")
+    
+    metadata = {
+        "filename": "test.txt",
+        "size": 100,
+        "content_type": "text/plain"
+    }
+    
+    attachment_cache.cache_attachment(100, test_file, metadata)
+    
+    # Manually delete the .dat file but leave index entry
+    cached_path = attachment_cache.get_cached_attachment(100)
+    cached_path.unlink()
+    
+    # Try to retrieve - should detect missing file
+    result = attachment_cache.get_cached_attachment(100)
+    assert result is None
+    
+    # Index should be cleaned up
+    index = attachment_cache._load_index()
+    assert "100" not in index
+@
+
+\subsection{Caching new attachments}
+
+When we download a new attachment, we compute its hash, store the file by hash,
+and update the index.
+If a file with the same hash already exists (deduplication), we reuse it.
+
+We log timing information for hash computation and file operations, following
+the pattern from [[cache.nw]] where pickle/encrypt/decrypt timing is logged.
+This helps users understand the cost of caching operations and see when
+deduplication saves disk space.
+
+Hash computation is I/O intensive (reading entire file), so we log its timing
+at INFO level.
+When deduplication occurs (file already cached), we log this at INFO level
+since it represents a performance benefit worth highlighting.
+
+<<cache operations>>=
+def cache_attachment(attachment_id: int, file_path: pathlib.Path,
+                     metadata: Dict[str, Any]):
+    """
+    Cache an attachment file using content-addressed storage.
+
+    Args:
+        attachment_id: Canvas attachment ID
+        file_path: Path to the downloaded file
+        metadata: Dictionary with 'filename', 'size', 'content_type'
+    """
+    _ensure_cache_dir()
+
+    # Compute content hash with timing
+    hash_start = time.perf_counter()
+    file_hash = _compute_hash(file_path)
+    hash_elapsed = time.perf_counter() - hash_start
+
+    file_size = file_path.stat().st_size
+    logger.info(f"Attachment {attachment_id}: hash computed "
+                f"({hash_elapsed:.2f}s, {file_size / 1024:.1f}KB)")
+
+    cached_file = CACHE_DIR / f"{file_hash}.dat"
+
+    # Copy file to cache if not already present (deduplication)
+    if not cached_file.exists():
+        copy_start = time.perf_counter()
+        shutil.copy2(file_path, cached_file)
+        copy_elapsed = time.perf_counter() - copy_start
+        logger.info(f"Attachment {attachment_id}: file cached "
+                    f"(copy: {copy_elapsed:.2f}s)")
+    else:
+        logger.info(f"Attachment {attachment_id}: content already cached (dedup)")
+
+    # Update index
+    index = _load_index()
+    index[str(attachment_id)] = {
+        "hash": file_hash,
+        "filename": metadata.get("filename", "unknown"),
+        "size": metadata.get("size", 0),
+        "content_type": metadata.get("content_type", "application/octet-stream"),
+        "last_access": datetime.now().isoformat()
+    }
+    _save_index(index)
+@
+
+\subsubsection{Testing cache and retrieve operations}
+
+Now we verify the main operations: caching new attachments and retrieving
+cached attachments work together correctly.
+
+<<test functions>>=
+def test_cache_and_retrieve_attachment(tmp_cache, test_file):
+    """Test that we can cache and retrieve an attachment"""
+    attachment_id = 12345
+    metadata = {
+        "filename": "test.txt",
+        "size": test_file.stat().st_size,
+        "content_type": "text/plain"
+    }
+    
+    # Cache the attachment
+    attachment_cache.cache_attachment(attachment_id, test_file, metadata)
+    
+    # Retrieve it
+    cached_path = attachment_cache.get_cached_attachment(attachment_id)
+    
+    assert cached_path is not None
+    assert cached_path.exists()
+    assert cached_path.read_bytes() == test_file.read_bytes()
+@
+
+\subsubsection{Testing deduplication}
+
+Content-addressed storage provides automatic deduplication.
+Let's prove this works by caching the same content with different attachment
+IDs.
+
+<<test functions>>=
+def test_deduplication_same_content(tmp_cache, tmp_path):
+    """Test that identical content is stored only once"""
+    # Create two files with identical content
+    content = b"Identical content for deduplication test"
+    file1 = tmp_path / "file1.txt"
+    file2 = tmp_path / "file2.txt"
+    file1.write_bytes(content)
+    file2.write_bytes(content)
+    
+    metadata = {
+        "filename": "test.txt",
+        "size": len(content),
+        "content_type": "text/plain"
+    }
+    
+    # Cache both with different IDs
+    attachment_cache.cache_attachment(100, file1, metadata)
+    attachment_cache.cache_attachment(200, file2, metadata)
+    
+    # Both should point to the same cached file
+    cached1 = attachment_cache.get_cached_attachment(100)
+    cached2 = attachment_cache.get_cached_attachment(200)
+    
+    assert cached1 == cached2  # Same path due to deduplication
+    
+    # Only one .dat file should exist
+    dat_files = list(tmp_cache.glob("*.dat"))
+    assert len(dat_files) == 1
+@
+
+\subsection{Cache cleanup}
+
+We provide a cleanup function that removes files not accessed within a
+specified time window.
+This allows users to manage cache size manually via the [[canvaslms cache
+clear-attachments]] command.
+
+The cleanup process:
+\begin{enumerate}
+\item Load the index and identify attachments not accessed recently
+\item Remove their index entries
+\item Find all [[.dat]] files in the cache directory
+\item Build a set of hashes still referenced by the index
+\item Remove [[.dat]] files whose hashes aren't referenced (orphaned files)
+\item Report statistics about removed files and space freed
+\end{enumerate}
+
+We log cleanup operations at INFO level to provide visibility into cache
+maintenance, following the pattern from [[cache.nw]]'s [[clear_command]].
+The start message helps users understand when cleanup begins, and the final
+statistics show the impact of the operation.
+
+<<cache operations>>=
+def cleanup_old_attachments(max_age_days: int = 90) -> Dict[str, Any]:
+    """
+    Remove cached attachments not accessed in max_age_days.
+
+    Returns:
+        Dictionary with 'files_removed' and 'bytes_freed' statistics
+    """
+    _ensure_cache_dir()
+    index = _load_index()
+    cutoff_date = datetime.now() - timedelta(days=max_age_days)
+
+    logger.info(f"Attachment cache cleanup: removing files not accessed in "
+                f"{max_age_days} days")
+
+    # Find attachments to remove from index
+    to_remove = []
+    for attachment_id, entry in index.items():
+        last_access = datetime.fromisoformat(entry["last_access"])
+        if last_access < cutoff_date:
+            to_remove.append(attachment_id)
+
+    # Remove old entries from index
+    for attachment_id in to_remove:
+        del index[attachment_id]
+    _save_index(index)
+
+    # Build set of hashes still referenced
+    referenced_hashes = {entry["hash"] for entry in index.values()}
+
+    # Find and remove orphaned .dat files
+    files_removed = 0
+    bytes_freed = 0
+
+    for dat_file in CACHE_DIR.glob("*.dat"):
+        file_hash = dat_file.stem  # filename without extension
+        if file_hash not in referenced_hashes:
+            file_size = dat_file.stat().st_size
+            dat_file.unlink()
+            files_removed += 1
+            bytes_freed += file_size
+
+    logger.info(f"Attachment cache cleanup: {files_removed} files removed, "
+                f"{bytes_freed / (1024 * 1024):.1f}MB freed")
+
+    return {
+        "files_removed": files_removed,
+        "bytes_freed": bytes_freed
+    }
+@
+
+\subsubsection{Testing cache cleanup}
+
+We verify that cleanup removes old attachments correctly and reports
+accurate statistics.
+
+<<test functions>>=
+def test_cleanup_old_attachments(tmp_cache, tmp_path):
+    """Test that cleanup removes old attachments correctly"""
+    # Create test files
+    old_file = tmp_path / "old.txt"
+    new_file = tmp_path / "new.txt"
+    old_file.write_bytes(b"old content")
+    new_file.write_bytes(b"new content")
+    
+    metadata = {
+        "filename": "test.txt",
+        "size": 100,
+        "content_type": "text/plain"
+    }
+    
+    # Cache both files
+    attachment_cache.cache_attachment(100, old_file, metadata)
+    attachment_cache.cache_attachment(200, new_file, metadata)
+    
+    # Manually set old attachment's last_access to 100 days ago
+    index = attachment_cache._load_index()
+    old_date = (datetime.now() - timedelta(days=100)).isoformat()
+    index["100"]["last_access"] = old_date
+    attachment_cache._save_index(index)
+    
+    # Run cleanup with 90-day threshold
+    stats = attachment_cache.cleanup_old_attachments(max_age_days=90)
+    
+    # Old attachment should be removed
+    assert stats["files_removed"] == 1
+    assert stats["bytes_freed"] > 0
+    
+    # New attachment should still be cached
+    assert attachment_cache.get_cached_attachment(200) is not None
+    
+    # Old attachment should not be cached
+    assert attachment_cache.get_cached_attachment(100) is None
+@
+
+<<test functions>>=
+def test_cleanup_removes_orphaned_files(tmp_cache, tmp_path):
+    """Test that cleanup removes .dat files not referenced in index"""
+    # Create and cache a file
+    test_file = tmp_path / "test.txt"
+    test_file.write_bytes(b"test content")
+    
+    metadata = {
+        "filename": "test.txt",
+        "size": 100,
+        "content_type": "text/plain"
+    }
+    
+    attachment_cache.cache_attachment(100, test_file, metadata)
+    
+    # Manually remove index entry but leave .dat file (simulates orphan)
+    index = attachment_cache._load_index()
+    del index["100"]
+    attachment_cache._save_index(index)
+    
+    # Run cleanup
+    stats = attachment_cache.cleanup_old_attachments(max_age_days=0)
+    
+    # Orphaned file should be removed
+    assert stats["files_removed"] == 1
+    assert len(list(tmp_cache.glob("*.dat"))) == 0
+@
+
+<<test functions>>=
+def test_cleanup_no_old_files(tmp_cache, tmp_path):
+    """Test that cleanup reports zero when no old files exist"""
+    # Create and cache a recent file
+    test_file = tmp_path / "test.txt"
+    test_file.write_bytes(b"recent content")
+    
+    metadata = {
+        "filename": "test.txt",
+        "size": 100,
+        "content_type": "text/plain"
+    }
+    
+    attachment_cache.cache_attachment(100, test_file, metadata)
+    
+    # Run cleanup with 90-day threshold (file is recent)
+    stats = attachment_cache.cleanup_old_attachments(max_age_days=90)
+    
+    # No files should be removed
+    assert stats["files_removed"] == 0
+    assert stats["bytes_freed"] == 0
+    
+    # File should still be cached
+    assert attachment_cache.get_cached_attachment(100) is not None
+@
+

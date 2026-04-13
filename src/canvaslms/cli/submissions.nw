@@ -16,7 +16,7 @@ by setting grades and comments programmatically or by opening the Canvas
 SpeedGrader interface.
 
 We outline the module:
-<<submissions.py>>=
+<<[[submissions.py]]>>=
 import canvasapi.exceptions
 import canvasapi.file
 import canvasapi.submission
@@ -26,6 +26,7 @@ import canvaslms.cli.assignments as assignments
 import canvaslms.cli.users as users
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
+import canvaslms.hacks.attachment_cache as attachment_cache
 
 import argparse
 import csv
@@ -65,6 +66,33 @@ def add_submission_command(subp):
   """Adds the submission (singular) command as an alias for submissions view"""
   <<add submission command to subp>>
 @
+
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after each implementation to verify correctness.
+
+\subsection{Test structure}
+
+We define the test file structure early, but the actual test implementations appear after their corresponding functionality:
+
+<<test [[submissions.py]]>>=
+"""Tests for patiencediff integration and helpers in submissions."""
+import pytest
+from unittest.mock import Mock
+
+from canvaslms.cli.submissions import (
+    format_submission_short,
+    get_course_user,
+    is_submission_ungraded,
+    list_submissions,
+    list_ungraded_submissions,
+    speedgrader,
+)
+
+<<test functions>>
+@
+
 
 \section{The [[submissions list]] subcommand and its options}
 
@@ -223,11 +251,15 @@ if args.history:
   to_include += ["submission_history"]
 
 if args.ungraded:
-  submissions = list_ungraded_submissions(assignment_list, include=to_include)
+  submissions = list_ungraded_submissions(
+    assignment_list,
+    include=to_include,
+    check_bulk_refresh=True)
 else:
-  # Enable bulk refresh when no filters will be applied (accessing all submissions)
-  check_bulk = not (args.user or args.category or args.group)
-  submissions = list_submissions(assignment_list, include=to_include, check_bulk_refresh=check_bulk)
+  check_bulk_refresh = not (args.user or args.category or args.group)
+  submissions = list_submissions(assignment_list,
+    include=to_include,
+    check_bulk_refresh=check_bulk_refresh)
 <<add options for history>>=
 list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
@@ -331,6 +363,39 @@ def speedgrader(submission):
   return speedgrader_url
 @
 
+\subsection{Verifying [[speedgrader]] URL generation}
+
+The [[speedgrader]] function transforms a preview URL into a SpeedGrader URL.
+This is critical for providing direct links to the grading interface.
+
+Let's verify the URL transformation works correctly:
+
+<<test functions>>=
+class TestSpeedgraderURL:
+    """Test speedgrader() URL transformation"""
+
+    def test_transforms_preview_url_to_speedgrader(self):
+        """Should convert preview URL to SpeedGrader format"""
+        from unittest.mock import MagicMock
+        
+        submission = MagicMock()
+        submission.preview_url = "https://canvas.kth.se/courses/26930/assignments/173825/submissions/108849?preview=1"
+        
+        result = speedgrader(submission)
+        
+        assert result == "https://canvas.kth.se/courses/26930/gradebook/speed_grader?assignment_id=173825&student_id=108849"
+
+    def test_returns_none_when_no_preview_url(self):
+        """Should return None when submission has no preview_url"""
+        from unittest.mock import MagicMock
+        
+        submission = MagicMock(spec=[])  # No preview_url attribute
+        
+        result = speedgrader(submission)
+        
+        assert result is None
+@
+
 
 \section{The [[submissions view]] subcommand and its options}
 
@@ -381,7 +446,7 @@ for submission in submission_list:
                              history=args.history,
                              tmpdir=tmpdir/subdir,
                              json_format=args.json,
-                             diff=args.diff)
+                             <<args for diff option>>)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
 
@@ -606,16 +671,6 @@ So we default to off, since it's only occasionally that we want to see the
 history.
 The [[-H/--history]] and [[--diff]] options are added by [[add_view_options]].
 
-When the user requests diffs between submission versions, we need access to the 
-submission history. Without history, there's only one version available and no 
-comparison can be made. Therefore, we automatically enable history mode when 
-diff is requested to provide better user experience - users don't need to 
-remember to specify both flags.
-<<enable history when diff is requested>>=
-if args.diff:
-  args.history = True
-@
-
 
 \section{Selecting a submission on the command line}%
 \label{submission-options}
@@ -696,8 +751,7 @@ def add_view_options(parser):
   parser.add_argument("-H", "--history", action="store_true",
     help="Include submission history.")
 
-  parser.add_argument("--diff", action="store_true",
-    help="Show diffs between submission versions. Automatically enables --history.")
+  <<add diff-related options>>
 
   parser.add_argument("--open", required=False,
     nargs="?", default=None, const="open",
@@ -746,15 +800,18 @@ def add_view_options(parser):
 def process_submission_options(canvas, args):
   assignment_list = assignments.process_assignment_option(canvas, args)
   user_list = users.process_user_or_group_option(canvas, args)
+  check_bulk_refresh = False
 
   if args.ungraded:
     submissions = list_ungraded_submissions(assignment_list,
       include=["submission_history", "submission_comments",
-      "rubric_assessment"])
+      "rubric_assessment"],
+      check_bulk_refresh=check_bulk_refresh)
   else:
     submissions = list_submissions(assignment_list,
       include=["submission_history", "submission_comments",
-      "rubric_assessment"])
+      "rubric_assessment"],
+      check_bulk_refresh=check_bulk_refresh)
 
   submission_list = list(filter_submissions(submissions, user_list))
   if not submission_list:
@@ -778,89 +835,184 @@ assignments with a regular expression (using [[filter_assignments]]).
 \subsection{Filtering strategy for ungraded submissions}
 \label{SubmissionsFiltering}
 
-Canvas provides a [[bucket="ungraded"]] parameter to filter submissions
-server-side.
-However, using this parameter causes cache inconsistencies: the caching system
-in [[canvasapi.nw]] doesn't track the [[bucket]] parameter, leading to
-incorrect results when mixing calls with and without this parameter.
+Canvas offers [[bucket="ungraded"]] as a server-side filter, but the
+submission cache in [[canvaslms.hacks.canvasapi]] treats
+[[get_submissions()]] as a cache of the complete collection. A bucketed fetch
+can therefore poison later unfiltered calls by making a partial result look
+complete. We instead fetch the full submission list and apply the ungraded
+predicate locally.
 
-Instead, we always fetch all submissions and filter locally.
-This approach:
-\begin{itemize}
-\item Ensures cache correctness---no ambiguity in cache keys.
-\item Maintains lazy-loading performance---the [[LazySubmission]] wrapper only
-refreshes accessed items.
-\item Simplifies the caching logic---no need to track the bucket parameter.
-\end{itemize}
-
-A submission is considered ungraded if:
-\begin{itemize}
-\item It has been submitted ([[submitted_at]] is not [[None]]).
-\item AND either:
-  \begin{itemize}
-  \item It has never been graded ([[graded_at is None]]), or
-  \item The grade doesn't match the current submission
-([[not grade_matches_current_submission]])---this occurs when a student
-resubmits after receiving a grade.
-  \end{itemize}
-\end{itemize}
-
-This local filtering logic matches Canvas's server-side [[bucket="ungraded"]]
-behavior while avoiding cache consistency issues.
-
-Note that we set [[submission.assignment]] for \emph{all} submissions, not just
-those we yield.
-This ensures that all submissions in the cache have this attribute set
-consistently, regardless of which filtering path is used to access them later.
+The same predicate is reused by the assignments and results commands so that
+all three commands agree on what \enquote{ungraded} means, including
+resubmissions that were graded once but changed afterwards. We still attach
+[[submission.assignment]] before filtering so cached submission objects expose
+the same parent assignment regardless of which listing path materialized them.
 
 \subsection{Helper function to check if a submission is ungraded}
 
 The logic for determining whether a submission is ungraded is used in multiple
-places throughout the codebase.
-We extract it into a helper function to maintain consistency and avoid code
-duplication.
-
-This function implements the filtering strategy described above
-(\cref{SubmissionsFiltering}), encapsulating the logic so it can be reused
-by other modules (such as [[assignments.nw]] and [[results.nw]]).
+places throughout the codebase. We extract it into a helper function to keep
+the different commands aligned on the same resubmission semantics.
 <<functions>>=
-def is_ungraded(submission):
-    """
-    Returns True if the submission is ungraded or needs regrading.
-
-    A submission is considered ungraded if:
-    - It has been submitted (submitted_at is not None), AND
-    - Either it has never been graded (graded_at is None), OR
-    - The grade doesn't match the current submission (not
-      grade_matches_current_submission) -- this occurs when a student
-      resubmits after receiving a grade.
-
-    Parameters:
-        submission: A Canvas Submission object
-
-    Returns:
-        bool: True if the submission needs grading, False otherwise
-    """
-    return (submission.submitted_at and
-            (submission.graded_at is None or
-             not submission.grade_matches_current_submission))
+def is_submission_ungraded(submission):
+  """Return True when ``submission`` still needs grading."""
+  return bool(submission.submitted_at) and (
+    submission.graded_at is None or
+    not submission.grade_matches_current_submission)
 @
 
+The general listing helper keeps caller-controlled bulk refresh optional. Some
+callers inspect every submission and can benefit from a collection-wide
+refresh, while narrower flows can stay with per-submission refreshes.
 <<functions>>=
-def list_submissions(assignments, include=["submission_comments"], check_bulk_refresh=False):
+def list_submissions(assignments, include=["submission_comments"],
+                     check_bulk_refresh=False):
   for assignment in assignments:
-    submissions = assignment.get_submissions(include=include, check_bulk_refresh=check_bulk_refresh)
+    submissions = assignment.get_submissions(
+      include=include,
+      check_bulk_refresh=check_bulk_refresh)
     for submission in submissions:
+      submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
       yield submission
 
-def list_ungraded_submissions(assignments, include=["submisson_comments"]):
+def list_ungraded_submissions(assignments, include=["submission_comments"],
+                              check_bulk_refresh=False):
   for assignment in assignments:
-    submissions = assignment.get_submissions(include=include, check_bulk_refresh=True)
+    submissions = assignment.get_submissions(
+      include=include,
+      check_bulk_refresh=check_bulk_refresh)
     for submission in submissions:
+      submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
-      if is_ungraded(submission):
+      if is_submission_ungraded(submission):
         yield submission
+@
+
+\subsection{Verifying submission normalization}
+
+The submission listing helpers are the main ingress point for submission
+objects, so they normalize the optional attributes before any later code reads
+them.
+
+<<test functions>>=
+class TestListSubmissions:
+    """Test submission ingress normalization."""
+
+    def test_normalizes_missing_submission_attrs(self):
+        """Missing submission attrs should be added as None."""
+        assignment = Mock()
+        submission = Mock(spec=['id'])
+        submission.id = 17
+        assignment.get_submissions.return_value = [submission]
+
+        result = list(list_submissions([assignment]))
+
+        assert result[0].assignment is assignment
+        assert result[0].submitted_at is None
+        assert result[0].grader_id is None
+
+    def test_forwards_bulk_refresh_flag(self):
+        """The listing helper should forward bulk-refresh opt-in."""
+        assignment = Mock()
+        assignment.get_submissions.return_value = []
+
+        list(list_submissions(
+            [assignment],
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        ))
+
+        assignment.get_submissions.assert_called_once_with(
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        )
+@
+
+\subsection{Verifying local ungraded filtering}
+
+The cache fix depends on two details: the ungraded predicate must stay
+consistent across commands, and [[list_ungraded_submissions()]] must fetch the
+full submission set instead of delegating the filter to Canvas.
+
+<<test functions>>=
+class TestListUngradedSubmissions:
+    """Test local ungraded submission filtering."""
+
+    @pytest.mark.parametrize(
+        ("submitted_at", "graded_at", "matches_current", "expected"),
+        [
+            ("2024-01-01T10:00:00Z", None, None, True),
+            ("2024-01-01T10:00:00Z", "2024-01-01T12:00:00Z", False, True),
+            ("2024-01-01T10:00:00Z", "2024-01-01T12:00:00Z", True, False),
+            (None, None, None, False),
+        ],
+    )
+    def test_uses_shared_ungraded_predicate(
+        self, submitted_at, graded_at, matches_current, expected
+    ):
+        """Ungraded means either never graded or changed after grading."""
+        submission = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        submission.submitted_at = submitted_at
+        submission.graded_at = graded_at
+        submission.grade_matches_current_submission = matches_current
+
+        assert is_submission_ungraded(submission) is expected
+
+    def test_fetches_full_collection_without_bucket(self):
+        """Ungraded listing should filter locally after a plain fetch."""
+        assignment = Mock()
+
+        graded = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        graded.submitted_at = "2024-01-01T10:00:00Z"
+        graded.graded_at = "2024-01-01T12:00:00Z"
+        graded.grade_matches_current_submission = True
+
+        never_graded = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        never_graded.submitted_at = "2024-01-01T10:05:00Z"
+        never_graded.graded_at = None
+        never_graded.grade_matches_current_submission = None
+
+        resubmitted = Mock(spec=[
+            "submitted_at",
+            "graded_at",
+            "grade_matches_current_submission",
+        ])
+        resubmitted.submitted_at = "2024-01-01T10:10:00Z"
+        resubmitted.graded_at = "2024-01-01T12:10:00Z"
+        resubmitted.grade_matches_current_submission = False
+
+        assignment.get_submissions.return_value = [
+            graded,
+            never_graded,
+            resubmitted,
+        ]
+
+        result = list(list_ungraded_submissions(
+            [assignment],
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        ))
+
+        assignment.get_submissions.assert_called_once_with(
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+        )
+        assert result == [never_graded, resubmitted]
+        assert never_graded.assignment is assignment
+        assert resubmitted.assignment is assignment
 @
 
 
@@ -909,6 +1061,40 @@ def format_submission_short(submission):
   ]
 @
 
+\subsection{Verifying [[format_submission_short]]}
+
+The [[format_submission_short]] function extracts key submission data into a list suitable for CSV output.
+This is the primary format for the [[submissions list]] command.
+
+<<test functions>>=
+class TestFormatSubmissionShort:
+    """Test format_submission_short() data extraction"""
+
+    def test_formats_submission_data(self):
+        """Should extract course code, assignment, user, grade, and dates"""
+        from unittest.mock import MagicMock
+        from datetime import datetime
+        
+        # Create mock submission with all required attributes
+        submission = MagicMock()
+        submission.assignment.course.course_code = "DD1234"
+        submission.assignment.name = "Lab 1"
+        submission.user.name = "Alice Anderson"
+        submission.grade = "5"
+        submission.submitted_at = "2023-12-15T10:30:00Z"
+        submission.graded_at = "2023-12-15T14:00:00Z"
+        
+        result = format_submission_short(submission)
+        
+        assert result[0] == "DD1234"
+        assert result[1] == "Lab 1"
+        assert result[2] == "Alice Anderson"
+        assert result[3] == "5"
+        # Dates will be formatted by format_local_time
+        assert result[4] is not None
+        assert result[5] is not None
+@
+
 Sometimes we want the short format to contain a unique identifier (such as 
 [[login_id]]) instead of the name.
 <<functions>>=
@@ -946,7 +1132,18 @@ Markdown version of the output.
 We want this to be able to recursively use [[format_submission]] to format the 
 submission history.
 This must then be passed to the recursive call and the section formatting.
+
+When we fetch a single user directly from a course, that lookup bypasses
+[[list_users()]]. We therefore normalize the returned object here as well.
 <<functions>>=
+def get_course_user(course, user_id):
+  """Fetch a course user and ensure common user attrs exist."""
+  if user_id is None:
+    return None
+
+  user = course.get_user(user_id)
+  return canvaslms.cli.utils.ensure_user_attrs(user)
+
 def format_submission(submission, history=False, json_format=False,
                       md_title_level="#",
                       <<[[format_submission]] args>>):
@@ -962,7 +1159,8 @@ def format_submission(submission, history=False, json_format=False,
 
   <<[[format_submission]] doc>>
   """
-  student = submission.assignment.course.get_user(submission.user_id)
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+  student = get_course_user(submission.assignment.course, submission.user_id)
 
   if json_format:
     formatted_submission = {}
@@ -983,6 +1181,36 @@ def format_submission(submission, history=False, json_format=False,
     <<add attachments to output>>
 
   return formatted_submission
+@
+
+\subsection{Verifying direct user fetches}
+
+Formatting a single submission still performs direct user lookups for the
+student and grader, so those lookups need their own normalization helper.
+
+<<test functions>>=
+class TestGetCourseUser:
+    """Test normalization of direct course user fetches."""
+
+    def test_normalizes_missing_user_attrs(self):
+        """Directly fetched users should gain missing attrs."""
+        course = Mock()
+        user = Mock(spec=['id', 'name'])
+        user.id = 23
+        user.name = "Alice"
+        course.get_user.return_value = user
+
+        result = get_course_user(course, 23)
+
+        assert result is user
+        assert result.login_id is None
+
+    def test_skips_lookup_when_user_id_is_none(self):
+        """None user IDs should not trigger a Canvas lookup."""
+        course = Mock()
+
+        assert get_course_user(course, None) is None
+        course.get_user.assert_not_called()
 @
 
 \subsection{Some helper functions}
@@ -1061,12 +1289,11 @@ def resolve_grader(submission):
   Returns a user object if the submission was graded by a human.
   Otherwise returns None if ungraded or a descriptive string.
   """
-  try:
-    if submission.grader_id is None:
-      return None
-  except AttributeError:
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+
+  if submission.grader_id is None:
     return None
-    
+     
   if submission.grader_id < 0:
     return "autograded"
 
@@ -1088,7 +1315,7 @@ But as mentioned, right now we can only do it through the course.
 This isn't a problem as long as none of the teachers or teaching assistants are 
 removed.
 <<resolve the grader's user ID from Canvas>>=
-return submission.assignment.course.get_user(submission.grader_id)
+return get_course_user(submission.assignment.course, submission.grader_id)
 @
 
 
@@ -1243,10 +1470,30 @@ def convert_to_md(attachment: canvasapi.file.File,
 contents = convert_to_md(attachment, tmpdir)
 @
 
-The download is simple.
+We check if the attachment is already cached before downloading.
+If cached, we copy from the cache to avoid redundant network requests.
+Otherwise, we download the file and add it to the cache.
+
+This is particularly important for computing diffs between submission versions:
+if a student submits version N+1, we already have the attachments from versions
+N, N-1, \ldots cached locally, so we only need to download version N+1.
+
 <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>=
 outfile = tmpdir / attachment.filename
-attachment.download(outfile)
+cached_path = attachment_cache.get_cached_attachment(attachment.id)
+
+if cached_path:
+  # Use cached file - copy to temporary directory for processing
+  import shutil
+  shutil.copy(cached_path, outfile)
+else:
+  # Download and cache for future use
+  attachment.download(outfile)
+  attachment_cache.cache_attachment(attachment.id, outfile, {
+    'filename': attachment.filename,
+    'size': getattr(attachment, 'size', 0),
+    'content_type': getattr(attachment, 'content-type', 'application/octet-stream')
+  })
 @
 
 If the content type is text, we can just decode it and use it in a Markdown 
@@ -1373,10 +1620,22 @@ attribute to it.
 Now we can reuse the [[format_submission]] function to format this version's 
 submission metadata.
 
-Note that we can't pass on the [[history]] argument to [[format_submission]], 
-we need to let it know that it's formatting a history version in another way to 
+Note that we can't pass on the [[history]] argument to [[format_submission]],
+we need to let it know that it's formatting a history version in another way to
 get the sectioning levels right.
 We'll use an argument [[md_title_level]].
+
+Similarly, we need to pass through the diff-related parameters.
+Since we're inside [[format_submission]], we don't have access to the [[args]]
+object---we only have the function's parameters ([[diff]],
+[[diff_threshold_fixed]], and [[diff_threshold_percent]]).
+We'll define a chunk that passes these parameters through to the recursive call.
+<<diff params>>=
+diff=diff,
+diff_threshold_fixed=diff_threshold_fixed,
+diff_threshold_percent=diff_threshold_percent
+@
+
 <<add [[prev_submission]] to [[versions]]>>=
 prev_submission = canvasapi.submission.Submission(
   submission._requester, prev_submission)
@@ -1386,7 +1645,7 @@ prev_metadata = format_submission(prev_submission,
                                   tmpdir=version_dir,
                                   json_format=json_format,
                                   md_title_level=md_title_level+"#",
-                                  diff=False)
+                                  <<diff params>>)
 
 versions[version] = prev_metadata
 @
@@ -1442,18 +1701,147 @@ except ImportError:
   import difflib
 @
 
-\subsection{Adding diff parameter to [[format_submission]]}
+\subsubsection{Testing patiencediff integration}
 
-The diff functionality requires an additional parameter to the format\_submission
-function to control whether we show diffs or full content for each version.
-<<[[format_submission]] args>>=
-diff=False,
+The patiencediff integration uses an optional dependency pattern with graceful
+fallback to standard difflib.
+We verify the import fallback works correctly and that both implementations
+provide the same interface.
+
+<<test functions>>=
+class TestPatiencediffImport:
+    """Test that patiencediff is imported correctly with fallback"""
+
+    def test_import_provides_unified_diff(self):
+        """Both patiencediff and difflib provide unified_diff"""
+        # The import pattern ensures we always have unified_diff available
+        try:
+            import patiencediff as difflib
+        except ImportError:
+            import difflib
+        
+        assert hasattr(difflib, 'unified_diff')
+
+    def test_fallback_to_standard_difflib(self):
+        """Standard difflib should always be available"""
+        import difflib
+        assert hasattr(difflib, 'unified_diff')
+
+class TestDiffFunctionality:
+    """Test that unified_diff works correctly regardless of implementation"""
+
+    def test_unified_diff_detects_changes(self):
+        """unified_diff should detect changes between old and new content"""
+        import difflib
+        
+        old_content = ['Hello\n', 'World\n']
+        new_content = ['Hello\n', 'World!\n']
+        
+        diff = list(difflib.unified_diff(old_content, new_content))
+        
+        # Should have diff lines
+        assert len(diff) > 0
+
+    def test_unified_diff_no_changes(self):
+        """unified_diff produces minimal output when content is identical"""
+        import difflib
+        
+        content = ['Hello\n', 'World\n']
+        
+        diff = list(difflib.unified_diff(content, content))
+        
+        # Should be empty or only headers
+        assert len(diff) <= 2
+
+    def test_unified_diff_with_context(self):
+        """unified_diff should respect context parameter"""
+        import difflib
+        
+        old_content = ['line 1\n', 'line 2\n', 'line 3\n', 'line 4\n', 'line 5\n']
+        new_content = ['line 1\n', 'line 2\n', 'CHANGED\n', 'line 4\n', 'line 5\n']
+        
+        # Use 1 line of context
+        diff = list(difflib.unified_diff(old_content, new_content, n=1))
+        
+        # Should have some output
+        assert len(diff) > 0
+
+    def test_unified_diff_multiple_changes(self):
+        """unified_diff should handle multiple changes"""
+        import difflib
+        
+        old_content = [
+            'line 1\n',
+            'line 2\n',
+            'line 3\n',
+            'line 4\n',
+            'line 5\n'
+        ]
+        new_content = [
+            'line 1 modified\n',
+            'line 2\n',
+            'line 3 modified\n',
+            'line 4\n',
+            'line 5 modified\n'
+        ]
+        
+        diff = list(difflib.unified_diff(old_content, new_content))
+        
+        # Should detect multiple changes
+        assert len(diff) > 0
+        removed_lines = [line for line in diff if line.startswith('-') and not line.startswith('---')]
+        added_lines = [line for line in diff if line.startswith('+') and not line.startswith('+++')]
+        assert len(removed_lines) > 0
+        assert len(added_lines) > 0
 @
 
-We also need to document this parameter for users of the function.
+\subsection{Adding diff options to command line}
+
 <<[[format_submission]] doc>>=
 `diff` is a boolean indicating whether to show diffs between submission versions
 instead of showing each version in full. Only works when `history` is True.
+`diff_threshold_fixed` and `diff_threshold_percent` control the matching
+sensitivity for renamed files (see [[match_renamed_files]] for details).
+<<add diff-related options>>=
+parser.add_argument("--diff", action="store_true",
+  help="Show diffs between submission versions. Automatically enables --history.")
+
+parser.add_argument("--diff-threshold-fixed", type=int,
+  default=DEFAULT_DIFF_THRESHOLD_FIXED,
+  metavar="N",
+  help="Fixed edit distance threshold for matching renamed files. "
+        "Files with distance <= N will match. Default: %(default)s")
+
+parser.add_argument("--diff-threshold-percent", type=int,
+  default=DEFAULT_DIFF_THRESHOLD_PERCENT,
+  metavar="PCT",
+  help="Percentage threshold for matching renamed files. "
+        "Files with distance <= PCT%% of filename length will match. "
+        "Default: %(default)s")
+@
+
+\subsection{Enabling history when diff is requested}
+
+When the user requests diffs between submission versions, we need access to the
+submission history. Without history, there's only one version available and no
+comparison can be made. Therefore, we automatically enable history mode when
+diff is requested to provide better user experience - users don't need to
+remember to specify both flags.
+<<enable history when diff is requested>>=
+if args.diff:
+  args.history = True
+@
+
+
+\subsection{Adding diff parameter to [[format_submission]]}
+
+The diff functionality requires an additional parameter to the 
+[[format_submission]] function to control whether we show diffs or full content 
+for each version.
+<<[[format_submission]] args>>=
+diff=False,
+<<args for diff option>>=
+diff=args.diff,
 @
 
 \subsection{Design decisions}
@@ -1598,7 +1986,7 @@ if version == 0:
                                           tmpdir=version_dir,
                                           json_format=json_format,
                                           md_title_level=md_title_level+"##",
-                                          diff=False)
+                                          <<diff params>>)
   diff_output += format_section(f"Version {version} (Full Content)",
                                 version_0_formatted,
                                 md_title_level=md_title_level+"#")
@@ -1610,7 +1998,9 @@ else:
   version_diff = generate_diff(prev_content,
                                curr_content,
                                f"Version {version-1}",
-                               f"Version {version}")
+                               f"Version {version}",
+                               diff_threshold_fixed,
+                               diff_threshold_percent)
   if version_diff:
     diff_output += format_section(f"Version {version} "
                                     f"(Changes from Version {version-1})",
@@ -1707,11 +2097,15 @@ for attachment in submission.attachments:
 This function generates unified diffs between two content dictionaries, handling
 different content types appropriately.
 <<functions>>=
-def generate_diff(prev_content, curr_content, prev_label, curr_label):
+def generate_diff(prev_content, curr_content, prev_label, curr_label,
+                 diff_threshold_fixed=DEFAULT_DIFF_THRESHOLD_FIXED,
+                 diff_threshold_percent=DEFAULT_DIFF_THRESHOLD_PERCENT):
   """
-  Generates a unified diff between two content dictionaries. Each key 
+  Generates a unified diff between two content dictionaries. Each key
   represents a part of the submission (body, quiz_answers, attachments).
   The attachments key contains itself a dictionary of filename to content.
+
+  The diff_threshold parameters control renamed file matching sensitivity.
 
   Returns a string with the diff output, or None if no differences.
   """
@@ -1799,85 +2193,117 @@ For example:
 \item [[lab1.java]] → [[lab1_revised.java]]
 \end{itemize}
 
-When there is exactly one file in each of two consecutive versions, we apply
-heuristics to determine if they should be treated as the same file (and thus
-diffed) rather than as separate add/delete operations.
+We use \emph{edit distance} (Levenshtein distance) to detect renamed files
+and match them across versions.
+This allows diffing the actual content changes rather than showing spurious
+add/delete operations.
 
-The matching criteria are:
+The matching algorithm works for any number of files:
 \begin{enumerate}
-\item Both files must have the same extension ([[.py]], [[.java]], etc.).
-      Different extensions suggest different file types, which shouldn't be
-      compared.
-\item The filenames (without extension) must share either:
+\item Compute edit distance between all pairs of files with matching extensions
+\item Sort pairs by edit distance (lowest first)
+\item Accept matches greedily, ensuring one-to-one mapping
+\item Only accept matches below a conservative threshold:
   \begin{itemize}
-  \item A common prefix of at least 3 characters, or
-  \item A common suffix of at least 3 characters, or
-  \item One name contains the other as a substring.
+  \item Distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]], or
+  \item Distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\%
+    of the longer filename (without extension)
   \end{itemize}
 \end{enumerate}
+
+This approach correctly handles cases like:
+\begin{itemize}
+\item Single file renames: [[lab.py]] → [[lab_final.py]]
+\item Multiple file renames: [[part1.py]], [[part2.py]] →
+  [[part1_v2.py]], [[part2_v2.py]]
+\item Mixed scenarios: [[lab.py]] → [[lab_final.py]] while [[test.py]]
+  remains unchanged
+\item Adding similarly-named files: [[lab1.py]] → [[lab1_final.py]]
+  with new [[lab1_test.py]]
+\end{itemize}
+We define the constants as follows.
+Our choice is based on testing on student data with cases similar to the above.
+And these values seems to make a good trade-off for a default.
+<<constants>>=
+DEFAULT_DIFF_THRESHOLD_FIXED = 30
+DEFAULT_DIFF_THRESHOLD_PERCENT = 60
+<<[[format_submission]] args>>=
+diff_threshold_fixed=DEFAULT_DIFF_THRESHOLD_FIXED,
+diff_threshold_percent=DEFAULT_DIFF_THRESHOLD_PERCENT,
+<<args for diff option>>=
+diff_threshold_fixed=args.diff_threshold_fixed,
+diff_threshold_percent=args.diff_threshold_percent
+@
+
+The key insight is that by considering lowest-distance pairs first,
+we naturally find the correct matches even when students add or remove
+files with similar names.
+
+\subsubsection{Adjusting matching thresholds}
+
+The default thresholds (distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]]
+or $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of length) work well
+for most common renaming patterns.
+However, some students use more substantial renames that exceed these limits.
+
+For example, [[lab_6_auxiliary.py]] $\to$ [[new_lab_6_auxiliary_functions.py]]
+has an edit distance of 14, which exceeds the default threshold of 9
+(max of [[DEFAULT_DIFF_THRESHOLD_FIXED]] and
+[[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of 30 characters).
+
+To match such files, increase the thresholds using command-line options:
+\begin{description}
+\item[{[[--diff-threshold-fixed N]]}]
+  Sets the minimum edit distance allowed
+  (default: [[DEFAULT_DIFF_THRESHOLD_FIXED]]).
+  Use higher values to match files with more character changes.
+\item[{[[--diff-threshold-percent PCT]]}]
+  Sets the percentage of filename length allowed
+  (default: [[DEFAULT_DIFF_THRESHOLD_PERCENT]]).
+  Use higher percentages to match files with proportionally larger changes.
+\end{description}
+
+The threshold used is the \emph{maximum} of these two values, so increasing
+either one allows more permissive matching.
+
+Examples:
+\begin{itemize}
+\item [[--diff-threshold-percent 50]] allows up to 50\% of filename length
+  (would match [[lab_6_auxiliary.py]] $\to$
+  [[new_lab_6_auxiliary_functions.py]])
+\item [[--diff-threshold-fixed 15]] allows up to 15 character edits
+  (also matches the above pair)
+\item [[--diff-threshold-fixed 20 --diff-threshold-percent 60]]
+  very permissive matching for heavily renamed files
+\end{itemize}
+
+Be conservative when increasing thresholds: very high values may cause
+incorrect matches between unrelated files.
+The diff headers always show both filenames, allowing you to verify matches
+are correct.
 
 When files are matched this way, the diff header shows both original names
 ([[--- Version 0/solution.py]] and [[+++ Version 1/solution_final.py]]) to
 make the matching transparent to the grader.
 This allows instructors to verify that the heuristic made the correct match.
 
-This heuristic intentionally only applies when there's a single file in each
-version.
-With multiple files, we fall back to exact name matching to avoid incorrect
-pairings (\eg matching [[test.py]] with [[test_data.py]] when both versions
-contain multiple files).
+We use the [[match_renamed_files()]] function to find matches using edit
+distance.
+This works for both single files and multiple files, using an optimal
+matching algorithm that considers all pairs and selects the best matches.
+The function uses a conservative threshold to avoid incorrect pairings
+(\eg it won't match [[test.py]] with [[test_data.py]] because the edit
+distance is too large).
+
 <<match single files with different names>>=
-if (len(prev_attachments) == 1 and len(curr_attachments) == 1
-    and list(prev_attachments.keys())[0] != list(curr_attachments.keys())[0]):
-  prev_filename = list(prev_attachments.keys())[0]
-  curr_filename = list(curr_attachments.keys())[0]
-  
-  <<check if files should be matched>>
-@
+# Find renamed files using edit distance matching
+filename_mapping = match_renamed_files(prev_attachments, curr_attachments,
+                                      diff_threshold_fixed,
+                                      diff_threshold_percent)
 
-We check if two files with different names should be treated as the same file
-by looking for common prefixes, suffixes, or file extensions.
-<<check if files should be matched>>=
-should_match = False
-
-# Check for common file extension
-prev_ext = get_file_extension(prev_filename)
-curr_ext = get_file_extension(curr_filename)
-
-if prev_ext and curr_ext and prev_ext == curr_ext:
-  # Same extension - check for common prefix or suffix
-  prev_base = get_file_base(prev_filename)
-  curr_base = get_file_base(curr_filename)
-  
-  <<set [[should_match]] if common prefix or suffix>>
-
-if should_match:
-  # Store the mapping for diff generation
-  # Use the current version's name as the canonical name
-  filename_mapping[curr_filename] = prev_filename
+# Rename files in prev_attachments to match current names
+for curr_filename, prev_filename in filename_mapping.items():
   prev_attachments[curr_filename] = prev_attachments.pop(prev_filename)
-@
-
-Check if filenames share a common prefix or suffix pattern.
-A prefix or suffix of at least 3 characters is considered sufficient.
-Or that one filename is a substring of the other.
-<<set [[should_match]] if common prefix or suffix>>=
-common_prefix_len = 0
-for i, (c1, c2) in enumerate(zip(prev_base, curr_base)):
-  if c1 == c2:
-    common_prefix_len = i + 1
-  else:
-    break
-
-common_suffix_len = 0
-for i, (c1, c2) in enumerate(zip(reversed(prev_base), reversed(curr_base))):
-  if c1 == c2:
-    common_suffix_len = i + 1
-  else:
-    break
-
-should_match = (common_prefix_len >= 3 or common_suffix_len >= 3
-                or prev_base in curr_base or curr_base in prev_base)
 @
 
 Each attachment file is compared individually.
@@ -1973,6 +2399,8 @@ limitations instructors should be aware of:
 Despite these limitations, the diff functionality significantly improves the
 efficiency of reviewing student submission revisions in the common case.
 
+\subsection{Filename processing helpers}
+
 Helper functions for file name processing used by the diff functionality.
 <<functions>>=
 def get_file_extension(filename):
@@ -1991,6 +2419,230 @@ def get_file_base(filename):
   if '.' in filename:
     return filename.rsplit('.', 1)[0]
   return filename
+@
+
+\subsection{Computing string similarity with edit distance}
+
+To match renamed files across submission versions, we need a measure of
+similarity between filenames.
+The \emph{Levenshtein edit distance} (or simply \enquote{edit distance})
+quantifies how different two strings are by counting the minimum number of
+single-character edits needed to transform one string into the other.
+
+The three allowed edit operations are:
+\begin{description}
+\item[Insertion] Add a character (\eg [[lab1]] $\to$ [[lab_1]])
+\item[Deletion] Remove a character (\eg [[lab_1]] $\to$ [[lab1]])
+\item[Substitution] Replace one character with another
+  (\eg [[Lab1]] $\to$ [[lab1]])
+\end{description}
+
+For example, transforming [[solution.py]] to [[solution_final.py]] requires
+inserting [[_final]] (6 operations), so the edit distance is 6.
+Transforming [[Lab1.py]] to [[lab1.py]] requires changing [[L]] to [[l]]
+(1 substitution), so the edit distance is 1.
+
+The smaller the edit distance, the more similar the strings.
+An edit distance of 0 means the strings are identical.
+
+We use edit distance to match filenames because it naturally handles the
+common patterns students use when renaming files:
+\begin{itemize}
+\item Adding suffixes: [[lab.py]] $\to$ [[lab_final.py]]
+\item Changing separators: [[lab_1.py]] $\to$ [[lab-1.py]]
+\item Fixing capitalization: [[Solution.py]] $\to$ [[solution.py]]
+\item Adding prefixes: [[test.py]] $\to$ [[new_test.py]]
+\end{itemize}
+
+<<functions>>=
+def compute_edit_distance(str1, str2):
+  """
+  Compute Levenshtein edit distance between two strings.
+
+  Returns the minimum number of single-character edits (insertions,
+  deletions, or substitutions) needed to transform str1 into str2.
+  """
+  <<compute edit distance using dynamic programming>>
+@
+
+The edit distance algorithm uses \emph{dynamic programming}.
+We build a matrix [[dp]] where [[dp[i][j]]] represents the edit distance
+between the first [[i]] characters of [[str1]] and the first [[j]] characters
+of [[str2]].
+
+The base cases are:
+\begin{itemize}
+\item [[dp[0][j] = j]] --- transforming empty string to [[str2[0:j]]]
+  requires [[j]] insertions
+\item [[dp[i][0] = i]] --- transforming [[str1[0:i]]] to empty string
+  requires [[i]] deletions
+\end{itemize}
+
+For each position [[(i, j)]], we consider three possibilities:
+\begin{description}
+\item[Characters match] If [[str1[i-1] == str2[j-1]]], no edit needed.
+  Take [[dp[i-1][j-1]]].
+\item[Substitution] Replace [[str1[i-1]]] with [[str2[j-1]]].
+  Cost: [[dp[i-1][j-1] + 1]].
+\item[Insertion] Insert [[str2[j-1]]].
+  Cost: [[dp[i][j-1] + 1]].
+\item[Deletion] Delete [[str1[i-1]]].
+  Cost: [[dp[i-1][j] + 1]].
+\end{description}
+
+We take the minimum of these options.
+The final answer is [[dp[len(str1)][len(str2)]]].
+
+<<compute edit distance using dynamic programming>>=
+m, n = len(str1), len(str2)
+
+# Create DP table
+dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+# Base cases
+for i in range(m + 1):
+  dp[i][0] = i  # Delete all characters from str1
+for j in range(n + 1):
+  dp[0][j] = j  # Insert all characters from str2
+
+# Fill DP table
+for i in range(1, m + 1):
+  for j in range(1, n + 1):
+    if str1[i-1] == str2[j-1]:
+      # Characters match, no edit needed
+      dp[i][j] = dp[i-1][j-1]
+    else:
+      # Take minimum of insert, delete, substitute
+      dp[i][j] = 1 + min(
+        dp[i-1][j],    # Delete from str1
+        dp[i][j-1],    # Insert from str2
+        dp[i-1][j-1]   # Substitute
+      )
+
+return dp[m][n]
+@
+
+\subsection{Matching renamed files using edit distance}
+
+With the edit distance function available, we can now match files across
+submission versions even when they have been renamed.
+The challenge is handling multiple files: if a student submits three files
+in version 0 and three files in version 1, which old files correspond to
+which new files?
+
+We want to find the \emph{optimal matching} that pairs files with minimal
+total edit distance.
+However, we must be conservative: only match files when we have high confidence
+the match is correct.
+An incorrect match would show a confusing diff between unrelated files.
+
+Our approach uses a greedy algorithm based on sorted distances:
+\begin{enumerate}
+\item Compute edit distance between every pair of files (old and new) with
+  matching extensions
+\item Sort all candidate pairs by edit distance (lowest first)
+\item Accept matches in order, skipping pairs where either file is already
+  matched
+\item Only accept matches below a conservative threshold
+\end{enumerate}
+
+This gives us near-optimal one-to-one matching without the complexity of
+the Hungarian algorithm.
+The key insight is that by considering lowest-distance pairs first, we naturally
+find the best matches.
+
+For example, if a student renames [[lab1.py]] to [[lab1_final.py]] (distance 6)
+and also adds a new file [[lab1_test.py]], we correctly match the first pair
+because its distance is lower than any pairing involving [[lab1_test.py]].
+
+<<functions>>=
+def match_renamed_files(prev_attachments, curr_attachments,
+                       fixed_threshold=DEFAULT_DIFF_THRESHOLD_FIXED,
+                       percent_threshold=DEFAULT_DIFF_THRESHOLD_PERCENT):
+  """
+  Match files across versions using edit distance.
+
+  Args:
+    prev_attachments: Dictionary of previous version's attachments
+    curr_attachments: Dictionary of current version's attachments
+    fixed_threshold: Maximum edit distance for a match
+                    (default: DEFAULT_DIFF_THRESHOLD_FIXED)
+    percent_threshold: Maximum distance as percentage of filename length
+                      (default: DEFAULT_DIFF_THRESHOLD_PERCENT)
+
+  Returns a dictionary mapping current filename -> previous filename
+  for files that appear to be renames.
+  """
+  <<build candidate matches with distances>>
+  <<accept matches in distance order>>
+@
+
+First, we compute edit distances for all candidate pairs.
+We only consider pairs with matching file extensions, since students rarely
+change extensions when renaming (\eg [[.py]] to [[.txt]]).
+
+<<build candidate matches with distances>>=
+candidates = []
+
+for curr_filename in curr_attachments:
+  curr_ext = get_file_extension(curr_filename)
+  curr_base = get_file_base(curr_filename)
+
+  for prev_filename in prev_attachments:
+    # Only match files with same extension
+    prev_ext = get_file_extension(prev_filename)
+    if prev_ext != curr_ext or not prev_ext:
+      continue
+
+    # Skip if names are identical (will be matched automatically later)
+    if curr_filename == prev_filename:
+      continue
+
+    prev_base = get_file_base(prev_filename)
+    distance = compute_edit_distance(prev_base, curr_base)
+
+    candidates.append((distance, curr_filename, prev_filename))
+@
+
+Next, we sort candidates by distance and accept matches greedily.
+We track which files have been matched to ensure one-to-one mapping.
+
+We use a conservative threshold: only accept matches where the edit distance
+is small relative to the filename length.
+By default, we require distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_FIXED]]
+or distance $\leq$ [[DEFAULT_DIFF_THRESHOLD_PERCENT]]\% of the
+longer filename's base length.
+These thresholds can be adjusted using [[--diff-threshold-fixed]] and
+[[--diff-threshold-percent]] command-line options.
+
+This prevents matching unrelated files that happen to have short names
+(\eg [[a.py]] and [[b.py]] have distance 1 but shouldn't be matched).
+
+<<accept matches in distance order>>=
+filename_mapping = {}
+matched_prev = set()
+matched_curr = set()
+
+# Sort by distance (ascending)
+candidates.sort(key=lambda x: x[0])
+
+for distance, curr_filename, prev_filename in candidates:
+  # Skip if either file already matched
+  if curr_filename in matched_curr or prev_filename in matched_prev:
+    continue
+
+  # Conservative threshold: distance <= fixed or <= percent% of base length
+  curr_base = get_file_base(curr_filename)
+  prev_base = get_file_base(prev_filename)
+  max_base_len = max(len(curr_base), len(prev_base))
+  threshold = max(fixed_threshold, int(percent_threshold / 100.0 * max_base_len))
+
+  if distance <= threshold:
+    filename_mapping[curr_filename] = prev_filename
+    matched_curr.add(curr_filename)
+    matched_prev.add(prev_filename)
+
+return filename_mapping
 @
 
 
@@ -2013,7 +2665,10 @@ def format_rubric(submission, json_format=False):
 
   for crit_id, rating_data in submission.rubric_assessment.items():
     criterion = get_criterion(crit_id, submission.assignment.rubric)
-    rating = get_rating(rating_data["rating_id"], criterion)
+    if criterion is None:
+      <<handle missing criterion>>
+      continue
+    rating = get_rating(rating_data.get("rating_id"), criterion)
     try:
       comments = rating_data["comments"]
     except KeyError:
@@ -2027,8 +2682,24 @@ def format_rubric(submission, json_format=False):
   return result.strip()
 @
 
-Sometimes Canvas is missing some data,
-for instance, an individual rating.
+Sometimes Canvas is missing some data.
+A rubric criterion referenced in the assessment may have been removed from the
+rubric after grading, in which case [[get_criterion]] returns [[None]].
+We output a placeholder for missing criteria so the user knows grading data
+existed for a now-deleted criterion.
+<<handle missing criterion>>=
+if json_format:
+  result[f"[removed criterion {crit_id}]"] = {
+    "rating": None,
+    "points": rating_data.get("points"),
+    "comments": rating_data.get("comments", "")
+  }
+else:
+  points = rating_data.get("points", "-")
+  result += f"- [removed criterion]: {points} points\n\n"
+@
+
+Similarly, an individual rating may be missing.
 So we add it only if it exists.
 <<add [[criterion]], [[rating]] and [[comments]] to [[result]]>>=
 if json_format:
@@ -2081,11 +2752,15 @@ def get_criterion(criterion_id, rubric):
       return criterion
 
   return None
-@ And in exactly the same fashion we want to extract a rating from the 
-criterion.
+@ And in the same fashion we want to extract a rating from the criterion.
+However, [[rating_id]] may be missing from the assessment data, and some
+criteria lack a ratings list (for instance, free-form criteria).
+We return [[None]] early in these cases, which the caller already handles.
 <<functions>>=
 def get_rating(rating_id, criterion):
   """Returns rating with ID `rating_id` from rubric criterion `criterion`"""
+  if not rating_id or not criterion.get("ratings"):
+    return None
   for rating in criterion["ratings"]:
     if rating["id"] == rating_id:
       return rating
@@ -2198,4 +2873,3 @@ except canvasapi.exceptions.CanvasException as err:
     f"for {submission.user}. "
     f"Canvas error: {err}")
 @
-

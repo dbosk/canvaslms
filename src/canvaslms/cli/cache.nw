@@ -1,4 +1,5 @@
-\chapter{Cache persistence}
+\chapter{Cache persistence and management}
+\chaterprecis{Written by Dan-Claude and reviewed by Daniel Bosk.}
 
 We want to persist the Canvas object between runs to avoid redundant API calls.
 The Canvas object contains cached data for courses, assignments, users, and
@@ -6,9 +7,22 @@ submissions.
 By saving this object to disk, we can reuse it on subsequent runs until the
 cache expires or is explicitly cleared.
 
+This persistence layer now serves two clients.
+The command-line interface uses it when running subcommands, and the top-level
+[[canvaslms]] package uses it to expose a lazy [[canvaslms.canvas]] object to
+Python programs.
+That package-level entry point also lets other command-line tools import
+[[canvaslms]] and reuse the same configured, cached Canvas object.
+That shared loader keeps both interfaces consistent: they restore the same
+encrypted cache, configure the same retry policy, and fail in the same way when
+credentials are missing.
+
 However, the Canvas object contains sensitive data (course information, student
 data, etc.), so we must encrypt it before storing to disk.
 We use authenticated encryption to ensure both confidentiality and integrity.
+
+Additionally, we cache submission attachments to avoid re-downloading files.
+This is managed separately from the Canvas object cache.
 
 \section{Design overview}
 
@@ -19,7 +33,7 @@ The cache persistence mechanism works as follows:
 \item If not, we create a new Canvas object from the API.
 \item After each command completes, we save the Canvas object to the cache.
 \item The cache is stored in the user's cache directory (from [[appdirs]]).
-\item We provide a [[cache clear]] subcommand to explicitly remove the cache.
+\item We provide [[cache clear]] and [[cache clear-attachments]] subcommands.
 \end{enumerate}
 
 The key derivation works as follows:
@@ -29,11 +43,12 @@ inaccessible (which is correct behavior, as it's tied to a specific account).
 
 \section{Implementation}
 
-<<cache.py>>=
+<<[[cache.py]]>>=
 """Cache persistence with authenticated encryption"""
 
 import appdirs
 import base64
+from canvasapi import Canvas
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet, InvalidToken
@@ -42,11 +57,224 @@ import logging
 import os
 import pickle
 import pathlib
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+import canvaslms.hacks.attachment_cache as attachment_cache
+from canvaslms.hacks.canvasapi import (
+    SUBMISSION_TTL_MINUTES,
+    DEFAULT_CACHE_TTL_DAYS,
+    USER_CACHE_TTL_DAYS,
+    GROUP_CACHE_TTL_DAYS
+)
 
 logger = logging.getLogger(__name__)
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
+<<classes and exceptions>>
 <<functions>>
+@
+
+\section{Testing}
+
+The new shared loader is the boundary between credential management,
+persistence, and network configuration.
+We therefore test it directly here so that both the command-line interface and
+the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
+
+<<test [[cache.py]]>>=
+"""Tests for cache-backed Canvas loading."""
+
+import pytest
+
+import canvaslms.cli.cache as cache
+import canvaslms.cli.login
+
+<<test functions>>
+@
+
+
+\subsection{Missing credentials should fail immediately}
+
+Returning [[None]] for missing credentials would push the failure to an
+arbitrary later API call.
+We instead raise a dedicated error at the loader boundary.
+
+<<classes and exceptions>>=
+class CanvasCredentialsError(RuntimeError):
+  """Raised when Canvas credentials are unavailable."""
+  pass
+@
+
+<<test functions>>=
+def test_load_configured_canvas_requires_credentials(monkeypatch):
+  """Missing credentials should raise [[CanvasCredentialsError]]."""
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: (None, None),
+  )
+
+  with pytest.raises(cache.CanvasCredentialsError):
+    cache.load_configured_canvas({})
+@
+
+
+\subsection{Normalising the Canvas hostname}
+
+Users naturally think in hostnames like [[canvas.kth.se]], but the
+[[canvasapi]] client needs a full base URL.
+We centralise this normalization so that the CLI and package API cannot drift.
+
+<<functions>>=
+def normalize_hostname(hostname):
+  """Return ``hostname`` as a URL suitable for ``canvasapi.Canvas``."""
+  if "://" not in hostname:
+    hostname = f"https://{hostname}"
+  return hostname
+@
+
+
+\subsection{Configuring retry policy with exponential backoff}
+
+The shared loader is also the right place to configure retry behaviour.
+Without this, the command-line client and the package API could end up with
+different resilience characteristics even though they talk to the same Canvas
+server.
+
+The retry policy itself stays unchanged.
+We still retry transient failures such as [[429]], [[500]], [[502]], [[503]],
+and [[504]] using exponential backoff with jitter.
+The only difference is where that policy lives: in the shared loader rather
+than in the CLI bootstrap.
+
+<<functions>>=
+def configure_canvas_retry_policy(canvas):
+  """Install the shared retry policy on a Canvas session."""
+  retry_strategy = Retry(
+    total=10,
+    backoff_factor=2,
+    backoff_max=256,
+    backoff_jitter=0.3,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"],
+    respect_retry_after_header=True,
+  )
+
+  adapter = HTTPAdapter(max_retries=retry_strategy)
+  canvas._Canvas__requester._session.mount("https://", adapter)
+  canvas._Canvas__requester._session.mount("http://", adapter)
+  return canvas
+@
+
+When no encrypted cache is available, we create a fresh [[Canvas]] instance and
+immediately configure it with the shared retry policy.
+
+This contrasts the cache-hit and cache-miss paths deliberately.
+Cached clients arrive with their warmed state already attached, while cache
+misses must construct a fresh client and then receive the same retry behaviour
+so that callers do not observe different network resilience depending on where
+the object came from.
+
+<<functions>>=
+def create_canvas(hostname, token):
+  """Create a new ``Canvas`` instance with shared retry configuration."""
+  canvas = Canvas(hostname, token)
+  return configure_canvas_retry_policy(canvas)
+@
+
+
+\subsection{Loading a configured Canvas client}
+
+This is the public entry point shared by the CLI and the top-level package.
+It hides three small decisions that should stay coupled:
+\begin{enumerate}
+\item where to read credentials from,
+\item whether to reuse the encrypted object cache,
+\item how to construct a fresh client when the cache misses.
+\end{enumerate}
+
+Keeping these decisions together prevents the command-line interface and the
+package API from drifting apart.
+If each caller reimplemented the sequence independently, they could easily end
+up disagreeing about cache semantics, retry configuration, or how missing
+credentials should fail.
+
+The function returns the [[canvas]] object together with the normalized
+[[hostname]] and [[token]].
+Those values are needed later when the caller wants to save the encrypted cache
+again.
+
+<<functions>>=
+def load_configured_canvas(config, use_cache=True):
+  """Return configured Canvas object and cache metadata.
+
+  The return value is the triple ``(canvas, hostname, token)``.
+  """
+  import canvaslms.cli.login
+
+  hostname, token = canvaslms.cli.login.load_credentials(config)
+
+  if not (hostname and token):
+    raise CanvasCredentialsError("No hostname or token, run `canvaslms login`")
+
+  hostname = normalize_hostname(hostname)
+
+  if use_cache:
+    canvas = load_canvas_cache(token, hostname)
+    if canvas:
+      return canvas, hostname, token
+
+  return create_canvas(hostname, token), hostname, token
+@
+
+<<test functions>>=
+def test_load_configured_canvas_uses_cached_canvas(monkeypatch):
+  """The shared loader should prefer the encrypted cache when available."""
+  expected = object()
+
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: ("canvas.example", "token"),
+  )
+  monkeypatch.setattr(cache, "load_canvas_cache", lambda token, hostname: expected)
+  monkeypatch.setattr(
+      cache,
+      "create_canvas",
+      lambda hostname, token: (_ for _ in ()).throw(AssertionError("unexpected fresh canvas")),
+  )
+
+  canvas, hostname, token = cache.load_configured_canvas({})
+
+  assert canvas is expected
+  assert hostname == "https://canvas.example"
+  assert token == "token"
+@
+
+<<test functions>>=
+def test_load_configured_canvas_bypasses_cache_when_requested(monkeypatch):
+  """The shared loader should create a fresh Canvas object when cache is bypassed."""
+  expected = object()
+
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: ("canvas.example", "token"),
+  )
+  monkeypatch.setattr(
+      cache,
+      "load_canvas_cache",
+      lambda token, hostname: (_ for _ in ()).throw(AssertionError("cache should not be read")),
+  )
+  monkeypatch.setattr(cache, "create_canvas", lambda hostname, token: expected)
+
+  canvas, hostname, token = cache.load_configured_canvas({}, use_cache=False)
+
+  assert canvas is expected
+  assert hostname == "https://canvas.example"
+  assert token == "token"
 @
 
 
@@ -67,7 +295,6 @@ security cost to prevent brute-force attacks on the cache encryption.
 <<functions>>=
 def derive_key(token, hostname):
   """Derives a Fernet key from the Canvas token and hostname"""
-  import time
   start = time.perf_counter()
 
   # Use hostname as salt (hashed to get consistent 16 bytes)
@@ -119,7 +346,6 @@ If the cache directory doesn't exist, we create it first.
 def save_canvas_cache(canvas, token, hostname):
   """Saves the Canvas object to encrypted cache"""
   try:
-    import time
     save_start = time.perf_counter()
 
     # Derive encryption key
@@ -183,7 +409,6 @@ In all these cases, the correct behavior is to create a fresh Canvas object.
 def load_canvas_cache(token, hostname):
   """Loads the Canvas object from encrypted cache, returns None if unavailable"""
   try:
-    import time
     load_start = time.perf_counter()
 
     # Derive encryption key
@@ -233,21 +458,39 @@ def clear_cache(hostname):
 @
 
 
-\subsection{The cache command}
+\section{The cache command and subcommands}
 
-The [[cache]] subcommand provides control over the cache.
-Currently, it only supports [[clear]], but we could add other operations in the
-future (e.g., [[cache status]] to show cache size and age).
+The [[cache]] command provides control over the various caches.
+We provide subcommands for different cache management operations:
+\begin{description}
+\item[[cache clear]] Clears the encrypted Canvas object cache
+\item[[cache clear-attachments]] Removes old cached attachment files
+\end{description}
+
 <<functions>>=
 def add_command(subp):
   """Adds the cache command to argparse parser"""
   cache_parser = subp.add_parser(
     "cache",
-    help="Manage the Canvas object cache",
-    description="""
-Manages the persistent cache of Canvas data. The cache stores previously
-fetched courses, assignments, users, and submissions to speed up subsequent
-commands. The cache is encrypted using your Canvas token.
+    help="Manage caches",
+    description=f"""
+Manages the persistent caches used by canvaslms.
+
+The Canvas object cache stores API responses (courses, assignments, users,
+submissions) encrypted on disk. Objects are refreshed based on their type:
+
+- Submissions (non-passing): {SUBMISSION_TTL_MINUTES} minutes
+
+- Users: {USER_CACHE_TTL_DAYS} days
+
+- Groups: {GROUP_CACHE_TTL_DAYS} days
+
+- Other objects: {DEFAULT_CACHE_TTL_DAYS} days
+
+Submissions with passing grades (A, P, complete) are never refreshed.
+
+The attachment cache stores downloaded submission files using content-addressed
+storage. Files not accessed in 90 days can be cleaned with clear-attachments.
 """
   )
 
@@ -257,13 +500,24 @@ commands. The cache is encrypted using your Canvas token.
     required=True
   )
 
-  # cache clear command
-  clear_parser = cache_subp.add_parser(
-    "clear",
-    help="Clear the cached Canvas data"
-  )
-  clear_parser.set_defaults(func=clear_command)
+  <<add cache clear subcommand>>
+  <<add cache clear-attachments subcommand>>
+@
 
+\subsection{The cache clear subcommand}
+
+The [[cache clear]] subcommand removes the encrypted Canvas object cache.
+This forces a fresh fetch of all Canvas data on the next run.
+
+<<add cache clear subcommand>>=
+clear_parser = cache_subp.add_parser(
+  "clear",
+  help="Clear the cached Canvas data"
+)
+clear_parser.set_defaults(func=clear_command)
+@
+
+<<functions>>=
 def clear_command(config, canvas, args):
   """Clears the Canvas cache"""
   import canvaslms.cli.login
@@ -281,3 +535,84 @@ def clear_command(config, canvas, args):
   else:
     logger.info(f"No cache found for {hostname}")
 @
+
+\subsection{The cache clear-attachments subcommand}
+
+The [[cache clear-attachments]] subcommand removes cached attachment files that
+haven't been accessed recently.
+This helps manage disk space without requiring users to manually locate and
+delete cache files.
+
+The subcommand accepts an [[--older-than-days]] option (default: 90 days) to
+control how aggressively files are removed.
+A shorter period frees more space but requires more re-downloads; a longer
+period keeps more files but uses more disk space.
+
+<<add cache clear-attachments subcommand>>=
+clear_attachments_parser = cache_subp.add_parser("clear-attachments",
+  help="Remove old cached attachment files",
+  description="""
+  Removes cached attachment files that haven't been accessed in the specified
+  number of days. This helps manage disk space while keeping frequently-used
+  files available.
+
+  Cached attachments are stored in a platform-specific cache directory and use
+  content-addressed storage (files are identified by SHA-256 hash). This means
+  identical files submitted by different students or in different submission
+  versions are stored only once.
+
+  The cleanup process:
+  1. Identifies attachments not accessed within the time window
+  2. Removes their index entries
+  3. Removes orphaned data files no longer referenced by any index entry
+  4. Reports statistics about files removed and space freed
+  """)
+clear_attachments_parser.add_argument("--older-than-days",
+  type=int,
+  default=90,
+  help="Remove files not accessed in this many days (default: 90)")
+clear_attachments_parser.set_defaults(func=clear_attachments_command)
+@
+
+<<functions>>=
+def clear_attachments_command(config, canvas, args):
+  """Removes old cached attachments and reports statistics"""
+  max_age = args.older_than_days
+
+  print(f"Removing cached attachments not accessed in {max_age} days...")
+
+  stats = attachment_cache.cleanup_old_attachments(max_age_days=max_age)
+
+  files_removed = stats["files_removed"]
+  bytes_freed = stats["bytes_freed"]
+
+  # Convert bytes to human-readable format
+  if bytes_freed < 1024:
+    size_str = f"{bytes_freed} bytes"
+  elif bytes_freed < 1024 * 1024:
+    size_str = f"{bytes_freed / 1024:.1f} KB"
+  elif bytes_freed < 1024 * 1024 * 1024:
+    size_str = f"{bytes_freed / (1024 * 1024):.1f} MB"
+  else:
+    size_str = f"{bytes_freed / (1024 * 1024 * 1024):.2f} GB"
+
+  if files_removed == 0:
+    print(f"No files older than {max_age} days found.")
+  else:
+    print(f"Removed {files_removed} file(s), freed {size_str}.")
+@
+
+\section{Future extensions}
+
+This module can be extended with additional cache management commands:
+
+\begin{description}
+\item[[cache stats]] Display statistics about cache usage (number of files,
+  total size, oldest/newest files)
+\item[[cache list]] List all cached attachments with details
+\item[[cache clear-all]] Remove all caches (attachments, pickles, etc.)
+\item[[cache view-location]] Display the cache directory path
+\end{description}
+
+The subcommand structure makes these additions straightforward---just add new
+subparsers in new chunks.

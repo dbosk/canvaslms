@@ -26,20 +26,17 @@ running [[python3 -m pip install canvasapi]].
 \end{itemize}
 
 Then the source code can be outlined as follows.
-<<cli.py>>=
+<<[[cli.py]]>>=
 """A command-line interface for the Canvas LMS."""
 
 import appdirs
 import argcomplete, argparse
-from canvasapi import Canvas
 import canvaslms.cli.login
 import json
 import logging
 import os
 import pathlib
 import sys
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 <<modules>>
 
@@ -54,12 +51,41 @@ def main():
 @
 
 
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after each implementation to verify correctness.
+
+<<test [[cli.py]]>>=
+"""
+Tests for canvaslms.cli verbosity system.
+
+These tests verify the multi-level verbosity system that maps -v and -q flags
+to Python logging levels.
+"""
+import pytest
+import logging
+import argparse
+
+<<test functions>>
+@
+
+
 \section{Printing errors and warnings}
 
 We want uniform error handling.
+Both [[EmptyListError]] and [[MultipleMatchesError]] represent query-result
+conditions: the caller asked for items and got the wrong number.
+Different callers handle these differently---interactive commands may catch
+them locally and continue, while batch commands let them propagate to the
+main handler for uniform treatment.
 <<classes and exceptions>>=
 class EmptyListError(Exception):
-  """Exception raised when a process function returns an empty list"""
+  """Exception raised when a query returns no matching items"""
+  pass
+
+class MultipleMatchesError(Exception):
+  """Exception raised when a query matches multiple items
+  but exactly one was expected"""
   pass
 @
 
@@ -158,7 +184,8 @@ the command-line arguments.
 <<command-line interface>>=
 argp = argparse.ArgumentParser(
   description="Scriptable Canvas LMS",
-  epilog="Web: https://github.com/dbosk/canvaslms")
+  epilog="Copyright (c) 2020--2026 Daniel Bosk. Licensed under the MIT License.\n"
+         "Web: https://github.com/dbosk/canvaslms")
 
 subp = argp.add_subparsers(
   title="commands",
@@ -202,27 +229,103 @@ The net verbosity maps to logging levels as follows:
 <<configure logging based on verbose flag>>=
 net_verbosity = args.verbose - args.quiet
 
+<<determine logging level from net verbosity>>
+logging.basicConfig(level=level, format='[%(levelname)s] %(message)s')
+@
+
+We extract the level determination logic into a reusable chunk:
+<<determine logging level from net verbosity>>=
 if net_verbosity <= -3:
   # -qqq or more: completely silent
-  logging.basicConfig(level=logging.CRITICAL + 1, format='[%(levelname)s] %(message)s')
+  level = logging.CRITICAL + 1
 elif net_verbosity == -2:
   # -qq: critical only
-  logging.basicConfig(level=logging.CRITICAL, format='[%(levelname)s] %(message)s')
+  level = logging.CRITICAL
 elif net_verbosity == -1:
   # -q: errors and critical
-  logging.basicConfig(level=logging.ERROR, format='[%(levelname)s] %(message)s')
+  level = logging.ERROR
 elif net_verbosity == 0:
   # default: warnings and above
-  logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+  level = logging.WARNING
 elif net_verbosity == 1:
   # -v: info and above
-  logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+  level = logging.INFO
 elif net_verbosity == 2:
   # -vv: debug and above
-  logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
+  level = logging.DEBUG
 else:  # net_verbosity >= 3
   # -vvv or more: everything including library debug messages
-  logging.basicConfig(level=logging.NOTSET, format='[%(levelname)s] %(message)s')
+  level = logging.NOTSET
+@
+
+\subsubsection{Verifying the verbosity system}
+
+Now let's verify this verbosity mapping works correctly.
+The tests demonstrate how [[-v]] and [[-q]] flags stack and offset each other.
+
+The core of the verbosity system is the net verbosity calculation, which allows
+flags to offset each other naturally:
+
+<<test functions>>=
+class TestVerbositySystem:
+    """Test the verbosity system in CLI"""
+
+    def test_net_verbosity_calculation(self):
+        """
+        Net verbosity should be verbose count minus quiet count.
+
+        This allows -v and -q to offset each other naturally.
+        """
+        args = argparse.Namespace(verbose=2, quiet=1)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 1
+
+    def test_multiple_verbose_flags(self):
+        """Multiple -v flags should stack: -vvv gives verbosity 3"""
+        args = argparse.Namespace(verbose=3, quiet=0)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 3
+
+    def test_multiple_quiet_flags(self):
+        """Multiple -q flags should stack: -qqq gives verbosity -3"""
+        args = argparse.Namespace(verbose=0, quiet=3)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == -3
+
+    def test_offsetting_flags(self):
+        """-vv -q should give net verbosity 1"""
+        args = argparse.Namespace(verbose=2, quiet=1)
+        net_verbosity = args.verbose - args.quiet
+        assert net_verbosity == 1
+@
+
+The net verbosity maps to specific Python logging levels.
+We test the complete mapping with parameterized tests:
+
+<<test functions>>=
+class TestVerbosityLevelMapping:
+    """Test the complete mapping from net verbosity to logging levels"""
+
+    @pytest.mark.parametrize("verbose,quiet,expected_level", [
+        (0, 3, logging.CRITICAL + 1),  # -qqq: completely silent
+        (0, 2, logging.CRITICAL),       # -qq: critical only
+        (0, 1, logging.ERROR),          # -q: error and critical
+        (0, 0, logging.WARNING),        # default: warnings and above
+        (1, 0, logging.INFO),           # -v: info and above
+        (2, 0, logging.DEBUG),          # -vv: debug and above
+        (3, 0, logging.NOTSET),         # -vvv: everything
+        (4, 0, logging.NOTSET),         # -vvvv: still everything
+        (2, 1, logging.INFO),           # -vv -q = -v: info level
+        (3, 2, logging.INFO),           # -vvv -qq = -v: info level
+    ])
+    def test_verbosity_to_logging_level(self, verbose, quiet, expected_level):
+        """Test that verbosity flags map correctly to logging levels"""
+        net_verbosity = verbose - quiet
+
+        # Use the same logic as in the implementation
+        <<determine logging level from net verbosity>>
+
+        assert level == expected_level
 @
 
 
@@ -257,6 +360,19 @@ argp.add_argument("-v", "--verbose",
   action="count",
   default=0,
   help="Increase verbosity: -v=INFO, -vv=DEBUG, -vvv=all library debug")
+@
+
+
+\subsection{Cache control}
+
+Most commands speed up by caching the Canvas API object between runs.
+Occasionally you want to bypass the cache for a single command,
+for example right after creating or updating objects.
+
+<<add global options to argp>>=
+argp.add_argument("--no-cache",
+  action="store_true",
+  help="Do not read or write the persistent Canvas object cache")
 @
 
 
@@ -302,6 +418,11 @@ if args.func:
       err(1, str(e))
     else:
       sys.exit(1)
+  except MultipleMatchesError as e:
+    if args.quiet == 0:
+      err(1, str(e))
+    else:
+      sys.exit(1)
 @
 
 We know that the [[login]] command doesn't need the Canvas object.
@@ -313,158 +434,28 @@ args.func == canvaslms.cli.login.login_command
 @
 
 To create the Canvas object, we must read the credentials using the
-[[canvaslms.cli.login]] module.
-If there are no credentials, we give an error about running the [[login]]
-command first.
-Otherwise, we try to load the Canvas object from the persistent cache.
-If that fails (cache doesn't exist or is invalid), we create a new Canvas
-object and will save it to the cache after the command completes.
+shared cache loader.
+That loader is responsible for reading credentials, normalizing the hostname,
+restoring the encrypted cache when available, and creating a fresh
+[[canvasapi.Canvas]] object otherwise.
+By delegating here, the command-line interface and the top-level
+[[canvaslms.canvas]] object both use the same configuration and retry policy.
 <<create canvas object>>=
-hostname, token = canvaslms.cli.login.load_credentials(config)
-
-if not (hostname and token):
-  err(1, "No hostname or token, run `canvaslms login`")
-
-<<add https to hostname if needed>>
-
-<<try to load canvas from cache>>
-
-if not canvas:
-  canvas = Canvas(hostname, token)
-  <<configure retry policy for canvas>>
-@
-
-Now, we must specify a URL to the Canvas server, not actually a hostname.
-If the hostname already contains \enquote{https}, fine; if not, we should add
-it.
-<<add https to hostname if needed>>=
-if "://" not in hostname:
-  hostname = f"https://{hostname}"
-@
-
-
-\subsubsection{Loading Canvas from cache}
-
-Before creating a new Canvas object from scratch, we try to load it from the
-persistent cache.
-This can significantly speed up commands by reusing previously fetched course
-data, assignments, users, and submissions.
-<<try to load canvas from cache>>=
-canvas = canvaslms.cli.cache.load_canvas_cache(token, hostname)
+try:
+  canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
+      config,
+      use_cache=not args.no_cache,
+  )
+except canvaslms.cli.cache.CanvasCredentialsError as e:
+  err(1, str(e))
 @
 
 After successfully executing a command, we save the Canvas object to the cache
 for future use.
 We only save if the canvas object was actually used (not [[None]]).
 <<save canvas to cache after command>>=
-if canvas:
+if canvas and not args.no_cache:
   canvaslms.cli.cache.save_canvas_cache(canvas, token, hostname)
-@
-
-
-\subsubsection{Configuring retry policy with exponential backoff}
-
-The Canvas API, like most web services, can experience transient failures due to
-network issues, temporary server overload, or rate limiting.
-Consider what happens without retry logic:
-A user runs [[canvaslms courses list]], but the Canvas server happens to return
-an HTTP 503 error because it's briefly overloaded.
-The command fails immediately with an error, and the user must manually re-run
-it\,---\,possibly multiple times if the server remains under load.
-This is frustrating and makes scripts brittle.
-
-With automatic retry logic, the same scenario plays out differently:
-The first request gets an HTTP 503, but instead of failing, the client waits 2
-seconds and tries again.
-If that fails, it waits 4 seconds, then 8, and so on.
-By the time it tries the third or fourth time, the server has likely recovered,
-and the request succeeds\,---\,all without user intervention.
-
-To make [[canvaslms]] more robust and user-friendly, we configure automatic
-retry handling with exponential backoff.
-
-The [[canvasapi]] library uses the [[requests]] library internally, which in
-turn uses [[urllib3]] for HTTP connections.
-The [[urllib3.util.retry.Retry]] class provides sophisticated retry logic with
-exponential backoff.
-We configure it to handle:
-\begin{description}
-\item[HTTP 429 (Too Many Requests)] The standard rate-limiting response code.
-\item[HTTP 500 (Internal Server Error)] Temporary server-side errors.
-\item[HTTP 502 (Bad Gateway)] Upstream server errors, often transient.
-\item[HTTP 503 (Service Unavailable)] Server temporarily unable to handle
-  requests.
-\item[HTTP 504 (Gateway Timeout)] Upstream server timeout, may succeed on retry.
-\end{description}
-
-\paragraph{Exponential backoff strategy}
-
-Exponential backoff means that the delay between retries grows exponentially
-rather than linearly.
-With a backoff factor of 2, the delays follow the sequence: 2, 4, 8, 16, 32, 64,
-128, 256 seconds.
-We cap the maximum delay at 256 seconds to prevent excessively long waits while
-still allowing the server time to recover.
-With 10 total retry attempts, the total maximum time spent retrying is
-approximately $2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 256 + 256 = 1022$ seconds
-(about 17 minutes).
-
-This strategy is beneficial because:
-\begin{itemize}
-\item Early retries happen quickly for transient glitches (2--4 seconds).
-\item Later retries give the server more time to recover from sustained issues.
-\item It prevents overwhelming a struggling server with rapid retry attempts.
-\end{itemize}
-
-\paragraph{Jitter to prevent thundering herd}
-
-We add jitter (random variation) of 0.3 to the backoff delays.
-This means each delay is multiplied by a random factor between 0.7 and 1.3.
-Jitter is important when many clients experience the same failure simultaneously
-(for example, if the Canvas server goes down briefly and then recovers).
-Without jitter, all clients would retry at exactly the same moments, potentially
-overwhelming the server again.
-Jitter spreads the retry attempts over time, allowing the server to recover
-smoothly.
-
-\paragraph{Respecting the Retry-After header}
-
-When a server is rate-limiting or overloaded, it may include a [[Retry-After]]
-header in the response to tell clients how long to wait before retrying.
-By setting [[respect_retry_after_header=True]], we honor this guidance from the
-Canvas API, which may specify shorter or longer delays than our exponential
-backoff would calculate.
-
-\paragraph{Implementation via session adapter monkey-patching}
-
-The [[canvasapi]] library doesn't expose a way to pass custom retry configuration
-through its [[Canvas]] constructor.
-However, it internally creates a [[requests.Session]] object for connection pooling.
-We can configure retry behavior by creating an [[HTTPAdapter]] with our retry
-strategy and mounting it to the session for both [[https://]] and [[http://]]
-protocols.
-
-We access the internal session through [[canvas._Canvas__requester._session]].
-This uses Python's name mangling for private attributes (the [[__requester]]
-attribute becomes [[_Canvas__requester]]).
-While this is somewhat fragile (it depends on [[canvasapi]]'s internal structure),
-it's currently the only way to configure retries without modifying the library
-itself.
-
-<<configure retry policy for canvas>>=
-retry_strategy = Retry(
-  total=10,
-  backoff_factor=2,
-  backoff_max=256,
-  backoff_jitter=0.3,
-  status_forcelist=[429, 500, 502, 503, 504],
-  allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"],
-  respect_retry_after_header=True
-)
-
-adapter = HTTPAdapter(max_retries=retry_strategy)
-canvas._Canvas__requester._session.mount("https://", adapter)
-canvas._Canvas__requester._session.mount("http://", adapter)
 @
 
 
@@ -572,6 +563,26 @@ The \texttt{quizzes} command is located in [[canvaslms.cli.quizzes]].
 import canvaslms.cli.quizzes
 <<add subcommands to subp>>=
 canvaslms.cli.quizzes.add_command(subp)
+@
+
+\paragraph{The \texttt{pages} command}
+
+The \texttt{pages} command manages wiki pages in Canvas courses.
+It supports listing, viewing, editing, and rendering pages with YAML front
+matter for Git-based workflows.
+<<modules>>=
+import canvaslms.cli.pages
+<<add subcommands to subp>>=
+canvaslms.cli.pages.add_command(subp)
+@
+
+\paragraph{The \texttt{syllabus} command}
+
+The \texttt{syllabus} command manages the course syllabus.
+<<modules>>=
+import canvaslms.cli.syllabus
+<<add subcommands to subp>>=
+canvaslms.cli.syllabus.add_command(subp)
 @
 
 If we use the [[quizzes]] command with a CSV file, we don't need to log in to

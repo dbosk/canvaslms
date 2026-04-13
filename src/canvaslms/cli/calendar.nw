@@ -12,16 +12,16 @@ The calendar commands allow users to list, view, and create calendar events.
 
 Canvas provides several calendar-related API endpoints:
 \begin{itemize}
-\item \texttt{get\_calendar\_events} to list calendar events
-\item \texttt{get\_calendar\_event} to get a specific calendar event
-\item \texttt{create\_calendar\_event} to create new calendar events
-\item \texttt{get\_upcoming\_events} to get upcoming events
+\item [[get_calendar_events]] to list calendar events
+\item [[get_calendar_event]] to get a specific calendar event
+\item [[create_calendar_event]] to create new calendar events
+\item [[get_upcoming_events]] to get upcoming events
 \end{itemize}
 
 \section{Module outline}
 
 We outline the module:
-<<calendar.py>>=
+<<[[calendar.py]]>>=
 import argparse
 import canvasapi.exceptions
 import canvaslms.cli
@@ -34,6 +34,8 @@ import sys
 import arrow
 import re
 import textwrap
+
+DEFAULT_COURSE_REGEX = '.*'
 
 <<functions>>
 
@@ -49,7 +51,7 @@ def add_command(subp):
     required=True)
   
   add_calendar_list_command(calendar_subp)
-  add_calendar_show_command(calendar_subp)
+  add_calendar_view_command(calendar_subp)
   add_calendar_create_command(calendar_subp)
 @
 
@@ -77,7 +79,10 @@ def add_calendar_list_command(subp):
   calendar_list_parser = subp.add_parser("list",
     help="Lists calendar events",
     description="Lists calendar events. Output, CSV-format: "
-      "<event-id> <title> <start-time> <end-time> <context-type> <context-name>")
+      "<title> <start-time> <end-time> <participants> "
+      "[<context-code> <context-name>] (add with --show-context). "
+      "With -b/--bookings, output is one line per booked student and one line "
+      "for free slots.")
   calendar_list_parser.set_defaults(func=calendar_list_command)
   courses.add_course_option(calendar_list_parser)
   <<add calendar list arguments>>
@@ -102,6 +107,10 @@ We add options to filter events.
 calendar_list_parser.add_argument("--type",
   choices=["event", "assignment"],
   help="Filter by event type")
+
+calendar_list_parser.add_argument("--show-context",
+  action="store_true", default=False,
+  help="Include context columns (context code and name) in output")
 @
 
 When we add time filtering arguments, we allow either a single date/time 
@@ -172,8 +181,14 @@ end_time = utils.format_canvas_time(end_time)
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
+
+The course option defaults to the regex [[.*]].
+We treat this default as \emph{no explicit course filter} and omit any
+context-code parameter, letting Canvas decide which calendars to include.
 <<process course option for calendar list>>=
-course_list = courses.process_course_option(canvas, args)
+course_list = None
+if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+  course_list = courses.process_course_option(canvas, args)
 @
 
 
@@ -181,11 +196,43 @@ course_list = courses.process_course_option(canvas, args)
 
 We fetch the calendar events and output them in CSV format.
 
+The Canvas API supports filtering by context codes, but the REST parameter
+[[context_codes[]]] is limited to 10 values per request.
+Since [[-c/--course]] is a regex, it may match more than 10 courses.
+In that case Canvas would silently ignore additional context codes, so we
+instead fail fast and ask the user to narrow the regex.
+
 The \texttt{args.type} parameter is optional and may be \texttt{None} by default.
 When \texttt{None}, the Canvas API includes all event types (both 
 \enquote{event} and \enquote{assignment}).
 When specified, it filters to only the requested type.
 <<functions>>=
+def event_in_any_context(event, context_set):
+  """Returns True if the event belongs to any of the contexts in context_set.
+
+  For appointment reservations, Canvas may return context_code as a user
+  calendar, while still listing the course context in all_context_codes or
+  effective_context_code.
+  """
+  if not context_set:
+    return True
+
+  code = getattr(event, 'context_code', None)
+  if code in context_set:
+    return True
+
+  code = getattr(event, 'effective_context_code', None)
+  if code in context_set:
+    return True
+
+  all_codes = getattr(event, 'all_context_codes', None)
+  if all_codes:
+    for code in all_codes.split(','):
+      if code.strip() in context_set:
+        return True
+
+  return False
+
 def get_calendar_events(canvas, course_list=None,
                         start_time=None, end_time=None, event_type=None):
   """Fetches calendar events from Canvas with optional filters"""
@@ -194,15 +241,26 @@ def get_calendar_events(canvas, course_list=None,
     context_codes = [f"course_{course.id}" for course in course_list]
   else:
     context_codes = None
-  if context_codes:
-    params['context_codes'] = context_codes
   if start_time:
     params['start_date'] = start_time
   if end_time:
     params['end_date'] = end_time
   if event_type:
     params['type'] = event_type
-    
+
+  if context_codes:
+    if len(context_codes) > 10:
+      canvaslms.cli.err(
+        1,
+        "-c/--course matches more than 10 courses, but the Canvas API only "
+        "accepts up to 10 context codes per request; narrow the regex "
+        "(e.g. '^...$') or match a specific Canvas ID"
+      )
+
+    # canvasapi flattens sequences into repeated `context_codes[]` params.
+    # Passing `context_codes[]` here would become `context_codes[][]`.
+    params['context_codes'] = context_codes
+
   return canvas.get_calendar_events(**params)
 <<get and output calendar events>>=
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
@@ -214,8 +272,14 @@ try:
     end_time=end_time,
     event_type=args.type
   )
+
+  context_set = None
+  if course_list:
+    context_set = {f"course_{course.id}" for course in course_list}
   
   for event in events:
+    if not event_in_any_context(event, context_set):
+      continue
     <<output calendar event data>>
     
 except canvasapi.exceptions.CanvasException as e:
@@ -237,87 +301,138 @@ calendar_list_parser.add_argument("--bookings", "-b",
        "(only for appointment group events)")
 @
 
+Canvas uses [[child_events]] in two different ways.  For an ordinary
+calendar event it may contain section-level child events, while for an
+appointment group it contains booking-related child events.  Only the
+appointment-group case carries booking metadata such as
+[[available_slots]] and [[participants_per_appointment]], so we check for
+those fields before we format booking output.
+<<functions>>=
+def get_appointment_booking_data(event):
+  """Return appointment-group booking data for ``event`` or ``None``."""
+  available_slots = getattr(event, 'available_slots', None)
+  participants_per_appointment = getattr(
+    event, 'participants_per_appointment', None)
+  appointment_group_id = getattr(event, 'appointment_group_id', None)
+  child_events = getattr(event, 'child_events', None)
+
+  if all(value is None for value in (
+      appointment_group_id,
+      participants_per_appointment,
+      available_slots,
+  )):
+    return None
+
+  return {
+    'available_slots': available_slots,
+    'participants_per_appointment': participants_per_appointment,
+    'child_events': child_events or [],
+  }
+@
+
 <<output calendar event data>>=
 start_at = canvaslms.cli.utils.format_local_time(getattr(event, 'start_at', None))
 end_at = canvaslms.cli.utils.format_local_time(getattr(event, 'end_at', None))
+booking_data = get_appointment_booking_data(event)
 
-try:
-  num_booked = event.participants_per_appointment - event.available_slots
-  participants = f"{num_booked}/{event.participants_per_appointment}"
-except AttributeError:
+if booking_data and \
+   booking_data['participants_per_appointment'] is not None and \
+   booking_data['available_slots'] is not None:
+  num_booked = booking_data['participants_per_appointment'] - \
+    booking_data['available_slots']
+  participants = \
+    f"{num_booked}/{booking_data['participants_per_appointment']}"
+else:
   participants = ''
 
 if args.bookings:
-  try:
-    slots = event.child_events
-  except AttributeError:
-    pass
-  else:
-    if event.available_slots:
-      output.writerow([
+  if booking_data:
+    available_slots = booking_data['available_slots']
+    if available_slots:
+      row = [
         event.title,
         start_at,
         end_at,
-        f"{event.available_slots} free slots"
-      ])
-    if slots:
-      for slot in slots:
-        user_name = slot["user"]["name"]
-        user_uname = slot["user"]["login_id"]
-        output.writerow([
-          slot["title"],
-          canvaslms.cli.utils.format_local_time(slot["start_at"]),
-          canvaslms.cli.utils.format_local_time(slot["end_at"]),
-          f"{user_name} ({user_uname})"
+        f"{available_slots} free slots"
+      ]
+      if args.show_context:
+        row.extend([
+          getattr(event, 'context_code', ''),
+          getattr(event, 'context_name', ''),
         ])
+      output.writerow(row)
+    for slot in booking_data['child_events']:
+      try:
+        user_name = slot['user']['name']
+        user_uname = slot['user']['login_id']
+      except (TypeError, KeyError):
+        continue
+      row = [
+        slot['title'],
+        canvaslms.cli.utils.format_local_time(slot['start_at']),
+        canvaslms.cli.utils.format_local_time(slot['end_at']),
+        f"{user_name} ({user_uname})"
+      ]
+      if args.show_context:
+        row.extend([
+          getattr(event, 'context_code', ''),
+          getattr(event, 'context_name', ''),
+        ])
+      output.writerow(row)
 else:
-  output.writerow([
+  row = [
     event.title,
     start_at,
     end_at,
     participants,
-  ])
+  ]
+  if args.show_context:
+    row.extend([
+      getattr(event, 'context_code', ''),
+      getattr(event, 'context_name', ''),
+    ])
+  output.writerow(row)
 @
 
 
-\section{The \texttt{calendar show} subcommand}
+\section{The \texttt{calendar view} subcommand}
 
-The \texttt{calendar show} subcommand shows details of one or more calendar events matched by a regex and/or date filters. By default, it shows the first upcoming event in the next week. Use --count to print more than one match.
+The \texttt{calendar view} subcommand shows details of one or more calendar events matched by a regex and/or date filters. By default, it shows the first upcoming event in the next week. Use --count to print more than one match.
 <<functions>>=
-def add_calendar_show_command(subp):
-  """Adds the calendar show subcommand and its options to argparse subparser subp"""
-  calendar_show_parser = subp.add_parser("show",
+def add_calendar_view_command(subp):
+  """Adds the calendar view subcommand and its options to argparse subparser subp"""
+  calendar_view_parser = subp.add_parser("view",
     help="Shows details of upcoming calendar events by regex/date",
     description="Shows details of one or more calendar events matched "
                 "by regex and/or dates. Defaults to the first event in "
                 "the coming week.")
-  calendar_show_parser.set_defaults(func=calendar_show_command)
-  <<add calendar show arguments>>
+  calendar_view_parser.set_defaults(func=calendar_view_command)
+  <<add calendar view arguments>>
 
-def calendar_show_command(config, canvas, args):
+def calendar_view_command(config, canvas, args):
   """Shows details of one or more calendar events matched by regex/date"""
   <<get and display calendar event details>>
 @
 
-The show command matches events by regex and dates rather than requiring an event ID. If no filters are provided, it searches the coming week and shows the first event. Use --count/-n to show more than one event.
-<<add calendar show arguments>>=
+The view command matches events by regex and dates rather than requiring an event ID. If no filters are provided, it searches the coming week and shows the first event. Use --count/-n to show more than one event.
+<<add calendar view arguments>>=
 # Regex to match course
-courses.add_course_option(calendar_show_parser)
+courses.add_course_option(calendar_view_parser)
 # Regex to match against event title/description
-calendar_show_parser.add_argument("--match",
+calendar_view_parser.add_argument("--match",
   help="Regular expression to match against event title and description")
-calendar_show_parser.add_argument("--title", "-t",
+calendar_view_parser.add_argument("--title", "-t",
   help="Regular expression to match against event title")
-calendar_show_parser.add_argument("--description", "-d",
+calendar_view_parser.add_argument("--description", "-d",
   help="Regular expression to match against event description")
-calendar_show_parser.add_argument("--ignore-case", "-i",
+calendar_view_parser.add_argument("--ignore-case", "-i",
   action="store_true",
   help="Make the regex case-insensitive")
 
-add_time_filtering_arguments(calendar_show_parser)
+add_time_filtering_arguments(calendar_view_parser)
 
 # How many events to print
-calendar_show_parser.add_argument("--count", "-n", type=int, default=1,
+calendar_view_parser.add_argument("--count", "-n", type=int, default=1,
   help="Number of matching events to show (default: 1), "
        "set to 0 to show all matches")
 @
@@ -327,26 +442,23 @@ We fetch events in the requested date window, filter them by regex (if provided)
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
 
-# Prepare parameters for API call
-params = {}
-
-# Process course option
-context_codes = []
-course_list = courses.process_course_option(canvas, args)
-if course_list:
-  context_codes = [f"course_{course.id}" for course in course_list]
-if context_codes:
-  params['context_codes'] = context_codes
-
-if start_time:
-  params['start_date'] = start_time
-if end_time:
-  params['end_date'] = end_time
-
 try:
-  events = canvas.get_calendar_events(**params)
+  course_list = None
+  if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+    course_list = courses.process_course_option(canvas, args)
+
+  events = get_calendar_events(
+    canvas,
+    course_list=course_list,
+    start_time=start_time,
+    end_time=end_time,
+  )
 except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to get calendar events: {e}")
+
+if course_list:
+  context_set = {f"course_{course.id}" for course in course_list}
+  events = [e for e in events if event_in_any_context(e, context_set)]
 
 <<let [[filtered]] be the events filtered by regex>>
 
@@ -379,14 +491,15 @@ else:
     print_event_details(event)
     if idx != len(selected) - 1:
       print()
-<<add calendar show arguments>>=
-calendar_show_parser.add_argument("--json",
+<<add calendar view arguments>>=
+calendar_view_parser.add_argument("--json",
   action="store_true", default=False,
   help="Output matching events as JSON")
 <<functions>>=
 def print_event_details(event):
   """Formats and prints details of a calendar event"""
   print(f"Title:    {getattr(event, 'title', 'N/A')}")
+  booking_data = get_appointment_booking_data(event)
   
   <<format start and end times>>
 
@@ -394,20 +507,23 @@ def print_event_details(event):
   <<format event description>>
 
   print(f"Location: {getattr(event, 'location_name', 'N/A')}")
-  try:
-    num_booked = event.participants_per_appointment - event.available_slots
+  if booking_data and \
+     booking_data['participants_per_appointment'] is not None and \
+     booking_data['available_slots'] is not None:
+    num_booked = booking_data['participants_per_appointment'] - \
+      booking_data['available_slots']
     print(f"Participants: "
-          f"{num_booked} / {event.participants_per_appointment}")
-  except AttributeError:
-    pass  # Not an appointment group event
+          f"{num_booked} / "
+          f"{booking_data['participants_per_appointment']}")
 
-  try:
-    for slot in event.child_events:
-      user_name = slot["user"]["name"]
-      user_uname = slot["user"]["login_id"]
+  if booking_data:
+    for slot in booking_data['child_events']:
+      try:
+        user_name = slot['user']['name']
+        user_uname = slot['user']['login_id']
+      except (TypeError, KeyError):
+        continue
       print(f"  {user_name} ({user_uname})")
-  except AttributeError:
-    pass # Not an appointment group event
   
   print(f"URL:      {getattr(event, 'html_url', 'N/A')}")
 @
@@ -509,7 +625,7 @@ The \texttt{calendar create} subcommand creates a new calendar event.
 It supports two types of events:
 \begin{itemize}
 \item Regular calendar events (\texttt{--event-type event}, default)
-\item Appointment groups for bookable time slots (\texttt{--event-type appointment\_group})
+\item Appointment groups for bookable time slots ( [[appointment_group]] )
 \end{itemize}
 
 Appointment groups allow students to book time slots within a defined time range.
@@ -661,4 +777,3 @@ while current_start + slot_duration <= end:
   params["appointment_group"]["new_appointments"][str(slot_num)] = slot
   current_start += slot_duration
   slot_num += 1
-

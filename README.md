@@ -14,6 +14,20 @@ pipx install canvaslms
 canvaslms login
 ```
 
+You can also use the package directly from Python.
+This lets scripts and other CLI tools import `canvaslms` and reuse the same
+authentication, configuration, and encrypted cache as the `canvaslms`
+command-line tool.
+The top-level `canvaslms.canvas` object is lazy-loaded, restored from the same
+encrypted cache as the CLI, and saved automatically at process exit.
+
+```python
+import canvaslms
+
+for course in canvaslms.canvas.get_courses():
+    print(course.name)
+```
+
 Let's consider how to grade students logging into the student-shell SSH
 server. We store the list of students' Canvas and KTH IDs in a file.
 
@@ -64,6 +78,36 @@ If you installed with the `[llm]` extra, configure your API keys:
 llm keys set openai  # or another provider
 ```
 
+### Managing Quiz Content
+
+View and edit quiz content directly from the command line:
+
+```bash
+# View quiz questions rendered as markdown
+canvaslms quizzes view -c "Course" -a "Quiz Name"
+
+# Edit quiz content interactively
+canvaslms quizzes edit -c "Course" -a "Quiz Name"
+
+# Export quiz items for backup or migration
+canvaslms quizzes items export -c "Course" -a "Quiz Name" --importable
+
+# Add questions to a quiz bank (use --example to see question formats)
+canvaslms quizzes items add -c "Course" -a "Quiz Name" --example
+```
+
+### Editing Announcements and Discussions
+
+Edit existing announcements using the same workflow as pages:
+
+```bash
+# Edit interactively (opens in editor)
+canvaslms discussions edit -c "Course" -t "Announcement Title"
+
+# Edit from a markdown file with YAML front matter
+canvaslms discussions edit -c "Course" -t "Announcement Title" -f announcement.md
+```
+
 ## Installation
 
 Install the PyPI package using `pip` or `pipx`:
@@ -80,6 +124,9 @@ pipx install canvaslms[llm] # recommended
 ```
 
 The `[llm]` extra includes the `llm` package and various LLM provider plugins (OpenAI, Anthropic, Gemini, Azure) for AI-powered features like quiz analysis summaries.
+
+The Python API uses the same credential sources as the command-line tool:
+system keyring, `CANVAS_SERVER`/`CANVAS_TOKEN`, or the config file.
 
 Some subcommands use `pandoc`, so you will likely have to [install 
 pandoc][pandoc] on your system manually.

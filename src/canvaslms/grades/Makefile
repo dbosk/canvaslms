@@ -6,6 +6,7 @@ MODULES+=			disjunctmax.py
 MODULES+=			maxgradesurvey.py
 MODULES+=			conjunctavgsurvey.py
 MODULES+=			tilkryLAB1.py
+MODULES+=			participation.py
 
 .PHONY: all
 all: grades.tex
@@ -14,6 +15,7 @@ all: disjunctmax.tex
 all: maxgradesurvey.tex
 all: conjunctavgsurvey.tex
 all: tilkryLAB1.tex
+all: participation.tex
 all: ${MODULES}
 
 grades.tex: conjunctavg.tex
@@ -21,6 +23,7 @@ grades.tex: disjunctmax.tex
 grades.tex: maxgradesurvey.tex
 grades.tex: conjunctavgsurvey.tex
 grades.tex: tilkryLAB1.tex
+grades.tex: participation.tex
 
 __init__.py: init.py
 	${MV} $^ $@
