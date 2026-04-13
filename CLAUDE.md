@@ -830,13 +830,15 @@ def example_command(config, canvas, args):
 
 ### Running Commands for Testing
 
+- Rebuild generated test files from the repository root with `make -C tests all` before running pytest
+- The test suite is tangled from `<<test ...>>` chunks in `.nw` sources, so editing a literate module does not refresh `tests/unit/*.py` by itself
 - Use `poetry run canvaslms <subcommand>` to test commands in the Poetry environment
 - This ensures you're testing against the current development version with all dependencies
 - Example: `poetry run canvaslms quizzes analyse -c <course> -a <assignment>`
 
 ### Development Workflow
 
-- No pytest framework currently in place
+- Use `poetry run pytest` for the generated test suite after rebuilding it with `make -C tests all`
 - Use `poetry run` or `poetry shell` for running the local development version.
 - Poetry manages dependencies and builds
 - Use `pdbpp` for debugging (included in dev dependencies)
