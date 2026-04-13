@@ -664,6 +664,11 @@ def process_XXX_option(canvas, args):
 
 This enables consistent option handling across commands (e.g., `add_course_option()` + `process_course_option()`).
 
+When future edits start reading additional Canvas object attributes, update the
+centralized attribute lists in `src/canvaslms/cli/utils.nw` and normalize the
+objects at the relevant ingress helper or full-fetch boundary. Prefer that over
+adding scattered `getattr(...)` fallbacks throughout the code.
+
 ## Adding a New Subcommand
 
 When adding a new CLI subcommand, follow these steps with literate programming principles:
