@@ -82,8 +82,10 @@ import pytest
 from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
+    filter_view_submissions,
     format_submission_short,
     get_course_user,
+    is_null_submission,
     is_submission_ungraded,
     list_submissions,
     list_ungraded_submissions,
@@ -405,15 +407,159 @@ submission.
 Prints data about matching submissions, including submission and grading time, 
 and any text-based attachments.
 
+By default, placeholder rows without student work or instructor feedback are
+hidden. Pass [[--include-null-submissions]] to inspect those rows as well.
+
 We also need the corresponding function.
 For now, we only print the most relevant data of a submission.
 <<functions>>=
 def submissions_view_command(config, canvas, args):
   <<enable history when diff is requested>>
   
-  submission_list = process_submission_options(canvas, args)
+  submission_list = filter_view_submissions(
+    process_submission_options(canvas, args),
+    include_null_submissions=args.include_null_submissions)
+  if not submission_list:
+    raise canvaslms.cli.EmptyListError(
+      "No submissions found matching the criteria")
 
   <<get and print the submission data>>
+@
+
+The shared selection helper intentionally leaves null submissions in place,
+because [[submissions list]] and [[submissions grade]] use them to reason about
+absence. For the viewing commands that same data is mostly noise: rendering a
+record with neither student work nor instructor feedback only repeats metadata.
+We therefore filter null submissions after the shared selection step, leaving
+the other commands untouched.
+
+A submission stops being null as soon as Canvas records either work or
+feedback. That includes actual submission artefacts such as timestamps,
+attachments, and history, but also instructor feedback such as comments,
+rubric assessments, and manually recorded grades.
+<<constants>>=
+NON_NULL_SUBMISSION_WORKFLOW_STATES = {
+  "submitted",
+  "graded",
+  "pending_review",
+}
+@
+
+<<functions>>=
+def filter_view_submissions(submission_list,
+                            include_null_submissions=False):
+  """Return the submissions that the view commands should render."""
+  submission_list = list(submission_list)
+  if include_null_submissions:
+    return submission_list
+
+  return [
+    submission for submission in submission_list
+    if not is_null_submission(submission)
+  ]
+
+def is_null_submission(submission):
+  """Return True when ``submission`` is only placeholder metadata."""
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+  return not (
+    bool(submission.submitted_at) or
+    submission.workflow_state in NON_NULL_SUBMISSION_WORKFLOW_STATES or
+    bool(submission.body) or
+    bool(submission.submission_data) or
+    bool(submission.attachments) or
+    bool(submission.submission_history) or
+    bool(submission.preview_url) or
+    bool(submission.submission_comments) or
+    bool(submission.rubric_assessment) or
+    submission.grade not in (None, "")
+  )
+@
+
+\subsection{Verifying null-submission filtering}
+
+The view commands suppress placeholder rows by default, but they must still
+show records that carry either actual work or instructor feedback. These tests
+fix the boundary between a truly empty placeholder and a record that already
+contains comments, rubric feedback, or grades.
+
+<<test functions>>=
+def make_submission(**attrs):
+    """Build a submission mock with the attrs used by view filtering."""
+    submission = Mock(spec=[
+        "submitted_at",
+        "workflow_state",
+        "body",
+        "submission_data",
+        "attachments",
+        "submission_history",
+        "preview_url",
+        "submission_comments",
+        "rubric_assessment",
+        "grade",
+    ])
+    submission.submitted_at = None
+    submission.workflow_state = "unsubmitted"
+    submission.body = None
+    submission.submission_data = None
+    submission.attachments = []
+    submission.submission_history = []
+    submission.preview_url = None
+    submission.submission_comments = []
+    submission.rubric_assessment = None
+    submission.grade = None
+
+    for name, value in attrs.items():
+        setattr(submission, name, value)
+
+    return submission
+
+
+class TestNullSubmissions:
+    """Test detection of placeholder submissions for view."""
+
+    @pytest.mark.parametrize(
+        ("attrs", "expected"),
+        [
+            ({}, True),
+            ({"submitted_at": "2024-01-01T10:00:00Z"}, False),
+            ({"workflow_state": "submitted"}, False),
+            ({"body": "answer"}, False),
+            ({"submission_comments": [{"comment": "Missing"}]}, False),
+            ({"rubric_assessment": {"crit": {"points": 0}}}, False),
+            ({"grade": "0"}, False),
+        ],
+    )
+    def test_detects_null_submissions(self, attrs, expected):
+        """A null submission has neither work nor feedback."""
+        assert is_null_submission(make_submission(**attrs)) is expected
+
+
+class TestFilterViewSubmissions:
+    """Test the view-specific filtering of null submissions."""
+
+    def test_skips_null_submissions_by_default(self):
+        """View should hide placeholder rows unless opted in."""
+        null_submission = make_submission()
+        visible_submission = make_submission(
+            submission_comments=[{"comment": "Missing"}]
+        )
+
+        assert filter_view_submissions([
+            null_submission,
+            visible_submission,
+        ]) == [visible_submission]
+
+    def test_keeps_null_submissions_when_requested(self):
+        """The opt-in flag should preserve placeholder rows."""
+        null_submission = make_submission()
+        visible_submission = make_submission(
+            submission_comments=[{"comment": "Missing"}]
+        )
+
+        assert filter_view_submissions(
+            [null_submission, visible_submission],
+            include_null_submissions=True,
+        ) == [null_submission, visible_submission]
 @
 
 Then we can fetch the submission, format it to markdown ([[format_submission]]) 
@@ -750,6 +896,10 @@ def add_view_options(parser):
 
   parser.add_argument("-H", "--history", action="store_true",
     help="Include submission history.")
+
+  parser.add_argument("--include-null-submissions",
+    action="store_true", default=False,
+    help="Include placeholder rows without student work or feedback.")
 
   <<add diff-related options>>
 
