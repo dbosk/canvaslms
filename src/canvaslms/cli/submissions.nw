@@ -435,8 +435,12 @@ the other commands untouched.
 
 A submission stops being null as soon as Canvas records either work or
 feedback. That includes actual submission artefacts such as timestamps,
-attachments, and history, but also instructor feedback such as comments,
-rubric assessments, and manually recorded grades.
+text bodies, quiz answers, and attachments, but also instructor feedback such
+as comments, rubric assessments, and manually recorded grades.
+History needs one extra check. Canvas may attach a metadata-only [[Version 0]]
+to an otherwise empty record, so a non-empty [[submission_history]] is not
+enough on its own. We inspect each historical version for the same signals that
+make the current submission meaningful.
 Canvas's [[preview_url]] does not count on its own: it is a link to Canvas's
 preview page, not evidence that the student uploaded work or entered a text
 submission.
@@ -461,19 +465,39 @@ def filter_view_submissions(submission_list,
     if not is_null_submission(submission)
   ]
 
-def is_null_submission(submission):
-  """Return True when ``submission`` is only placeholder metadata."""
+def is_meaningful_submission(submission):
+  """Return True when ``submission`` contains work or feedback."""
   submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
-  return not (
+  return (
     bool(submission.submitted_at) or
     submission.workflow_state in NON_NULL_SUBMISSION_WORKFLOW_STATES or
     bool(submission.body) or
     bool(submission.submission_data) or
     bool(submission.attachments) or
-    bool(submission.submission_history) or
     bool(submission.submission_comments) or
     bool(submission.rubric_assessment) or
     submission.grade not in (None, "")
+  )
+
+def has_meaningful_submission_history(submission):
+  """Return True when history contains work or feedback."""
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+  if not submission.submission_history:
+    return False
+
+  for prev_submission in submission.submission_history:
+    prev_submission = canvasapi.submission.Submission(
+      submission._requester, prev_submission)
+    if is_meaningful_submission(prev_submission):
+      return True
+
+  return False
+
+def is_null_submission(submission):
+  """Return True when ``submission`` is only placeholder metadata."""
+  return not (
+    is_meaningful_submission(submission) or
+    has_meaningful_submission_history(submission)
   )
 @
 
@@ -481,13 +505,15 @@ def is_null_submission(submission):
 
 The view commands suppress placeholder rows by default, but they must still
 show records that carry either actual work or instructor feedback. These tests
-fix the boundary between a truly empty placeholder and a record that already
-contains comments, rubric feedback, or grades.
+fix the boundary between a truly empty placeholder, including Canvas's
+metadata-only history entries, and a record that already contains comments,
+rubric feedback, grades, or historical work.
 
 <<test functions>>=
 def make_submission(**attrs):
     """Build a submission mock with the attrs used by view filtering."""
     submission = Mock(spec=[
+        "_requester",
         "submitted_at",
         "workflow_state",
         "body",
@@ -499,6 +525,7 @@ def make_submission(**attrs):
         "rubric_assessment",
         "grade",
     ])
+    submission._requester = Mock()
     submission.submitted_at = None
     submission.workflow_state = "unsubmitted"
     submission.body = None
@@ -527,6 +554,8 @@ class TestNullSubmissions:
             ({"workflow_state": "submitted"}, False),
             ({"preview_url": "https://canvas.example/submissions/1?preview=1"},
              True),
+            ({"submission_history": [{}]}, True),
+            ({"submission_history": [{"body": "answer"}]}, False),
             ({"body": "answer"}, False),
             ({"submission_comments": [{"comment": "Missing"}]}, False),
             ({"rubric_assessment": {"crit": {"points": 0}}}, False),
@@ -564,6 +593,18 @@ class TestFilterViewSubmissions:
             [null_submission, visible_submission],
             include_null_submissions=True,
         ) == [null_submission, visible_submission]
+
+    def test_ignores_placeholder_history_entries(self):
+        """History should matter only when a version contains real work."""
+        null_submission = make_submission(submission_history=[{}])
+        visible_submission = make_submission(
+            submission_history=[{"body": "answer"}]
+        )
+
+        assert filter_view_submissions([
+            null_submission,
+            visible_submission,
+        ]) == [visible_submission]
 @
 
 Then we can fetch the submission, format it to markdown ([[format_submission]]) 
