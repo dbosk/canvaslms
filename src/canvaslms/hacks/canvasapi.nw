@@ -21,6 +21,7 @@ import functools
 import importlib
 import inspect
 import logging
+import os
 import time
 import sys
 
@@ -49,7 +50,7 @@ This pedagogical organization shows: explain problem → implement solution → 
 
 The main test file structure is defined here, then individual test chunks appear after their corresponding implementations:
 \begin{description}
-\item[Equality and hashability tests] Appear after [[make_classes_comparable()]] (Section~\ref{ComparableObjects})
+\item[Equality and hashability tests] Appear after [[make_classes_comparable()]] (\cref{ComparableObjects})
 \item[User string representation tests] Appear after [[make_useful_user_dunder_str()]]
 \item[Caching tests] Will appear after caching infrastructure (future sections)
 \end{description}
@@ -2768,6 +2769,11 @@ So the only grades that we should use are passing grades that can't be
 improved.
 <<constants>>=
 NOREFRESH_GRADES = ["A", "P", "P+", "complete"]
+
+# Threshold for bulk refresh optimization
+# Can be overridden via environment variables
+BULK_REFRESH_THRESHOLD = float(os.environ.get('CANVASLMS_BULK_THRESHOLD', '0.2'))
+BULK_REFRESH_MIN_COUNT = int(os.environ.get('CANVASLMS_BULK_MIN_COUNT', '3'))
 @
 
 We define constants for all cache time-to-live (TTL) values to ensure
@@ -3505,6 +3511,476 @@ def make_course_groups_cacheable():
 @
 
 
+\subsection{Lazy-loading submissions}
+
+The current caching approach has an inefficiency: when we call
+[[get_submissions()]], we immediately check if each cached submission needs
+updating and refresh it if necessary.
+However, in many workflows we filter the submission list to access only a few
+submissions (e.g., filtering by user or assignment).
+This means we waste API calls refreshing submissions we never actually use.
+
+\subsubsection{Contrasting eager and lazy loading}
+
+Consider this usage pattern:
+\begin{minted}{python}
+submissions = assignment.get_submissions()
+filtered = [s for s in submissions if s.user_id == target_user]
+print(filtered[0].grade)
+\end{minted}
+
+With \emph{eager loading} (the old approach):
+\begin{enumerate}
+\item [[get_submissions()]] returns 50 cached submissions
+\item We check each submission: is it stale? Does it need refresh?
+\item We make 50 API calls to refresh non-final grades
+\item We filter to 1 submission
+\item We access the grade (already fresh)
+\end{enumerate}
+
+With \emph{lazy loading} (the new approach):
+\begin{enumerate}
+\item [[get_submissions()]] returns 50 wrapped submissions (no API calls)
+\item We filter to 1 submission (wrapper objects pass through filters)
+\item We access the grade attribute
+\item The wrapper detects access to mutable attribute, checks staleness
+\item We make 1 API call to refresh only the accessed submission
+\end{enumerate}
+
+The performance improvement is dramatic when filtering: \textbf{1 API call instead
+of 50}.
+
+\subsubsection{Design: LazySubmission wrapper}
+
+We implement lazy loading using a transparent wrapper class that intercepts
+attribute access.
+The wrapper stores the original submission and assignment reference, allowing it
+to refresh itself when needed.
+
+Key design decisions:
+\begin{description}
+\item[Mutable attributes] Only certain attributes change over time: grade,
+  grading dates, rubrics, submission data, comments, attachments, and submission
+  body.
+  We track these and trigger refresh only when they're accessed.
+\item[Final grade policy] Submissions with final grades (A, P, P+, complete)
+  are never refreshed, maintaining the existing [[NOREFRESH_GRADES]] policy.
+\item[Time-based staleness] We use the existing [[outdated()]] function
+  with 5-minute TTL for non-final grades.
+\item[Preserved includes] The wrapper stores the original [[include]]
+  parameters from [[get_submissions()]] to ensure refreshes request the
+  same data.
+\item[Cache updates] When a wrapper refreshes, it updates its internal state.
+  Since the cache holds references to wrapper objects, the cache automatically
+  reflects the update.
+\end{description}
+
+\subsubsection{Implementation: LazySubmission class}
+
+The [[LazySubmission]] class wraps a submission object and intercepts
+attribute access using [[__getattribute__]].
+
+<<LazySubmission class>>=
+class LazySubmission:
+  """
+  Transparent wrapper for Submission objects that lazily refreshes on access.
+
+  This wrapper intercepts access to mutable attributes (grade, timestamps,
+  rubrics, etc.) and refreshes the submission from Canvas if:
+  - The submission is stale (based on TTL)
+  - The grade is not a final grade (not in NOREFRESH_GRADES)
+
+  Immutable attributes (user_id, assignment_id, etc.) are accessed directly
+  without triggering a refresh.
+  """
+
+  # Attributes that can change and should trigger refresh when accessed
+  MUTABLE_ATTRS = {
+    'grade', 'graded_at', 'submitted_at', 'rubric_assessment',
+    'submission_data', 'submission_history', 'submission_comments',
+    'attachments', 'body', 'grade_matches_current_submission'
+  }
+
+  def __init__(self, submission, assignment, includes, original_get_submission):
+    """
+    Initialize lazy submission wrapper.
+
+    Parameters:
+      submission: The Submission object to wrap
+      assignment: The Assignment object this submission belongs to
+      includes: List of include parameters used when fetching
+      original_get_submission: Unwrapped get_submission method for refreshing
+    """
+    # Use object.__setattr__ to avoid triggering our custom __setattr__
+    object.__setattr__(self, '_submission', submission)
+    object.__setattr__(self, '_assignment', assignment)
+    object.__setattr__(self, '_includes', includes)
+    object.__setattr__(self, '_original_get_submission', original_get_submission)
+    object.__setattr__(self, '_last_refresh', datetime.now())
+
+  def _needs_refresh(self):
+    """Check if the wrapped submission needs refreshing."""
+    submission = object.__getattribute__(self, '_submission')
+    last_refresh = object.__getattribute__(self, '_last_refresh')
+
+    # Never refresh final grades
+    if submission.grade in NOREFRESH_GRADES:
+      return False
+
+    # Check time-based staleness (5-minute TTL for non-final grades)
+    if datetime.now() - last_refresh > timedelta(minutes=5):
+      return True
+
+    return False
+
+  def would_need_refresh(self):
+    """
+    Check if submission would need refresh WITHOUT triggering it.
+
+    Used by pre-check phase to count stale submissions before deciding
+    whether to do bulk refresh.
+
+    Returns:
+        bool: True if submission would refresh on next access
+    """
+    return self._needs_refresh()
+
+  def _refresh(self):
+    """Refresh the wrapped submission from Canvas."""
+    assignment = object.__getattribute__(self, '_assignment')
+    submission = object.__getattribute__(self, '_submission')
+    includes = object.__getattribute__(self, '_includes')
+    original_get_submission = object.__getattribute__(self, '_original_get_submission')
+
+    # Call original method directly (bypasses decorator, no double-wrapping)
+    fresh_submission = original_get_submission(
+      assignment,
+      submission.user_id,
+      include=list(includes)
+    )
+
+    # Update internal state (cache automatically updated via reference)
+    object.__setattr__(self, '_submission', fresh_submission)
+    object.__setattr__(self, '_last_refresh', datetime.now())
+
+  def __getattribute__(self, name):
+    """
+    Intercept attribute access to trigger refresh when needed.
+
+    Logic:
+    1. Internal attributes (_*) and methods: access directly
+    2. Mutable attributes: check staleness, refresh if needed, then delegate
+    3. All other attributes: delegate to wrapped submission
+    """
+    # Always access internal attributes directly to avoid recursion
+    if name.startswith('_') or name in ['MUTABLE_ATTRS']:
+      return object.__getattribute__(self, name)
+
+    # Check if this is a mutable attribute that might need refresh
+    if name in LazySubmission.MUTABLE_ATTRS:
+      if object.__getattribute__(self, '_needs_refresh')():
+        object.__getattribute__(self, '_refresh')()
+
+    # Delegate to wrapped submission
+    submission = object.__getattribute__(self, '_submission')
+    return getattr(submission, name)
+
+  def __setattr__(self, name, value):
+    """
+    Intercept attribute setting to handle both wrapper and submission attrs.
+
+    Internal attributes (_*) are set on the wrapper.
+    All other attributes are set on the wrapped submission.
+    """
+    if name.startswith('_'):
+      object.__setattr__(self, name, value)
+    else:
+      submission = object.__getattribute__(self, '_submission')
+      setattr(submission, name, value)
+
+  def __getattr__(self, name):
+    """Fallback for attributes not found on wrapper (delegates to submission)."""
+    submission = object.__getattribute__(self, '_submission')
+    return getattr(submission, name)
+
+  def __repr__(self):
+    """Delegate repr to wrapped submission."""
+    submission = object.__getattribute__(self, '_submission')
+    return repr(submission)
+
+  def __str__(self):
+    """Delegate str to wrapped submission."""
+    submission = object.__getattribute__(self, '_submission')
+    return str(submission)
+
+  <<pickle support for LazySubmission>>
+@
+
+\subsubsection{Pickle support for cache persistence}
+
+The [[LazySubmission]] wrapper must support pickling to enable cache
+persistence.
+When the [[Canvas]] object is saved to disk (see cache.nw), Python's
+[[pickle]] module serializes the entire object hierarchy, including all
+cached submissions.
+
+\paragraph{The pickling challenge}
+
+Python's [[pickle]] cannot serialize certain objects, including:
+\begin{itemize}
+\item Function and method references (unless they're module-level functions)
+\item Lambda functions
+\item Generator objects
+\item Objects with circular references to unpicklable objects
+\end{itemize}
+
+Our [[LazySubmission]] stores [[_original_get_submission]], which is
+a reference to the original (unwrapped) [[get_submission]] method.
+This is a \emph{bound method} when called, but we store the \emph{unbound
+function} from the decorator's closure.
+Method objects are not picklable by default.
+
+\paragraph{The solution: reconstruct from closure}
+
+We implement [[__getstate__]] and [[__setstate__]] to handle
+pickling:
+\begin{enumerate}
+\item \textbf{Before pickling} ([[__getstate__]]): Exclude the
+  unpicklable [[_original_get_submission]] from the state dictionary.
+  Save only the submission, assignment reference, includes list, and last
+  refresh timestamp.
+\item \textbf{After unpickling} ([[__setstate__]]): Reconstruct
+  [[_original_get_submission]] by searching the decorator's closure.
+  The decorated method stores the original in its [[__closure__]]
+  attribute, which we can access via
+  [[assignment.__class__.get_submission]].
+\end{enumerate}
+
+\paragraph{Why closure search works}
+
+When the [[cache_submissions]] decorator wraps
+[[Assignment.get_submission]], it captures the original method in a
+closure variable (line~1072 in the decorator):
+\begin{minted}{python}
+original_get_submission = cls.get_submission
+\end{minted}
+
+This variable is referenced by the [[new_get_submission]] function,
+making it part of the function's closure.
+After unpickling, we can access this closure via the class's decorated method.
+
+\paragraph{Limitations and failure modes}
+
+This approach has several limitations:
+\begin{description}
+\item[Version compatibility] If the decorator implementation changes between
+  pickle and unpickle (e.g., code upgrade), the closure structure may differ,
+  causing reconstruction to fail.
+\item[Closure ambiguity] If multiple callable objects exist in the closure with
+  \enquote{get\_submission} in their name, we might retrieve the wrong one.
+  The heuristic checks for callables with matching names.
+\item[Graceful degradation] If reconstruction fails, we set
+  [[_original_get_submission]] to [[None]].
+  The wrapper remains functional for read-only access (attributes pass through
+  to the wrapped submission), but calling [[_refresh()]] will fail.
+  This is acceptable because:
+  \begin{itemize}
+  \item Cache files are typically invalidated on code changes
+  \item The user can clear the cache manually if issues arise
+  \item Better to have stale data than a complete crash
+  \end{itemize}
+\end{description}
+
+\paragraph{Alternative approaches considered}
+
+We considered but rejected these alternatives:
+\begin{description}
+\item[Storing method name as string] Reconstruct via
+  [[getattr(assignment, 'get_submission')]].
+  Problem: This retrieves the \emph{decorated} method, not the original,
+  causing infinite recursion or double-wrapping.
+\item[Not using a wrapper] Store a \enquote{needs refresh} flag on the
+  submission itself.
+  Problem: Mutating Canvas API objects is fragile and breaks the lazy-loading
+  design.
+\item[Store assignment ID, re-fetch assignment] Reconstruct the entire context
+  from IDs.
+  Problem: Defeats the purpose of caching; would require API calls just to
+  restore cache state.
+\end{description}
+
+Now we implement the pickle support:
+<<pickle support for LazySubmission>>=
+def __getstate__(self):
+  """
+  Prepare object for pickling.
+
+  We can't pickle method references, so we exclude _original_get_submission.
+  It will be restored from the decorator's closure during unpickling.
+  """
+  state = {
+    '_submission': object.__getattribute__(self, '_submission'),
+    '_assignment': object.__getattribute__(self, '_assignment'),
+    '_includes': object.__getattribute__(self, '_includes'),
+    '_last_refresh': object.__getattribute__(self, '_last_refresh'),
+  }
+  return state
+
+def __setstate__(self, state):
+  """
+  Restore object after unpickling.
+
+  Restore all attributes from state, and reconstruct _original_get_submission
+  by searching the decorator's closure for the original method.
+  """
+  for key, value in state.items():
+    object.__setattr__(self, key, value)
+
+  # Restore the original method from the assignment's decorated method
+  # The decorated method has the original in its closure
+  assignment = state['_assignment']
+  decorated_method = assignment.__class__.get_submission
+
+  # The original method is captured in the decorator's closure
+  # We can access it via the closure of the decorated method
+  # The decorated method's __closure__ contains the original method
+  try:
+    # Find the original_get_submission in the closure
+    for cell in decorated_method.__closure__:
+      try:
+        obj = cell.cell_contents
+        # Check if it's a callable with the right name
+        if callable(obj) and hasattr(obj, '__name__') and \
+           'get_submission' in obj.__name__:
+          object.__setattr__(self, '_original_get_submission', obj)
+          break
+      except (AttributeError, ValueError):
+        continue
+  except (AttributeError, TypeError):
+    # If we can't find it in closure, fall back to None
+    # This means refresh won't work, but at least unpickling succeeds
+    object.__setattr__(self, '_original_get_submission', None)
+@
+
+This class is used by the caching decorator below.
+<<functions>>=
+<<LazySubmission class>>
+@
+
+\subsubsection{Threshold-based bulk refresh optimization}
+
+While lazy loading solves the problem of wasted refreshes when filtering
+submissions, it introduces a new inefficiency in the opposite scenario: when
+workflows access \emph{all} submissions' mutable attributes, lazy loading
+triggers individual API calls for each stale submission.
+
+\paragraph{The performance bottleneck}
+
+Consider the [[-U]] (ungraded) option in [[submissions.nw]]:
+\begin{minted}{python}
+for submission in submissions:
+    if is_submission_ungraded(submission):
+        yield submission
+\end{minted}
+
+The [[is_submission_ungraded()]] function checks [[submitted_at]],
+[[graded_at]], and [[grade_matches_current_submission]]---all mutable
+attributes.
+With 50 submissions where 40 are stale:
+\begin{enumerate}
+\item Access [[submission.submitted_at]] → triggers refresh check
+\item Submission is stale → makes API call to refresh
+\item Repeat for all 50 submissions
+\item Result: 40 individual API calls
+\end{enumerate}
+
+This is \textbf{40× slower} than fetching all submissions in one bulk request.
+
+\paragraph{The solution: pre-check and bulk refresh}
+
+We add an optional pre-check phase that counts how many submissions would need
+refresh before accessing them. If the count exceeds a threshold, we trigger one
+bulk fetch instead of many individual refreshes.
+
+The optimization is opt-in via a [[check_bulk_refresh]] parameter to
+[[get_submissions()]]:
+\begin{enumerate}
+\item Count stale submissions using [[would_need_refresh()]] (non-mutating check)
+\item Calculate threshold: [[max(total × 0.2, 3)]] (20\% with minimum 3)
+\item If [[stale_count ≥ threshold]], perform bulk refresh (1 API call)
+\item Update all [[LazySubmission]] wrappers in-place with fresh data
+\item Return refreshed cache so subsequent attribute access doesn't trigger refreshes
+\end{enumerate}
+
+\paragraph{When to enable bulk refresh}
+
+The optimization is beneficial when workflows will access mutable attributes on
+\emph{most} submissions:
+\begin{description}
+\item[The [[-U]] option] Always enabled---checks all submissions'
+  grading state
+\item[Unfiltered listings] Enabled when no [[--user]], [[--category]], or
+  [[--group]] filters are applied
+\item[Specific user filtering] Disabled---only a few submissions will be
+  accessed
+\end{description}
+
+\paragraph{Threshold configuration}
+
+The threshold is configurable via environment variables:
+\begin{description}
+\item[[CANVASLMS_BULK_THRESHOLD]] Fraction of stale submissions needed (default:
+  0.2 = 20\%)
+\item[[CANVASLMS_BULK_MIN_COUNT]] Minimum number of stale submissions required
+  (default: 3)
+\end{description}
+
+Examples:
+\begin{itemize}
+\item Small assignment (10 submissions): threshold = [[max(2, 3) = 3]] (30\%)
+\item Medium assignment (50 submissions): threshold = 10 (20\%)
+\item Large assignment (200 submissions): threshold = 40 (20\%)
+\end{itemize}
+
+\paragraph{Trade-offs}
+
+\emph{Advantages:}
+\begin{itemize}
+\item Dramatic reduction in API calls for [[-U]] scenarios (40 calls → 1 call)
+\item Faster execution when many submissions are accessed
+\item Respects final grade policy ([[NOREFRESH_GRADES]] never counted as stale)
+\item Updates cache in-place (preserves object identity and references)
+\end{itemize}
+
+\emph{Disadvantages:}
+\begin{itemize}
+\item Pre-check adds overhead (one pass through cache to count staleness)
+\item May refresh submissions that won't ultimately be accessed (if filtering
+  happens after refresh)
+\item Bulk refresh fetches all includes, increasing response size slightly
+\end{itemize}
+
+The threshold (20\% minimum 3) balances these trade-offs: we only bulk refresh
+when it's likely to save significant API calls.
+
+\paragraph{Design rationale}
+
+Why implement in the decorator, not in [[LazySubmission]]?
+\begin{itemize}
+\item The decorator has access to the entire cache (all submissions)
+\item [[LazySubmission]] only knows about individual submissions
+\item Threshold calculation requires global view of staleness
+\item Bulk refresh requires coordinating multiple wrappers
+\end{itemize}
+
+Why opt-in instead of automatic?
+\begin{itemize}
+\item Filtering workflows benefit from lazy loading (don't want bulk refresh)
+\item [[-U]] and unfiltered listings benefit from bulk refresh
+\item Call site knows the access pattern, decorator doesn't
+\item Opt-in ensures we only bulk refresh when beneficial
+\end{itemize}
+
 \subsection{Caching quizzes}
 
 Courses contain quizzes, which come in two flavors:
@@ -3648,14 +4124,41 @@ class TestQuizCaching:
         assert 20 in instance.new_quiz_cache
 @
 
-
 \subsection{Caching submissions}
 
 For the results, we can construct something more specific.
 Results that we're interested in are submissions.
 We can only get submission from an assignment object.
-We can either get all submissions, or one specific submission if we specify the 
+We can either get all submissions, or one specific submission if we specify the
 user.
+
+Canvas's [[get_submissions()]] method accepts a [[bucket]] parameter to filter
+submissions server-side (e.g., [[bucket="ungraded"]]).
+However, this caching implementation does not track the [[bucket]] parameter in
+the cache key.
+
+This is intentional: tracking [[bucket]] would require separate caches for
+different bucket values, complicating the cache hierarchy and potentially
+causing inconsistencies.
+Instead, client code (particularly [[submissions.nw]] and [[assignments.nw]])
+performs local filtering on the complete submission list.
+
+This design ensures:
+\begin{itemize}
+\item Cache keys are unambiguous (based only on user ID).
+\item Lazy loading works correctly (submissions refresh based on staleness, not
+bucket parameter).
+\item Cache hierarchy is preserved (course caches contain assignment caches
+contain submission caches).
+\end{itemize}
+
+See \cref{SubmissionsFiltering} in [[submissions.nw]] for the local filtering
+implementation.
+
+Now we combine the caching mechanism with lazy loading.
+The cache stores [[LazySubmission]] wrappers instead of raw submissions.
+This means submissions are only refreshed when their attributes are actually
+accessed, not when the list is returned.
 <<functions>>=
 def make_assignment_submissions_cacheable():
   def cache_submissions(cls):
@@ -3668,9 +4171,11 @@ def make_assignment_submissions_cacheable():
 @
 
 Then we can write the decorator as follows.
-We need to add a cache attribute in the constructor, so we must decorate the 
+We need to add a cache attribute in the constructor, so we must decorate the
 constructor.
-The we must decorate both [[get_submission]] and [[get_submissions]].
+We must also store the original [[get_submission]] method before decorating it,
+because [[LazySubmission]] needs to call it directly to avoid double-wrapping.
+Then we must decorate both [[get_submission]] and [[get_submissions]].
 <<decorator body for caching assignment submissions>>=
 old_constructor = cls.__init__
 
@@ -3681,6 +4186,8 @@ def new_init(self, *args, **kwargs):
 
 cls.__init__ = new_init
 
+# Store original method before wrapping (needed by LazySubmission)
+original_get_submission = cls.get_submission
 get_submission = cls.get_submission
 
 @functools.wraps(cls.get_submission)
@@ -3699,17 +4206,23 @@ cls.get_submissions = new_get_submissions
 @
 
 We decorate the method to get a specific submission, [[get_submission]].
-This way we can cache the submissions of users who have passed.
-Then we always return up-to-date submissions of students who are expected to 
-update their submissions.
+With lazy loading, we wrap the submission in [[LazySubmission]] and cache the
+wrapper.
+The wrapper will handle staleness checking and refresh only when attributes are
+accessed.
+This still preserves the earlier caching goal: submissions with final grades
+stay stable in cache, while students who may resubmit are refreshed only when
+their mutable attributes are actually inspected.
 For this, we first need a cache attribute.
 <<extend class constructor for decorators>>=
 self.__cache = {}
 @
 
-Let's start with how we get an individual submission.
-We also want to add info messages to log cache hits and misses and their 
-timings.
+Now we can treat how we get an individual submission.
+The lazy path only fetches when a submission is missing from the cache or when a
+caller requests additional [[include]] data.
+We keep the cache-hit diagnostics from [[master]], but we leave the staleness
+policy itself to [[LazySubmission._needs_refresh()]].
 <<return submission of user>>=
 # canvasapi allows either User object or user ID.
 if isinstance(user, User):
@@ -3719,59 +4232,37 @@ elif isinstance(user, int):
 else:
   raise TypeError(f"user must be User or int")
 
-submission = None
-
 if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
 
-if must_refresh(uid, to_include, self.__cache):
-  fetch_start = time.perf_counter()
-  submission = get_submission(self, user, include=list(to_include))
-  fetch_elapsed = time.perf_counter() - fetch_start
-  submission._fetched_at = datetime.now()
-  logger.info(f"Fetched submission user_id={uid} in {fetch_elapsed:.2f}s")
-  self.__cache[uid] = (submission, to_include)
+if uid in self.__cache:
+  lazy_submission = self.__cache[uid]
+  current_includes = set(lazy_submission._includes)
+  if to_include.issubset(current_includes):
+    logger.info(f"Cache hit: submission user_id={uid}")
+    return lazy_submission
+
+  logger.info(f"Cache miss (new include required): submission user_id={uid}")
+  to_include |= current_includes
 else:
-  submission, _ = self.__cache[uid]
+  logger.info(f"Cache miss (not found): submission user_id={uid}")
 
-return submission
-@ We also add the time of last fetch ([[._fetched_at]]), that way we don't need 
-to update all the time, but with short intervals (see the [[outdated]] 
-function).
-<<functions>>=
-def must_refresh(uid, to_include, cache):
-  """
-  Returns True if the submission needs refreshing based on kwargs.
-  """
-  cache_status = ""
-  if uid in cache:
-    submission, included = cache[uid]
-    if not to_include.issubset(set(included)):
-      cache_status = " (new include required)"
-      submission = None
-      to_include |= set(included)
-  else:
-    cache_status = " (not found)"
-    submission = None
-
-  if submission:
-    if not outdated(submission):
-      logger.info(f"Cache hit: submission user_id={uid}")
-      return False
-    elif not cache_status:
-      reason = get_staleness_reason(submission)
-      cache_status = f" (stale: {reason})" if reason else " (stale)"
-
-  logger.info(f"Cache miss{cache_status}: submission user_id={uid}")
-  return True
+raw_submission = get_submission(self, user, include=list(to_include))
+lazy_submission = LazySubmission(raw_submission, self, to_include,
+                                 original_get_submission)
+self.__cache[uid] = lazy_submission
+return lazy_submission
 @
 
 Now we can deal with [[get_submissions]].
-As we might call [[get_submission]] before any [[get_submissions]], we cannot 
+As we might call [[get_submission]] before any [[get_submissions]], we cannot
 rely on the cache as a check.
-We introduce a new attribute.
+We introduce a new attribute, initialized to [[None]] to indicate that no bulk
+fetch has been performed yet.
+This follows the same pattern as [[CacheGetMethods]], which uses [[None]] for
+\enquote{not fetched} and [[datetime.now()]] for \enquote{last fetch time}.
 <<extend class constructor for decorators>>=
 self.__all_fetched = None
 @ Now we can check if this is set or not.
@@ -3783,15 +4274,26 @@ between many individual refreshes and one bulk refresh. We expose that extra
 scan as an explicit [[check_bulk_refresh]] opt-in instead of making every call
 pay for it.
 <<functions>>=
-def should_bulk_refresh_submissions(cache, to_include, threshold):
+def bulk_refresh_threshold(total_count):
+  """Return stale-submission count that triggers bulk refresh."""
+  if isinstance(BULK_REFRESH_THRESHOLD, float):
+    return max(int(total_count * BULK_REFRESH_THRESHOLD),
+               BULK_REFRESH_MIN_COUNT)
+  return BULK_REFRESH_THRESHOLD
+
+def count_stale_submissions(cache):
+  """Return number of cached submissions that would refresh on access."""
+  return sum(1 for lazy_submission in cache.values()
+             if lazy_submission.would_need_refresh())
+
+def should_bulk_refresh_submissions(cache):
   """Return True when enough cached submissions need refresh."""
-  num_needs_refresh = 0
-  for submission, _ in cache.values():
-    if must_refresh(submission.user_id, to_include, cache):
-      num_needs_refresh += 1
-      if num_needs_refresh > threshold:
-        return True
-  return False
+  total_count = len(cache)
+  if total_count == 0:
+    return False
+  stale_count = count_stale_submissions(cache)
+  threshold = bulk_refresh_threshold(total_count)
+  return stale_count >= threshold
 @
 
 Then the collection getter can choose whether to run that pre-check.
@@ -3802,116 +4304,100 @@ else:
   to_include = set()
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
+need_refetch = self.__all_fetched is None
 
-# Collect everything to include from before.
-for _, included in self.__cache.values():
-  to_include |= included
+if not need_refetch:
+  for lazy_submission in self.__cache.values():
+    cached_includes = set(lazy_submission._includes)
+    if not to_include.issubset(cached_includes):
+      need_refetch = True
+      break
 
-if self.__all_fetched:
+if need_refetch:
+  for lazy_submission in self.__cache.values():
+    to_include |= set(lazy_submission._includes)
+
+  logger.info(f"Fetching all submissions for assignment id={self.id}")
+  for raw_submission in get_submissions(self, include=list(to_include)):
+    lazy_submission = LazySubmission(raw_submission, self, to_include,
+                                     original_get_submission)
+    self.__cache[raw_submission.user_id] = lazy_submission
+
+  self.__all_fetched = datetime.now()
+else:
   cache_age = datetime.now() - self.__all_fetched
   logger.info(f"Using cached submissions for assignment id={self.id}: "
               f"{len(self.__cache)} submissions cached "
               f"(age: {cache_age.total_seconds()/60:.1f} minutes)")
 
-  if check_bulk_refresh and should_bulk_refresh_submissions(
-      self.__cache, to_include, THRESHOLD_INDIVIDUAL_REFRESH):
-    logger.info(f"Refreshing all submissions for assignment id={self.id} "
-                f"because more than {THRESHOLD_INDIVIDUAL_REFRESH} cached "
-                f"submissions need refresh")
-    <<bulk refresh all submissions>>
+  if check_bulk_refresh and should_bulk_refresh_submissions(self.__cache):
+    <<check staleness threshold and bulk refresh if needed>>
+
+return list(self.__cache.values())
+@
+
+The bulk refresh pre-check logic counts how many submissions would need refresh
+and triggers a bulk fetch if the count exceeds the threshold.
+<<check staleness threshold and bulk refresh if needed>>=
+stale_count = count_stale_submissions(self.__cache)
+threshold = bulk_refresh_threshold(len(self.__cache))
+
+logger.info(f"Refreshing all submissions for assignment id={self.id} "
+            f"because {stale_count} cached submissions would refresh "
+            f"individually (threshold={threshold})")
+
+all_includes = set(to_include)
+for lazy_submission in self.__cache.values():
+  all_includes |= set(lazy_submission._includes)
+
+for raw_submission in get_submissions(self, include=list(all_includes)):
+  if raw_submission.user_id in self.__cache:
+    lazy_submission = self.__cache[raw_submission.user_id]
+    object.__setattr__(lazy_submission, '_submission', raw_submission)
+    object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+    object.__setattr__(lazy_submission, '_includes', all_includes)
   else:
-    logger.info(f"Refreshing cached submissions individually for assignment "
-                f"id={self.id}")
-    for submission, _ in self.__cache.values():
-      # Use the cached method above to trigger any individual refreshes.
-      self.get_submission(submission.user_id, include=list(to_include))
-else:
-
-  logger.info(f"Fetching all submissions for assignment id={self.id}")
-  <<bulk refresh all submissions>>
-
-return [submission for submission, _ in self.__cache.values()]
-<<bulk refresh all submissions>>=
-start_fetch = time.perf_counter()
-submissions = list(get_submissions(self, include=list(to_include)))
-fetch_elapsed = time.perf_counter() - start_fetch
-logger.info(f"Bulk refresh: {len(submissions)} submissions in "
-            f"{fetch_elapsed:.2f}s")
-
-for submission in submissions:
-  submission._fetched_at = datetime.now()
-  self.__cache[submission.user_id] = (submission, to_include)
+    lazy_submission = LazySubmission(raw_submission, self, all_includes,
+                                     original_get_submission)
+    self.__cache[raw_submission.user_id] = lazy_submission
 
 self.__all_fetched = datetime.now()
 @
 
-Based on some tests, it takes Canvas roughly \qty{3}{\second} to return all 
-submissions.
-It takes Canvas roughly \qty{0.5}{\second} to return an individual submission.
-So if we have more than 6 submissions to refresh, it's better to refresh them 
-all at once.
-<<constants>>=
-THRESHOLD_INDIVIDUAL_REFRESH = 6
-@
-
 Let's verify that the bulk-refresh pre-check stays optional and only flips to a
-bulk refresh when enough cached submissions would otherwise be refreshed one by
+bulk refresh when enough cached lazy submissions would otherwise refresh one by
 one.
 
 <<test functions>>=
 class TestAssignmentSubmissionRefreshStrategy:
-    """Test the assignment submission bulk-refresh decision helper."""
+    """Test the lazy submission bulk-refresh decision helper."""
 
-    def make_submission(self, user_id, *, grade="B"):
-        """Create a cached submission with refresh metadata."""
-        submission = MagicMock()
-        submission.user_id = user_id
-        submission.grade = grade
-        submission._fetched_at = datetime.now() - timedelta(minutes=6)
-        return submission
+    def make_lazy_submission(self, *, needs_refresh):
+        """Create a cached lazy submission with configurable staleness."""
+        lazy_submission = MagicMock()
+        lazy_submission.would_need_refresh.return_value = needs_refresh
+        lazy_submission._includes = set()
+        return lazy_submission
 
-    def test_no_bulk_refresh_when_threshold_not_exceeded(self):
-        """Exactly-threshold stale submissions should stay on individual refreshes."""
+    def test_no_bulk_refresh_when_threshold_not_reached(self):
+        """Fewer stale submissions than the threshold should skip bulk refresh."""
         cache = {
-            user_id: (self.make_submission(user_id), set())
-            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH)
+            user_id: self.make_lazy_submission(needs_refresh=user_id < 2)
+            for user_id in range(10)
         }
 
-        result = should_bulk_refresh_submissions(
-            cache,
-            set(),
-            THRESHOLD_INDIVIDUAL_REFRESH,
-        )
+        assert should_bulk_refresh_submissions(cache) is False
 
-        assert result is False
-
-    def test_bulk_refresh_when_threshold_exceeded(self):
-        """More-than-threshold stale submissions should trigger bulk refresh."""
+    def test_bulk_refresh_when_threshold_reached(self):
+        """Meeting the threshold should trigger bulk refresh."""
         cache = {
-            user_id: (self.make_submission(user_id), set())
-            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH + 1)
+            user_id: self.make_lazy_submission(needs_refresh=user_id < 3)
+            for user_id in range(10)
         }
 
-        result = should_bulk_refresh_submissions(
-            cache,
-            set(),
-            THRESHOLD_INDIVIDUAL_REFRESH,
-        )
+        assert should_bulk_refresh_submissions(cache) is True
 
-        assert result is True
-
-    def test_new_include_also_counts_towards_bulk_refresh(self):
-        """Bulk refresh should trigger when many cached entries miss an include."""
-        cache = {
-            user_id: (self.make_submission(user_id, grade="A"), set())
-            for user_id in range(THRESHOLD_INDIVIDUAL_REFRESH + 1)
-        }
-
-        result = should_bulk_refresh_submissions(
-            cache,
-            {"submission_comments"},
-            THRESHOLD_INDIVIDUAL_REFRESH,
-        )
-
-        assert result is True
+    def test_bulk_refresh_threshold_scales_with_cache_size(self):
+        """Larger caches should use the fractional threshold."""
+        assert bulk_refresh_threshold(50) == 10
 @
