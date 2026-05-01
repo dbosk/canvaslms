@@ -7,7 +7,7 @@ This is `canvaslms`, a command-line interface (CLI) tool for Canvas LMS that pro
 ## Architecture & Technology Stack
 
 ### Core Technologies
-- **Python 3.8+**: Primary programming language
+- **Python 3.10+**: Primary programming language
 - **Poetry**: Dependency management and packaging
 - **Literate Programming**: Source code written in noweb (.nw) files
 - **Canvas API**: Integration via `canvasapi` library
