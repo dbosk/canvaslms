@@ -112,12 +112,12 @@ canvaslms discussions edit -c "Course" -t "Announcement Title" -f announcement.m
 
 Install the PyPI package using `pip` or `pipx`:
 ```bash
-# Basic installation (Python 3.8+)
+# Basic installation (Python 3.10+)
 python3 -m pip install canvaslms
 # or
 pipx install canvaslms # recommended
 
-# With optional LLM support for AI summaries (Python 3.9+)
+# With optional LLM support for AI summaries (Python 3.10+)
 python3 -m pip install canvaslms[llm]
 # or
 pipx install canvaslms[llm] # recommended
