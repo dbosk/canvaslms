@@ -71,6 +71,7 @@ clean:
 	${RM} canvaslms.pdf
 	${RM} intro.tex
 	${RM} -r examples
+	${RM} -r __pycache__
 
 .PHONY: distclean
 distclean: clean

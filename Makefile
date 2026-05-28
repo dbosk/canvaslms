@@ -47,6 +47,7 @@ publish-docker:
 
 .PHONY: clean
 clean:
+	${RM} -r __pycache__
 
 .PHONY: distclean
 distclean:

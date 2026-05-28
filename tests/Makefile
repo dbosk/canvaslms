@@ -64,7 +64,7 @@ compile:
 .PHONY: clean
 clean:
 	$(RM) $(TEST_MODULES) $(DOC_MODULES)
-	$(RM) -r .pytest_cache __pycache__ unit/__pycache__
+	$(RM) -r .pytest_cache __pycache__ unit *unit
 	$(RM) -r htmlcov .coverage
 
 INCLUDE_MAKEFILES=../makefiles
