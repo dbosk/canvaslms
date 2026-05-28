@@ -814,7 +814,7 @@ def example_command(config, canvas, args):
 ## Dependencies
 
 ### Core Runtime
-- Python 3.8+
+- Python 3.10+
 - `canvasapi>=3.3.0` - Canvas LMS API client
 - `argcomplete>=2,<4` - Bash completion
 - `rich>=13,<15` - Terminal formatting
@@ -823,7 +823,7 @@ def example_command(config, canvas, args):
 - `keyring>=24.2,<26.0` - Credential storage
 
 ### Optional
-- `canvaslms[llm]` - AI summaries for quiz analysis (Python 3.9+)
+- `canvaslms[llm]` - AI summaries for quiz analysis (Python 3.10+)
 - `pandoc` - System package required by some subcommands
 
 ## Testing and Development

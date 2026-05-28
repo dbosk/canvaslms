@@ -46,6 +46,18 @@ def summarize_group(assignments_list, users_list):
     yield [user, grade, grade_date, *graders]
 @
 
+We define the test file structure early, then add the concrete regressions near
+the grade handling they verify.
+<<test [[disjunctmax.py]]>>=
+"""Tests for canvaslms.grades.disjunctmax."""
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from canvaslms.grades.disjunctmax import *
+
+<<test functions>>
+@
+
 
 \subsection{Summarizing grades: assignment grades to component grade}%
 \label{disjunctmax-summarize}
@@ -57,6 +69,21 @@ For the most recent date, we just add them to a list as we iterate through the
 submissions.
 We do the same for grades, as we iterate through we add any grade to a list.
 In the end we compute the maximums of both lists.
+Canvas can also use the label [[must fix]] for a failing attempt.
+Disjunctive grading only needs to know that the attempt has not yet passed, so
+we normalize that label to [[F]] before ranking the grades.
+A missing submission has the same effect, so the exception path also records
+[[F]].
+<<helper functions>>=
+def normalize_grade(grade):
+  """Normalize Canvas failing aliases before ranking grades."""
+  if grade is None:
+    return "F"
+  if isinstance(grade, str) and grade.casefold() == "must fix":
+    return "F"
+  return grade
+@
+
 <<helper functions>>=
 def summarize(user, assignments_list):
   """Extracts user's submissions for assignments in assingments_list to 
@@ -72,16 +99,13 @@ def summarize(user, assignments_list):
       submission = assignment.get_submission(user,
                                             include=["submission_history"])
     except ResourceDoesNotExist:
-      pf_grades.append("F")
+      grades.append("F")
       continue
 
     submission.assignment = assignment
     graders += results.all_graders(submission)
 
-    grade = submission.grade
-
-    if grade is None:
-      grade = "F"
+    grade = normalize_grade(submission.grade)
 
     grades.append(grade)
 
@@ -122,6 +146,7 @@ def grade_max(grades):
   return None
 
 def grade_to_int(grade):
+  grade = normalize_grade(grade)
   grade_map = {"F": -2, "Fx": -1,
                "P": 0,
                "E": 1, "D": 2, "C": 3, "B": 4, "A": 5}
@@ -177,7 +202,7 @@ def missing_assignments(assignments_list, users_list,
 
       try:
         submission = assignment.get_submission(user)
-        grade = submission.grade or "F"
+        grade = normalize_grade(submission.grade)
       except ResourceDoesNotExist:
         grade = "F"
 
@@ -191,4 +216,75 @@ def missing_assignments(assignments_list, users_list,
       for assignment, grade in grades_with_assignments:
         yield user, assignment, \
               f"not a passing grade ({grade}) - complete any one to pass"
+@
 
+Both summary and missing-assignment reporting should collapse [[must fix]] to
+the ordinary failing grade token.
+<<test functions>>=
+class TestMustFixGrade:
+    """Test normalization of the Canvas [[must fix]] grade."""
+
+    def test_summarize_treats_must_fix_as_f(self):
+        """A [[must fix]] attempt should behave like [[F]]."""
+        user = SimpleNamespace(id=1)
+        assignment = SimpleNamespace(name="Exam")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade="must fix",
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+
+        grade, grade_date, graders = summarize(user, [assignment])
+
+        assert grade == "F"
+        assert grade_date is not None
+        assert graders == []
+
+    def test_missing_assignments_reports_normalized_f(self):
+        """Missing output should use the normalized failing grade token."""
+        user = SimpleNamespace(id=1)
+        assignment = SimpleNamespace(name="Exam")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(grade="must fix")
+        )
+
+        missing = list(missing_assignments([assignment], [user]))
+
+        assert len(missing) == 1
+        assert missing[0][0] is user
+        assert missing[0][1] is assignment
+        assert missing[0][2] == \
+            "not a passing grade (F) - complete any one to pass"
+
+
+class TestMissingSubmission:
+    """Test disjunctive handling of missing submissions."""
+
+    def test_summarize_treats_missing_submission_as_f(self):
+        """Missing submissions should behave like failing attempts."""
+        user = SimpleNamespace(id=1)
+        missing_assignment = SimpleNamespace(name="Exam 1")
+        missing_assignment.get_submission = Mock(
+            side_effect=ResourceDoesNotExist("missing submission")
+        )
+        graded_assignment = SimpleNamespace(name="Exam 2")
+        graded_assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade="F",
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+
+        grade, grade_date, graders = summarize(
+            user, [missing_assignment, graded_assignment]
+        )
+
+        assert grade == "F"
+        assert grade_date is not None
+        assert graders == []
+@

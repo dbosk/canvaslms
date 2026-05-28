@@ -237,9 +237,21 @@ else:
   row.append(user.name)
 @
 
-If we filter by groups, then we must iterate over the groups to include the 
-group information.
-Other than the group data, we include the user data as before.
+If we filter by groups, then we must still include the group information in
+each row.
+At first sight it seems sufficient to fetch the users directly from each
+group, and that does work when we only care about membership.
+However, the [[--students]] and [[--assistants]] options depend on the
+enrollment data that we fetch from the course user list.
+
+We therefore separate membership from role filtering:
+\begin{enumerate}
+\item read the member IDs from the group itself;
+\item fetch the fully populated course users and keep only the users whose IDs
+  belong to the group.
+\end{enumerate}
+This reuses the same course-level role filtering as [[make_user_rows]] while
+still letting the output show which group each user came from.
 <<functions>>=
 def make_user_rows_w_groups(canvas, args, roles):
   """Takes a list of courses and returns a list of users in those courses,
@@ -248,18 +260,15 @@ def make_user_rows_w_groups(canvas, args, roles):
   groups = process_group_options(canvas, args)
 
   for group in groups:
-    users = filter_users([group], args.regex, roles)
+    <<resolve [[group]] members in the owning [[course]]>>
+    users = filter_users([course], args.regex, roles)
 
     for user in users:
+      if user.id not in member_ids:
+        continue
+
       try:
-        try:
-          row = [group.category.course.course_code]
-        except AttributeError:
-          pass
-        try:
-          row = [group.course.course_code]
-        except AttributeError:
-          pass
+        row = [course.course_code]
         row.append(group.name)
         <<append user attributes>>
       except AttributeError as err:
@@ -267,6 +276,85 @@ def make_user_rows_w_groups(canvas, args, roles):
         continue
 
       yield row
+@
+
+The group object identifies which users belong to the group, but the course
+object is where we can reliably retrieve enrollment data.
+That is why we first resolve the owning course and then turn the group members
+into a set of identifiers.
+
+<<resolve [[group]] members in the owning [[course]]>>=
+try:
+  course = group.course
+except AttributeError:
+  course = group.category.course
+
+member_ids = {user.id for user in group.get_users()}
+@
+
+Now let's verify the grouped path still recognizes students even when the
+group membership objects only contain identifiers.
+This is the regression that previously made [[users -s -G]] return no users:
+we found the correct members, but the role filter never saw their course
+enrollments.
+
+<<test functions>>=
+def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
+    """Grouped rows should use course enrollments for role filtering."""
+    course = Mock()
+    course.course_code = "DD1390/91 prosam 25/26"
+
+    student = Mock()
+    student.id = 100
+    student.name = "Alice Student"
+    student.login_id = "alice@example.com"
+    student.sortable_name = "Student, Alice"
+    student.enrollments = [{"type": "StudentEnrollment"}]
+
+    ta = Mock()
+    ta.id = 200
+    ta.name = "Bob TA"
+    ta.login_id = "bob@example.com"
+    ta.sortable_name = "TA, Bob"
+    ta.enrollments = [{"type": "TaEnrollment"}]
+
+    course.get_users = Mock(return_value=[student, ta])
+
+    member_student = Mock(spec=['id'])
+    member_student.id = 100
+    member_ta = Mock(spec=['id'])
+    member_ta.id = 200
+
+    group = Mock(spec=['name', 'course', 'get_users'])
+    group.name = "mentorsgrupp 7-9"
+    group.course = course
+    group.get_users = Mock(return_value=[member_student, member_ta])
+
+    args = Mock()
+    args.regex = ".*"
+    args.canvas_id = False
+    args.ladok = False
+    args.split_name = False
+    args.email = False
+
+    monkeypatch.setattr(
+        users_module,
+        "process_group_options",
+        lambda canvas, args: [group],
+    )
+
+    rows = list(users_module.make_user_rows_w_groups(
+        Mock(), args, ["student"]
+    ))
+
+    assert rows == [[
+        "DD1390/91 prosam 25/26",
+        "mentorsgrupp 7-9",
+        "alice@example.com",
+        "Alice Student",
+    ]]
+    group.get_users.assert_called_once_with()
+    course.get_users.assert_called_once_with(include=["enrollments"])
 @
 
 
