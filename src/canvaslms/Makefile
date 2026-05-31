@@ -21,6 +21,7 @@ __init__.py: init.py
 clean:
 	${RM} ${MODULES}
 	${RM} init.py
+	${RM} -r __pycache__
 
 
 INCLUDE_MAKEFILES=../../makefiles

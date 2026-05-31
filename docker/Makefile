@@ -15,7 +15,7 @@ docker-image:
 
 .PHONY: clean
 clean:
-	true
+	${RM} -r __pycache__
 
 .PHONY: distclean
 distclean:

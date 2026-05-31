@@ -29,10 +29,10 @@ __init__.py: cli.py
 .PHONY: clean
 clean:
 	${RM} ${MODULES}
+	${RM} -r __pycache__
 
 
 INCLUDE_MAKEFILES=../../../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
 include ${INCLUDE_MAKEFILES}/pkg.mk
-

@@ -38,10 +38,10 @@ clean:
 	${RM} grades.tex
 	${RM} ${MODULES}
 	${RM} init.py
+	${RM} -r __pycache__
 
 
 INCLUDE_MAKEFILES=../../../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
 include ${INCLUDE_MAKEFILES}/pkg.mk
-

@@ -10,9 +10,9 @@ all: attachment_cache.py attachment_cache.tex
 clean:
 	${RM} canvasapi.py canvasapi.tex
 	${RM} attachment_cache.py attachment_cache.tex
+	${RM} -r __pycache__
 
 
 INCLUDE_MAKEFILES=../../../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
-
