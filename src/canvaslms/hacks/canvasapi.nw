@@ -3580,6 +3580,25 @@ Key design decisions:
 The [[LazySubmission]] class wraps a submission object and intercepts
 attribute access using [[__getattribute__]].
 
+A transparent proxy has two kinds of attributes to serve, and conflating them
+is a subtle trap.  Most names---[[grade]], [[user_id]], [[body]]---belong to the
+wrapped submission and should be delegated.  But the wrapper also has its own
+behavioural API: the staleness probe [[would_need_refresh]] (and, later, the
+normalisation hook [[ensure_attrs]]).  If [[__getattribute__]] delegates
+\emph{everything} that is not a dunder or underscore-private name, then
+[[lazy.would_need_refresh]] is looked up on the wrapped submission---which has no
+such method---and raises [[AttributeError]].  The bulk-refresh pre-check
+(\cref{sec:bulk-refresh}) calls exactly this method, so naive delegation makes
+the optimisation crash on real submissions while passing against mock objects
+that auto-create any attribute.
+
+The fix is to let the wrapper's own class members take precedence over proxied
+data.  We test [[name in LazySubmission.__dict__]]: methods and class attributes
+defined on the wrapper are served from the wrapper, and only genuinely foreign
+names fall through to the submission.  This cannot shadow real submission data,
+because submission payload attributes ([[grade]], [[body]], \dots) never collide
+with the handful of method names we define here.
+
 <<LazySubmission class>>=
 class LazySubmission:
   """
@@ -3645,6 +3664,21 @@ class LazySubmission:
     """
     return self._needs_refresh()
 
+  def ensure_attrs(self, attrs):
+    """Fill in any missing names in attrs on the wrapped submission as None.
+
+    Normalisation must not read mutable attributes through the wrapper:
+    probing presence with hasattr would route through __getattribute__ and
+    trigger a staleness refresh (a network call) for what should be a purely
+    local fill-in. We therefore operate on the wrapped submission directly,
+    leaving the lazy-refresh behaviour for genuine attribute reads.
+    """
+    submission = object.__getattribute__(self, '_submission')
+    for attr in attrs:
+      if not hasattr(submission, attr):
+        setattr(submission, attr, None)
+    return self
+
   def _refresh(self):
     """Refresh the wrapped submission from Canvas."""
     assignment = object.__getattribute__(self, '_assignment')
@@ -3668,12 +3702,14 @@ class LazySubmission:
     Intercept attribute access to trigger refresh when needed.
 
     Logic:
-    1. Internal attributes (_*) and methods: access directly
+    1. Internal attributes (_*) and the wrapper's own members: access directly
     2. Mutable attributes: check staleness, refresh if needed, then delegate
     3. All other attributes: delegate to wrapped submission
     """
-    # Always access internal attributes directly to avoid recursion
-    if name.startswith('_') or name in ['MUTABLE_ATTRS']:
+    # Serve internal state and the wrapper's own methods/class attributes from
+    # the wrapper itself; delegating them would proxy to the wrapped submission
+    # and raise AttributeError (see would_need_refresh / ensure_attrs).
+    if name.startswith('_') or name in LazySubmission.__dict__:
       return object.__getattribute__(self, name)
 
     # Check if this is a mutable attribute that might need refresh
@@ -3867,7 +3903,94 @@ This class is used by the caching decorator below.
 <<LazySubmission class>>
 @
 
+Let us verify that the wrapper's own methods stay reachable rather than being
+proxied to the wrapped submission.  We wrap a minimal stand-in submission that
+deliberately lacks a [[would_need_refresh]] method: if the wrapper delegated the
+call, the stand-in would raise [[AttributeError]]; instead the wrapper answers
+from its own staleness logic.
+
+<<test functions>>=
+class TestLazySubmissionMethodAccess:
+    """The wrapper's own methods must not be proxied to the submission."""
+
+    class StandInSubmission:
+        """A submission without any wrapper methods of its own."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def wrap(self, *, grade, age_minutes):
+        """Wrap a stand-in submission whose last refresh is age_minutes old."""
+        lazy = LazySubmission(
+            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=age_minutes))
+        return lazy
+
+    def test_would_need_refresh_is_reachable(self):
+        """Calling would_need_refresh() returns a bool, not AttributeError."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.would_need_refresh() is False
+
+    def test_would_need_refresh_detects_staleness(self):
+        """A stale, non-final submission reports it would refresh."""
+        lazy = self.wrap(grade="F", age_minutes=10)
+        assert lazy.would_need_refresh() is True
+
+    def test_final_grade_never_needs_refresh(self):
+        """Final grades are never stale, even when old."""
+        lazy = self.wrap(grade="P", age_minutes=10)
+        assert lazy.would_need_refresh() is False
+
+    def test_payload_attribute_still_delegates(self):
+        """Submission payload attributes still come from the submission."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.user_id == 1
+@
+
+The [[ensure_attrs]] hook is what lets the CLI normalise submissions in bulk
+without paying for a refresh per submission.  We verify that it fills in absent
+fields yet never calls the refresh function, even on a submission old enough to
+be stale.
+
+<<test functions>>=
+class TestLazySubmissionNormalization:
+    """ensure_attrs fills missing fields without triggering a refresh."""
+
+    class StandInSubmission:
+        """A submission carrying only a couple of real attributes."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def test_ensure_attrs_does_not_refresh_stale_submission(self):
+        """Normalising a stale wrapper must not issue a refresh call."""
+        refresh = MagicMock()
+        lazy = LazySubmission(
+            self.StandInSubmission("F"), MagicMock(), set(), refresh)
+        object.__setattr__(
+            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+
+        lazy.ensure_attrs(["grade", "missing_field"])
+
+        refresh.assert_not_called()
+
+    def test_ensure_attrs_fills_missing_fields(self):
+        """Absent fields become None; existing fields are untouched."""
+        lazy = LazySubmission(
+            self.StandInSubmission("F"), MagicMock(), set(), MagicMock())
+
+        lazy.ensure_attrs(["grade", "missing_field"])
+
+        assert lazy.missing_field is None
+        assert lazy.grade == "F"
+@
+
 \subsubsection{Threshold-based bulk refresh optimization}
+\label{sec:bulk-refresh}
 
 While lazy loading solves the problem of wasted refreshes when filtering
 submissions, it introduces a new inefficiency in the opposite scenario: when
@@ -3914,16 +4037,28 @@ The optimization is opt-in via a [[check_bulk_refresh]] parameter to
 
 \paragraph{When to enable bulk refresh}
 
-The optimization is beneficial when workflows will access mutable attributes on
-\emph{most} submissions:
+The optimization is beneficial when a workflow will access mutable attributes on
+\emph{most} of the submissions it cares about.  The listing commands therefore
+enable it unconditionally, and the only question is which submissions count as
+\enquote{cared about}:
 \begin{description}
-\item[The [[-U]] option] Always enabled---checks all submissions'
-  grading state
-\item[Unfiltered listings] Enabled when no [[--user]], [[--category]], or
-  [[--group]] filters are applied
-\item[Specific user filtering] Disabled---only a few submissions will be
-  accessed
+\item[The [[-U]] option] All submissions are inspected, so the pre-check spans
+  the whole assignment.
+\item[Unfiltered listings] Every submission is printed, so again the whole
+  assignment is in scope.
+\item[Filtered listings] With [[--user]], [[--category]], or [[--group]], only
+  the matching users are read.  We pass those [[student_ids]] so the pre-check
+  scopes both its staleness count and its threshold to that subset---a small
+  group stays on the cheap lazy path, while a large filtered cohort still
+  collapses many individual refreshes into one bulk fetch.
 \end{description}
+
+Earlier versions \emph{disabled} the pre-check entirely for filtered listings,
+on the assumption that filtering means few reads.  That backfired: submission
+normalisation touched every cached submission before the filter ran, so the
+\enquote{few reads} assumption never held and the disabled pre-check left no
+bulk fallback.  Scoping by [[student_ids]] is the more honest version of the
+same idea.
 
 \paragraph{Threshold configuration}
 
@@ -4348,11 +4483,20 @@ self.__all_fetched = None
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 
-Most callers only need the cached collection as-is, but the broad listing
-commands inspect every submission and can sometimes save API calls by choosing
+Most callers only need the cached collection as-is, but the listing commands
+inspect a whole set of submissions and can sometimes save API calls by choosing
 between many individual refreshes and one bulk refresh. We expose that extra
 scan as an explicit [[check_bulk_refresh]] opt-in instead of making every call
 pay for it.
+
+A filtered listing (for example by group) only reads the submissions of a few
+users, so basing the decision on the whole assignment would be wrong---one stale
+submission elsewhere should not provoke a bulk fetch. Callers therefore pass the
+[[student_ids]] they will actually read, and the pre-check counts staleness and
+computes its threshold over that subset alone. The bulk fetch itself still pulls
+the whole assignment, because Canvas's per-assignment submissions endpoint has
+no cheap per-student variant; we accept that one paginated fetch only when the
+filtered subset is itself large and stale enough to justify it.
 <<functions>>=
 def bulk_refresh_threshold(total_count):
   """Return stale-submission count that triggers bulk refresh."""
@@ -4361,18 +4505,34 @@ def bulk_refresh_threshold(total_count):
                BULK_REFRESH_MIN_COUNT)
   return BULK_REFRESH_THRESHOLD
 
-def count_stale_submissions(cache):
-  """Return number of cached submissions that would refresh on access."""
-  return sum(1 for lazy_submission in cache.values()
-             if lazy_submission.would_need_refresh())
+def relevant_submission_count(cache, student_ids=None):
+  """Return the number of cached submissions in scope.
 
-def should_bulk_refresh_submissions(cache):
-  """Return True when enough cached submissions need refresh."""
-  total_count = len(cache)
-  if total_count == 0:
+  With no student_ids the whole cache is in scope; otherwise only the
+  submissions belonging to those users.
+  """
+  if student_ids is None:
+    return len(cache)
+  return sum(1 for user_id in cache if user_id in student_ids)
+
+def count_stale_submissions(cache, student_ids=None):
+  """Return how many in-scope cached submissions would refresh on access."""
+  return sum(1 for user_id, lazy_submission in cache.items()
+             if (student_ids is None or user_id in student_ids)
+             and lazy_submission.would_need_refresh())
+
+def should_bulk_refresh_submissions(cache, student_ids=None):
+  """Return True when enough in-scope cached submissions need refresh.
+
+  Scoping to student_ids lets a filtered listing (for example by group) base
+  the decision on the submissions it will actually read, rather than on the
+  whole assignment.
+  """
+  relevant_count = relevant_submission_count(cache, student_ids)
+  if relevant_count == 0:
     return False
-  stale_count = count_stale_submissions(cache)
-  threshold = bulk_refresh_threshold(total_count)
+  stale_count = count_stale_submissions(cache, student_ids)
+  threshold = bulk_refresh_threshold(relevant_count)
   return stale_count >= threshold
 @
 
@@ -4388,6 +4548,7 @@ else:
   to_include = set()
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
+student_ids = kwargs.pop("student_ids", None)
 purge_legacy_submission_entries(self.__cache)
 need_refetch = self.__all_fetched is None
 
@@ -4415,7 +4576,8 @@ else:
               f"{len(self.__cache)} submissions cached "
               f"(age: {cache_age.total_seconds()/60:.1f} minutes)")
 
-  if check_bulk_refresh and should_bulk_refresh_submissions(self.__cache):
+  if check_bulk_refresh and \
+     should_bulk_refresh_submissions(self.__cache, student_ids):
     <<check staleness threshold and bulk refresh if needed>>
 
 return list(self.__cache.values())
@@ -4424,8 +4586,9 @@ return list(self.__cache.values())
 The bulk refresh pre-check logic counts how many submissions would need refresh
 and triggers a bulk fetch if the count exceeds the threshold.
 <<check staleness threshold and bulk refresh if needed>>=
-stale_count = count_stale_submissions(self.__cache)
-threshold = bulk_refresh_threshold(len(self.__cache))
+stale_count = count_stale_submissions(self.__cache, student_ids)
+threshold = bulk_refresh_threshold(
+    relevant_submission_count(self.__cache, student_ids))
 
 logger.info(f"Refreshing all submissions for assignment id={self.id} "
             f"because {stale_count} cached submissions would refresh "
@@ -4485,4 +4648,55 @@ class TestAssignmentSubmissionRefreshStrategy:
     def test_bulk_refresh_threshold_scales_with_cache_size(self):
         """Larger caches should use the fractional threshold."""
         assert bulk_refresh_threshold(50) == 10
+@
+
+Filtered listings scope the decision to the users they will read.  We verify
+that the staleness count and the threshold both consider only the submissions
+in [[student_ids]], so a small fresh group stays lazy while a stale subset still
+triggers a bulk refresh.
+
+<<test functions>>=
+class TestFilteredBulkRefreshScope:
+    """The bulk-refresh decision can be scoped to a subset of users."""
+
+    def make_lazy_submission(self, *, needs_refresh):
+        """Create a cached lazy submission with configurable staleness."""
+        lazy_submission = MagicMock()
+        lazy_submission.would_need_refresh.return_value = needs_refresh
+        lazy_submission._includes = set()
+        return lazy_submission
+
+    def test_relevant_count_scopes_to_student_ids(self):
+        """relevant_submission_count counts only the requested users."""
+        cache = {
+            user_id: self.make_lazy_submission(needs_refresh=False)
+            for user_id in range(10)
+        }
+
+        assert relevant_submission_count(cache) == 10
+        assert relevant_submission_count(cache, {1, 2, 9}) == 3
+        assert relevant_submission_count(cache, {99}) == 0
+
+    def test_fresh_subset_skips_bulk_refresh(self):
+        """A small fresh group stays on the lazy path despite a stale cache."""
+        cache = {
+            user_id: self.make_lazy_submission(needs_refresh=user_id != 0)
+            for user_id in range(50)
+        }
+
+        # Users 1, 2, 3 are stale here, but if we only read a fresh user the
+        # whole-assignment staleness is irrelevant.
+        assert should_bulk_refresh_submissions(
+            cache, student_ids={0}) is False
+
+    def test_stale_subset_triggers_bulk_refresh(self):
+        """A fully stale subset meets its own (subset-sized) threshold."""
+        cache = {
+            user_id: self.make_lazy_submission(needs_refresh=True)
+            for user_id in range(50)
+        }
+
+        # Three stale users in scope: threshold = max(int(3*0.2), 3) = 3.
+        assert should_bulk_refresh_submissions(
+            cache, student_ids={0, 1, 2}) is True
 @
