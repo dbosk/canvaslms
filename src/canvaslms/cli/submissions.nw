@@ -243,35 +243,54 @@ def submissions_list_command(config, canvas, args):
 
 \subsection{Get and print the list of submissions}
 
-We then simply call the appropriate list-submissions function with the 
+We then simply call the appropriate list-submissions function with the
 [[assignments_list]] object as a parameter.
-However, since we optionally want to include the submission history, we must 
+However, since we optionally want to include the submission history, we must
 pass that as an argument to the list-submissions function.
+
+When the user narrows the listing to a group or set of users, we resolve that
+filter \emph{before} fetching submissions.  Doing so lets us hand the matching
+[[student_ids]] to the listing helpers, so the cache's bulk-refresh pre-check is
+scoped to exactly the submissions we will read.  We resolve [[user_list]] once
+here and reuse it later for the actual filtering, avoiding a second round-trip.
 <<get submissions and print them>>=
 to_include=[]
 if args.history:
   to_include += ["submission_history"]
 
+<<resolve user filter and student ids>>
+
 if args.ungraded:
   submissions = list_ungraded_submissions(
     assignment_list,
     include=to_include,
-    check_bulk_refresh=True)
+    check_bulk_refresh=True,
+    student_ids=student_ids)
 else:
-  check_bulk_refresh = not (args.user or args.category or args.group)
   submissions = list_submissions(assignment_list,
     include=to_include,
-    check_bulk_refresh=check_bulk_refresh)
+    check_bulk_refresh=True,
+    student_ids=student_ids)
 <<add options for history>>=
 list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
 @
 
-If any of the group options are set, we filter out the submissions to only 
-include submissions by the users in the groups.
-<<get submissions and print them>>=
+When no user or group options are set, both [[user_list]] and [[student_ids]]
+stay [[None]]: the listing helpers then treat the whole assignment as in scope,
+and we skip filtering entirely.
+<<resolve user filter and student ids>>=
+user_list = None
+student_ids = None
 if args.user or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
+  student_ids = {user.id for user in user_list}
+@
+
+If a user or group filter was set, we now restrict the submissions to the users
+we resolved above.  We reuse [[user_list]] rather than querying Canvas again.
+<<get submissions and print them>>=
+if user_list is not None:
   submissions = filter_submissions(submissions, user_list)
 @
 
@@ -1058,25 +1077,29 @@ def is_ungraded(submission):
 
 The general listing helper keeps caller-controlled bulk refresh optional. Some
 callers inspect every submission and can benefit from a collection-wide
-refresh, while narrower flows can stay with per-submission refreshes.
+refresh, while narrower flows can stay with per-submission refreshes.  When a
+caller already knows which users it will read, it passes [[student_ids]] so the
+cache scopes its bulk-refresh decision to that subset.
 <<functions>>=
 def list_submissions(assignments, include=["submission_comments"],
-                     check_bulk_refresh=False):
+                     check_bulk_refresh=False, student_ids=None):
   for assignment in assignments:
     submissions = assignment.get_submissions(
       include=include,
-      check_bulk_refresh=check_bulk_refresh)
+      check_bulk_refresh=check_bulk_refresh,
+      student_ids=student_ids)
     for submission in submissions:
       submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
       yield submission
 
 def list_ungraded_submissions(assignments, include=["submission_comments"],
-                              check_bulk_refresh=False):
+                              check_bulk_refresh=False, student_ids=None):
   for assignment in assignments:
     submissions = assignment.get_submissions(
       include=include,
-      check_bulk_refresh=check_bulk_refresh)
+      check_bulk_refresh=check_bulk_refresh,
+      student_ids=student_ids)
     for submission in submissions:
       submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
@@ -1121,6 +1144,25 @@ class TestListSubmissions:
         assignment.get_submissions.assert_called_once_with(
             include=["submission_comments"],
             check_bulk_refresh=True,
+            student_ids=None,
+        )
+
+    def test_forwards_student_ids_scope(self):
+        """A caller's student_ids scope is handed to the cache."""
+        assignment = Mock()
+        assignment.get_submissions.return_value = []
+
+        list(list_submissions(
+            [assignment],
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+            student_ids={1, 2, 3},
+        ))
+
+        assignment.get_submissions.assert_called_once_with(
+            include=["submission_comments"],
+            check_bulk_refresh=True,
+            student_ids={1, 2, 3},
         )
 @
 
@@ -1204,6 +1246,7 @@ class TestListUngradedSubmissions:
         assignment.get_submissions.assert_called_once_with(
             include=["submission_comments"],
             check_bulk_refresh=True,
+            student_ids=None,
         )
         assert result == [never_graded, resubmitted]
         assert never_graded.assignment is assignment
