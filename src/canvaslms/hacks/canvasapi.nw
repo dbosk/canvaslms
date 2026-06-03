@@ -3580,6 +3580,25 @@ Key design decisions:
 The [[LazySubmission]] class wraps a submission object and intercepts
 attribute access using [[__getattribute__]].
 
+A transparent proxy has two kinds of attributes to serve, and conflating them
+is a subtle trap.  Most names---[[grade]], [[user_id]], [[body]]---belong to the
+wrapped submission and should be delegated.  But the wrapper also has its own
+behavioural API: the staleness probe [[would_need_refresh]] (and, later, the
+normalisation hook [[ensure_attrs]]).  If [[__getattribute__]] delegates
+\emph{everything} that is not a dunder or underscore-private name, then
+[[lazy.would_need_refresh]] is looked up on the wrapped submission---which has no
+such method---and raises [[AttributeError]].  The bulk-refresh pre-check
+(\cref{sec:bulk-refresh}) calls exactly this method, so naive delegation makes
+the optimisation crash on real submissions while passing against mock objects
+that auto-create any attribute.
+
+The fix is to let the wrapper's own class members take precedence over proxied
+data.  We test [[name in LazySubmission.__dict__]]: methods and class attributes
+defined on the wrapper are served from the wrapper, and only genuinely foreign
+names fall through to the submission.  This cannot shadow real submission data,
+because submission payload attributes ([[grade]], [[body]], \dots) never collide
+with the handful of method names we define here.
+
 <<LazySubmission class>>=
 class LazySubmission:
   """
@@ -3668,12 +3687,14 @@ class LazySubmission:
     Intercept attribute access to trigger refresh when needed.
 
     Logic:
-    1. Internal attributes (_*) and methods: access directly
+    1. Internal attributes (_*) and the wrapper's own members: access directly
     2. Mutable attributes: check staleness, refresh if needed, then delegate
     3. All other attributes: delegate to wrapped submission
     """
-    # Always access internal attributes directly to avoid recursion
-    if name.startswith('_') or name in ['MUTABLE_ATTRS']:
+    # Serve internal state and the wrapper's own methods/class attributes from
+    # the wrapper itself; delegating them would proxy to the wrapped submission
+    # and raise AttributeError (see would_need_refresh / ensure_attrs).
+    if name.startswith('_') or name in LazySubmission.__dict__:
       return object.__getattribute__(self, name)
 
     # Check if this is a mutable attribute that might need refresh
@@ -3867,7 +3888,55 @@ This class is used by the caching decorator below.
 <<LazySubmission class>>
 @
 
+Let us verify that the wrapper's own methods stay reachable rather than being
+proxied to the wrapped submission.  We wrap a minimal stand-in submission that
+deliberately lacks a [[would_need_refresh]] method: if the wrapper delegated the
+call, the stand-in would raise [[AttributeError]]; instead the wrapper answers
+from its own staleness logic.
+
+<<test functions>>=
+class TestLazySubmissionMethodAccess:
+    """The wrapper's own methods must not be proxied to the submission."""
+
+    class StandInSubmission:
+        """A submission without any wrapper methods of its own."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def wrap(self, *, grade, age_minutes):
+        """Wrap a stand-in submission whose last refresh is age_minutes old."""
+        lazy = LazySubmission(
+            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=age_minutes))
+        return lazy
+
+    def test_would_need_refresh_is_reachable(self):
+        """Calling would_need_refresh() returns a bool, not AttributeError."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.would_need_refresh() is False
+
+    def test_would_need_refresh_detects_staleness(self):
+        """A stale, non-final submission reports it would refresh."""
+        lazy = self.wrap(grade="F", age_minutes=10)
+        assert lazy.would_need_refresh() is True
+
+    def test_final_grade_never_needs_refresh(self):
+        """Final grades are never stale, even when old."""
+        lazy = self.wrap(grade="P", age_minutes=10)
+        assert lazy.would_need_refresh() is False
+
+    def test_payload_attribute_still_delegates(self):
+        """Submission payload attributes still come from the submission."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.user_id == 1
+@
+
 \subsubsection{Threshold-based bulk refresh optimization}
+\label{sec:bulk-refresh}
 
 While lazy loading solves the problem of wasted refreshes when filtering
 submissions, it introduces a new inefficiency in the opposite scenario: when
