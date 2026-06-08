@@ -3734,8 +3734,51 @@ class LazySubmission:
       submission = object.__getattribute__(self, '_submission')
       setattr(submission, name, value)
 
+@
+
+\subsubsection{Surviving a refresh: serving [[assignment]] from [[_assignment]]}
+
+A subtle interaction lurks between [[__setattr__]] and [[_refresh]].  Callers
+attach the parent assignment to a submission so that downstream code can reach
+[[submission.assignment.course]]---the results command does this for every
+submission it summarises.  Because [[assignment]] is not a private name,
+[[__setattr__]] stores it on the \emph{wrapped} submission, not on the wrapper.
+
+Now suppose a later read touches a mutable attribute such as
+[[submission_history]].  That access triggers [[_refresh]], which fetches a
+\emph{new} submission from Canvas and rebinds [[_submission]] to it.  The
+freshly fetched object never had [[assignment]] assigned, so the caller's
+attribute silently vanishes---and the next read of [[submission.assignment]]
+raises [[AttributeError]].
+
+We cannot recover the lost value from [[assignment_id]] alone: downstream code
+needs the assignment's [[course]] object, and re-fetching by id would neither
+restore [[course]] nor have a [[Canvas]] handle to query.  Fortunately the
+wrapper already retains exactly what we need.  [[_assignment]] is the
+[[Assignment]] the submission was fetched from---it carries [[course]] and is
+untouched by refreshes.  So when a delegated lookup of [[assignment]] fails, we
+fall back to [[_assignment]] as the canonical source.
+
+Python only calls [[__getattr__]] after normal lookup (including
+[[__getattribute__]]'s delegation to the wrapped submission) has already failed
+with [[AttributeError]].  That makes it the precise place for the fallback: an
+intact [[assignment]] on the wrapped submission is still returned directly, and
+only a missing one reaches us here.  We guard on [[_assignment]] being present
+so that a wrapper genuinely lacking an assignment still raises the ordinary
+[[AttributeError]] rather than masking it with [[None]].
+<<LazySubmission class>>=
   def __getattr__(self, name):
-    """Fallback for attributes not found on wrapper (delegates to submission)."""
+    """Fallback for attributes the wrapped submission no longer carries.
+
+    A refresh swaps in a freshly fetched submission that lacks any attribute a
+    caller set on the previous instance---notably ``assignment``.  The wrapper
+    keeps the assignment it was fetched from in ``_assignment`` (with its
+    ``course``), so serve that as the canonical fallback.
+    """
+    if name == "assignment":
+      assignment = object.__getattribute__(self, "_assignment")
+      if assignment is not None:
+        return assignment
     submission = object.__getattribute__(self, '_submission')
     return getattr(submission, name)
 
@@ -3987,6 +4030,57 @@ class TestLazySubmissionNormalization:
 
         assert lazy.missing_field is None
         assert lazy.grade == "F"
+@
+
+Now let's verify the [[assignment]] fallback.  A caller-set [[assignment]] lives
+on the wrapped submission, so a refresh---which rebinds [[_submission]] to a
+freshly fetched object---would otherwise discard it.  We check both that the
+wrapper serves [[assignment]] from [[_assignment]] when the wrapped submission
+lacks it, and that the attribute therefore survives an actual refresh.
+
+<<test functions>>=
+class TestLazySubmissionAssignmentSurvivesRefresh:
+    """`.assignment` falls back to the stored assignment after a refresh."""
+
+    class StandInSubmission:
+        """A submission as Canvas returns it: no caller-set `.assignment`."""
+
+        def __init__(self, grade="F"):
+            self.grade = grade
+            self.user_id = 1
+            self.submission_history = ()
+
+    def test_assignment_served_from_wrapper_when_missing(self):
+        """A wrapped submission without `.assignment` falls back to
+        `_assignment`."""
+        sentinel_assignment = object()
+        lazy = LazySubmission(
+            self.StandInSubmission(), sentinel_assignment, set(), MagicMock())
+
+        assert lazy.assignment is sentinel_assignment
+
+    def test_assignment_survives_a_refresh(self):
+        """A refresh swaps the wrapped submission yet `.assignment` persists."""
+        sentinel_assignment = object()
+        fresh = self.StandInSubmission()
+        # The refresh fetches a new submission that lacks `.assignment`.
+        original_get_submission = MagicMock(return_value=fresh)
+
+        lazy = LazySubmission(
+            self.StandInSubmission(), sentinel_assignment,
+            {"submission_history"}, original_get_submission)
+        # A caller attaches the assignment to the wrapped submission, ...
+        lazy.assignment = sentinel_assignment
+        # ... but the wrapper is stale, so the next mutable read refreshes.
+        object.__setattr__(
+            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+
+        # Touching a mutable attribute swaps in `fresh`, dropping `.assignment`.
+        lazy.submission_history
+
+        original_get_submission.assert_called_once()
+        assert not hasattr(fresh, "assignment")
+        assert lazy.assignment is sentinel_assignment
 @
 
 \subsubsection{Threshold-based bulk refresh optimization}
