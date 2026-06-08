@@ -3680,6 +3680,41 @@ def would_need_refresh(self):
   return self._needs_refresh()
 @
 
+Let us verify the policy with a minimal stand-in submission whose last refresh
+we can age at will.  A non-final grade older than the TTL must report that it
+would refresh, whereas a final grade never does---even when stale.
+
+<<test functions>>=
+class TestLazySubmissionStaleness:
+    """_needs_refresh implements the time-and-grade refresh policy."""
+
+    class StandInSubmission:
+        """A submission carrying only the attributes the policy reads."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def wrap(self, *, grade, age_minutes):
+        """Wrap a stand-in submission whose last refresh is age_minutes old."""
+        lazy = LazySubmission(
+            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=age_minutes))
+        return lazy
+
+    def test_would_need_refresh_detects_staleness(self):
+        """A stale, non-final submission reports it would refresh."""
+        lazy = self.wrap(grade="F", age_minutes=10)
+        assert lazy.would_need_refresh() is True
+
+    def test_final_grade_never_needs_refresh(self):
+        """Final grades are never stale, even when old."""
+        lazy = self.wrap(grade="P", age_minutes=10)
+        assert lazy.would_need_refresh() is False
+@
+
 \paragraph{Filling in attributes without a refresh}
 
 The CLI normalises submissions in bulk so that later code can read a fixed set
@@ -3704,6 +3739,44 @@ def ensure_attrs(self, attrs):
     if not hasattr(submission, attr):
       setattr(submission, attr, None)
   return self
+@
+
+We verify that [[ensure_attrs]] fills in absent fields yet never calls the
+refresh function, even on a submission old enough to be stale---the whole point
+of reaching past the wrapper.
+
+<<test functions>>=
+class TestLazySubmissionNormalization:
+    """ensure_attrs fills missing fields without triggering a refresh."""
+
+    class StandInSubmission:
+        """A submission carrying only a couple of real attributes."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def test_ensure_attrs_does_not_refresh_stale_submission(self):
+        """Normalising a stale wrapper must not issue a refresh call."""
+        refresh = MagicMock()
+        lazy = LazySubmission(
+            self.StandInSubmission("F"), MagicMock(), set(), refresh)
+        object.__setattr__(
+            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+
+        lazy.ensure_attrs(["grade", "missing_field"])
+
+        refresh.assert_not_called()
+
+    def test_ensure_attrs_fills_missing_fields(self):
+        """Absent fields become None; existing fields are untouched."""
+        lazy = LazySubmission(
+            self.StandInSubmission("F"), MagicMock(), set(), MagicMock())
+
+        lazy.ensure_attrs(["grade", "missing_field"])
+
+        assert lazy.missing_field is None
+        assert lazy.grade == "F"
 @
 
 \paragraph{Performing the refresh}
@@ -3783,6 +3856,43 @@ def __getattribute__(self, name):
   return getattr(submission, name)
 @
 
+Let us verify the two halves of this split.  We wrap a stand-in that
+deliberately lacks a [[would_need_refresh]] method: if the wrapper delegated the
+call, the stand-in would raise [[AttributeError]]; instead the wrapper answers
+from its own logic.  A genuine payload attribute, by contrast, must still come
+from the wrapped submission.
+
+<<test functions>>=
+class TestLazySubmissionDelegation:
+    """The wrapper's own methods are served locally; payload is delegated."""
+
+    class StandInSubmission:
+        """A submission without any wrapper methods of its own."""
+
+        def __init__(self, grade):
+            self.grade = grade
+            self.user_id = 1
+
+    def wrap(self, *, grade, age_minutes):
+        """Wrap a stand-in submission whose last refresh is age_minutes old."""
+        lazy = LazySubmission(
+            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=age_minutes))
+        return lazy
+
+    def test_would_need_refresh_is_reachable(self):
+        """Calling would_need_refresh() returns a bool, not AttributeError."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.would_need_refresh() is False
+
+    def test_payload_attribute_still_delegates(self):
+        """Submission payload attributes still come from the submission."""
+        lazy = self.wrap(grade="F", age_minutes=0)
+        assert lazy.user_id == 1
+@
+
 \paragraph{Intercepting writes}
 
 Writes mirror reads: internal state---the underscore-private names---stays on
@@ -3849,6 +3959,57 @@ def __getattr__(self, name):
       return assignment
   submission = object.__getattribute__(self, '_submission')
   return getattr(submission, name)
+@
+
+Now let's verify the [[assignment]] fallback.  A caller-set [[assignment]] lives
+on the wrapped submission, so a refresh---which rebinds [[_submission]] to a
+freshly fetched object---would otherwise discard it.  We check both that the
+wrapper serves [[assignment]] from [[_assignment]] when the wrapped submission
+lacks it, and that the attribute therefore survives an actual refresh.
+
+<<test functions>>=
+class TestLazySubmissionAssignmentSurvivesRefresh:
+    """`.assignment` falls back to the stored assignment after a refresh."""
+
+    class StandInSubmission:
+        """A submission as Canvas returns it: no caller-set `.assignment`."""
+
+        def __init__(self, grade="F"):
+            self.grade = grade
+            self.user_id = 1
+            self.submission_history = ()
+
+    def test_assignment_served_from_wrapper_when_missing(self):
+        """A wrapped submission without `.assignment` falls back to
+        `_assignment`."""
+        sentinel_assignment = object()
+        lazy = LazySubmission(
+            self.StandInSubmission(), sentinel_assignment, set(), MagicMock())
+
+        assert lazy.assignment is sentinel_assignment
+
+    def test_assignment_survives_a_refresh(self):
+        """A refresh swaps the wrapped submission yet `.assignment` persists."""
+        sentinel_assignment = object()
+        fresh = self.StandInSubmission()
+        # The refresh fetches a new submission that lacks `.assignment`.
+        original_get_submission = MagicMock(return_value=fresh)
+
+        lazy = LazySubmission(
+            self.StandInSubmission(), sentinel_assignment,
+            {"submission_history"}, original_get_submission)
+        # A caller attaches the assignment to the wrapped submission, ...
+        lazy.assignment = sentinel_assignment
+        # ... but the wrapper is stale, so the next mutable read refreshes.
+        object.__setattr__(
+            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+
+        # Touching a mutable attribute swaps in `fresh`, dropping `.assignment`.
+        lazy.submission_history
+
+        original_get_submission.assert_called_once()
+        assert not hasattr(fresh, "assignment")
+        assert lazy.assignment is sentinel_assignment
 @
 
 \paragraph{String representations}
@@ -4017,143 +4178,6 @@ def __setstate__(self, state):
 This class is used by the caching decorator below.
 <<functions>>=
 <<LazySubmission class>>
-@
-
-Let us verify that the wrapper's own methods stay reachable rather than being
-proxied to the wrapped submission.  We wrap a minimal stand-in submission that
-deliberately lacks a [[would_need_refresh]] method: if the wrapper delegated the
-call, the stand-in would raise [[AttributeError]]; instead the wrapper answers
-from its own staleness logic.
-
-<<test functions>>=
-class TestLazySubmissionMethodAccess:
-    """The wrapper's own methods must not be proxied to the submission."""
-
-    class StandInSubmission:
-        """A submission without any wrapper methods of its own."""
-
-        def __init__(self, grade):
-            self.grade = grade
-            self.user_id = 1
-
-    def wrap(self, *, grade, age_minutes):
-        """Wrap a stand-in submission whose last refresh is age_minutes old."""
-        lazy = LazySubmission(
-            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
-        object.__setattr__(
-            lazy, "_last_refresh",
-            datetime.now() - timedelta(minutes=age_minutes))
-        return lazy
-
-    def test_would_need_refresh_is_reachable(self):
-        """Calling would_need_refresh() returns a bool, not AttributeError."""
-        lazy = self.wrap(grade="F", age_minutes=0)
-        assert lazy.would_need_refresh() is False
-
-    def test_would_need_refresh_detects_staleness(self):
-        """A stale, non-final submission reports it would refresh."""
-        lazy = self.wrap(grade="F", age_minutes=10)
-        assert lazy.would_need_refresh() is True
-
-    def test_final_grade_never_needs_refresh(self):
-        """Final grades are never stale, even when old."""
-        lazy = self.wrap(grade="P", age_minutes=10)
-        assert lazy.would_need_refresh() is False
-
-    def test_payload_attribute_still_delegates(self):
-        """Submission payload attributes still come from the submission."""
-        lazy = self.wrap(grade="F", age_minutes=0)
-        assert lazy.user_id == 1
-@
-
-The [[ensure_attrs]] hook is what lets the CLI normalise submissions in bulk
-without paying for a refresh per submission.  We verify that it fills in absent
-fields yet never calls the refresh function, even on a submission old enough to
-be stale.
-
-<<test functions>>=
-class TestLazySubmissionNormalization:
-    """ensure_attrs fills missing fields without triggering a refresh."""
-
-    class StandInSubmission:
-        """A submission carrying only a couple of real attributes."""
-
-        def __init__(self, grade):
-            self.grade = grade
-            self.user_id = 1
-
-    def test_ensure_attrs_does_not_refresh_stale_submission(self):
-        """Normalising a stale wrapper must not issue a refresh call."""
-        refresh = MagicMock()
-        lazy = LazySubmission(
-            self.StandInSubmission("F"), MagicMock(), set(), refresh)
-        object.__setattr__(
-            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
-
-        lazy.ensure_attrs(["grade", "missing_field"])
-
-        refresh.assert_not_called()
-
-    def test_ensure_attrs_fills_missing_fields(self):
-        """Absent fields become None; existing fields are untouched."""
-        lazy = LazySubmission(
-            self.StandInSubmission("F"), MagicMock(), set(), MagicMock())
-
-        lazy.ensure_attrs(["grade", "missing_field"])
-
-        assert lazy.missing_field is None
-        assert lazy.grade == "F"
-@
-
-Now let's verify the [[assignment]] fallback.  A caller-set [[assignment]] lives
-on the wrapped submission, so a refresh---which rebinds [[_submission]] to a
-freshly fetched object---would otherwise discard it.  We check both that the
-wrapper serves [[assignment]] from [[_assignment]] when the wrapped submission
-lacks it, and that the attribute therefore survives an actual refresh.
-
-<<test functions>>=
-class TestLazySubmissionAssignmentSurvivesRefresh:
-    """`.assignment` falls back to the stored assignment after a refresh."""
-
-    class StandInSubmission:
-        """A submission as Canvas returns it: no caller-set `.assignment`."""
-
-        def __init__(self, grade="F"):
-            self.grade = grade
-            self.user_id = 1
-            self.submission_history = ()
-
-    def test_assignment_served_from_wrapper_when_missing(self):
-        """A wrapped submission without `.assignment` falls back to
-        `_assignment`."""
-        sentinel_assignment = object()
-        lazy = LazySubmission(
-            self.StandInSubmission(), sentinel_assignment, set(), MagicMock())
-
-        assert lazy.assignment is sentinel_assignment
-
-    def test_assignment_survives_a_refresh(self):
-        """A refresh swaps the wrapped submission yet `.assignment` persists."""
-        sentinel_assignment = object()
-        fresh = self.StandInSubmission()
-        # The refresh fetches a new submission that lacks `.assignment`.
-        original_get_submission = MagicMock(return_value=fresh)
-
-        lazy = LazySubmission(
-            self.StandInSubmission(), sentinel_assignment,
-            {"submission_history"}, original_get_submission)
-        # A caller attaches the assignment to the wrapped submission, ...
-        lazy.assignment = sentinel_assignment
-        # ... but the wrapper is stale, so the next mutable read refreshes.
-        object.__setattr__(
-            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
-
-        # Touching a mutable attribute swaps in `fresh`, dropping `.assignment`.
-        lazy.submission_history
-
-        original_get_submission.assert_called_once()
-        assert not hasattr(fresh, "assignment")
-        assert lazy.assignment is sentinel_assignment
 @
 
 \subsubsection{Threshold-based bulk refresh optimization}
