@@ -3577,27 +3577,21 @@ Key design decisions:
 
 \subsubsection{Implementation: LazySubmission class}
 
-The [[LazySubmission]] class wraps a submission object and intercepts
-attribute access using [[__getattribute__]].
+We give the whole picture first, then fill in each method.  The wrapper holds
+the fetched submission together with everything needed to re-fetch it---the
+originating assignment, the [[include]] parameters, and the unwrapped
+[[get_submission]] method---plus the timestamp of the last refresh.  Around that
+state it layers three groups of behaviour: deciding \emph{when} a refresh is due
+([[_needs_refresh]], [[would_need_refresh]]); performing the refresh and
+filling in attributes locally ([[_refresh]], [[ensure_attrs]]); and intercepting
+attribute access so that reads and writes reach the right object
+([[__getattribute__]], [[__setattr__]], [[__getattr__]]).  Two thin string hooks
+and pickle support round out the class.
 
-A transparent proxy has two kinds of attributes to serve, and conflating them
-is a subtle trap.  Most names---[[grade]], [[user_id]], [[body]]---belong to the
-wrapped submission and should be delegated.  But the wrapper also has its own
-behavioural API: the staleness probe [[would_need_refresh]] (and, later, the
-normalisation hook [[ensure_attrs]]).  If [[__getattribute__]] delegates
-\emph{everything} that is not a dunder or underscore-private name, then
-[[lazy.would_need_refresh]] is looked up on the wrapped submission---which has no
-such method---and raises [[AttributeError]].  The bulk-refresh pre-check
-(\cref{sec:bulk-refresh}) calls exactly this method, so naive delegation makes
-the optimisation crash on real submissions while passing against mock objects
-that auto-create any attribute.
-
-The fix is to let the wrapper's own class members take precedence over proxied
-data.  We test [[name in LazySubmission.__dict__]]: methods and class attributes
-defined on the wrapper are served from the wrapper, and only genuinely foreign
-names fall through to the submission.  This cannot shadow real submission data,
-because submission payload attributes ([[grade]], [[body]], \dots) never collide
-with the handful of method names we define here.
+The shell below establishes the stored state; each method follows in its own
+section.  We collect the methods in the [[LazySubmission methods]] bucket chunk
+so that source order can follow the pedagogical order above rather than Python's
+definition order.
 
 <<LazySubmission class>>=
 class LazySubmission:
@@ -3637,112 +3631,185 @@ class LazySubmission:
     object.__setattr__(self, '_original_get_submission', original_get_submission)
     object.__setattr__(self, '_last_refresh', datetime.now())
 
-  def _needs_refresh(self):
-    """Check if the wrapped submission needs refreshing."""
-    submission = object.__getattribute__(self, '_submission')
-    last_refresh = object.__getattribute__(self, '_last_refresh')
+  <<LazySubmission methods>>
 
-    # Never refresh final grades
-    if submission.grade in NOREFRESH_GRADES:
-      return False
-
-    # Check time-based staleness (5-minute TTL for non-final grades)
-    if datetime.now() - last_refresh > timedelta(minutes=5):
-      return True
-
-    return False
-
-  def would_need_refresh(self):
-    """
-    Check if submission would need refresh WITHOUT triggering it.
-
-    Used by pre-check phase to count stale submissions before deciding
-    whether to do bulk refresh.
-
-    Returns:
-        bool: True if submission would refresh on next access
-    """
-    return self._needs_refresh()
-
-  def ensure_attrs(self, attrs):
-    """Fill in any missing names in attrs on the wrapped submission as None.
-
-    Normalisation must not read mutable attributes through the wrapper:
-    probing presence with hasattr would route through __getattribute__ and
-    trigger a staleness refresh (a network call) for what should be a purely
-    local fill-in. We therefore operate on the wrapped submission directly,
-    leaving the lazy-refresh behaviour for genuine attribute reads.
-    """
-    submission = object.__getattribute__(self, '_submission')
-    for attr in attrs:
-      if not hasattr(submission, attr):
-        setattr(submission, attr, None)
-    return self
-
-  def _refresh(self):
-    """Refresh the wrapped submission from Canvas."""
-    assignment = object.__getattribute__(self, '_assignment')
-    submission = object.__getattribute__(self, '_submission')
-    includes = object.__getattribute__(self, '_includes')
-    original_get_submission = object.__getattribute__(self, '_original_get_submission')
-
-    # Call original method directly (bypasses decorator, no double-wrapping)
-    fresh_submission = original_get_submission(
-      assignment,
-      submission.user_id,
-      include=list(includes)
-    )
-
-    # Update internal state (cache automatically updated via reference)
-    object.__setattr__(self, '_submission', fresh_submission)
-    object.__setattr__(self, '_last_refresh', datetime.now())
-
-  def __getattribute__(self, name):
-    """
-    Intercept attribute access to trigger refresh when needed.
-
-    Logic:
-    1. Internal attributes (_*) and the wrapper's own members: access directly
-    2. Mutable attributes: check staleness, refresh if needed, then delegate
-    3. All other attributes: delegate to wrapped submission
-    """
-    # Serve internal state and the wrapper's own methods/class attributes from
-    # the wrapper itself; delegating them would proxy to the wrapped submission
-    # and raise AttributeError (see would_need_refresh / ensure_attrs).
-    if name.startswith('_') or name in LazySubmission.__dict__:
-      return object.__getattribute__(self, name)
-
-    # Check if this is a mutable attribute that might need refresh
-    if name in LazySubmission.MUTABLE_ATTRS:
-      if object.__getattribute__(self, '_needs_refresh')():
-        object.__getattribute__(self, '_refresh')()
-
-    # Delegate to wrapped submission
-    submission = object.__getattribute__(self, '_submission')
-    return getattr(submission, name)
-
-  def __setattr__(self, name, value):
-    """
-    Intercept attribute setting to handle both wrapper and submission attrs.
-
-    Internal attributes (_*) are set on the wrapper.
-    All other attributes are set on the wrapped submission.
-    """
-    if name.startswith('_'):
-      object.__setattr__(self, name, value)
-    else:
-      submission = object.__getattribute__(self, '_submission')
-      setattr(submission, name, value)
-
+  <<pickle support for LazySubmission>>
 @
 
-\subsubsection{Surviving a refresh: serving [[assignment]] from [[_assignment]]}
+\paragraph{Deciding when to refresh}
 
-A subtle interaction lurks between [[__setattr__]] and [[_refresh]].  Callers
-attach the parent assignment to a submission so that downstream code can reach
-[[submission.assignment.course]]---the results command does this for every
-submission it summarises.  Because [[assignment]] is not a private name,
-[[__setattr__]] stores it on the \emph{wrapped} submission, not on the wrapper.
+A non-final grade can still change on Canvas, so we re-fetch it once it is older
+than a short time-to-live.  A \emph{final} grade never changes, so we skip the
+refresh entirely---this is the [[NOREFRESH_GRADES]] policy, and it is what keeps
+a fully graded course from re-fetching every submission on access.
+
+<<LazySubmission methods>>=
+def _needs_refresh(self):
+  """Check if the wrapped submission needs refreshing."""
+  submission = object.__getattribute__(self, '_submission')
+  last_refresh = object.__getattribute__(self, '_last_refresh')
+
+  # Never refresh final grades
+  if submission.grade in NOREFRESH_GRADES:
+    return False
+
+  # Check time-based staleness (5-minute TTL for non-final grades)
+  if datetime.now() - last_refresh > timedelta(minutes=5):
+    return True
+
+  return False
+@
+
+The pre-check that decides whether a \emph{bulk} refresh is worthwhile
+(\cref{sec:bulk-refresh}) must count stale submissions without refreshing any of
+them.  [[_needs_refresh]] already answers that question with no side effects, so
+[[would_need_refresh]] merely exposes it under a public name that reads clearly
+at the call site.
+
+<<LazySubmission methods>>=
+def would_need_refresh(self):
+  """
+  Check if submission would need refresh WITHOUT triggering it.
+
+  Used by pre-check phase to count stale submissions before deciding
+  whether to do bulk refresh.
+
+  Returns:
+      bool: True if submission would refresh on next access
+  """
+  return self._needs_refresh()
+@
+
+\paragraph{Filling in attributes without a refresh}
+
+The CLI normalises submissions in bulk so that later code can read a fixed set
+of attributes without scattered [[getattr]] fallbacks.  That fill-in must not
+itself trigger refreshes: probing presence through the wrapper would route a
+mutable name through [[__getattribute__]] and fire a network call for what is
+meant to be a purely local touch-up.  We therefore reach past the wrapper with
+[[object.__getattribute__]] and operate on the wrapped submission directly.
+
+<<LazySubmission methods>>=
+def ensure_attrs(self, attrs):
+  """Fill in any missing names in attrs on the wrapped submission as None.
+
+  Normalisation must not read mutable attributes through the wrapper:
+  probing presence with hasattr would route through __getattribute__ and
+  trigger a staleness refresh (a network call) for what should be a purely
+  local fill-in. We therefore operate on the wrapped submission directly,
+  leaving the lazy-refresh behaviour for genuine attribute reads.
+  """
+  submission = object.__getattribute__(self, '_submission')
+  for attr in attrs:
+    if not hasattr(submission, attr):
+      setattr(submission, attr, None)
+  return self
+@
+
+\paragraph{Performing the refresh}
+
+Refreshing re-fetches the submission for the same user, assignment, and
+[[include]] set.  We call the \emph{unwrapped} [[get_submission]] captured at
+construction rather than the decorated one, so the refresh does not recurse back
+through the cache and double-wrap the result.  Rebinding [[_submission]] updates
+every holder of this wrapper at once, because they all share the one wrapper
+object---which is exactly why the cache need not be touched separately.
+
+<<LazySubmission methods>>=
+def _refresh(self):
+  """Refresh the wrapped submission from Canvas."""
+  assignment = object.__getattribute__(self, '_assignment')
+  submission = object.__getattribute__(self, '_submission')
+  includes = object.__getattribute__(self, '_includes')
+  original_get_submission = object.__getattribute__(self, '_original_get_submission')
+
+  # Call original method directly (bypasses decorator, no double-wrapping)
+  fresh_submission = original_get_submission(
+    assignment,
+    submission.user_id,
+    include=list(includes)
+  )
+
+  # Update internal state (cache automatically updated via reference)
+  object.__setattr__(self, '_submission', fresh_submission)
+  object.__setattr__(self, '_last_refresh', datetime.now())
+@
+
+\paragraph{Intercepting reads}
+
+A transparent proxy has two kinds of attributes to serve, and conflating them
+is a subtle trap.  Most names---[[grade]], [[user_id]], [[body]]---belong to the
+wrapped submission and should be delegated.  But the wrapper also has its own
+behavioural API: the staleness probe [[would_need_refresh]] and the
+normalisation hook [[ensure_attrs]].  If [[__getattribute__]] delegates
+\emph{everything} that is not a dunder or underscore-private name, then
+[[lazy.would_need_refresh]] is looked up on the wrapped submission---which has no
+such method---and raises [[AttributeError]].  The bulk-refresh pre-check
+(\cref{sec:bulk-refresh}) calls exactly this method, so naive delegation would
+crash the optimisation on real submissions while passing against mock objects
+that auto-create any attribute.
+
+The fix is to let the wrapper's own class members take precedence over proxied
+data.  We test [[name in LazySubmission.__dict__]]: methods and class attributes
+defined on the wrapper are served from the wrapper, and only genuinely foreign
+names fall through to the submission.  This cannot shadow real submission data,
+because submission payload attributes ([[grade]], [[body]], \dots) never collide
+with the handful of method names we define here.  Once delegation is reached, a
+mutable name first gets a staleness check, so reads always see fresh-enough data.
+
+<<LazySubmission methods>>=
+def __getattribute__(self, name):
+  """
+  Intercept attribute access to trigger refresh when needed.
+
+  Logic:
+  1. Internal attributes (_*) and the wrapper's own members: access directly
+  2. Mutable attributes: check staleness, refresh if needed, then delegate
+  3. All other attributes: delegate to wrapped submission
+  """
+  # Serve internal state and the wrapper's own methods/class attributes from
+  # the wrapper itself; delegating them would proxy to the wrapped submission
+  # and raise AttributeError (see would_need_refresh / ensure_attrs).
+  if name.startswith('_') or name in LazySubmission.__dict__:
+    return object.__getattribute__(self, name)
+
+  # Check if this is a mutable attribute that might need refresh
+  if name in LazySubmission.MUTABLE_ATTRS:
+    if object.__getattribute__(self, '_needs_refresh')():
+      object.__getattribute__(self, '_refresh')()
+
+  # Delegate to wrapped submission
+  submission = object.__getattribute__(self, '_submission')
+  return getattr(submission, name)
+@
+
+\paragraph{Intercepting writes}
+
+Writes mirror reads: internal state---the underscore-private names---stays on
+the wrapper, while every other name is set on the wrapped submission so callers
+can annotate it.  The most important such annotation is [[assignment]], whose
+fate after a refresh we turn to next.
+
+<<LazySubmission methods>>=
+def __setattr__(self, name, value):
+  """
+  Intercept attribute setting to handle both wrapper and submission attrs.
+
+  Internal attributes (_*) are set on the wrapper.
+  All other attributes are set on the wrapped submission.
+  """
+  if name.startswith('_'):
+    object.__setattr__(self, name, value)
+  else:
+    submission = object.__getattribute__(self, '_submission')
+    setattr(submission, name, value)
+@
+
+\paragraph{Surviving a refresh: serving [[assignment]] from [[_assignment]]}
+
+A subtle interaction lurks between [[__setattr__]] and [[_refresh]].  As just
+noted, a caller-set [[assignment]] lands on the \emph{wrapped} submission, since
+[[assignment]] is not a private name.
 
 Now suppose a later read touches a mutable attribute such as
 [[submission_history]].  That access triggers [[_refresh]], which fetches a
@@ -3766,33 +3833,39 @@ intact [[assignment]] on the wrapped submission is still returned directly, and
 only a missing one reaches us here.  We guard on [[_assignment]] being present
 so that a wrapper genuinely lacking an assignment still raises the ordinary
 [[AttributeError]] rather than masking it with [[None]].
-<<LazySubmission class>>=
-  def __getattr__(self, name):
-    """Fallback for attributes the wrapped submission no longer carries.
 
-    A refresh swaps in a freshly fetched submission that lacks any attribute a
-    caller set on the previous instance---notably ``assignment``.  The wrapper
-    keeps the assignment it was fetched from in ``_assignment`` (with its
-    ``course``), so serve that as the canonical fallback.
-    """
-    if name == "assignment":
-      assignment = object.__getattribute__(self, "_assignment")
-      if assignment is not None:
-        return assignment
-    submission = object.__getattribute__(self, '_submission')
-    return getattr(submission, name)
+<<LazySubmission methods>>=
+def __getattr__(self, name):
+  """Fallback for attributes the wrapped submission no longer carries.
 
-  def __repr__(self):
-    """Delegate repr to wrapped submission."""
-    submission = object.__getattribute__(self, '_submission')
-    return repr(submission)
+  A refresh swaps in a freshly fetched submission that lacks any attribute a
+  caller set on the previous instance---notably ``assignment``.  The wrapper
+  keeps the assignment it was fetched from in ``_assignment`` (with its
+  ``course``), so serve that as the canonical fallback.
+  """
+  if name == "assignment":
+    assignment = object.__getattribute__(self, "_assignment")
+    if assignment is not None:
+      return assignment
+  submission = object.__getattribute__(self, '_submission')
+  return getattr(submission, name)
+@
 
-  def __str__(self):
-    """Delegate str to wrapped submission."""
-    submission = object.__getattribute__(self, '_submission')
-    return str(submission)
+\paragraph{String representations}
 
-  <<pickle support for LazySubmission>>
+Both string hooks delegate to the wrapped submission so that a wrapper is
+indistinguishable from the object it proxies in logs and error messages.
+
+<<LazySubmission methods>>=
+def __repr__(self):
+  """Delegate repr to wrapped submission."""
+  submission = object.__getattribute__(self, '_submission')
+  return repr(submission)
+
+def __str__(self):
+  """Delegate str to wrapped submission."""
+  submission = object.__getattribute__(self, '_submission')
+  return str(submission)
 @
 
 \subsubsection{Pickle support for cache persistence}
