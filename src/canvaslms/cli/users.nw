@@ -258,10 +258,11 @@ def make_user_rows_w_groups(canvas, args, roles):
   includes a group column"""
 
   groups = process_group_options(canvas, args)
+  users_by_course = {}
 
   for group in groups:
     <<resolve [[group]] members in the owning [[course]]>>
-    users = filter_users([course], args.regex, roles)
+    <<look up role-filtered [[users]] of [[course]]>>
 
     for user in users:
       if user.id not in member_ids:
@@ -362,6 +363,20 @@ def test_group_member_ids_falls_back_without_embedding():
     assert users_module.group_member_ids(group) == {100}
 @
 
+Many groups typically belong to the same course---lab groups, for
+instance, partition the whole roster.
+The role-filtered roster is the same for all of them, so filtering it anew
+for every group would re-walk the entire cached user list (and re-log the
+cache traversal) once per group.
+We therefore filter each course's roster once and share the result across
+its groups.
+<<look up role-filtered [[users]] of [[course]]>>=
+if course.id not in users_by_course:
+  users_by_course[course.id] = list(
+    filter_users([course], args.regex, roles))
+users = users_by_course[course.id]
+@
+
 Now let's verify the grouped path still recognizes students even when the
 group membership objects only contain identifiers.
 This is the regression that previously made [[users -s -G]] return no users:
@@ -427,6 +442,66 @@ def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
     ]]
     group.get_users.assert_called_once_with()
     course.get_users.assert_called_once_with(include=["enrollments"])
+@
+
+Let's also verify that several groups in the same course share one
+filtered roster: the course users must be fetched and filtered once, not
+once per group.
+
+<<test functions>>=
+def test_make_user_rows_w_groups_filters_course_roster_once(monkeypatch):
+    """Groups in the same course should share one role-filtered roster"""
+    course = Mock()
+    course.id = 1
+    course.course_code = "prgi25"
+
+    student1 = Mock()
+    student1.id = 100
+    student1.name = "Alice Student"
+    student1.login_id = "alice@example.com"
+    student1.enrollments = [{"type": "StudentEnrollment"}]
+
+    student2 = Mock()
+    student2.id = 200
+    student2.name = "Bob Student"
+    student2.login_id = "bob@example.com"
+    student2.enrollments = [{"type": "StudentEnrollment"}]
+
+    course.get_users = Mock(return_value=[student1, student2])
+
+    def make_group(name, member_id):
+        group = Mock(spec=['name', 'course', 'get_users',
+                           'users', 'members_count'])
+        group.name = name
+        group.course = course
+        group.users = [{"id": member_id}]
+        group.members_count = 1
+        return group
+
+    groups = [make_group("Labb 1", 100), make_group("Labb 2", 200)]
+
+    args = Mock()
+    args.regex = ".*"
+    args.canvas_id = False
+    args.ladok = False
+    args.split_name = False
+    args.email = False
+
+    monkeypatch.setattr(
+        users_module,
+        "process_group_options",
+        lambda canvas, args: groups,
+    )
+
+    rows = list(users_module.make_user_rows_w_groups(
+        Mock(), args, ["student"]
+    ))
+
+    assert course.get_users.call_count == 1
+    assert [row[1] for row in rows] == ["Labb 1", "Labb 2"]
+    assert [row[2] for row in rows] == [
+        "alice@example.com", "bob@example.com",
+    ]
 @
 
 
