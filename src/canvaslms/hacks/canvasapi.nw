@@ -817,8 +817,23 @@ For these, we use [[include_singular=False]].
 
 We need to update two methods in sync, the [[get_x]] and [[get_xs]] methods.
 This is why we can't just use the decorators from [[cachetools]] or similar.
+
+The two wrappers are not independent: the plural method's cached path
+refreshes individual stale objects by calling the wrapped singular method,
+which it reaches through the closure variable [[get_attr]].
+When [[include_singular=False]], that variable is never bound, so the first
+stale object would crash the plural method with a [[NameError]]---a latent
+bug, since none of the plural-only entities (groups, group categories,
+assignment groups) produce objects that [[outdated()]] marks stale on their
+own.
+We initialize [[get_attr]] to [[None]] so the plural method can detect the
+configuration and skip individual refreshes; such entities instead rely
+entirely on the periodic bulk TTL machinery in [[outdated()]] for
+freshness.
 <<create decorator functions and update [[cls]]>>=
 <<update constructor with new attributes>>
+
+get_attr = None
 
 if self.__include_singular:
   <<update the singular method>>
@@ -1791,9 +1806,17 @@ Without this update, the stale object remains in the cache, causing the same
 object to be re-fetched on every subsequent call---a significant performance bug
 for objects like pages that are marked stale when they lack complete data
 (e.g., missing [[body]] attribute from bulk fetches).
+
+For plural-only entities ([[include_singular=False]]), [[get_attr]] is
+[[None]] and there is no singular method to refresh a single object with,
+so we yield the cached object as is.
+The order of the conjunction matters: [[outdated()]] must run even when we
+cannot refresh, because it has the side effect of resetting expired
+[[_all_fetched]] timestamps on the object's own child caches, which is what
+drives the periodic bulk refreshes.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
-  if outdated(obj):
+  if outdated(obj) and get_attr is not None:
     obj_key = getattr(obj, cache_key)
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
@@ -1808,6 +1831,43 @@ for obj, obj_kwargs in attr_cache.values():
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
   yield obj
+@
+
+Let's verify that a plural-only entity survives a stale cached object:
+before the [[get_attr]] guard, this raised [[NameError]] inside the
+generator instead of yielding the object.
+
+<<test functions>>=
+class TestPluralOnlyStaleObjects:
+    """Test cached path for entities without a singular get method"""
+
+    def test_stale_object_without_singular_is_yielded(self):
+        """A stale object should be yielded as is, not crash with NameError"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_items(self, **kwargs):
+                obj = MagicMock()
+                obj.id = 1
+                obj.grade = "F"  # non-passing grade, can become stale
+                return [obj]
+
+        CacheGetMethods("item", include_singular=False)(TestClass)
+        instance = TestClass()
+
+        # First call - bulk fetch
+        list(instance.get_items())
+
+        # Make the cached object stale (TTL expired)
+        obj, kwargs = instance.item_cache[1]
+        obj._fetched_at = datetime.now() - timedelta(minutes=6)
+        instance.item_cache[1] = (obj, kwargs)
+
+        # Second call must yield the stale object without refreshing
+        result = list(instance.get_items())
+
+        assert len(result) == 1
+        assert result[0] is obj
 @
 
 \subsubsection{Testing cache timing and logging}
@@ -3497,6 +3557,27 @@ Note that groups can be fetched from both [[Course]] and [[GroupCategory]]
 objects, so we cache on both.
 For [[group_category]], the plural is irregular (``categories'' not
 ``categorys''), so we specify [[plural_name="group_categories"]].
+
+Group \emph{membership} needs caching too.
+Commands that operate on groups---listing users by group, grading by
+group---resolve the members of every matching group through
+[[Group.get_users()]].
+Left uncached, that costs one API call per group on every invocation; for a
+course whose lab groups partition all students, this amounts to refetching
+the whole roster over the network on every run, and nothing ever persists
+between runs.
+We therefore wrap [[Group]] with a user cache as well.
+Memberships then live in [[group.user_cache]], persist inside the pickled
+[[Canvas]] object (groups are reachable from the course's group cache), and
+expire through the same [[user_all_fetched]] TTL
+([[USER_CACHE_TTL_DAYS]] days) that [[outdated()]] applies to any object
+carrying that attribute: every traversal of the cached groups listing calls
+[[outdated(group)]], which resets an expired [[user_all_fetched]] and
+thereby triggers a membership refetch on the next [[get_users()]] call.
+Like the other group-related methods, [[Group]] has no singular
+[[get_user()]], so we use [[include_singular=False]]; cached members are
+never refreshed one by one, which is safe because plain [[User]] objects
+never turn stale on their own.
 <<functions>>=
 def make_course_groups_cacheable():
   import canvasapi.course
@@ -3508,6 +3589,40 @@ def make_course_groups_cacheable():
     include_singular=False)(canvasapi.course.Course)
   canvasapi.group.GroupCategory = CacheGetMethods("group",
     include_singular=False)(canvasapi.group.GroupCategory)
+  canvasapi.group.Group = CacheGetMethods("user",
+    include_singular=False)(canvasapi.group.Group)
+@
+
+Let's verify that group membership is fetched once and then served from the
+cache: a second [[get_users()]] call must not invoke the underlying API
+method again.
+
+<<test functions>>=
+class TestGroupUserCaching:
+    """Test that group membership is cached across get_users() calls"""
+
+    def test_second_get_users_call_uses_cache(self):
+        """Second get_users() call should not hit the API again"""
+        call_count = {"count": 0}
+
+        class TestGroup:
+            def __init__(self):
+                pass
+            def get_users(self, **kwargs):
+                call_count["count"] += 1
+                user = MagicMock()
+                user.id = 100
+                return [user]
+
+        CacheGetMethods("user", include_singular=False)(TestGroup)
+        group = TestGroup()
+
+        first = list(group.get_users())
+        second = list(group.get_users())
+
+        assert call_count["count"] == 1
+        assert len(first) == len(second) == 1
+        assert first[0] is second[0]
 @
 
 
