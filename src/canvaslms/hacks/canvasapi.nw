@@ -4664,89 +4664,19 @@ For this, we first need a cache attribute.
 self.__cache = {}
 @
 
-\subsubsection{Defending against legacy cache shapes}
-
-Before the [[LazySubmission]] integration, [[cache_submissions]] stored each
-entry as a [[(submission, includes)]] tuple.
-Cache files written by those older builds survive on disk because
-[[load_canvas_cache]] in [[cache.nw]] performs no schema check---a tuple
-unpickles cleanly and only fails later, when the new reader dereferences
-[[lazy_submission._includes]].
-A proper schema version on the encrypted cache would catch this at load time
-but would force a full re-fetch on every shape change; that trade-off is
-tracked separately as issue~\#317.
-
-For now we keep the encrypted cache untouched and clean up lazily.
-Any entry whose runtime shape is not a [[LazySubmission]] is treated as
-unusable and discarded the first time we touch the cache.
-The very next [[get_submission]] / [[get_submissions]] call repopulates the
-slot with a fresh wrapper, so the rest of the cache (courses, users,
-assignment groups, \ldots) keeps serving traffic without a forced reset.
-
-We collect the offending [[uid]]s in a list before mutating the dict, because
-deleting during iteration over [[cache.values()]] would raise
-[[RuntimeError]].
-
-<<functions>>=
-def purge_legacy_submission_entries(cache):
-  """Discard cached submissions that predate LazySubmission.
-
-  Cache files written by older canvaslms versions stored each entry as
-  a ``(submission, includes)`` tuple.  The current reader expects a
-  ``LazySubmission`` wrapper and would raise ``AttributeError`` on the
-  first attribute access.  Called at the top of every cache-reading
-  path so legacy slots are evicted lazily and refetched on demand.
-  """
-  for uid in [u for u, entry in cache.items()
-              if not isinstance(entry, LazySubmission)]:
-    logger.info(
-      f"Cache miss (legacy entry shape, discarding): "
-      f"submission user_id={uid}"
-    )
-    del cache[uid]
-@
-
-Let's verify the helper drops legacy entries and leaves modern ones alone.
-
-<<test functions>>=
-class TestPurgeLegacySubmissionEntries:
-    """Test the legacy submission cache entry purger."""
-
-    def test_drops_tuple_entries(self):
-        """Pre-LazySubmission tuples should be evicted."""
-        cache = {1: ("submission", {"history"})}
-        purge_legacy_submission_entries(cache)
-        assert cache == {}
-
-    def test_keeps_lazy_submission_entries(self):
-        """Current-shape entries should survive."""
-        lazy = MagicMock(spec=LazySubmission)
-        cache = {1: lazy}
-        purge_legacy_submission_entries(cache)
-        assert cache == {1: lazy}
-
-    def test_mixed_cache_keeps_only_lazy(self):
-        """A mixed cache should retain only LazySubmission entries."""
-        lazy = MagicMock(spec=LazySubmission)
-        cache = {1: ("old", set()), 2: lazy, 3: None}
-        purge_legacy_submission_entries(cache)
-        assert cache == {2: lazy}
-
-    def test_empty_cache_is_noop(self):
-        """Purging an empty cache should not raise."""
-        cache = {}
-        purge_legacy_submission_entries(cache)
-        assert cache == {}
-@
+A cache file written by an older canvaslms may contain submissions in an
+older shape (before [[LazySubmission]], each entry was a
+[[(submission, includes)]] tuple).
+We don't migrate or purge such entries here: the loader in [[cache.nw]]
+stamps every cache file with [[CACHE_SCHEMA_VERSION]] and discards the
+whole cache on mismatch, so this code only ever sees entries written by
+the same schema version.
 
 Now we can treat how we get an individual submission.
 The lazy path only fetches when a submission is missing from the cache or when a
 caller requests additional [[include]] data.
 We keep the cache-hit diagnostics from [[master]], but we leave the staleness
 policy itself to [[LazySubmission._needs_refresh()]].
-The first thing we do on the cache is call [[purge_legacy_submission_entries]]
-so a stale-shape slot turns into a normal cache miss instead of an
-[[AttributeError]] later in this function.
 <<return submission of user>>=
 # canvasapi allows either User object or user ID.
 if isinstance(user, User):
@@ -4760,8 +4690,6 @@ if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
-
-purge_legacy_submission_entries(self.__cache)
 
 if uid in self.__cache:
   lazy_submission = self.__cache[uid]
@@ -4848,10 +4776,6 @@ def should_bulk_refresh_submissions(cache, student_ids=None):
 @
 
 Then the collection getter can choose whether to run that pre-check.
-We purge legacy-shape entries here as well, for the same reason as in
-[[<<return submission of user>>]]: the subsequent loops over
-[[self.__cache.values()]] read [[lazy_submission._includes]] and would crash
-on a tuple from a pre-[[LazySubmission]] cache.
 <<return a list of all submissions>>=
 if "include" in kwargs:
   to_include = set(kwargs["include"])
@@ -4860,7 +4784,6 @@ else:
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
-purge_legacy_submission_entries(self.__cache)
 need_refetch = self.__all_fetched is None
 
 if not need_refetch:
