@@ -72,6 +72,7 @@ from canvaslms.hacks.canvasapi import (
 logger = logging.getLogger(__name__)
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
+<<constants>>
 <<classes and exceptions>>
 <<functions>>
 @
@@ -332,11 +333,38 @@ def get_cache_path(hostname):
 @
 
 
+\subsection{Versioning the cache format}
+
+A pickled cache outlives the code that wrote it.
+The decorators in [[hacks/canvasapi.nw]] inject cache attributes in wrapped
+constructors, but unpickling never runs [[__init__]]: an object pickled
+before its class gained a wrap lacks that wrap's attributes, and the first
+wrapped call crashes with [[AttributeError]].
+The same applies when the shape of cache entries changes (as when plain
+submission tuples became [[LazySubmission]] wrappers).
+We used to patch over such mismatches with lazy migration shims, but every
+layout change risks a new variant and the shims accumulate.
+
+Instead, we stamp every cache file with a schema version and discard the
+whole cache on mismatch.
+The cost is one full refetch after an upgrade that changes the cached
+layout; the benefit is that no run ever sees objects shaped by older code.
+
+\textbf{Maintainers: bump [[CACHE_SCHEMA_VERSION]] whenever the layout of
+cached objects changes.}
+That includes adding or removing a [[CacheGetMethods]] wrap, renaming cache
+attributes, and changing the shape of cache entries.
+A mismatch costs one refetch; a forgotten bump costs crashes on users'
+existing caches---when in doubt, bump.
+<<constants>>=
+CACHE_SCHEMA_VERSION = 1
+@
+
 \subsection{Saving the Canvas object}
 
 To save the Canvas object, we:
 \begin{enumerate}
-\item Pickle the object to bytes.
+\item Wrap the object in a version envelope and pickle it to bytes.
 \item Encrypt the bytes using Fernet (authenticated encryption).
 \item Write the encrypted bytes to the cache file.
 \end{enumerate}
@@ -354,7 +382,10 @@ def save_canvas_cache(canvas, token, hostname):
 
     # Pickle and encrypt
     pickle_start = time.perf_counter()
-    pickled = pickle.dumps(canvas)
+    pickled = pickle.dumps({
+      "version": CACHE_SCHEMA_VERSION,
+      "canvas": canvas,
+    })
     pickle_elapsed = time.perf_counter() - pickle_start
     pickle_size = len(pickled)
 
@@ -392,17 +423,17 @@ To load the Canvas object, we:
 \begin{enumerate}
 \item Read the encrypted bytes from the cache file.
 \item Decrypt using the key derived from the token.
-\item Unpickle to reconstruct the Canvas object.
+\item Unpickle and check the version envelope.
 \end{enumerate}
 
-If any step fails (file not found, decryption fails, unpickling fails), we
-return [[None]] to indicate that a new Canvas object should be created.
+If any step fails (file not found, decryption fails, unpickling fails, or
+the schema version doesn't match), we return [[None]] to indicate that a
+new Canvas object should be created.
 
 The decryption can fail for several reasons:
 \begin{itemize}
 \item The cache file is corrupted.
 \item The token has changed (different key).
-\item The cache was created with a different version of the code.
 \end{itemize}
 In all these cases, the correct behavior is to create a fresh Canvas object.
 <<functions>>=
@@ -428,18 +459,78 @@ def load_canvas_cache(token, hostname):
     decrypt_elapsed = time.perf_counter() - decrypt_start
 
     unpickle_start = time.perf_counter()
-    canvas = pickle.loads(pickled)
+    payload = pickle.loads(pickled)
     unpickle_elapsed = time.perf_counter() - unpickle_start
+
+    <<discard [[payload]] on schema mismatch>>
 
     load_elapsed = time.perf_counter() - load_start
     logger.info(f"Canvas cache load: {load_elapsed:.2f}s total "
                  f"(read: {read_elapsed:.2f}s/{encrypted_size/1024:.1f}KB, "
                  f"decrypt: {decrypt_elapsed:.2f}s, unpickle: {unpickle_elapsed:.2f}s)")
 
-    return canvas
+    return payload["canvas"]
   except (FileNotFoundError, InvalidToken, pickle.UnpicklingError, Exception):
     # Cache doesn't exist or is invalid, return None
     return None
+@
+
+A cache written by an older canvaslms is a bare pickled [[Canvas]] object,
+not a dict, so the [[isinstance]] check rejects it just like a wrong
+version number.
+We log the discard at INFO level: the next run will be slow (full
+refetch), and the user deserves to know why.
+<<discard [[payload]] on schema mismatch>>=
+if (not isinstance(payload, dict)
+    or payload.get("version") != CACHE_SCHEMA_VERSION):
+  found = payload.get("version") if isinstance(payload, dict) else None
+  logger.info(f"Canvas cache schema changed (found: {found}, "
+              f"expected: {CACHE_SCHEMA_VERSION}); "
+              f"discarding cache and starting fresh")
+  return None
+@
+
+Let's verify the envelope: a round trip must return the cached object,
+while a bare (pre-envelope) payload and a wrong version number must both be
+discarded.
+
+<<test functions>>=
+@pytest.fixture
+def tmp_cache_path(monkeypatch, tmp_path):
+  """Redirect the cache file to a temporary path."""
+  path = tmp_path / "canvas_cache_test.enc"
+  monkeypatch.setattr(cache, "get_cache_path", lambda hostname: str(path))
+  return path
+
+def test_cache_round_trip(tmp_cache_path):
+  """Saving and loading should return the cached object."""
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  assert cache.load_canvas_cache("token", "https://host") == \
+      {"fake": "canvas"}
+
+def test_cache_discards_unversioned_payload(tmp_cache_path):
+  """A bare pickled object (pre-envelope cache) should be discarded."""
+  import pickle
+  from cryptography.fernet import Fernet
+
+  key = cache.derive_key("token", "https://host")
+  tmp_cache_path.write_bytes(
+      Fernet(key).encrypt(pickle.dumps(["bare canvas object"])))
+
+  assert cache.load_canvas_cache("token", "https://host") is None
+
+def test_cache_discards_wrong_version(tmp_cache_path):
+  """An envelope with a different schema version should be discarded."""
+  import pickle
+  from cryptography.fernet import Fernet
+
+  key = cache.derive_key("token", "https://host")
+  envelope = {"version": cache.CACHE_SCHEMA_VERSION - 1, "canvas": {}}
+  tmp_cache_path.write_bytes(
+      Fernet(key).encrypt(pickle.dumps(envelope)))
+
+  assert cache.load_canvas_cache("token", "https://host") is None
 @
 
 
