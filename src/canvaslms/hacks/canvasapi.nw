@@ -817,8 +817,23 @@ For these, we use [[include_singular=False]].
 
 We need to update two methods in sync, the [[get_x]] and [[get_xs]] methods.
 This is why we can't just use the decorators from [[cachetools]] or similar.
+
+The two wrappers are not independent: the plural method's cached path
+refreshes individual stale objects by calling the wrapped singular method,
+which it reaches through the closure variable [[get_attr]].
+When [[include_singular=False]], that variable is never bound, so the first
+stale object would crash the plural method with a [[NameError]]---a latent
+bug, since none of the plural-only entities (groups, group categories,
+assignment groups) produce objects that [[outdated()]] marks stale on their
+own.
+We initialize [[get_attr]] to [[None]] so the plural method can detect the
+configuration and skip individual refreshes; such entities instead rely
+entirely on the periodic bulk TTL machinery in [[outdated()]] for
+freshness.
 <<create decorator functions and update [[cls]]>>=
 <<update constructor with new attributes>>
+
+get_attr = None
 
 if self.__include_singular:
   <<update the singular method>>
@@ -1684,9 +1699,11 @@ if not attr_all_fetched:
 else:
   cache_age = datetime.now() - attr_all_fetched
   stale_count = sum(1 for obj, _ in attr_cache.values() if outdated(obj))
-  logger.info(f"Using cached {display_plural}: {len(attr_cache)} cached "
-              f"(age: {cache_age.total_seconds()/60:.1f} minutes, "
-              f"{stale_count} stale), updating stale entries individually")
+  cache_msg = (f"Using cached {display_plural}: {len(attr_cache)} cached "
+               f"(age: {cache_age.total_seconds()/60:.1f} minutes)")
+  if stale_count and get_attr is not None:
+    cache_msg += f", updating {stale_count} stale entries individually"
+  logger.info(cache_msg)
   <<yield all objects in [[attr_cache]], update individual entries if needed>>
 @
 
@@ -1703,8 +1720,13 @@ We log three critical decision points:
   whether this is the first fetch (cold cache) or a cache invalidation (TTL expired
   or kwargs changed). This explains why a bulk refresh is happening.
 \item \textbf{Cached path usage}: When [[attr_all_fetched]] is set, we log the
-  cache age, total size, and how many entries are stale (requiring individual refresh).
-  This provides visibility into cache health and effectiveness.
+  cache age and total size.
+  Only when entries are actually stale \emph{and} a singular method exists
+  to refresh them (the [[get_attr]] guard below) do we add that they will
+  be updated individually---an earlier version appended this
+  unconditionally, which made every cache hit read like a refetch and
+  misled users into thinking the cache was broken.
+  The message must only promise what the refresh loop will actually do.
 \item \textbf{Kwargs invalidation}: When [[must_update()]] detects that cached
   objects don't have the requested kwargs (e.g., new [[include]] fields), we log
   what changed before invalidating the cache. This explains why a bulk refresh
@@ -1791,9 +1813,17 @@ Without this update, the stale object remains in the cache, causing the same
 object to be re-fetched on every subsequent call---a significant performance bug
 for objects like pages that are marked stale when they lack complete data
 (e.g., missing [[body]] attribute from bulk fetches).
+
+For plural-only entities ([[include_singular=False]]), [[get_attr]] is
+[[None]] and there is no singular method to refresh a single object with,
+so we yield the cached object as is.
+The order of the conjunction matters: [[outdated()]] must run even when we
+cannot refresh, because it has the side effect of resetting expired
+[[_all_fetched]] timestamps on the object's own child caches, which is what
+drives the periodic bulk refreshes.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in attr_cache.values():
-  if outdated(obj):
+  if outdated(obj) and get_attr is not None:
     obj_key = getattr(obj, cache_key)
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
@@ -1808,6 +1838,43 @@ for obj, obj_kwargs in attr_cache.values():
 <<yield all objects in [[attr_cache]]>>=
 for obj, _ in attr_cache.values():
   yield obj
+@
+
+Let's verify that a plural-only entity survives a stale cached object:
+before the [[get_attr]] guard, this raised [[NameError]] inside the
+generator instead of yielding the object.
+
+<<test functions>>=
+class TestPluralOnlyStaleObjects:
+    """Test cached path for entities without a singular get method"""
+
+    def test_stale_object_without_singular_is_yielded(self):
+        """A stale object should be yielded as is, not crash with NameError"""
+        class TestClass:
+            def __init__(self):
+                pass
+            def get_items(self, **kwargs):
+                obj = MagicMock()
+                obj.id = 1
+                obj.grade = "F"  # non-passing grade, can become stale
+                return [obj]
+
+        CacheGetMethods("item", include_singular=False)(TestClass)
+        instance = TestClass()
+
+        # First call - bulk fetch
+        list(instance.get_items())
+
+        # Make the cached object stale (TTL expired)
+        obj, kwargs = instance.item_cache[1]
+        obj._fetched_at = datetime.now() - timedelta(minutes=6)
+        instance.item_cache[1] = (obj, kwargs)
+
+        # Second call must yield the stale object without refreshing
+        result = list(instance.get_items())
+
+        assert len(result) == 1
+        assert result[0] is obj
 @
 
 \subsubsection{Testing cache timing and logging}
@@ -3497,6 +3564,31 @@ Note that groups can be fetched from both [[Course]] and [[GroupCategory]]
 objects, so we cache on both.
 For [[group_category]], the plural is irregular (``categories'' not
 ``categorys''), so we specify [[plural_name="group_categories"]].
+
+Group \emph{membership} needs caching too.
+Commands that operate on groups---listing users by group, grading by
+group---resolve the members of every matching group through
+[[Group.get_users()]].
+Left uncached, that costs one API call per group on every invocation; for a
+course whose lab groups partition all students, this amounts to refetching
+the whole roster over the network on every run, and nothing ever persists
+between runs.
+We therefore wrap [[Group]] with a user cache as well.
+Memberships then live in [[group.user_cache]], persist inside the pickled
+[[Canvas]] object (groups are reachable from the course's group cache), and
+expire through the same [[user_all_fetched]] TTL
+([[USER_CACHE_TTL_DAYS]] days) that [[outdated()]] applies to any object
+carrying that attribute: every traversal of the cached groups listing calls
+[[outdated(group)]], which resets an expired [[user_all_fetched]] and
+thereby triggers a membership refetch on the next [[get_users()]] call.
+Note that this cache and its TTL govern the [[get_users()]] callers; the
+grouped user listing in [[users.nw]] \emph{prefers} the membership embedded
+in the groups listing itself, which instead refreshes on the groups cadence
+([[GROUP_CACHE_TTL_DAYS]] days).
+Like the other group-related methods, [[Group]] has no singular
+[[get_user()]], so we use [[include_singular=False]]; cached members are
+never refreshed one by one, which is safe because plain [[User]] objects
+never turn stale on their own.
 <<functions>>=
 def make_course_groups_cacheable():
   import canvasapi.course
@@ -3508,6 +3600,40 @@ def make_course_groups_cacheable():
     include_singular=False)(canvasapi.course.Course)
   canvasapi.group.GroupCategory = CacheGetMethods("group",
     include_singular=False)(canvasapi.group.GroupCategory)
+  canvasapi.group.Group = CacheGetMethods("user",
+    include_singular=False)(canvasapi.group.Group)
+@
+
+Let's verify that group membership is fetched once and then served from the
+cache: a second [[get_users()]] call must not invoke the underlying API
+method again.
+
+<<test functions>>=
+class TestGroupUserCaching:
+    """Test that group membership is cached across get_users() calls"""
+
+    def test_second_get_users_call_uses_cache(self):
+        """Second get_users() call should not hit the API again"""
+        call_count = {"count": 0}
+
+        class TestGroup:
+            def __init__(self):
+                pass
+            def get_users(self, **kwargs):
+                call_count["count"] += 1
+                user = MagicMock()
+                user.id = 100
+                return [user]
+
+        CacheGetMethods("user", include_singular=False)(TestGroup)
+        group = TestGroup()
+
+        first = list(group.get_users())
+        second = list(group.get_users())
+
+        assert call_count["count"] == 1
+        assert len(first) == len(second) == 1
+        assert first[0] is second[0]
 @
 
 
@@ -4544,89 +4670,19 @@ For this, we first need a cache attribute.
 self.__cache = {}
 @
 
-\subsubsection{Defending against legacy cache shapes}
-
-Before the [[LazySubmission]] integration, [[cache_submissions]] stored each
-entry as a [[(submission, includes)]] tuple.
-Cache files written by those older builds survive on disk because
-[[load_canvas_cache]] in [[cache.nw]] performs no schema check---a tuple
-unpickles cleanly and only fails later, when the new reader dereferences
-[[lazy_submission._includes]].
-A proper schema version on the encrypted cache would catch this at load time
-but would force a full re-fetch on every shape change; that trade-off is
-tracked separately as issue~\#317.
-
-For now we keep the encrypted cache untouched and clean up lazily.
-Any entry whose runtime shape is not a [[LazySubmission]] is treated as
-unusable and discarded the first time we touch the cache.
-The very next [[get_submission]] / [[get_submissions]] call repopulates the
-slot with a fresh wrapper, so the rest of the cache (courses, users,
-assignment groups, \ldots) keeps serving traffic without a forced reset.
-
-We collect the offending [[uid]]s in a list before mutating the dict, because
-deleting during iteration over [[cache.values()]] would raise
-[[RuntimeError]].
-
-<<functions>>=
-def purge_legacy_submission_entries(cache):
-  """Discard cached submissions that predate LazySubmission.
-
-  Cache files written by older canvaslms versions stored each entry as
-  a ``(submission, includes)`` tuple.  The current reader expects a
-  ``LazySubmission`` wrapper and would raise ``AttributeError`` on the
-  first attribute access.  Called at the top of every cache-reading
-  path so legacy slots are evicted lazily and refetched on demand.
-  """
-  for uid in [u for u, entry in cache.items()
-              if not isinstance(entry, LazySubmission)]:
-    logger.info(
-      f"Cache miss (legacy entry shape, discarding): "
-      f"submission user_id={uid}"
-    )
-    del cache[uid]
-@
-
-Let's verify the helper drops legacy entries and leaves modern ones alone.
-
-<<test functions>>=
-class TestPurgeLegacySubmissionEntries:
-    """Test the legacy submission cache entry purger."""
-
-    def test_drops_tuple_entries(self):
-        """Pre-LazySubmission tuples should be evicted."""
-        cache = {1: ("submission", {"history"})}
-        purge_legacy_submission_entries(cache)
-        assert cache == {}
-
-    def test_keeps_lazy_submission_entries(self):
-        """Current-shape entries should survive."""
-        lazy = MagicMock(spec=LazySubmission)
-        cache = {1: lazy}
-        purge_legacy_submission_entries(cache)
-        assert cache == {1: lazy}
-
-    def test_mixed_cache_keeps_only_lazy(self):
-        """A mixed cache should retain only LazySubmission entries."""
-        lazy = MagicMock(spec=LazySubmission)
-        cache = {1: ("old", set()), 2: lazy, 3: None}
-        purge_legacy_submission_entries(cache)
-        assert cache == {2: lazy}
-
-    def test_empty_cache_is_noop(self):
-        """Purging an empty cache should not raise."""
-        cache = {}
-        purge_legacy_submission_entries(cache)
-        assert cache == {}
-@
+A cache file written by an older canvaslms may contain submissions in an
+older shape (before [[LazySubmission]], each entry was a
+[[(submission, includes)]] tuple).
+We don't migrate or purge such entries here: the loader in [[cache.nw]]
+stamps every cache file with [[CACHE_SCHEMA_VERSION]] and discards the
+whole cache on mismatch, so this code only ever sees entries written by
+the same schema version.
 
 Now we can treat how we get an individual submission.
 The lazy path only fetches when a submission is missing from the cache or when a
 caller requests additional [[include]] data.
 We keep the cache-hit diagnostics from [[master]], but we leave the staleness
 policy itself to [[LazySubmission._needs_refresh()]].
-The first thing we do on the cache is call [[purge_legacy_submission_entries]]
-so a stale-shape slot turns into a normal cache miss instead of an
-[[AttributeError]] later in this function.
 <<return submission of user>>=
 # canvasapi allows either User object or user ID.
 if isinstance(user, User):
@@ -4640,8 +4696,6 @@ if "include" in kwargs:
   to_include = set(kwargs["include"])
 else:
   to_include = set()
-
-purge_legacy_submission_entries(self.__cache)
 
 if uid in self.__cache:
   lazy_submission = self.__cache[uid]
@@ -4728,10 +4782,6 @@ def should_bulk_refresh_submissions(cache, student_ids=None):
 @
 
 Then the collection getter can choose whether to run that pre-check.
-We purge legacy-shape entries here as well, for the same reason as in
-[[<<return submission of user>>]]: the subsequent loops over
-[[self.__cache.values()]] read [[lazy_submission._includes]] and would crash
-on a tuple from a pre-[[LazySubmission]] cache.
 <<return a list of all submissions>>=
 if "include" in kwargs:
   to_include = set(kwargs["include"])
@@ -4740,7 +4790,6 @@ else:
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
-purge_legacy_submission_entries(self.__cache)
 need_refetch = self.__all_fetched is None
 
 if not need_refetch:

@@ -258,10 +258,11 @@ def make_user_rows_w_groups(canvas, args, roles):
   includes a group column"""
 
   groups = process_group_options(canvas, args)
+  users_by_course = {}
 
   for group in groups:
     <<resolve [[group]] members in the owning [[course]]>>
-    users = filter_users([course], args.regex, roles)
+    <<look up role-filtered [[users]] of [[course]]>>
 
     for user in users:
       if user.id not in member_ids:
@@ -289,7 +290,96 @@ try:
 except AttributeError:
   course = group.category.course
 
-member_ids = {user.id for user in group.get_users()}
+member_ids = group_member_ids(group)
+@
+
+There are two ways to learn who is in a group.
+We can call [[group.get_users()]], which costs one API request per
+group---resolving all lab groups in a course this way refetches more or
+less the whole roster, one group at a time, on every run.
+Or we can ask Canvas to embed the members when we list the groups
+([[include=["users"]]] in [[process_group_options]]), which piggybacks all
+memberships onto a single, already cached request.
+The two sources age differently: the embedded snapshot refreshes with the
+cached groups listing (every [[GROUP_CACHE_TTL_DAYS]] days, see
+[[hacks/canvasapi.nw]]), while the cached [[get_users()]] fallback refreshes
+every [[USER_CACHE_TTL_DAYS]] days; both cadences are acceptable for group
+membership.
+
+We prefer the embedded membership but keep [[get_users()]] as a fallback,
+because the embedded list is not always trustworthy: the listing endpoint
+for group categories ignores the [[include]] parameter, and Canvas may
+truncate embedded lists.
+We therefore only trust the embedded list when its length matches the
+group's [[members_count]].
+The embedded members are plain JSON dictionaries rather than [[User]]
+objects, but we only need their IDs here; the fully populated [[User]]
+objects come from the course roster.
+<<functions>>=
+def group_member_ids(group):
+  """Return the set of user IDs of the members of ``group``.
+
+  Uses the membership embedded by ``include=["users"]`` when it's
+  complete, otherwise fetches the members through the API.
+  """
+  if group.users is not None and len(group.users) == group.members_count:
+    return {user["id"] for user in group.users}
+  return {user.id for user in group.get_users()}
+@
+
+Let's verify both ways of resolving membership: a complete embedded list
+should be used as is, while a truncated one (fewer embedded users than
+[[members_count]]) must fall back to fetching.
+
+<<test functions>>=
+def test_group_member_ids_uses_embedded_users():
+    """Complete embedded membership should not trigger an API call"""
+    group = Mock(spec=['users', 'members_count', 'get_users'])
+    group.users = [{"id": 100}, {"id": 200}]
+    group.members_count = 2
+
+    assert users_module.group_member_ids(group) == {100, 200}
+    group.get_users.assert_not_called()
+
+def test_group_member_ids_falls_back_when_truncated():
+    """Incomplete embedded membership should fall back to get_users()"""
+    group = Mock(spec=['users', 'members_count', 'get_users'])
+    group.users = [{"id": 100}]
+    group.members_count = 2
+
+    member = Mock(spec=['id'])
+    member.id = 100
+    other = Mock(spec=['id'])
+    other.id = 200
+    group.get_users = Mock(return_value=[member, other])
+
+    assert users_module.group_member_ids(group) == {100, 200}
+
+def test_group_member_ids_falls_back_without_embedding():
+    """A normalized group without embedded users should fetch members"""
+    group = Mock(spec=['users', 'members_count', 'get_users'])
+    group.users = None
+    group.members_count = 1
+
+    member = Mock(spec=['id'])
+    member.id = 100
+    group.get_users = Mock(return_value=[member])
+
+    assert users_module.group_member_ids(group) == {100}
+@
+
+Many groups typically belong to the same course---lab groups, for
+instance, partition the whole roster.
+The role-filtered roster is the same for all of them, so filtering it anew
+for every group would re-walk the entire cached user list (and re-log the
+cache traversal) once per group.
+We therefore filter each course's roster once and share the result across
+its groups.
+<<look up role-filtered [[users]] of [[course]]>>=
+if course.id not in users_by_course:
+  users_by_course[course.id] = list(
+    filter_users([course], args.regex, roles))
+users = users_by_course[course.id]
 @
 
 Now let's verify the grouped path still recognizes students even when the
@@ -325,9 +415,11 @@ def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
     member_ta = Mock(spec=['id'])
     member_ta.id = 200
 
-    group = Mock(spec=['name', 'course', 'get_users'])
+    group = Mock(spec=['name', 'course', 'get_users',
+                       'users', 'members_count'])
     group.name = "mentorsgrupp 7-9"
     group.course = course
+    group.users = None  # normalized but not embedded
     group.get_users = Mock(return_value=[member_student, member_ta])
 
     args = Mock()
@@ -355,6 +447,66 @@ def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
     ]]
     group.get_users.assert_called_once_with()
     course.get_users.assert_called_once_with(include=["enrollments"])
+@
+
+Let's also verify that several groups in the same course share one
+filtered roster: the course users must be fetched and filtered once, not
+once per group.
+
+<<test functions>>=
+def test_make_user_rows_w_groups_filters_course_roster_once(monkeypatch):
+    """Groups in the same course should share one role-filtered roster"""
+    course = Mock()
+    course.id = 1
+    course.course_code = "prgi25"
+
+    student1 = Mock()
+    student1.id = 100
+    student1.name = "Alice Student"
+    student1.login_id = "alice@example.com"
+    student1.enrollments = [{"type": "StudentEnrollment"}]
+
+    student2 = Mock()
+    student2.id = 200
+    student2.name = "Bob Student"
+    student2.login_id = "bob@example.com"
+    student2.enrollments = [{"type": "StudentEnrollment"}]
+
+    course.get_users = Mock(return_value=[student1, student2])
+
+    def make_group(name, member_id):
+        group = Mock(spec=['name', 'course', 'get_users',
+                           'users', 'members_count'])
+        group.name = name
+        group.course = course
+        group.users = [{"id": member_id}]
+        group.members_count = 1
+        return group
+
+    groups = [make_group("Labb 1", 100), make_group("Labb 2", 200)]
+
+    args = Mock()
+    args.regex = ".*"
+    args.canvas_id = False
+    args.ladok = False
+    args.split_name = False
+    args.email = False
+
+    monkeypatch.setattr(
+        users_module,
+        "process_group_options",
+        lambda canvas, args: groups,
+    )
+
+    rows = list(users_module.make_user_rows_w_groups(
+        Mock(), args, ["student"]
+    ))
+
+    assert course.get_users.call_count == 1
+    assert [row[1] for row in rows] == ["Labb 1", "Labb 2"]
+    assert [row[2] for row in rows] == [
+        "alice@example.com", "bob@example.com",
+    ]
 @
 
 
@@ -444,21 +596,27 @@ def filter_group_categories(course_list, regex):
 
 We can produce a list of groups in two ways:
 list all groups in a course or lists all groups in a group category.
-Fortunately, both the group category and course objects of [[canvasapi]] have a 
-method [[.get_groups()]], so thanks to Python's duck typing we can write short 
+Fortunately, both the group category and course objects of [[canvasapi]] have a
+method [[.get_groups()]], so thanks to Python's duck typing we can write short
 code.
+We forward any keyword arguments to [[.get_groups()]] so that callers can
+request extra data---[[process_group_options]] uses this to embed group
+memberships ([[include=["users"]]]) in the listing instead of fetching them
+group by group.
 <<functions>>=
-def filter_groups(items, regex):
+def filter_groups(items, regex, **kwargs):
   """
   Items is a list of either courses or group categories,
   regex is a regular expression.
   Returns all groups whose name match regex.
+
+  Keyword arguments are passed on to ``.get_groups()``.
   """
 
   name = re.compile(regex or ".*")
 
   for item in items:
-    for group in item.get_groups():
+    for group in item.get_groups(**kwargs):
       group = canvaslms.cli.utils.ensure_group_attrs(group)
       if name.search(group.name or ''):
         if isinstance(item, canvasapi.course.Course):
@@ -1192,6 +1350,12 @@ def add_group_option(parser):
 @
 
 We must also provide a function that can process these options.
+We ask Canvas to embed each group's members in the listing
+([[include=["users"]]]): all consumers of these groups go on to resolve
+membership, and the embedded lists let them do so without one API call per
+group (see [[group_member_ids]]).
+The group category listing endpoint ignores this parameter, in which case
+membership resolution falls back to [[get_users()]].
 <<functions>>=
 def process_group_options(canvas, args):
   """Processes the group/group category options, returns a list of groups"""
@@ -1201,11 +1365,13 @@ def process_group_options(canvas, args):
   if args.category:
     group_list = list(filter_groups(
       filter_group_categories(course_list, args.category),
-      args.group))
+      args.group,
+      include=["users"]))
   else:
     group_list = list(filter_groups(
       course_list,
-      args.group))
+      args.group,
+      include=["users"]))
   
   if not group_list:
     raise canvaslms.cli.EmptyListError("No groups found matching the criteria")

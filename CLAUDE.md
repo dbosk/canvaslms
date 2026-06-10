@@ -804,6 +804,16 @@ def example_command(config, canvas, args):
 - Raise `canvaslms.cli.EmptyListError` when no results match filters
 - Main CLI catches this and exits with code 1 (suppressed if `-q/--quiet`)
 
+### Cache Schema Versioning
+
+The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
+`src/canvaslms/cli/cache.nw`). **Bump this constant whenever the layout of
+cached objects changes**: adding or removing a `CacheGetMethods` wrap,
+renaming cache attributes, or changing the shape of cache entries (e.g. the
+`LazySubmission` wrapper). A version mismatch discards the cache (one full
+refetch on the next run); a forgotten bump crashes on users' existing caches.
+When in doubt, bump. Do not write lazy migration shims for old cache layouts.
+
 ## Output Conventions
 
 - Default: tab-separated values (TSV) for Unix pipeline compatibility
