@@ -366,10 +366,17 @@ To save the Canvas object, we:
 \begin{enumerate}
 \item Wrap the object in a version envelope and pickle it to bytes.
 \item Encrypt the bytes using Fernet (authenticated encryption).
-\item Write the encrypted bytes to the cache file.
+\item Write the encrypted bytes atomically to the cache file.
 \end{enumerate}
 
 If the cache directory doesn't exist, we create it first.
+
+The cache is optional, so a failed save must not break the command.
+But it must not be invisible either: if saving fails persistently (one
+unpicklable object in the graph is enough), the cache silently stops
+updating and every future run pays full API cost---a failure mode that is
+undiagnosable without a log message.
+We therefore log a warning and continue.
 <<functions>>=
 def save_canvas_cache(canvas, token, hostname):
   """Saves the Canvas object to encrypted cache"""
@@ -397,18 +404,48 @@ def save_canvas_cache(canvas, token, hostname):
     cache_path = get_cache_path(hostname)
     <<create cache directory if needed>>
     write_start = time.perf_counter()
-    with open(cache_path, "wb") as f:
-      f.write(encrypted)
+    <<write [[encrypted]] atomically to [[cache_path]]>>
     write_elapsed = time.perf_counter() - write_start
 
     save_elapsed = time.perf_counter() - save_start
     logger.info(f"Canvas cache save: {save_elapsed:.2f}s total "
                  f"(pickle: {pickle_elapsed:.2f}s/{pickle_size/1024:.1f}KB, "
                  f"encrypt: {encrypt_elapsed:.2f}s, write: {write_elapsed:.2f}s)")
-  except Exception:
-    # If saving fails, silently continue
-    # (cache is optional, don't break the command)
+  except Exception as err:
+    logger.warning(f"Canvas cache save failed ({err}); "
+                   f"continuing without saving the cache")
+@
+
+Writing the file in place would mean that a crash or kill mid-write leaves
+a truncated file; Fernet's authentication then rejects it on the next load,
+silently costing the user the whole cache.
+Instead we write to a temporary file in the same directory and
+[[os.replace]] it over the cache path, which is atomic on POSIX: the cache
+file always holds either the old complete bytes or the new complete bytes.
+
+The temporary name includes the process ID so that two concurrent
+[[canvaslms]] invocations don't interleave writes into the same temporary
+file; with distinct names, the last completed [[os.replace]] wins and both
+files are complete.
+
+We create the temporary file with mode [[0o600]]: the content is encrypted,
+but there is no reason to let other users read it at all.
+[[os.replace]] preserves the mode, so the cache file inherits it.
+If anything fails after the temporary file was created, we remove it on a
+best-effort basis before re-raising to the warning handler above.
+<<write [[encrypted]] atomically to [[cache_path]]>>=
+tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+  with os.fdopen(fd, "wb") as f:
+    f.write(encrypted)
+  os.replace(tmp_path, cache_path)
+except BaseException:
+  try:
+    os.remove(tmp_path)
+  except OSError:
     pass
+  raise
 @
 
 If the cache directory doesn't exist, we must create it.
@@ -436,6 +473,13 @@ The decryption can fail for several reasons:
 \item The token has changed (different key).
 \end{itemize}
 In all these cases, the correct behavior is to create a fresh Canvas object.
+
+We distinguish the failure modes when logging.
+A missing file is the normal first-run case and stays quiet.
+A decryption failure usually means the token changed and is expected
+behavior, so we log it at INFO.
+Anything else is unexpected; we log it at WARNING, because an undiagnosed
+load failure silently degrades every run to full API cost.
 <<functions>>=
 def load_canvas_cache(token, hostname):
   """Loads the Canvas object from encrypted cache, returns None if unavailable"""
@@ -470,8 +514,14 @@ def load_canvas_cache(token, hostname):
                  f"decrypt: {decrypt_elapsed:.2f}s, unpickle: {unpickle_elapsed:.2f}s)")
 
     return payload["canvas"]
-  except (FileNotFoundError, InvalidToken, pickle.UnpicklingError, Exception):
-    # Cache doesn't exist or is invalid, return None
+  except FileNotFoundError:
+    return None
+  except InvalidToken:
+    logger.info("Canvas cache exists but cannot be decrypted "
+                "(token changed?); starting fresh")
+    return None
+  except Exception as err:
+    logger.warning(f"Canvas cache load failed ({err}); starting fresh")
     return None
 @
 
@@ -531,6 +581,38 @@ def test_cache_discards_wrong_version(tmp_cache_path):
       Fernet(key).encrypt(pickle.dumps(envelope)))
 
   assert cache.load_canvas_cache("token", "https://host") is None
+@
+
+Let's also verify the failure and atomicity behavior of saving: a failing
+save must leave an existing cache file untouched and emit a warning, a
+missing cache file must load quietly as [[None]], and the saved file must
+not be readable by other users.
+
+<<test functions>>=
+def test_failed_save_keeps_old_cache_and_warns(
+    tmp_cache_path, monkeypatch, caplog):
+  """A failing save should leave the old cache intact and log a warning."""
+  cache.save_canvas_cache({"old": "cache"}, "token", "https://host")
+  old_bytes = tmp_cache_path.read_bytes()
+
+  def broken_dumps(obj):
+    raise RuntimeError("unpicklable object in graph")
+  monkeypatch.setattr(cache.pickle, "dumps", broken_dumps)
+
+  cache.save_canvas_cache({"new": "cache"}, "token", "https://host")
+
+  assert tmp_cache_path.read_bytes() == old_bytes
+  assert "cache save failed" in caplog.text
+
+def test_load_missing_cache_returns_none(tmp_cache_path):
+  """Loading without a cache file should quietly return None."""
+  assert cache.load_canvas_cache("token", "https://host") is None
+
+def test_saved_cache_is_user_only(tmp_cache_path):
+  """The cache file should be created with mode 0600."""
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  assert tmp_cache_path.stat().st_mode & 0o777 == 0o600
 @
 
 
