@@ -38,7 +38,10 @@ file, or if a student resubmits an unchanged file, we store it only once.
 
 The storage structure is:
 \begin{description}
-\item[Content files] [[<cache_dir>/attachments/<sha256>.dat]]
+\item[Content files] [[<cache_dir>/attachments/<sha256>.dat]], stored
+  Fernet-encrypted (see below); the hash is computed over the
+  \emph{plaintext}, so deduplication is unaffected by the randomized
+  encryption.
 \item[Metadata index] [[<cache_dir>/attachments/index.json]] mapping attachment
   IDs to hashes
 \end{description}
@@ -55,6 +58,38 @@ The index maps Canvas attachment IDs to cached file metadata:
   }
 }
 \end{minted}
+
+\subsection{Encrypting cached content}
+
+Cached attachments are student submissions---at least as sensitive as the
+course and student metadata that motivates encrypting the Canvas object
+cache in [[cache.nw]].
+We therefore apply the same protection: content files are encrypted with
+the same token-derived Fernet key as the Canvas object cache.
+The key is registered at program start by [[load_configured_canvas]] in
+[[cache.nw]] (the shared bootstrap for the command line and the package
+API), so this module never sees the token itself.
+If no key has been registered---library use without the bootstrap, or
+tests without the fixture---cache operations degrade to misses and no-ops
+rather than crash: the cache is an optimization, never a requirement.
+
+Consumers no longer get a path into the cache directory; they get the
+plaintext \emph{restored} (decrypted) into a destination of their choice,
+typically a temporary directory that is processed and discarded.
+Plaintext therefore exists only transiently during use.
+
+The index stays plaintext JSON: cleanup must read it without a key, and a
+human-readable index is invaluable when debugging cache problems.
+It holds metadata (filenames, sizes), not student work, and it is
+protected by file permissions instead: the cache directory is [[0o700]]
+and the index and content files [[0o600]].
+
+A [[.dat]] file written by an older, unencrypted canvaslms fails
+decryption.
+Consistent with the no-migration policy for the Canvas object cache, we
+don't convert such files: we discard the entry and the file, report a
+cache miss, and let the consumer re-download---the re-cached copy is then
+encrypted.
 
 \subsection{When attachments become stale}
 
@@ -88,6 +123,7 @@ import pytest
 import pathlib
 import json
 import time
+from cryptography.fernet import Fernet
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -98,14 +134,15 @@ import canvaslms.hacks.attachment_cache as attachment_cache
 @
 
 <<[[attachment_cache.py]]>>=
-"""Content-addressed cache for Canvas submission attachments"""
+"""Encrypted content-addressed cache for Canvas submission attachments"""
 
 import appdirs
+from cryptography.fernet import InvalidToken
 import hashlib
 import json
 import logging
+import os
 import pathlib
-import shutil
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -113,6 +150,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 <<cache directory initialization>>
+<<encryption key state>>
 <<cache operations>>
 @
 
@@ -121,13 +159,19 @@ logger = logging.getLogger(__name__)
 We use [[appdirs]] to get the platform-specific cache directory, and create the
 necessary subdirectories on first use.
 
+We [[chmod]] explicitly instead of passing [[mode=]] to [[mkdir]]: the
+[[mode]] argument is filtered by the umask, and an explicit [[chmod]] also
+tightens directories and index files created by older canvaslms versions
+with default permissions.
+
 <<cache directory initialization>>=
 CACHE_DIR = pathlib.Path(appdirs.user_cache_dir("canvaslms")) / "attachments"
 INDEX_FILE = CACHE_DIR / "index.json"
 
 def _ensure_cache_dir():
-    """Create cache directory if it doesn't exist"""
+    """Create cache directory if it doesn't exist, user-only access"""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.chmod(0o700)
 
 def _load_index() -> dict[str, dict[str, Any]]:
     """Load the metadata index from disk"""
@@ -142,6 +186,28 @@ def _save_index(index: dict[str, dict[str, Any]]):
     _ensure_cache_dir()
     with open(INDEX_FILE, 'w') as f:
         json.dump(index, f, indent=2)
+    INDEX_FILE.chmod(0o600)
+@
+
+\subsection{Holding the encryption key}
+
+The module holds the Fernet instance in a module-level variable, set once
+at program start.
+We deliberately take a [[Fernet]] object rather than the Canvas token: this
+module then never handles the secret itself, and the (PBKDF2) key
+derivation stays in one place, [[cache.nw]].
+
+<<encryption key state>>=
+_fernet = None
+
+def set_fernet(fernet):
+    """Register the Fernet instance used to encrypt cached attachments.
+
+    Called once at program start; without it, all cache operations
+    degrade to cache misses and no-ops.
+    """
+    global _fernet
+    _fernet = fernet
 @
 
 \subsubsection{Test fixtures}
@@ -152,18 +218,22 @@ user's actual cache.
 
 The [[tmp_cache]] fixture creates a temporary cache directory and patches the
 module-level [[CACHE_DIR]] and [[INDEX_FILE]] variables to use it.
+It also registers a fresh Fernet key, since the encrypted cache degrades to
+no-ops without one.
 
 <<test fixtures>>=
 @pytest.fixture
 def tmp_cache(tmp_path):
-    """Provide a temporary cache directory for testing"""
+    """Provide a temporary cache directory and key for testing"""
     cache_dir = tmp_path / "attachments"
     cache_dir.mkdir()
     index_file = cache_dir / "index.json"
-    
+    test_fernet = Fernet(Fernet.generate_key())
+
     # Patch module-level constants
     with patch.object(attachment_cache, 'CACHE_DIR', cache_dir), \
-         patch.object(attachment_cache, 'INDEX_FILE', index_file):
+         patch.object(attachment_cache, 'INDEX_FILE', index_file), \
+         patch.object(attachment_cache, '_fernet', test_fernet):
         yield cache_dir
 @
 
@@ -277,30 +347,47 @@ def test_compute_hash_different_content(tmp_cache, tmp_path):
     assert hash1 != hash2
 @
 
-\subsection{Retrieving cached attachments}
+\subsection{Restoring cached attachments}
 
 When we need an attachment, we first check if it's in the cache.
-If found, we update the [[last_access]] timestamp to prevent premature cleanup,
-and return the path to the cached file.
+Since content files are encrypted, we cannot hand the caller a path into
+the cache directory as the old [[get_cached_attachment]] did; instead the
+caller names a destination and we \emph{restore} the plaintext there.
+On success we update the [[last_access]] timestamp to prevent premature
+cleanup.
+
+If decryption fails, the file is either a plaintext leftover from an older
+canvaslms or was encrypted under a different token.
+Either way it is useless to us, and merely reporting a miss would loop
+forever: the consumer would re-download, but [[cache_attachment]]'s
+deduplication would see the existing [[.dat]] file and never replace it.
+So we delete the unusable file along with its index entry; the re-cached
+copy is then encrypted under the current key.
 
 We log cache hits and misses at INFO level (consistent with [[cache.nw]]) so
 users can see cache effectiveness with the [[-v]] flag.
-This helps users understand when cached files are being reused, and when new
-downloads are required.
 
 <<cache operations>>=
-def get_cached_attachment(attachment_id: int) -> pathlib.Path | None:
+def restore_cached_attachment(attachment_id: int,
+                              dest_path: pathlib.Path) -> bool:
     """
-    Get cached file path for attachment, or None if not cached.
+    Decrypt the cached attachment into dest_path.
 
+    Returns True on success, False on cache miss (not cached, missing
+    or undecryptable content file, or no encryption key registered).
     Updates last_access timestamp on cache hit.
     """
+    if _fernet is None:
+        logger.debug(f"Attachment cache disabled (no encryption key): "
+                     f"{attachment_id}")
+        return False
+
     index = _load_index()
     attachment_key = str(attachment_id)
 
     if attachment_key not in index:
         logger.info(f"Attachment cache miss: {attachment_id}")
-        return None
+        return False
 
     entry = index[attachment_key]
     file_hash = entry["hash"]
@@ -311,7 +398,20 @@ def get_cached_attachment(attachment_id: int) -> pathlib.Path | None:
         logger.info(f"Attachment cache: stale entry removed: {attachment_id}")
         del index[attachment_key]
         _save_index(index)
-        return None
+        return False
+
+    try:
+        plaintext = _fernet.decrypt(cached_file.read_bytes())
+    except InvalidToken:
+        logger.info(f"Attachment cache: undecryptable content "
+                    f"(unencrypted legacy file or changed token), "
+                    f"discarding: {attachment_id}")
+        cached_file.unlink()
+        del index[attachment_key]
+        _save_index(index)
+        return False
+
+    pathlib.Path(dest_path).write_bytes(plaintext)
 
     # Update last access time
     entry["last_access"] = datetime.now().isoformat()
@@ -320,19 +420,20 @@ def get_cached_attachment(attachment_id: int) -> pathlib.Path | None:
     logger.info(f"Attachment cache hit: {attachment_id} "
                 f"({entry['filename']}, {entry['size'] / 1024:.1f}KB)")
 
-    return cached_file
+    return True
 @
 
-\subsubsection{Testing cache retrieval}
+\subsubsection{Testing cache restoration}
 
-We verify that retrieving cached attachments works correctly, including both
+We verify that restoring cached attachments works correctly, including both
 cache hits and misses.
 
 <<test functions>>=
-def test_get_cached_attachment_returns_none_for_missing(tmp_cache):
-    """Test that get_cached_attachment returns None for uncached attachments"""
-    cached_path = attachment_cache.get_cached_attachment(99999)
-    assert cached_path is None
+def test_restore_returns_false_for_missing(tmp_cache, tmp_path):
+    """Test that restoring an uncached attachment returns False"""
+    dest = tmp_path / "restored.txt"
+    assert attachment_cache.restore_cached_attachment(99999, dest) is False
+    assert not dest.exists()
 @
 
 \subsubsection{Testing stale entry handling}
@@ -341,38 +442,73 @@ When an index entry exists but the actual file is missing, we should detect
 and handle this gracefully.
 
 <<test functions>>=
-def test_get_cached_attachment_handles_missing_file(tmp_cache, tmp_path):
+def test_restore_handles_missing_file(tmp_cache, tmp_path):
     """Test that missing .dat file is detected and index cleaned up"""
     # Create and cache a file
     test_file = tmp_path / "test.txt"
     test_file.write_bytes(b"test content")
-    
+
     metadata = {
         "filename": "test.txt",
         "size": 100,
         "content_type": "text/plain"
     }
-    
+
     attachment_cache.cache_attachment(100, test_file, metadata)
-    
+
     # Manually delete the .dat file but leave index entry
-    cached_path = attachment_cache.get_cached_attachment(100)
-    cached_path.unlink()
-    
-    # Try to retrieve - should detect missing file
-    result = attachment_cache.get_cached_attachment(100)
-    assert result is None
-    
+    for dat_file in tmp_cache.glob("*.dat"):
+        dat_file.unlink()
+
+    # Try to restore - should detect missing file
+    dest = tmp_path / "restored.txt"
+    assert attachment_cache.restore_cached_attachment(100, dest) is False
+
     # Index should be cleaned up
     index = attachment_cache._load_index()
     assert "100" not in index
 @
 
+\subsubsection{Testing legacy plaintext entries}
+
+A [[.dat]] file written by an older, unencrypted canvaslms must be treated
+as a miss \emph{and} removed, so that the consumer's re-download replaces
+it with an encrypted copy instead of hitting the same undecryptable file
+forever.
+
+<<test functions>>=
+def test_legacy_plaintext_entry_becomes_miss(tmp_cache, test_file, tmp_path):
+    """Test that an unencrypted .dat file is discarded as a cache miss"""
+    metadata = {
+        "filename": "test.txt",
+        "size": 100,
+        "content_type": "text/plain"
+    }
+    attachment_cache.cache_attachment(1, test_file, metadata)
+
+    # Overwrite the encrypted file with plaintext, as an old version wrote
+    dat_file, = tmp_cache.glob("*.dat")
+    dat_file.write_bytes(test_file.read_bytes())
+
+    dest = tmp_path / "restored.txt"
+    assert attachment_cache.restore_cached_attachment(1, dest) is False
+
+    # The unusable file and its index entry are gone, so re-caching works
+    assert not dat_file.exists()
+    assert "1" not in attachment_cache._load_index()
+@
+
 \subsection{Caching new attachments}
 
-When we download a new attachment, we compute its hash, store the file by hash,
-and update the index.
+When we download a new attachment, we compute its hash, store the encrypted
+file by hash, and update the index.
 If a file with the same hash already exists (deduplication), we reuse it.
+The hash is computed over the plaintext, so two identical submissions
+deduplicate even though Fernet encryption is randomized.
+
+Without a registered encryption key we skip caching entirely---including
+the index update, since an index entry without a content file would just
+become a stale entry on the next restore.
 
 We log timing information for hash computation and file operations, following
 the pattern from [[cache.nw]] where pickle/encrypt/decrypt timing is logged.
@@ -388,13 +524,20 @@ since it represents a performance benefit worth highlighting.
 def cache_attachment(attachment_id: int, file_path: pathlib.Path,
                      metadata: dict[str, Any]):
     """
-    Cache an attachment file using content-addressed storage.
+    Cache an attachment file, encrypted, using content-addressed storage.
+
+    Does nothing if no encryption key is registered (see set_fernet).
 
     Args:
         attachment_id: Canvas attachment ID
         file_path: Path to the downloaded file
         metadata: Dictionary with 'filename', 'size', 'content_type'
     """
+    if _fernet is None:
+        logger.debug(f"Attachment cache disabled (no encryption key); "
+                     f"not caching {attachment_id}")
+        return
+
     _ensure_cache_dir()
 
     # Compute content hash with timing
@@ -408,13 +551,17 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
 
     cached_file = CACHE_DIR / f"{file_hash}.dat"
 
-    # Copy file to cache if not already present (deduplication)
+    # Encrypt into cache if not already present (deduplication)
     if not cached_file.exists():
-        copy_start = time.perf_counter()
-        shutil.copy2(file_path, cached_file)
-        copy_elapsed = time.perf_counter() - copy_start
+        encrypt_start = time.perf_counter()
+        encrypted = _fernet.encrypt(file_path.read_bytes())
+        fd = os.open(cached_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                     0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(encrypted)
+        encrypt_elapsed = time.perf_counter() - encrypt_start
         logger.info(f"Attachment {attachment_id}: file cached "
-                    f"(copy: {copy_elapsed:.2f}s)")
+                    f"(encrypt and write: {encrypt_elapsed:.2f}s)")
     else:
         logger.info(f"Attachment {attachment_id}: content already cached (dedup)")
 
@@ -430,30 +577,63 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     _save_index(index)
 @
 
-\subsubsection{Testing cache and retrieve operations}
+\subsubsection{Testing cache and restore operations}
 
-Now we verify the main operations: caching new attachments and retrieving
-cached attachments work together correctly.
+Now we verify the main operations: caching new attachments and restoring
+cached attachments work together correctly, and that what reaches the disk
+is actually ciphertext with user-only permissions.
 
 <<test functions>>=
-def test_cache_and_retrieve_attachment(tmp_cache, test_file):
-    """Test that we can cache and retrieve an attachment"""
+def test_cache_and_restore_attachment(tmp_cache, test_file, tmp_path):
+    """Test that we can cache and restore an attachment"""
     attachment_id = 12345
     metadata = {
         "filename": "test.txt",
         "size": test_file.stat().st_size,
         "content_type": "text/plain"
     }
-    
+
     # Cache the attachment
     attachment_cache.cache_attachment(attachment_id, test_file, metadata)
-    
-    # Retrieve it
-    cached_path = attachment_cache.get_cached_attachment(attachment_id)
-    
-    assert cached_path is not None
-    assert cached_path.exists()
-    assert cached_path.read_bytes() == test_file.read_bytes()
+
+    # Restore it
+    dest = tmp_path / "restored.txt"
+    assert attachment_cache.restore_cached_attachment(attachment_id, dest)
+
+    assert dest.read_bytes() == test_file.read_bytes()
+@
+
+<<test functions>>=
+def test_cached_file_is_encrypted_and_user_only(tmp_cache, test_file):
+    """The on-disk content file must be ciphertext with mode 0600"""
+    metadata = {
+        "filename": "test.txt",
+        "size": test_file.stat().st_size,
+        "content_type": "text/plain"
+    }
+    attachment_cache.cache_attachment(1, test_file, metadata)
+
+    dat_file, = tmp_cache.glob("*.dat")
+    assert test_file.read_bytes() not in dat_file.read_bytes()
+    assert dat_file.stat().st_mode & 0o777 == 0o600
+    assert attachment_cache.INDEX_FILE.stat().st_mode & 0o777 == 0o600
+@
+
+<<test functions>>=
+def test_no_key_degrades_to_noop(tmp_cache, test_file, tmp_path):
+    """Without a registered key, caching and restoring are no-ops"""
+    metadata = {
+        "filename": "test.txt",
+        "size": test_file.stat().st_size,
+        "content_type": "text/plain"
+    }
+
+    with patch.object(attachment_cache, '_fernet', None):
+        attachment_cache.cache_attachment(1, test_file, metadata)
+        assert attachment_cache._load_index() == {}
+
+        dest = tmp_path / "restored.txt"
+        assert attachment_cache.restore_cached_attachment(1, dest) is False
 @
 
 \subsubsection{Testing deduplication}
@@ -481,13 +661,12 @@ def test_deduplication_same_content(tmp_cache, tmp_path):
     # Cache both with different IDs
     attachment_cache.cache_attachment(100, file1, metadata)
     attachment_cache.cache_attachment(200, file2, metadata)
-    
-    # Both should point to the same cached file
-    cached1 = attachment_cache.get_cached_attachment(100)
-    cached2 = attachment_cache.get_cached_attachment(200)
-    
-    assert cached1 == cached2  # Same path due to deduplication
-    
+
+    # Both should restore from the cache
+    assert attachment_cache.restore_cached_attachment(100, tmp_path / "r1")
+    assert attachment_cache.restore_cached_attachment(200, tmp_path / "r2")
+    assert (tmp_path / "r1").read_bytes() == content
+
     # Only one .dat file should exist
     dat_files = list(tmp_cache.glob("*.dat"))
     assert len(dat_files) == 1
@@ -598,16 +777,18 @@ def test_cleanup_old_attachments(tmp_cache, tmp_path):
     
     # Run cleanup with 90-day threshold
     stats = attachment_cache.cleanup_old_attachments(max_age_days=90)
-    
+
     # Old attachment should be removed
     assert stats["files_removed"] == 1
     assert stats["bytes_freed"] > 0
-    
+
     # New attachment should still be cached
-    assert attachment_cache.get_cached_attachment(200) is not None
-    
+    assert attachment_cache.restore_cached_attachment(
+        200, tmp_path / "r200") is True
+
     # Old attachment should not be cached
-    assert attachment_cache.get_cached_attachment(100) is None
+    assert attachment_cache.restore_cached_attachment(
+        100, tmp_path / "r100") is False
 @
 
 <<test functions>>=
@@ -655,11 +836,12 @@ def test_cleanup_no_old_files(tmp_cache, tmp_path):
     
     # Run cleanup with 90-day threshold (file is recent)
     stats = attachment_cache.cleanup_old_attachments(max_age_days=90)
-    
+
     # No files should be removed
     assert stats["files_removed"] == 0
     assert stats["bytes_freed"] == 0
-    
+
     # File should still be cached
-    assert attachment_cache.get_cached_attachment(100) is not None
+    assert attachment_cache.restore_cached_attachment(
+        100, tmp_path / "r100") is True
 @
