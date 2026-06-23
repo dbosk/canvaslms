@@ -573,8 +573,9 @@ We simply call the [[summary.summarize_group]] function with the assignments
 and users and process the results.
 <<produce a list of grades>>=
 <<load the correct summary module as [[summary]]>>
+<<bulk-fetch submissions and scope to enrolled users>>
 for user, grade, grade_date, *graders in summary.summarize_group(
-  assignments_list, users_list):
+  assignments_list, relevant_users):
     <<check if we should skip based on [[grade]]>>
     yield [
       course.course_code,
@@ -585,6 +586,53 @@ for user, grade, grade_date, *graders in summary.summarize_group(
       *graders
     ]
 @ We will now cover the [[summarize_group]] function in the [[summary]] module.
+
+\subsection{Fetching submissions in bulk before summarizing}
+\label{sec:prime-submission-cache}
+
+A [[summarize_group]] implementation reads each student's grade by calling
+[[assignment.get_submission(user)]] inside a nested loop over users and
+assignments (see the [[grades]] modules).
+Left to itself, that loop is slow for two compounding reasons, and a single bulk
+fetch cures both.
+
+The first reason is a cold cache.
+The cache that backs [[get_submission]] is keyed by user, and a single bulk
+[[get_submissions]] call populates an entry for every enrolled student of an
+assignment in one paginated request (see
+[[make_assignment_submissions_cacheable]] in the [[hacks]] package).
+So before we summarize, we force that bulk fetch for the whole group; the
+per-user reads inside [[summarize_group]] then become cache hits rather than one
+request each.
+This mirrors what the [[-a]] path already does when it builds
+[[submissions_list]]: we reuse the same [[list_submissions]] helper, request the
+same [[submission_history]] include the summary modules ask for, and scope the
+bulk-refresh pre-check to the [[student_ids]] we will actually report on.
+
+The second reason is that [[users_list]] spans \emph{every} matched course,
+while each iteration of the outer loop summarizes the assignments of just one
+course.
+Passing the whole list to [[summarize_group]] would make it call
+[[get_submission]] for users who are not enrolled here, and each such call is an
+uncacheable [[404]]---one wasted round-trip per outside user per assignment.
+When many courses match, these [[404]]s dominate the run.
+The bulk fetch already tells us who belongs: Canvas returns a submission for
+every enrolled student (a placeholder even when nothing was handed in), so the
+user IDs in the fetched submissions are exactly this course's roster.
+We therefore keep only the users that appear there, which is
+output-preserving---an outside user summarizes to an empty grade with no date and
+is dropped by the grade/date skip check below anyway---but avoids ever issuing
+the [[404]].
+<<bulk-fetch submissions and scope to enrolled users>>=
+student_ids = {user.id for user in users_list}
+enrolled_ids = {submission.user_id
+                for submission in submissions.list_submissions(
+                  assignments_list,
+                  include=["submission_history"],
+                  check_bulk_refresh=True,
+                  student_ids=student_ids)}
+relevant_users = [user for user in users_list if user.id in enrolled_ids]
+@
 
 Similarly, we want to summarize modules.
 This is very similar to assignment groups, but we work with modules instead.
@@ -615,10 +663,15 @@ def summarize_modules(canvas, args):
 \subsection{Producing grades and missing assignments for modules}
 
 @ We also need to handle the module case for grades.
+The module case has the same [[assignments_list]] and [[users_list]] in scope as
+the assignment-group case, so it bulk-fetches submissions and scopes to the
+course's enrolled users the same way (see \cref{sec:prime-submission-cache})
+before delegating to [[summarize_group]].
 <<produce a list of grades for module>>=
 <<load the correct summary module as [[summary]]>>
+<<bulk-fetch submissions and scope to enrolled users>>
 for user, grade, grade_date, *graders in summary.summarize_group(
-  assignments_list, users_list):
+  assignments_list, relevant_users):
     <<check if we should skip based on [[grade]]>>
     yield [
       course.course_code,
