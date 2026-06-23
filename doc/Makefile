@@ -26,6 +26,10 @@ canvaslms.pdf: didactic.sty
 canvaslms.pdf: intro.tex
 canvaslms.pdf: ${EXAMPLES}
 
+# The minted code blocks are highlighted with noweb's custom Pygments lexer,
+# which noweb.mk copies in from the noweb library (see its noweb_lexer.py rule).
+canvaslms.pdf: noweb_lexer.py
+
 canvaslms.pdf: ${SRC_DIR}/hacks/canvasapi.tex
 canvaslms.pdf: ${SRC_DIR}/hacks/attachment_cache.tex
 canvaslms.pdf: ${SRC_DIR}/canvaslms.tex
@@ -51,7 +55,7 @@ canvaslms.pdf: src
 src:
 	${MAKE} -C ${SRC_DIR} all
 
-${SRC_DIR}/%.tex: ${SRC_DIR}/%.nw
+../%:
 	${MAKE} -C $(dir $@) $(notdir $@)
 
 # Introduction chapter
