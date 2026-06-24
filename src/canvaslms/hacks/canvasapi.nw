@@ -1498,8 +1498,9 @@ class TestSingularMethodCaching:
 
         # First call
         result1 = instance.get_submission(1)
-        # Make it outdated (> 5 minutes old)
-        result1._fetched_at = datetime.now() - timedelta(minutes=6)
+        # Make it outdated (past the submission TTL)
+        result1._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
         instance.submission_cache[1] = (result1, {})
 
         # Second call should refetch
@@ -1867,7 +1868,8 @@ class TestPluralOnlyStaleObjects:
 
         # Make the cached object stale (TTL expired)
         obj, kwargs = instance.item_cache[1]
-        obj._fetched_at = datetime.now() - timedelta(minutes=6)
+        obj._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
         instance.item_cache[1] = (obj, kwargs)
 
         # Second call must yield the stale object without refreshing
@@ -2160,7 +2162,8 @@ class TestPluralMethodCaching:
 
         # Make it outdated
         obj, kwargs = instance.submission_cache[1]
-        obj._fetched_at = datetime.now() - timedelta(minutes=6)
+        obj._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
         instance.submission_cache[1] = (obj, kwargs)
 
         # Second call should refetch the outdated object
@@ -2843,17 +2846,33 @@ BULK_REFRESH_THRESHOLD = float(os.environ.get('CANVASLMS_BULK_THRESHOLD', '0.2')
 BULK_REFRESH_MIN_COUNT = int(os.environ.get('CANVASLMS_BULK_MIN_COUNT', '3'))
 @
 
+\label{sec:cache-ttl-constants}
+
 We define constants for all cache time-to-live (TTL) values to ensure
-consistency between the [[outdated()]] function and log messages.
-When these values are tuned for performance, both the cache behavior and
-diagnostic messages update automatically.
+consistency between the [[outdated()]] function, [[LazySubmission]] and the
+staleness log messages.  When these values are tuned for performance, both the
+cache behavior and diagnostic messages update automatically.
+
+Each TTL is also read from the environment, following the same
+[[CANVASLMS_*]] pattern as the [[BULK_REFRESH_*]] thresholds above.  This lets a
+user trade freshness for speed without editing the source: a long-running
+grading session can extend the submission window, while a script that must see
+the very latest grades can shorten it.  We default the submission TTL to
+20~minutes---long enough that back-to-back [[results]] runs reuse the cache
+rather than re-fetching every in-progress submission, while final grades in
+[[NOREFRESH_GRADES]] stay cached regardless.
 <<constants>>=
-# Cache TTL constants
-SUBMISSION_TTL_MINUTES = 5
-DEFAULT_CACHE_TTL_DAYS = 7
-USER_CACHE_TTL_DAYS = 2
-GROUP_CACHE_TTL_DAYS = 5
-QUIZ_CACHE_TTL_DAYS = 3
+# Cache TTL constants (overridable via environment)
+SUBMISSION_TTL_MINUTES = int(
+  os.environ.get("CANVASLMS_SUBMISSION_TTL_MINUTES", "20"))
+DEFAULT_CACHE_TTL_DAYS = int(
+  os.environ.get("CANVASLMS_DEFAULT_CACHE_TTL_DAYS", "7"))
+USER_CACHE_TTL_DAYS = int(
+  os.environ.get("CANVASLMS_USER_CACHE_TTL_DAYS", "2"))
+GROUP_CACHE_TTL_DAYS = int(
+  os.environ.get("CANVASLMS_GROUP_CACHE_TTL_DAYS", "5"))
+QUIZ_CACHE_TTL_DAYS = int(
+  os.environ.get("CANVASLMS_QUIZ_CACHE_TTL_DAYS", "3"))
 @
 
 Some query arguments are additive, such as [[include]], and fit naturally in a
@@ -3006,27 +3025,30 @@ class TestOutdated:
         assert not outdated(submission)
 
     def test_non_passing_grade_recent_not_outdated(self):
-        """Recent non-passing grade (< 5 min) should not be outdated"""
+        """Non-passing grade within the TTL should not be outdated"""
         submission = MagicMock()
         submission.grade = "F"
-        submission._fetched_at = datetime.now() - timedelta(minutes=4)
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES - 1)
 
         assert not outdated(submission)
 
     def test_non_passing_grade_old_is_outdated(self):
-        """Old non-passing grade (> 5 min) should be outdated"""
+        """Non-passing grade past the TTL should be outdated"""
         submission = MagicMock()
         submission.grade = "B"
-        submission._fetched_at = datetime.now() - timedelta(minutes=6)
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
 
         assert outdated(submission)
 
-    def test_non_passing_grade_exactly_5min_not_outdated(self):
-        """Exactly 5 minutes should not trigger update (not >5)"""
+    def test_non_passing_grade_at_ttl_not_outdated(self):
+        """Exactly at the TTL should not trigger update (not >TTL)"""
         submission = MagicMock()
         submission.grade = "C"
-        # Set to just under 5 minutes to account for execution time
-        submission._fetched_at = datetime.now() - timedelta(minutes=5, seconds=-1)
+        # Just under the TTL to account for execution time
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES, seconds=-1)
 
         assert not outdated(submission)
 
@@ -3048,7 +3070,8 @@ class TestOutdated:
         """Ungraded submissions (None grade) should refresh"""
         submission = MagicMock()
         submission.grade = None
-        submission._fetched_at = datetime.now() - timedelta(minutes=6)
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
 
         assert outdated(submission)
 
@@ -3056,7 +3079,8 @@ class TestOutdated:
         """Empty grade string should refresh if old"""
         submission = MagicMock()
         submission.grade = ""
-        submission._fetched_at = datetime.now() - timedelta(minutes=10)
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
 
         assert outdated(submission)
 
@@ -3064,7 +3088,8 @@ class TestOutdated:
         """Numeric grades (improvable) should refresh if old"""
         submission = MagicMock()
         submission.grade = "85"
-        submission._fetched_at = datetime.now() - timedelta(minutes=7)
+        submission._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
 
         assert outdated(submission)
 @
@@ -3691,8 +3716,8 @@ Key design decisions:
   We track these and trigger refresh only when they're accessed.
 \item[Final grade policy] Submissions with final grades (A, P, P+, complete)
   are never refreshed, maintaining the existing [[NOREFRESH_GRADES]] policy.
-\item[Time-based staleness] We use the existing [[outdated()]] function
-  with 5-minute TTL for non-final grades.
+\item[Time-based staleness] We apply the same time-to-live as [[outdated()]],
+  the [[SUBMISSION_TTL_MINUTES]] constant, for non-final grades.
 \item[Preserved includes] The wrapper stores the original [[include]]
   parameters from [[get_submissions()]] to ensure refreshes request the
   same data.
@@ -3769,6 +3794,13 @@ than a short time-to-live.  A \emph{final} grade never changes, so we skip the
 refresh entirely---this is the [[NOREFRESH_GRADES]] policy, and it is what keeps
 a fully graded course from re-fetching every submission on access.
 
+The time-to-live is [[SUBMISSION_TTL_MINUTES]], the same constant that drives
+[[outdated()]] and the staleness log messages, so all three agree on how long a
+non-final submission stays fresh.  Reading the constant here (rather than a
+literal) is what makes the [[CANVASLMS_SUBMISSION_TTL_MINUTES]] override
+(\cref{sec:cache-ttl-constants}) actually take effect on the live submission
+cache.
+
 <<LazySubmission methods>>=
 def _needs_refresh(self):
   """Check if the wrapped submission needs refreshing."""
@@ -3779,8 +3811,7 @@ def _needs_refresh(self):
   if submission.grade in NOREFRESH_GRADES:
     return False
 
-  # Check time-based staleness (5-minute TTL for non-final grades)
-  if datetime.now() - last_refresh > timedelta(minutes=5):
+  if datetime.now() - last_refresh > timedelta(minutes=SUBMISSION_TTL_MINUTES):
     return True
 
   return False
@@ -3832,12 +3863,12 @@ class TestLazySubmissionStaleness:
 
     def test_would_need_refresh_detects_staleness(self):
         """A stale, non-final submission reports it would refresh."""
-        lazy = self.wrap(grade="F", age_minutes=10)
+        lazy = self.wrap(grade="F", age_minutes=SUBMISSION_TTL_MINUTES + 1)
         assert lazy.would_need_refresh() is True
 
     def test_final_grade_never_needs_refresh(self):
         """Final grades are never stale, even when old."""
-        lazy = self.wrap(grade="P", age_minutes=10)
+        lazy = self.wrap(grade="P", age_minutes=SUBMISSION_TTL_MINUTES + 1)
         assert lazy.would_need_refresh() is False
 @
 
@@ -3888,7 +3919,8 @@ class TestLazySubmissionNormalization:
         lazy = LazySubmission(
             self.StandInSubmission("F"), MagicMock(), set(), refresh)
         object.__setattr__(
-            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
 
         lazy.ensure_attrs(["grade", "missing_field"])
 
@@ -4128,7 +4160,8 @@ class TestLazySubmissionAssignmentSurvivesRefresh:
         lazy.assignment = sentinel_assignment
         # ... but the wrapper is stale, so the next mutable read refreshes.
         object.__setattr__(
-            lazy, "_last_refresh", datetime.now() - timedelta(minutes=10))
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
 
         # Touching a mutable attribute swaps in `fresh`, dropping `.assignment`.
         lazy.submission_history
