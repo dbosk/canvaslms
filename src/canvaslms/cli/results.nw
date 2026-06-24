@@ -396,6 +396,101 @@ submissions_list = submissions.filter_submissions(
   users_list)
 @
 
+\subsection{Warming the submission cache for the summary paths}
+\label{sec:prefetch-submissions}
+
+The grade path above reads each submission directly from [[submissions_list]],
+so the single bulk [[list_submissions]] call already pays for every student in
+one request per assignment.  The remaining paths---assignment groups ([[-A]]),
+modules ([[-M]]) and every [[--missing]] report---are different: they hand the
+assignments and users to a summary module (\cref{custom-summary-modules}) or to
+[[missing_assignments]], both of which loop \emph{per user} and call the
+singular [[assignment.get_submission(user)]].
+
+On a cold cache that singular call fetches one student at a time, so a group of
+$a$ assignments and $u$ students costs $a \times u$ requests.  The plural
+[[get_submissions]] behind [[list_submissions]] instead fetches a whole
+assignment in one request and marks it fully fetched, after which those
+singular lookups become cache hits.  We therefore \emph{warm} the cache with
+one bulk fetch per assignment before entering the per-user loop, which collapses
+the cost back to $a$ requests.
+
+The warming only pays off when there are enough students to amortise it.  A cold
+bulk fetch always pulls the assignment's whole roster---Canvas has no cheap
+per-student bulk endpoint---so for a handful of students the individual lookups
+are actually cheaper.  We gate on [[BULK_REFRESH_MIN_COUNT]], the same threshold
+the cache layer uses to choose between many individual refreshes and one bulk
+refresh; the caller is the natural place for this decision because only it knows
+the total student count up front, whereas the singular cache path sees one user
+at a time.
+
+We request [["submission_history"]] in [[include]], which is a superset of what
+every bundled summary module asks for, so their singular lookups find the cached
+includes sufficient and never refetch.  As in the grade path, we scope the
+bulk-refresh pre-check to the students we will actually read via
+[[student_ids]].
+<<functions>>=
+def prefetch_submissions(assignments_list, users_list):
+  """
+  Warm the per-assignment submission cache with one bulk fetch per assignment.
+
+  The grade, group, module and missing-assignment paths look up submissions one
+  user at a time; warming the cache first turns those lookups into cache hits
+  instead of one request per (user, assignment).
+
+  Skipped for small user sets, where the per-user lookups the cache already
+  performs are cheaper than pulling each assignment's whole roster.
+  """
+  if len(users_list) < canvaslms.hacks.canvasapi.BULK_REFRESH_MIN_COUNT:
+    return
+
+  student_ids = {user.id for user in users_list}
+  for _ in submissions.list_submissions(
+      assignments_list,
+      include=["submission_history"],
+      check_bulk_refresh=True,
+      student_ids=student_ids):
+    pass
+@
+
+Let's verify the guard and the scoping.  Below the threshold we must not touch
+the network at all; at or above it we must issue exactly one scoped bulk fetch
+carrying the history include.
+
+<<test functions>>=
+def test_prefetch_submissions_skips_small_user_sets(monkeypatch):
+  recorded = []
+  monkeypatch.setattr(
+    results_module.submissions, "list_submissions",
+    lambda *args, **kwargs: recorded.append(kwargs) or iter([]))
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi,
+    "BULK_REFRESH_MIN_COUNT", 3)
+
+  users = [SimpleNamespace(id=i) for i in range(2)]
+  results_module.prefetch_submissions(["assignment"], users)
+
+  assert recorded == []
+
+
+def test_prefetch_submissions_warms_large_user_sets(monkeypatch):
+  recorded = []
+  monkeypatch.setattr(
+    results_module.submissions, "list_submissions",
+    lambda *args, **kwargs: recorded.append(kwargs) or iter([]))
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi,
+    "BULK_REFRESH_MIN_COUNT", 3)
+
+  users = [SimpleNamespace(id=i) for i in range(3)]
+  results_module.prefetch_submissions(["assignment"], users)
+
+  assert len(recorded) == 1
+  assert recorded[0]["check_bulk_refresh"] is True
+  assert recorded[0]["include"] == ["submission_history"]
+  assert recorded[0]["student_ids"] == {0, 1, 2}
+@
+
 \subsection{Producing a list of missing assignments for the [[-a]] path}
 \label{sec:summarize-assignments-missing}
 
@@ -418,6 +513,8 @@ lets them treat [[-a --missing]] and [[-A --missing]] identically.
 <<produce a list of missing assignments for assignment filter>>=
 assignments_list = list(assignments.process_assignment_option(canvas, args))
 users_list = set(users.process_user_or_group_option(canvas, args))
+
+prefetch_submissions(assignments_list, users_list)
 
 <<load the correct missing module as [[missing]]>>
 <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
@@ -553,6 +650,8 @@ def summarize_assignment_groups(canvas, args):
   all_assignments = list(assignments.process_assignment_option(canvas, args))
   users_list = set(users.process_user_or_group_option(canvas, args))
 
+  prefetch_submissions(all_assignments, users_list)
+
   for course in courses_list:
     ag_list = assignments.filter_assignment_groups(
       course, args.assignment_group)
@@ -599,6 +698,8 @@ def summarize_modules(canvas, args):
   courses_list = courses.process_course_option(canvas, args)
   all_assignments = list(assignments.process_assignment_option(canvas, args))
   users_list = set(users.process_user_or_group_option(canvas, args))
+
+  prefetch_submissions(all_assignments, users_list)
 
   for course in courses_list:
     module_list = modules.filter_modules(course, args.module)
