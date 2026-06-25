@@ -46,8 +46,18 @@ publish-docker:
 
 
 .PHONY: clean
-clean:
+clean: clean-makefiles
 	${RM} -r __pycache__
+
+# The makefiles submodule is bundled into the sdist (see pyproject.toml), but it
+# is not part of SUBDIR, so a top-level clean never descends into it. Its
+# PythonTeX runs leave dangling makefiles.pytxcode / pythontex-files-makefiles
+# symlinks (pointing into the removed ltxobj dir) that break poetry build. Remove
+# them here so clean keeps the tree buildable.
+.PHONY: clean-makefiles
+clean-makefiles:
+	${RM} makefiles/makefiles.pytxcode
+	${RM} -R makefiles/pythontex-files-makefiles
 
 .PHONY: distclean
 distclean:
