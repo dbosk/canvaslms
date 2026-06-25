@@ -396,15 +396,256 @@ submissions_list = submissions.filter_submissions(
   users_list)
 @
 
+\subsection{Warming the submission cache for the summary paths}
+\label{sec:prefetch-submissions}
+
+The grade path above reads each submission directly from [[submissions_list]],
+so the single bulk [[list_submissions]] call already pays for every student in
+one request per assignment.  The remaining paths---assignment groups ([[-A]]),
+modules ([[-M]]) and every [[--missing]] report---are different: they hand the
+assignments and users to a summary module (\cref{custom-summary-modules}) or to
+[[missing_assignments]], both of which loop \emph{per user} and call the
+singular [[assignment.get_submission(user)]].
+
+On a cold cache that singular call fetches one student at a time, so a group of
+$a$ assignments and $u$ students costs $a \times u$ requests.  The plural
+[[get_submissions]] behind [[list_submissions]] instead fetches a whole
+assignment in one request and marks it fully fetched, after which those
+singular lookups become cache hits.  We therefore \emph{warm} the cache with
+one bulk fetch per assignment before entering the per-user loop, which collapses
+the cost back to $a$ requests.
+
+The warming only pays off when there are enough students to amortise it.  A cold
+bulk fetch always pulls the assignment's whole roster---Canvas has no cheap
+per-student bulk endpoint---so for a handful of students the individual lookups
+are actually cheaper.  We gate on [[BULK_REFRESH_MIN_COUNT]], the same threshold
+the cache layer uses to choose between many individual refreshes and one bulk
+refresh; the caller is the natural place for this decision because only it knows
+the total student count up front, whereas the singular cache path sees one user
+at a time.
+
+We request [["submission_history"]] in [[include]], which is a superset of what
+every bundled summary module asks for, so their singular lookups find the cached
+includes sufficient and never refetch.  As in the grade path, we scope the
+bulk-refresh pre-check to the students we will actually read via
+[[student_ids]].
+<<functions>>=
+def prefetch_submissions(assignments_list, users_list):
+  """
+  Warm the per-assignment submission cache with one bulk fetch per assignment.
+
+  The grade, group, module and missing-assignment paths look up submissions one
+  user at a time; warming the cache first turns those lookups into cache hits
+  instead of one request per (user, assignment).
+
+  Skipped for small user sets, where the per-user lookups the cache already
+  performs are cheaper than pulling each assignment's whole roster.
+  """
+  if len(users_list) < canvaslms.hacks.canvasapi.BULK_REFRESH_MIN_COUNT:
+    return
+
+  student_ids = {user.id for user in users_list}
+  for _ in submissions.list_submissions(
+      assignments_list,
+      include=["submission_history"],
+      check_bulk_refresh=True,
+      student_ids=student_ids):
+    pass
+@
+
+Let's verify the guard and the scoping.  Below the threshold we must not touch
+the network at all; at or above it we must issue exactly one scoped bulk fetch
+carrying the history include.
+
+<<test functions>>=
+def test_prefetch_submissions_skips_small_user_sets(monkeypatch):
+  recorded = []
+  monkeypatch.setattr(
+    results_module.submissions, "list_submissions",
+    lambda *args, **kwargs: recorded.append(kwargs) or iter([]))
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi,
+    "BULK_REFRESH_MIN_COUNT", 3)
+
+  users = [SimpleNamespace(id=i) for i in range(2)]
+  results_module.prefetch_submissions(["assignment"], users)
+
+  assert recorded == []
+
+
+def test_prefetch_submissions_warms_large_user_sets(monkeypatch):
+  recorded = []
+  monkeypatch.setattr(
+    results_module.submissions, "list_submissions",
+    lambda *args, **kwargs: recorded.append(kwargs) or iter([]))
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi,
+    "BULK_REFRESH_MIN_COUNT", 3)
+
+  users = [SimpleNamespace(id=i) for i in range(3)]
+  results_module.prefetch_submissions(["assignment"], users)
+
+  assert len(recorded) == 1
+  assert recorded[0]["check_bulk_refresh"] is True
+  assert recorded[0]["include"] == ["submission_history"]
+  assert recorded[0]["student_ids"] == {0, 1, 2}
+@
+
+\subsection{Scoping students to their course round}
+\label{sec:scope-users-by-course}
+
+The three summary paths each resolve their students once, with
+[[process_user_or_group_option]], and that call returns the \emph{union} of
+students across every course round matched by [[-c]].  A student who took the
+course in an earlier round, but not the one we are reporting on, still sits in
+that union.
+
+Resolving the students once is convenient, but it turns the per-user submission
+lookup into a cross-round trap.  Each round is summarized against its own
+assignments (\cref{custom-summary-modules}), yet the lookup loops over
+\emph{every} student in the union.  Asking Canvas for a round's assignment
+submission by a student who never enrolled in that round is a question with no
+answer: Canvas replies [[404]].  On the grade path the empty result is silently
+dropped, so only the wasted round-trip shows; on the missing path the [[404]]
+is read by [[missing_assignments]] as \enquote{no submission exists}, and the
+student is wrongly reported as missing an assignment from a round they were
+never part of.
+
+The cure is to ask only the questions that can have answers: before summarizing
+a round, restrict the union to the students actually enrolled in that round.
+We intersect by Canvas user id against the round's roster.  Intersecting rather
+than re-resolving is what keeps the caller's filters intact---[[-u]], [[-r]]
+and [[-g]] have already shaped the union, so a [[-u]]-matched student simply
+appears for exactly the rounds they belong to, and no filter has to be
+re-applied here.
+
+We deliberately scope the \emph{students}, not the loop.  Collapsing the
+per-round loop into a single course would foreclose a future where a student's
+work in one round counts toward another round's grade; keeping the loop and
+narrowing the students leaves that door open.  Combining rounds then becomes a
+matter of \emph{widening} the assignments handed to the summary, not of undoing
+this scoping.
+
+The roster comes from [[list_users]], which fetches
+[[course.get_users(include=["enrollments"])]]---the very call the user paths
+already made and cached---so the intersection costs a cache hit, not a fresh
+request.  Passing no roles returns the whole roster; the role filter, if any,
+is already baked into [[users_list]].
+<<functions>>=
+def filter_users_by_course(users_list, course):
+  """
+  Restrict users_list to the students enrolled in course.
+
+  The summary paths gather students across every matched course round into one
+  set, but each round must be summarized against only its own students.
+  Probing a submission for a student not enrolled in the round's course makes a
+  doomed singular request that Canvas answers with 404 (and, on the missing
+  path, yields a spurious "missing" row). We intersect by Canvas user id
+  against the round's roster, so every filter already applied to users_list
+  (-u, -r, -g) is preserved.
+  """
+  roster_ids = {user.id for user in users.list_users([course], [])}
+  return [user for user in users_list if user.id in roster_ids]
+@
+
+Let's verify the intersection: only roster members survive, the rest are
+dropped, and an already-narrowed [[users_list]] (as a [[-u]] query produces) is
+returned untouched when its student is on the roster.
+
+<<test functions>>=
+def test_filter_users_by_course_keeps_only_enrolled(monkeypatch):
+  roster = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+  monkeypatch.setattr(
+    results_module.users, "list_users",
+    lambda courses, roles: roster)
+
+  users_list = [SimpleNamespace(id=1), SimpleNamespace(id=2),
+                SimpleNamespace(id=3)]
+  scoped = results_module.filter_users_by_course(users_list, "course")
+
+  assert {user.id for user in scoped} == {1, 2}
+
+
+def test_filter_users_by_course_preserves_a_single_user_query(monkeypatch):
+  roster = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+  monkeypatch.setattr(
+    results_module.users, "list_users",
+    lambda courses, roles: roster)
+
+  # A -u query has already narrowed users_list to one student.
+  users_list = [SimpleNamespace(id=2)]
+  scoped = results_module.filter_users_by_course(users_list, "course")
+
+  assert [user.id for user in scoped] == [2]
+
+
+def test_filter_users_by_course_drops_user_absent_from_round(monkeypatch):
+  roster = [SimpleNamespace(id=1)]
+  monkeypatch.setattr(
+    results_module.users, "list_users",
+    lambda courses, roles: roster)
+
+  # The -u student belongs to another round, not this one.
+  users_list = [SimpleNamespace(id=2)]
+  scoped = results_module.filter_users_by_course(users_list, "course")
+
+  assert scoped == []
+@
+
 \subsection{Producing a list of missing assignments for the [[-a]] path}
 \label{sec:summarize-assignments-missing}
 
-The missing path mirrors the [[-A]] path, but without the outer
-course/group loop: [[process_assignment_option]] already returns a flat
-list of assignments with their [[course]] attached, so we can hand that
-list directly to [[missing.missing_assignments]].
+Unlike the [[-A]] path, this one has no course/group loop of its own:
+[[process_assignment_option]] hands back a single flat list of assignments,
+potentially spanning several course rounds at once.
+\Cref{sec:scope-users-by-course} showed why we must still summarize each round
+against only its own students, so before reporting we group the flat list by
+course and scope the students to each group in turn.
 We wrap the users in a [[set]] the same way [[summarize_assignment_groups]]
 does, to avoid duplicate rows when a user appears under several filters.
+
+To split the flat list per round we bucket assignments by their course.
+[[process_assignment_option]] attaches a [[course]] to every assignment (we
+already rely on it for the [[course_code]] column below), so we key by
+[[course.id]] and keep one [[Course]] object per bucket to hand to
+[[filter_users_by_course]].
+<<functions>>=
+def group_assignments_by_course(assignments_list):
+  """
+  Group assignments by their course, returning (course, assignments) pairs.
+
+  Used by the -a path, which receives a flat assignment list spanning every
+  matched course round and must summarize each round against only its own
+  students.
+  """
+  groups = {}
+  for assignment in assignments_list:
+    course = assignment.course
+    if course.id not in groups:
+      groups[course.id] = (course, [])
+    groups[course.id][1].append(assignment)
+  return list(groups.values())
+@
+
+We verify that assignments from two rounds land in separate buckets, each
+carrying its own [[Course]] object and assignment list.
+
+<<test functions>>=
+def test_group_assignments_by_course_buckets_per_round():
+  round1 = SimpleNamespace(id=10)
+  round2 = SimpleNamespace(id=20)
+  a1 = SimpleNamespace(name="H1", course=round1)
+  a2 = SimpleNamespace(name="H2", course=round1)
+  a3 = SimpleNamespace(name="H1", course=round2)
+
+  groups = {
+    course.id: assignments
+    for course, assignments in
+    results_module.group_assignments_by_course([a1, a2, a3])}
+
+  assert groups[10] == [a1, a2]
+  assert groups[20] == [a3]
+@
 
 The row shape matches the other missing paths:
 [[(course code, component, identifier, missing assignment, reason)]].
@@ -416,19 +657,23 @@ That coincidence is intentional: downstream tools already consume the
 five-column contract from the [[-A]] path, and keeping column~2 stable
 lets them treat [[-a --missing]] and [[-A --missing]] identically.
 <<produce a list of missing assignments for assignment filter>>=
-assignments_list = list(assignments.process_assignment_option(canvas, args))
-users_list = set(users.process_user_or_group_option(canvas, args))
+all_assignments = list(assignments.process_assignment_option(canvas, args))
+all_users = set(users.process_user_or_group_option(canvas, args))
+
+prefetch_submissions(all_assignments, all_users)
 
 <<load the correct missing module as [[missing]]>>
-<<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
-for user, assignment, reason in missing_results:
-  yield [
-    assignment.course.course_code,
-    assignment.name,
-    result_identifier(user, args),
-    assignment.name,
-    reason
-  ]
+for course, assignments_list in group_assignments_by_course(all_assignments):
+  users_list = filter_users_by_course(all_users, course)
+  <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>
+  for user, assignment, reason in missing_results:
+    yield [
+      assignment.course.course_code,
+      assignment.name,
+      result_identifier(user, args),
+      assignment.name,
+      reason
+    ]
 @
 
 Let's pin the behaviour of the default [[missing_assignments]] helper that
@@ -538,9 +783,15 @@ In this case, we want to have one assignment group per row in the output.
 We want to output course, assignment group, student identifier, summarized
 grade based on all assignments in the group and the latest submission date.
 
-Unlike the previous case, here we must maintain the structure of which 
-assignments belong to which assignment group so that we can check easily that a 
+Unlike the previous case, here we must maintain the structure of which
+assignments belong to which assignment group so that we can check easily that a
 user has passed all assignments in the group.
+We resolve the students once into [[all_users]] (the union across every matched
+round), warm the cache for all of them, and then, per round, narrow that union
+to the round's own students with [[filter_users_by_course]]
+(\cref{sec:scope-users-by-course}) before summarizing.
+The grade and missing chunks both read [[users_list]], so rebinding it inside
+the loop scopes both without touching either chunk.
 <<functions>>=
 def summarize_assignment_groups(canvas, args):
   """
@@ -551,9 +802,12 @@ def summarize_assignment_groups(canvas, args):
 
   courses_list = courses.process_course_option(canvas, args)
   all_assignments = list(assignments.process_assignment_option(canvas, args))
-  users_list = set(users.process_user_or_group_option(canvas, args))
+  all_users = set(users.process_user_or_group_option(canvas, args))
+
+  prefetch_submissions(all_assignments, all_users)
 
   for course in courses_list:
+    users_list = filter_users_by_course(all_users, course)
     ag_list = assignments.filter_assignment_groups(
       course, args.assignment_group)
 
@@ -598,9 +852,12 @@ def summarize_modules(canvas, args):
 
   courses_list = courses.process_course_option(canvas, args)
   all_assignments = list(assignments.process_assignment_option(canvas, args))
-  users_list = set(users.process_user_or_group_option(canvas, args))
+  all_users = set(users.process_user_or_group_option(canvas, args))
+
+  prefetch_submissions(all_assignments, all_users)
 
   for course in courses_list:
+    users_list = filter_users_by_course(all_users, course)
     module_list = modules.filter_modules(course, args.module)
 
     for module in module_list:
