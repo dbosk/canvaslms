@@ -10,8 +10,9 @@ module is the same as `canvaslms.grades.disjunctmax`, but also includes
 ungraded surveys (for instance quiz with points, where the number of points is 
 ignored). Consequently all assignments must have a date.
 
-This function also doen't fail when there is a grade other than A--F or P/F 
-present. Such grades are all treated as F.
+This function also doesn't fail when there is a grade other than A--F or P/F
+present. P+ counts as P; all other unrecognized grades (for instance numeric
+survey scores) are treated as F.
 @
 
 We have one requirement on the summary module: it must contain a function 
@@ -41,6 +42,76 @@ def summarize_group(assignments_list, users_list):
     yield [user, grade, grade_date, *graders]
 @
 
+We define the test file structure early, but place each test after the
+functionality it verifies.
+<<test [[maxgradesurvey.py]]>>=
+"""Tests for the canvaslms.grades.maxgradesurvey module."""
+import canvaslms.grades.maxgradesurvey as maxgradesurvey
+
+<<test functions>>
+@
+
+
+\subsection{Normalizing grades for survey-inclusive grading}
+
+This module's defining trait is that unrecognized grades---numeric survey
+scores, for instance---count as F instead of crashing the summary.
+That translation used to be inlined as
+[[grade not in "ABCDEPF"]], which has two flaws.
+First, it is a \emph{substring} test, not a membership test: the empty
+string and two-letter fragments like \enquote{EP} count as valid grades,
+only to crash later with a [[KeyError]] inside [[grade_max]].
+Second, it silently downgraded P+ to F.
+P+ is a first-class passing grade elsewhere in canvaslms (the cache
+treats it as final, and [[tilkryLAB1]] maps it to P), so a student whose
+passing grade was P+ would be reported as \emph{failing}, with no
+warning.
+
+We centralize the translation in one helper: set membership against the
+grades [[grade_max]] can rank, with P+ normalized to P first.
+
+We deliberately do \emph{not} map Canvas's \enquote{complete} to P, even
+though the [[results]] command counts it as passing elsewhere: surveys in
+these assignment groups commonly auto-record completion, and under
+disjunctive grading a complete-counts-as-P rule would pass a student on
+survey participation alone.
+Such grades stay F here; a course where \enquote{complete} is a real
+grade needs its own summary module.
+<<helper functions>>=
+RECOGNIZED_GRADES = {"A", "B", "C", "D", "E", "P", "F"}
+
+def normalize_survey_grade(grade):
+  """Normalize a Canvas grade for survey-inclusive grading.
+
+  P+ counts as P. Any grade not recognized by grade_max
+  (e.g. None or a numeric survey score) is treated as F.
+  """
+  if grade == "P+":
+    return "P"
+  if grade in RECOGNIZED_GRADES:
+    return grade
+  return "F"
+@
+
+Let's verify the three behaviours: P+ passes, recognized grades pass
+through untouched, and everything else---including the substring-test
+false positives---becomes F.
+
+<<test functions>>=
+def test_p_plus_normalizes_to_p():
+  assert maxgradesurvey.normalize_survey_grade("P+") == "P"
+
+
+def test_recognized_grades_pass_through():
+  for grade in ["A", "B", "C", "D", "E", "P", "F"]:
+    assert maxgradesurvey.normalize_survey_grade(grade) == grade
+
+
+def test_unrecognized_grades_become_f():
+  for grade in [None, "", "EP", "17.0", "complete"]:
+    assert maxgradesurvey.normalize_survey_grade(grade) == "F"
+@
+
 
 \subsection{Summarizing grades: assignment grades to component grade}
 
@@ -53,8 +124,9 @@ submissions.
 We do the same for grades, as we iterate through we add any grade to a list.
 In the end we compute the maximums of both lists.
 
-The key difference to the [[summarize]] function in 
-\cref{disjunctmax-summarize} is the translation of other grades to F.
+The key difference to the [[summarize]] function in
+\cref{disjunctmax-summarize} is the grade translation through
+[[normalize_survey_grade]].
 <<helper functions>>=
 def summarize(user, assignments_list):
   """Extracts user's submissions for assignments in assingments_list to 
@@ -76,12 +148,7 @@ def summarize(user, assignments_list):
     submission.assignment = assignment
     graders += results.all_graders(submission)
 
-    grade = submission.grade
-
-    if grade is None or grade not in "ABCDEPF":
-      grade = "F"
-
-    grades.append(grade)
+    grades.append(normalize_survey_grade(submission.grade))
 
     grade_date = submission.submitted_at or submission.graded_at
 
@@ -115,8 +182,8 @@ The semantics of \enquote{missing} are the same:
   options.
 \end{itemize}
 
-The key difference from [[disjunctmax]] is that unknown grades (grades not in
-A--F or P) are treated as F.
+The key difference from [[disjunctmax]] is that grades again pass through
+[[normalize_survey_grade]]: P+ counts as P, unrecognized grades as F.
 This accommodates surveys where numeric scores don't count as grades.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
@@ -126,7 +193,7 @@ def missing_assignments(assignments_list, users_list,
   Returns missing assignments for disjunctive maximum grading with surveys.
 
   Only reports assignments if the student has NO passing grades.
-  Unknown grades (not A-F or P) are treated as F.
+  P+ counts as P; unrecognized grades are treated as F.
   """
   import re
 
@@ -142,10 +209,7 @@ def missing_assignments(assignments_list, users_list,
 
       try:
         submission = assignment.get_submission(user)
-        grade = submission.grade
-        # Unknown grades are treated as F
-        if grade is None or grade not in "ABCDEPF":
-          grade = "F"
+        grade = normalize_survey_grade(submission.grade)
       except ResourceDoesNotExist:
         grade = "F"
 
