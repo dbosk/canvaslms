@@ -60,6 +60,8 @@ import argparse
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 import canvasapi.exceptions
 
 import canvaslms.cli.results as results_module
@@ -1037,9 +1039,19 @@ reporting grades.
 For instance, a malicious module could change grades, \eg always set 
 A's.
 
-Now to the loader, we first try to load a system module, then we look for a 
+Now to the loader, we first try to load a system module, then we look for a
 module in the current working directory.
 We provide a helper function to do this.
+
+When both attempts fail, the file loader raises [[FileNotFoundError]]
+with the working directory prepended to the dotted module name---for
+example \enquote{No such file or directory:
+'/home/user/canvaslms.grades.conjunctavg'}---which reads like a bug in
+the program rather than a typo in the module name.
+We translate it into a [[ModuleNotFoundError]] that states both failed
+interpretations and lists the available grading modules (reusing
+[[list_grading_modules]]), so a user can spot a misspelling directly
+from the error message.
 <<functions>>=
 def load_module(module_name):
   """
@@ -1055,7 +1067,14 @@ def load_module(module_name):
       module, str(module_path))
     spec = importlib.util.spec_from_loader(module, loader)
     module_obj = importlib.util.module_from_spec(spec)
-    loader.exec_module(module_obj)
+    try:
+      loader.exec_module(module_obj)
+    except FileNotFoundError:
+      available = ", ".join(m[0] for m in list_grading_modules())
+      raise ModuleNotFoundError(
+        f"'{module_name}' is neither an importable module nor "
+        f"a file in the current directory; "
+        f"available grading modules: {available}")
     return module_obj
 <<load the correct summary module as [[summary]]>>=
 try:
@@ -1065,8 +1084,29 @@ except Exception as err:
     f"'{args.summary_module}': {err}")
 @
 
-The available summary functions and the default one can be found in 
+The available summary functions and the default one can be found in
 \cref{summary-modules}.
+
+Let's verify that [[load_module]] loads built-in grading modules, and
+that a nonexistent module fails with a message that names the module
+and lists the available ones---rather than leaking the
+[[FileNotFoundError]] with its misleading path.
+
+<<test functions>>=
+def test_load_module_imports_builtin_grading_module():
+  module = results_module.load_module("canvaslms.grades.conjunctavg")
+
+  assert hasattr(module, "summarize_group")
+
+
+def test_load_module_reports_unknown_module_cleanly():
+  with pytest.raises(ModuleNotFoundError) as excinfo:
+    results_module.load_module("canvaslms.grades.doesnotexist")
+
+  message = str(excinfo.value)
+  assert "canvaslms.grades.doesnotexist" in message
+  assert "conjunctavg" in message
+@
 
 \subsection{Producing a list of missing assignments for assignment groups}
 
@@ -1104,14 +1144,27 @@ results_parser.add_argument("--missing",
 Since [[--missing]] is now a simple flag, we use the summary module (specified
 via [[-S]]) to provide the [[missing_assignments]] function.
 If the summary module doesn't have one, we fall back to this module's default.
+
+The fallback is this very module, so we look it up as
+[[sys.modules[__name__]]] rather than importing it.
+We must not write [[import canvaslms.cli.results]] here:
+this chunk expands inside the summarize functions, and Python decides
+scoping at compile time, so a function-local [[import]] statement makes
+the name [[canvaslms]] local to the \emph{entire} function.
+That local binding used to shadow the global package name in the error
+handler of the summary-loading chunk above, which runs \emph{before} the
+import statement:
+a failed module load then crashed with [[UnboundLocalError]] on
+[[canvaslms.cli.err]] instead of printing the intended error message.
+The [[sys.modules]] lookup binds no name other than [[missing]] and thus
+cannot shadow anything.
 <<load the correct missing module as [[missing]]>>=
 if args.missing:
   <<load the correct summary module as [[summary]]>>
   if hasattr(summary, 'missing_assignments'):
     missing = summary
   else:
-    import canvaslms.cli.results
-    missing = canvaslms.cli.results
+    missing = sys.modules[__name__]
 @
 
 Now, to the main part of the problem.
