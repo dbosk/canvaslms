@@ -61,9 +61,12 @@ compile:
 	$(MAKE) -C ../src/canvaslms all
 
 # Clean generated test files
+# Also remove top-level test_*.py: an older layout tangled tests here
+# instead of unit/, and leftovers would otherwise survive make clean.
 .PHONY: clean
 clean:
 	$(RM) $(TEST_MODULES) $(DOC_MODULES)
+	$(RM) test_*.py
 	$(RM) -r .pytest_cache __pycache__ unit *unit
 	$(RM) -r htmlcov .coverage
 
