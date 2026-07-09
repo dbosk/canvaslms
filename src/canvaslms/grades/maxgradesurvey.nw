@@ -1,14 +1,25 @@
 \section{Maximum grade, latest date with surveys, the \texttt{maxgradesurvey} 
 module}
 
-In this module we want to provide the disjunctive maximum way of computing 
+In this module we want to provide the disjunctive maximum way of computing
 \emph{one grade} from \emph{several assignments}.
-But we also want to include ungraded surveys.
+But we also want to include surveys, which are mandatory.
+This gives the module two independent rules:
+\begin{enumerate}
+\item Graded assignments combine by \emph{disjunctive maximum}: one passing
+  grade suffices, the remaining graded assignments may be failed or not
+  attempted at all.
+\item Every survey is \emph{mandatory}: it must be completed, and an
+  uncompleted survey blocks the grade.
+\end{enumerate}
+Surveys carry no letter grade (typically a quiz with points, where the
+number of points is ignored), so they can never contribute a passing grade;
+their only contribution is their completion---and their date.
 <<module doc>>=
-Module that summarizes an assignment group by maximizing grade and date. This 
-module is the same as `canvaslms.grades.disjunctmax`, but also includes 
-ungraded surveys (for instance quiz with points, where the number of points is 
-ignored). Consequently all assignments must have a date.
+Module that summarizes an assignment group by maximizing grade and date.
+Graded assignments combine as in `canvaslms.grades.disjunctmax`: one passing
+grade suffices. Surveys (assignments graded in points, not letter grades)
+are mandatory: each must be completed, but their scores are ignored.
 
 This function also doesn't fail when there is a grade other than A--F or P/F
 present. P+ counts as P; all other unrecognized grades (for instance numeric
@@ -46,6 +57,11 @@ We define the test file structure early, but place each test after the
 functionality it verifies.
 <<test [[maxgradesurvey.py]]>>=
 """Tests for the canvaslms.grades.maxgradesurvey module."""
+import datetime as dt
+from types import SimpleNamespace
+
+from canvasapi.exceptions import ResourceDoesNotExist
+
 import canvaslms.grades.maxgradesurvey as maxgradesurvey
 
 <<test functions>>
@@ -113,61 +129,281 @@ def test_unrecognized_grades_become_f():
 @
 
 
+\subsection{Telling surveys from graded assignments}
+
+The two rules from the introduction treat surveys and graded assignments
+differently, so we must classify each assignment.
+What distinguishes a survey is its grading scheme: graded assignments use a
+letter-grade scheme (A--F or P/F), while surveys are graded in points only.
+Canvas exposes the scheme as the assignment's [[grading_type]]: the
+letter-grade schemes are [[letter_grade]] and its GPA variant [[gpa_scale]].
+The points-only schemes ([[points]], [[percent]] and friends) can never
+produce a grade that [[grade_max]] can rank, so such an assignment's only
+meaningful contribution is its completion.
+
+We classify by set membership against the letter-grade schemes and treat
+everything else as a survey.
+The direction of this default is deliberate.
+Misclassifying a graded assignment as a survey is mostly harmless: its grade
+still feeds the maximum, we merely also require completion---which a graded
+submission has.
+Misclassifying a survey as graded, however, would silently drop the
+mandatory-survey rule.
+Hence an unknown or missing [[grading_type]] classifies as survey.
+We keep the classification in one small predicate so the detection strategy
+stays swappable.
+<<helper functions>>=
+LETTER_GRADING_TYPES = {"letter_grade", "gpa_scale"}
+
+def is_survey(assignment):
+  """True iff the assignment is a survey (points only, no letter grades)."""
+  return assignment.grading_type not in LETTER_GRADING_TYPES
+@
+
+Let's verify that the letter-grade schemes classify as graded assignments
+and that everything else---including a missing grading type---classifies as
+a survey.
+<<test functions>>=
+def test_letter_grading_types_are_not_surveys():
+  for grading_type in ["letter_grade", "gpa_scale"]:
+    assert not maxgradesurvey.is_survey(
+      SimpleNamespace(grading_type=grading_type))
+
+
+def test_other_grading_types_are_surveys():
+  for grading_type in ["points", "percent", "complete_incomplete",
+                       "not_graded", None]:
+    assert maxgradesurvey.is_survey(
+      SimpleNamespace(grading_type=grading_type))
+@
+
+Both [[summarize]] and [[missing_assignments]] must agree on what it means
+for a survey to be completed, so we define completion once.
+The evidence of completion is a date: a survey the student submitted has
+[[submitted_at]], and one a teacher marked manually has [[graded_at]].
+Accepting [[None]] lets call sites map a missing submission
+([[ResourceDoesNotExist]]) to \enquote{not completed} without duplicating
+the rule.
+<<helper functions>>=
+def survey_completed(submission):
+  """True iff the submission shows the survey was completed.
+
+  Pass None (no submission exists) for not completed.
+  """
+  if submission is None:
+    return False
+  return bool(submission.submitted_at or submission.graded_at)
+@
+
+A survey counts as completed with either date, and as uncompleted with
+neither date---or with no submission at all.
+<<test functions>>=
+def test_survey_completed_by_submission_date():
+  assert maxgradesurvey.survey_completed(
+    SimpleNamespace(submitted_at="2026-07-01T10:00:00Z", graded_at=None))
+
+
+def test_survey_completed_by_grading_date():
+  assert maxgradesurvey.survey_completed(
+    SimpleNamespace(submitted_at=None, graded_at="2026-07-01T10:00:00Z"))
+
+
+def test_survey_without_dates_not_completed():
+  assert not maxgradesurvey.survey_completed(
+    SimpleNamespace(submitted_at=None, graded_at=None))
+
+
+def test_missing_submission_not_completed():
+  assert not maxgradesurvey.survey_completed(None)
+@
+
+
 \subsection{Summarizing grades: assignment grades to component grade}
 
 Now we will describe the [[summarize]] helper function.
-We want to establish three things: the most recent date, a suitable grade and 
-the graders.
+We want to establish three things: the most recent date, a suitable grade
+and the graders.
 
-For the most recent date, we just add them to a list as we iterate through the 
-submissions.
+For the most recent date, we just add them to a list as we iterate through
+the submissions.
 We do the same for grades, as we iterate through we add any grade to a list.
 In the end we compute the maximums of both lists.
+Compared to the [[summarize]] function in \cref{disjunctmax-summarize}, all
+grades pass through [[normalize_survey_grade]] and we additionally track
+whether every survey is completed.
 
-The key difference to the [[summarize]] function in
-\cref{disjunctmax-summarize} is the grade translation through
-[[normalize_survey_grade]].
+The mandatory-survey rule needs care.
+An earlier version enforced it as [[len(dates) < len(grades)]]: every
+assignment contributes a grade, but only submissions with a date contribute
+a date, so any missing date forced the final grade to F.
+That test looks like \enquote{every survey answered}, but it actually
+asserts \enquote{every \emph{assignment} has a date}.
+A graded assignment the student never attempted appends an F with no date
+and trips the veto---even though the disjunctive rule says an unattempted
+graded assignment is fine as long as another one passes.
+A student with an A who skipped a redundant graded assignment was thus
+reported as failing.
+Therefore we test completion per \emph{survey} only, using [[is_survey]]
+and [[survey_completed]]; graded assignments participate only through
+[[grade_max]].
 <<helper functions>>=
 def summarize(user, assignments_list):
-  """Extracts user's submissions for assignments in assingments_list to 
-  summarize results into one grade and a grade date. Summarize by disjunctive 
-  maximum."""
+  """Extracts user's submissions for assignments in assingments_list to
+  summarize results into one grade and a grade date. Graded assignments
+  summarize by disjunctive maximum; every survey must be completed."""
 
   grades = []
   dates = []
   graders = []
+  surveys_done = True
 
   for assignment in assignments_list:
-    try:
-      submission = assignment.get_submission(user,
-                                             include=["submission_history"])
-    except ResourceDoesNotExist:
-      grades.append("F")
-      continue
+    <<collect grade, date and survey completion from one submission>>
 
-    submission.assignment = assignment
-    graders += results.all_graders(submission)
-
-    grades.append(normalize_survey_grade(submission.grade))
-
-    grade_date = submission.submitted_at or submission.graded_at
-
-    if grade_date:
-      grade_date = dt.date.fromisoformat(grade_date.split("T")[0])
-      dates.append(grade_date)
-
-  if len(dates) < len(grades):
-    final_grade = "F"
-  else:
-    final_grade = grade_max(grades) or "F"
-
-  if dates:
-    final_date = max(dates)
-  else:
-    final_date = None
-    final_grade = None
+  <<combine collected results into [[final_grade]] and [[final_date]]>>
 
   return (final_grade, final_date, graders)
+@
+
+For each assignment we fetch the user's submission.
+A submission that doesn't exist contributes an F to the maximum; if the
+assignment is a survey, the missing submission also means the survey is
+uncompleted.
+<<collect grade, date and survey completion from one submission>>=
+try:
+  submission = assignment.get_submission(user,
+                                         include=["submission_history"])
+except ResourceDoesNotExist:
+  grades.append("F")
+  if is_survey(assignment):
+    surveys_done = False
+  continue
+
+submission.assignment = assignment
+graders += results.all_graders(submission)
+
+grades.append(normalize_survey_grade(submission.grade))
+
+if is_survey(assignment) and not survey_completed(submission):
+  surveys_done = False
+
+grade_date = submission.submitted_at or submission.graded_at
+
+if grade_date:
+  grade_date = dt.date.fromisoformat(grade_date.split("T")[0])
+  dates.append(grade_date)
+@
+
+If there are no dates at all, the student hasn't done anything; we return
+[[None]] so that the [[results]] command can skip the row entirely.
+Otherwise an uncompleted survey caps the grade at F, and only when all
+surveys are completed do we award the disjunctive maximum.
+<<combine collected results into [[final_grade]] and [[final_date]]>>=
+if not dates:
+  final_grade = None
+  final_date = None
+elif not surveys_done:
+  final_grade = "F"
+  final_date = max(dates)
+else:
+  final_grade = grade_max(grades) or "F"
+  final_date = max(dates)
+@
+
+Let's verify the interplay of the two rules, with fake assignments and
+submissions modelled on the real Canvas objects.
+<<test functions>>=
+def fake_assignment(grading_type, submission=None, missing=False,
+                    name="fake"):
+  """Fake assignment whose get_submission returns submission,
+  or raises ResourceDoesNotExist if missing is True."""
+  def get_submission(user, **kwargs):
+    if missing:
+      raise ResourceDoesNotExist("no submission")
+    return submission
+  return SimpleNamespace(grading_type=grading_type,
+                         name=name,
+                         get_submission=get_submission)
+
+
+def fake_submission(grade, submitted_at=None, graded_at=None):
+  """Fake submission with the attributes summarize reads."""
+  return SimpleNamespace(grade=grade,
+                         submitted_at=submitted_at,
+                         graded_at=graded_at,
+                         submission_history=[])
+@
+
+First the regression that motivated the per-survey test: an A on one graded
+assignment, another graded assignment never attempted, and a completed
+survey must yield the A---not F.
+<<test functions>>=
+def test_skipped_graded_assignment_does_not_veto():
+  assignments = [
+    fake_assignment("letter_grade",
+                    fake_submission("A",
+                                    submitted_at="2026-05-01T10:00:00Z")),
+    fake_assignment("letter_grade", missing=True),
+    fake_assignment("points",
+                    fake_submission("17.0",
+                                    submitted_at="2026-05-02T10:00:00Z")),
+  ]
+  grade, date, graders = maxgradesurvey.summarize("user", assignments)
+  assert grade == "A"
+  assert date == dt.date(2026, 5, 2)
+  assert graders == []
+@
+
+Conversely, an uncompleted survey must block the grade---whether the
+submission is entirely missing or exists without any date.
+<<test functions>>=
+def test_missing_survey_vetoes_grade():
+  assignments = [
+    fake_assignment("letter_grade",
+                    fake_submission("A",
+                                    submitted_at="2026-05-01T10:00:00Z")),
+    fake_assignment("points", missing=True),
+  ]
+  grade, date, _ = maxgradesurvey.summarize("user", assignments)
+  assert grade == "F"
+  assert date == dt.date(2026, 5, 1)
+
+
+def test_dateless_survey_submission_vetoes_grade():
+  assignments = [
+    fake_assignment("letter_grade",
+                    fake_submission("A",
+                                    submitted_at="2026-05-01T10:00:00Z")),
+    fake_assignment("points", fake_submission(None)),
+  ]
+  grade, _, _ = maxgradesurvey.summarize("user", assignments)
+  assert grade == "F"
+@
+
+A student who hasn't done anything yields no grade at all (the row is
+skipped downstream), while a student who only completed the survey gets F:
+the survey score can never pass.
+<<test functions>>=
+def test_nothing_done_yields_no_grade():
+  assignments = [
+    fake_assignment("letter_grade", missing=True),
+    fake_assignment("points", missing=True),
+  ]
+  grade, date, _ = maxgradesurvey.summarize("user", assignments)
+  assert grade is None
+  assert date is None
+
+
+def test_only_survey_done_yields_f():
+  assignments = [
+    fake_assignment("letter_grade", missing=True),
+    fake_assignment("points",
+                    fake_submission("17.0",
+                                    submitted_at="2026-05-02T10:00:00Z")),
+  ]
+  grade, date, _ = maxgradesurvey.summarize("user", assignments)
+  assert grade == "F"
+  assert date == dt.date(2026, 5, 2)
 @
 
 
