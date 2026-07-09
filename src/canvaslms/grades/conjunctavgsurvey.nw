@@ -239,34 +239,37 @@ class TestSurveyScoring:
 
 \subsection{Finding missing assignments}
 
-For conjunctive average with surveys, the definition of \enquote{passing} is
-broader than plain [[conjunctavg]]: numeric grades (points, percentages) also
-count as passing.
-This accommodates mandatory surveys that aren't graded A--F but still need to
-be completed.
+Missing assignments split the same way as the grades: surveys are
+missing when uncompleted, letter-graded assignments when they lack a
+passing grade.
 
-We define [[is_passing_grade]] to accept A--E, P, complete, and any numeric
-value.
+For the letter-graded assignments we reuse the shared implementation
+in [[results]], with a passing check over the grades that
+\cref{conjunctavg} can produce.
+An earlier version also counted numeric grades as passing, to
+accommodate surveys; with assignment-level classification the passing
+check no longer needs to know about scores.
 <<helper functions>>=
 def is_passing_grade(grade):
   """
-  Returns True if grade is passing (includes numeric grades).
+  Returns True if grade is passing (A-E, P or complete).
   """
   grade = normalize_grade(grade)
   if grade in ["A", "B", "C", "D", "E", "P"]:
     return True
-  if isinstance(grade, str):
-    if grade.casefold() == "complete":
-      return True
-    # Numeric grades (points, percentages) count as passing
-    if (grade.isdigit()
-        or grade.replace('.', '', 1).isdigit()
-        or grade.replace('%', '', 1).isdigit()):
-      return True
+  if isinstance(grade, str) and grade.casefold() == "complete":
+    return True
   return False
 @
 
-We reuse the shared implementation with our broader [[is_passing_grade]].
+Surveys bypass the shared implementation entirely.
+Its grade-centric reasons would misreport them: a completed, ungraded
+survey came back as \enquote{submitted \ldots, but not graded}, and a
+dateless numeric score passed.
+Completion is the only criterion, checked with the same
+[[survey_completed]] as [[summarize]] uses---and the reason string
+matches [[maxgradesurvey]], so the [[--missing]] output reads the same
+across the survey-aware modules.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         passing_regex=None,
@@ -274,16 +277,90 @@ def missing_assignments(assignments_list, users_list,
   """
   Returns missing assignments for conjunctive average with surveys.
 
-  Any assignment without a passing grade (A-E, P, complete, or numeric) is
-  missing.
+  Surveys are missing when uncompleted; other assignments when they
+  lack a passing grade (A-E, P or complete).
   """
-  from canvaslms.cli import results
-  return results.missing_assignments(
-    assignments_list, users_list,
-    optional_assignments=optional_assignments,
-    is_passing=is_passing_grade,
-    normalize_grade=normalize_grade
-  )
+  import re
+
+  surveys = [a for a in assignments_list if is_survey(a)]
+  graded = [a for a in assignments_list if not is_survey(a)]
+
+  <<yield each user's uncompleted surveys>>
+
+  <<delegate graded assignments to the shared implementation>>
+@
+
+The survey loop must apply the [[optional_assignments]] filter itself,
+since those assignments never reach the shared implementation that
+normally applies it.
+<<yield each user's uncompleted surveys>>=
+for user in users_list:
+  for assignment in surveys:
+    if optional_assignments:
+      if any(re.search(opt, assignment.name)
+             for opt in optional_assignments):
+        continue
+
+    try:
+      submission = assignment.get_submission(user)
+    except ResourceDoesNotExist:
+      submission = None
+
+    if not survey_completed(submission):
+      yield user, assignment, "mandatory survey not completed"
+@
+
+The letter-graded assignments keep the conjunctive rule from
+[[conjunctavg]]: each one without a passing grade is missing.
+<<delegate graded assignments to the shared implementation>>=
+yield from results.missing_assignments(
+  graded, users_list,
+  optional_assignments=optional_assignments,
+  is_passing=is_passing_grade,
+  normalize_grade=normalize_grade
+)
+@
+
+Let's verify both halves: a completed, ungraded survey is no longer
+reported missing, while an uncompleted survey is reported---and is the
+only report even when the exams pass.
+<<test functions>>=
+class TestMissingSurveys:
+    """Test completion-based missing reporting for surveys."""
+
+    def test_completed_ungraded_survey_not_missing(self):
+        user = SimpleNamespace(id=1)
+        survey = SimpleNamespace(name="Survey", grading_type="points")
+        survey.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade=None,
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+            )
+        )
+
+        assert list(missing_assignments([survey], [user])) == []
+
+    def test_uncompleted_survey_missing_despite_passing_exam(self):
+        user = SimpleNamespace(id=1)
+        survey = SimpleNamespace(name="Survey", grading_type="points")
+        survey.get_submission = Mock(
+            side_effect=ResourceDoesNotExist("no submission")
+        )
+        exam = SimpleNamespace(name="Exam", grading_type="letter_grade")
+        exam.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade="A",
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+            )
+        )
+
+        missing = list(missing_assignments([exam, survey], [user]))
+
+        assert len(missing) == 1
+        assert missing[0][1] is survey
+        assert missing[0][2] == "mandatory survey not completed"
 @
 
 The survey variant should normalize [[must fix]] in both the summary and the
@@ -295,7 +372,8 @@ class TestMustFixGrade:
     def test_summarize_treats_must_fix_as_f(self):
         """A [[must fix]] grade should fail conjunctive survey grading."""
         user = SimpleNamespace(id=1)
-        assignment = SimpleNamespace(name="Survey 1")
+        assignment = SimpleNamespace(name="Survey 1",
+                                     grading_type="letter_grade")
         assignment.get_submission = Mock(
             return_value=SimpleNamespace(
                 grade="must fix",
@@ -314,7 +392,8 @@ class TestMustFixGrade:
     def test_missing_assignments_reports_normalized_f(self):
         """Missing output should collapse [[must fix]] to [[F]]."""
         user = SimpleNamespace(id=1)
-        assignment = SimpleNamespace(name="Survey 1")
+        assignment = SimpleNamespace(name="Survey 1",
+                                     grading_type="letter_grade")
         assignment.get_submission = Mock(
             return_value=SimpleNamespace(
                 grade="must fix",
