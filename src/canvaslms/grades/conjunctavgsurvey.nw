@@ -1,27 +1,58 @@
 \section{Conjunctive average with surveys, \texttt{conjunctavgsurvey}}
 
 This is the same as \cref{conjunctavg}, but with one difference:
-When we extract the grade and then try to figure out which grading scale is 
-used, we treat numerical grades as passes.
-This is to allow for mandatory surveys that are not graded, but still need to 
-be included in the summary.
+the assignment group may contain surveys, which must be completed but
+whose scores are ignored.
+This is to allow for mandatory surveys that are not graded, but still
+need to be included in the summary.
+
+An earlier version identified surveys by their \emph{grade format}:
+any numeric grade (points or percentages) was treated as P.
+That heuristic fails in two ways.
+A score in a format the parser didn't anticipate---for instance
+[[85.5%]], with both a decimal point and a percent sign---matched
+neither the numeric patterns nor any known grade and crashed the whole
+summary with a [[ValueError]].
+And a survey that was completed but carries no grade at all normalized
+to F, failing the student---even though supporting \emph{ungraded}
+mandatory surveys is this module's purpose.
+
+Instead we classify at the assignment level, reusing [[is_survey]] and
+[[survey_completed]] from [[maxgradesurvey]]: an assignment whose
+grading scheme cannot produce letter grades is a survey, and a survey
+counts as P exactly when it is completed.
+Explicit grades keep their meaning and are translated first: mere
+completion never overrides a grade a teacher actually set, so A--E,
+P/F and complete/incomplete take precedence over the survey rule.
+A numeric grade on a \emph{letter-graded} assignment is no longer
+silently treated as P; it is an error, like any other unknown grade
+in \cref{conjunctavg}.
+
+One subtlety: [[normalize_grade]] maps a missing grade ([[None]]) to
+F, which is right for letter-graded assignments---no grade means not
+passed---but wrong for surveys, where no grade merely means the survey
+is ungraded and completion must decide.
+We therefore keep [[None]] distinct until the survey branch has had
+its chance.
 So when we translate and add the grades to the proper list, we do this:
 <<add grade to the correct grades list>>=
-grade = normalize_grade(submission.grade)
+if submission.grade is None:
+  grade = None
+else:
+  grade = normalize_grade(submission.grade)
 
 if grade in ["A", "B", "C", "D", "E"]:
   a2e_grades.append(grade)
 elif grade in ["P", "F"]:
   pf_grades.append(grade)
-elif grade.casefold() == "complete":
+elif grade and grade.casefold() == "complete":
   pf_grades.append("P")
-elif grade.casefold() == "incomplete":
+elif grade and grade.casefold() == "incomplete":
   pf_grades.append("F")
-elif (grade.isdigit()
-      or grade.replace('.', '', 1).isdigit()
-      or grade.replace('%', '', 1).isdigit()):
-  # Numeric grades (like points) are treated as P
-  pf_grades.append("P")
+elif is_survey(assignment):
+  pf_grades.append("P" if survey_completed(submission) else "F")
+elif grade is None:
+  pf_grades.append("F")
 else:
   raise ValueError(f"Unknown grade {grade} for assignment {assignment}.")
 @
@@ -29,15 +60,16 @@ else:
 The rest of this section is the same as \cref{conjunctavg}.
 <<[[conjunctavgsurvey.py]]>>=
 """
-This module is the same as `canvaslms.grades.conjunctavg` except that any 
-submissions with grades other than A--F, P/F and complete/incomplete are 
-treated as P---for instance, numeric grades (points or percentages). Also, all 
-submissions must have a date. This makes this module useful for including 
-mandatory, ungraded surveys.
+This module is the same as `canvaslms.grades.conjunctavg` except that the
+assignment group may contain surveys: assignments graded in points rather
+than letter grades. Each survey must be completed---its score is
+ignored---which makes this module useful for including mandatory, possibly
+ungraded, surveys.
 """
 
 import datetime as dt
 from canvaslms.grades.conjunctavg import a2e_average, normalize_grade
+from canvaslms.grades.maxgradesurvey import is_survey, survey_completed
 from canvaslms.cli import results
 from canvasapi.exceptions import ResourceDoesNotExist
 
@@ -70,8 +102,9 @@ Now we will describe the [[summarize]] helper function.
 We want to establish three things: the most recent date, a suitable grade and 
 who graded.
 
-For the grade, as we iterate through we look for P/F, A--E, and 
-complete/incomplete grades.
+For the grade, as we iterate through we look for P/F, A--E, and
+complete/incomplete grades; surveys contribute a completion-based P/F
+as described above.
 We can then check for Fs among the P/F grades (as seen above), if we find an F 
 the summarized grade will be an F.
 If we find no Fs, then we can compute the average over all A--E grades and use 
@@ -138,37 +171,105 @@ For who graded, we simply extract the list of graders from the submissions.
 graders += results.all_graders(submission)
 @
 
+Let's verify the survey handling in [[summarize]]: a completed survey
+counts as P whatever its score looks like---the percent-and-decimal
+format that crashed the numeric heuristic, or no grade at all---while
+an uncompleted survey fails the student even alongside a passing exam.
+<<test functions>>=
+class TestSurveyScoring:
+    """Test completion-based scoring of surveys in summarize."""
+
+    def _survey(self, grade, submitted_at=None):
+        assignment = SimpleNamespace(name="Survey",
+                                     grading_type="points")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade=grade,
+                submitted_at=submitted_at,
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+        return assignment
+
+    def _passed_exam(self):
+        assignment = SimpleNamespace(name="Exam",
+                                     grading_type="letter_grade")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade="A",
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+        return assignment
+
+    def test_completed_survey_with_odd_score_passes(self):
+        """A score like '85.5%' must not crash; completion counts."""
+        user = SimpleNamespace(id=1)
+        survey = self._survey("85.5%",
+                              submitted_at="2026-01-10T10:00:00Z")
+
+        grade, grade_date, _ = summarize(user, [survey])
+
+        assert grade == "P"
+        assert grade_date is not None
+
+    def test_completed_ungraded_survey_passes(self):
+        """No grade at all: completion still counts."""
+        user = SimpleNamespace(id=1)
+        survey = self._survey(None,
+                              submitted_at="2026-01-10T10:00:00Z")
+
+        grade, _, _ = summarize(user, [survey])
+
+        assert grade == "P"
+
+    def test_uncompleted_survey_fails(self):
+        """A dateless survey submission fails, despite a passing exam."""
+        user = SimpleNamespace(id=1)
+
+        grade, _, _ = summarize(user,
+                                [self._survey(None), self._passed_exam()])
+
+        assert grade == "F"
+@
+
 
 \subsection{Finding missing assignments}
 
-For conjunctive average with surveys, the definition of \enquote{passing} is
-broader than plain [[conjunctavg]]: numeric grades (points, percentages) also
-count as passing.
-This accommodates mandatory surveys that aren't graded A--F but still need to
-be completed.
+Missing assignments split the same way as the grades: surveys are
+missing when uncompleted, letter-graded assignments when they lack a
+passing grade.
 
-We define [[is_passing_grade]] to accept A--E, P, complete, and any numeric
-value.
+For the letter-graded assignments we reuse the shared implementation
+in [[results]], with a passing check over the grades that
+\cref{conjunctavg} can produce.
+An earlier version also counted numeric grades as passing, to
+accommodate surveys; with assignment-level classification the passing
+check no longer needs to know about scores.
 <<helper functions>>=
 def is_passing_grade(grade):
   """
-  Returns True if grade is passing (includes numeric grades).
+  Returns True if grade is passing (A-E, P or complete).
   """
   grade = normalize_grade(grade)
   if grade in ["A", "B", "C", "D", "E", "P"]:
     return True
-  if isinstance(grade, str):
-    if grade.casefold() == "complete":
-      return True
-    # Numeric grades (points, percentages) count as passing
-    if (grade.isdigit()
-        or grade.replace('.', '', 1).isdigit()
-        or grade.replace('%', '', 1).isdigit()):
-      return True
+  if isinstance(grade, str) and grade.casefold() == "complete":
+    return True
   return False
 @
 
-We reuse the shared implementation with our broader [[is_passing_grade]].
+Surveys bypass the shared implementation entirely.
+Its grade-centric reasons would misreport them: a completed, ungraded
+survey came back as \enquote{submitted \ldots, but not graded}, and a
+dateless numeric score passed.
+Completion is the only criterion, checked with the same
+[[survey_completed]] as [[summarize]] uses---and the reason string
+matches [[maxgradesurvey]], so the [[--missing]] output reads the same
+across the survey-aware modules.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         passing_regex=None,
@@ -176,16 +277,90 @@ def missing_assignments(assignments_list, users_list,
   """
   Returns missing assignments for conjunctive average with surveys.
 
-  Any assignment without a passing grade (A-E, P, complete, or numeric) is
-  missing.
+  Surveys are missing when uncompleted; other assignments when they
+  lack a passing grade (A-E, P or complete).
   """
-  from canvaslms.cli import results
-  return results.missing_assignments(
-    assignments_list, users_list,
-    optional_assignments=optional_assignments,
-    is_passing=is_passing_grade,
-    normalize_grade=normalize_grade
-  )
+  import re
+
+  surveys = [a for a in assignments_list if is_survey(a)]
+  graded = [a for a in assignments_list if not is_survey(a)]
+
+  <<yield each user's uncompleted surveys>>
+
+  <<delegate graded assignments to the shared implementation>>
+@
+
+The survey loop must apply the [[optional_assignments]] filter itself,
+since those assignments never reach the shared implementation that
+normally applies it.
+<<yield each user's uncompleted surveys>>=
+for user in users_list:
+  for assignment in surveys:
+    if optional_assignments:
+      if any(re.search(opt, assignment.name)
+             for opt in optional_assignments):
+        continue
+
+    try:
+      submission = assignment.get_submission(user)
+    except ResourceDoesNotExist:
+      submission = None
+
+    if not survey_completed(submission):
+      yield user, assignment, "mandatory survey not completed"
+@
+
+The letter-graded assignments keep the conjunctive rule from
+[[conjunctavg]]: each one without a passing grade is missing.
+<<delegate graded assignments to the shared implementation>>=
+yield from results.missing_assignments(
+  graded, users_list,
+  optional_assignments=optional_assignments,
+  is_passing=is_passing_grade,
+  normalize_grade=normalize_grade
+)
+@
+
+Let's verify both halves: a completed, ungraded survey is no longer
+reported missing, while an uncompleted survey is reported---and is the
+only report even when the exams pass.
+<<test functions>>=
+class TestMissingSurveys:
+    """Test completion-based missing reporting for surveys."""
+
+    def test_completed_ungraded_survey_not_missing(self):
+        user = SimpleNamespace(id=1)
+        survey = SimpleNamespace(name="Survey", grading_type="points")
+        survey.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade=None,
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+            )
+        )
+
+        assert list(missing_assignments([survey], [user])) == []
+
+    def test_uncompleted_survey_missing_despite_passing_exam(self):
+        user = SimpleNamespace(id=1)
+        survey = SimpleNamespace(name="Survey", grading_type="points")
+        survey.get_submission = Mock(
+            side_effect=ResourceDoesNotExist("no submission")
+        )
+        exam = SimpleNamespace(name="Exam", grading_type="letter_grade")
+        exam.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade="A",
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+            )
+        )
+
+        missing = list(missing_assignments([exam, survey], [user]))
+
+        assert len(missing) == 1
+        assert missing[0][1] is survey
+        assert missing[0][2] == "mandatory survey not completed"
 @
 
 The survey variant should normalize [[must fix]] in both the summary and the
@@ -197,7 +372,8 @@ class TestMustFixGrade:
     def test_summarize_treats_must_fix_as_f(self):
         """A [[must fix]] grade should fail conjunctive survey grading."""
         user = SimpleNamespace(id=1)
-        assignment = SimpleNamespace(name="Survey 1")
+        assignment = SimpleNamespace(name="Survey 1",
+                                     grading_type="letter_grade")
         assignment.get_submission = Mock(
             return_value=SimpleNamespace(
                 grade="must fix",
@@ -216,7 +392,8 @@ class TestMustFixGrade:
     def test_missing_assignments_reports_normalized_f(self):
         """Missing output should collapse [[must fix]] to [[F]]."""
         user = SimpleNamespace(id=1)
-        assignment = SimpleNamespace(name="Survey 1")
+        assignment = SimpleNamespace(name="Survey 1",
+                                     grading_type="letter_grade")
         assignment.get_submission = Mock(
             return_value=SimpleNamespace(
                 grade="must fix",
