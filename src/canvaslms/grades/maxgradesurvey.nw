@@ -409,54 +409,178 @@ def test_only_survey_done_yields_f():
 
 \subsection{Finding missing assignments}
 
-Like [[disjunctmax]], this module uses disjunctive grading: a student only needs
-ONE passing grade.
-The semantics of \enquote{missing} are the same:
+For graded assignments the semantics of \enquote{missing} are the same as
+in [[disjunctmax]]: a student only needs ONE passing grade, so
 \begin{itemize}
-\item If the student has at least one passing grade, nothing is missing.
-\item If the student has no passing grades, all assignments are reported as
-  options.
+\item if the student has at least one passing grade among the graded
+  assignments, no graded assignment is missing;
+\item if the student has no passing grade, all graded assignments are
+  reported as options.
 \end{itemize}
+Surveys follow the opposite, conjunctive rule: every uncompleted survey is
+missing, \emph{regardless} of the student's grades.
+An earlier version ignored surveys here, which contradicted [[summarize]]:
+a student with a passing grade but an uncompleted survey was reported as
+having nothing missing, while their summarized grade was F.
 
-The key difference from [[disjunctmax]] is that grades again pass through
+Surveys never count towards the passing check.
+[[normalize_survey_grade]] maps survey scores to F anyway, so this only
+matters if a survey somehow carried a letter grade---and counting that
+would let survey participation substitute for graded work, for the same
+reason we don't map \enquote{complete} to P above.
+As in the other grade modules, grades pass through
 [[normalize_survey_grade]]: P+ counts as P, unrecognized grades as F.
-This accommodates surveys where numeric scores don't count as grades.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         passing_regex=None,
                         optional_assignments=None):
   """
-  Returns missing assignments for disjunctive maximum grading with surveys.
+  Returns missing assignments for disjunctive maximum grading with
+  mandatory surveys.
 
-  Only reports assignments if the student has NO passing grades.
-  P+ counts as P; unrecognized grades are treated as F.
+  Reports every uncompleted survey. Reports graded assignments only if
+  the student has no passing grade among them; P+ counts as P,
+  unrecognized grades are treated as F.
   """
   import re
 
   for user in users_list:
-    grades_with_assignments = []
+    <<partition [[user]]'s assignments into graded and undone surveys>>
+    <<report undone surveys>>
+    <<report graded assignments if none passes>>
+@
 
-    # First pass: collect all grades
-    for assignment in assignments_list:
-      # Skip optional assignments
-      if optional_assignments:
-        if any(re.search(opt, assignment.name) for opt in optional_assignments):
-          continue
+We make one pass over the assignments, skipping optional ones, and classify
+each with [[is_survey]].
+For a survey we only need its completion; for a graded assignment we need
+the normalized grade.
+Both cases share the submission lookup, where a missing submission maps to
+[[None]] so that [[survey_completed]] and [[normalize_survey_grade]] treat
+it as uncompleted and F, respectively.
+<<partition [[user]]'s assignments into graded and undone surveys>>=
+graded_grades = []
+undone_surveys = []
 
-      try:
-        submission = assignment.get_submission(user)
-        grade = normalize_survey_grade(submission.grade)
-      except ResourceDoesNotExist:
-        grade = "F"
+for assignment in assignments_list:
+  if optional_assignments:
+    if any(re.search(opt, assignment.name)
+           for opt in optional_assignments):
+      continue
 
-      grades_with_assignments.append((assignment, grade))
+  try:
+    submission = assignment.get_submission(user)
+  except ResourceDoesNotExist:
+    submission = None
 
-    # Check if student has at least one passing grade (P or better)
-    has_passing = any(grade_max([g]) != "F" for _, g in grades_with_assignments)
+  if is_survey(assignment):
+    if not survey_completed(submission):
+      undone_surveys.append(assignment)
+  else:
+    grade = normalize_survey_grade(
+      submission.grade if submission else None)
+    graded_grades.append((assignment, grade))
+@
 
-    if not has_passing:
-      # Report all assignments as options to complete
-      for assignment, grade in grades_with_assignments:
-        yield user, assignment, \
-              f"not a passing grade ({grade}) - complete any one to pass"
+Every uncompleted survey is reported, before and independently of the
+graded assignments: completing it is mandatory even for a student who
+already passed.
+<<report undone surveys>>=
+for assignment in undone_surveys:
+  yield user, assignment, "mandatory survey not completed"
+@
+
+The graded assignments keep the disjunctive rule: only when no graded
+assignment passes do we report them, all of them, as options.
+<<report graded assignments if none passes>>=
+has_passing = any(grade_max([g]) != "F" for _, g in graded_grades)
+
+if not has_passing:
+  for assignment, grade in graded_grades:
+    yield user, assignment, \
+          f"not a passing grade ({grade}) - complete any one to pass"
+@
+
+Let's verify that the two rules combine correctly, reusing the fakes from
+the [[summarize]] tests.
+The regression that motivated the survey rule: a passing grade must not
+hide an uncompleted survey.
+<<test functions>>=
+def test_undone_survey_reported_despite_passing_grade():
+  passing = fake_assignment(
+    "letter_grade",
+    fake_submission("A", submitted_at="2026-05-01T10:00:00Z"))
+  survey = fake_assignment("points", missing=True)
+
+  rows = list(maxgradesurvey.missing_assignments(
+    [passing, survey], ["user"]))
+
+  assert len(rows) == 1
+  user, assignment, reason = rows[0]
+  assert assignment is survey
+  assert "survey" in reason
+
+
+def test_nothing_missing_when_passing_and_survey_done():
+  passing = fake_assignment(
+    "letter_grade",
+    fake_submission("A", submitted_at="2026-05-01T10:00:00Z"))
+  survey = fake_assignment(
+    "points",
+    fake_submission("17.0", submitted_at="2026-05-02T10:00:00Z"))
+
+  rows = list(maxgradesurvey.missing_assignments(
+    [passing, survey], ["user"]))
+
+  assert rows == []
+@
+
+Without a passing grade, both rules fire: the survey is reported as
+mandatory and every graded assignment as an option.
+<<test functions>>=
+def test_all_reported_when_no_passing_grade():
+  failed = fake_assignment(
+    "letter_grade",
+    fake_submission("F", submitted_at="2026-05-01T10:00:00Z"))
+  unattempted = fake_assignment("letter_grade", missing=True)
+  survey = fake_assignment("points", missing=True)
+
+  rows = list(maxgradesurvey.missing_assignments(
+    [failed, unattempted, survey], ["user"]))
+
+  assert len(rows) == 3
+  reported = [assignment for _, assignment, _ in rows]
+  assert survey in reported
+  assert failed in reported
+  assert unattempted in reported
+@
+
+Optional assignments are skipped before classification, so even an
+uncompleted survey is not demanded when it matches the optional pattern.
+And the survey's own score never counts as passing: a student who only
+completed the survey still has all graded assignments reported.
+<<test functions>>=
+def test_optional_survey_not_required():
+  passing = fake_assignment(
+    "letter_grade",
+    fake_submission("A", submitted_at="2026-05-01T10:00:00Z"))
+  survey = fake_assignment("points", missing=True,
+                           name="Optional survey")
+
+  rows = list(maxgradesurvey.missing_assignments(
+    [passing, survey], ["user"], optional_assignments=["Optional"]))
+
+  assert rows == []
+
+
+def test_survey_grade_never_passes():
+  unattempted = fake_assignment("letter_grade", missing=True)
+  survey = fake_assignment(
+    "points",
+    fake_submission("17.0", submitted_at="2026-05-02T10:00:00Z"))
+
+  rows = list(maxgradesurvey.missing_assignments(
+    [unattempted, survey], ["user"]))
+
+  assert len(rows) == 1
+  assert rows[0][1] is unattempted
 
