@@ -7957,28 +7957,86 @@ def clean_scoring_data(scoring_data, original_interaction_data, interaction_type
 
 \subsubsection{Cleaning Classic Quiz exports}
 
-Classic Quizzes are simpler: we only need to remove the [[id]] field from each
-question.  The answer format in Classic Quizzes does not use UUIDs, so no
-special handling is needed for correct answer references.
+Classic Quizzes are simpler than New Quizzes: for each question we only need
+to keep the creatable fields, dropping metadata such as [[id]].  The answer
+format in Classic Quizzes does not use UUIDs, so no special handling is
+needed for correct answer references.
+
+Group entries (\cref{sec:classic-question-groups}) need one level of
+recursion: the group specification keeps its three defining attributes
+(dropping the exported [[id]] and [[position]], which are meaningless in
+another quiz) and each pool question is cleaned like an ungrouped one.
 
 <<functions>>=
 def clean_classic_quiz_for_import(export):
   """Cleans Classic Quiz export for import"""
-  clean_questions = []
+  clean_entries = []
 
-  for q in export.get('questions', []):
-    clean_q = {}
-    # Keep essential fields, skip 'id'
-    for key in ['question_name', 'question_text', 'question_type',
-                'points_possible', 'answers', 'correct_comments',
-                'incorrect_comments', 'neutral_comments',
-                'matching_answer_incorrect_matches', 'formulas', 'variables',
-                'formula_decimal_places', 'answer_tolerance']:
-      if key in q:
-        clean_q[key] = q[key]
-    clean_questions.append(clean_q)
+  for entry in export.get('questions', []):
+    if 'group' in entry:
+      <<clean a question group entry>>
+    else:
+      clean_entries.append(clean_classic_question_for_import(entry))
 
-  return {'questions': clean_questions}
+  return {'questions': clean_entries}
+@
+
+<<clean a question group entry>>=
+group = {key: entry['group'][key]
+         for key in ('name', 'pick_count', 'question_points')
+         if entry['group'].get(key) is not None}
+clean_entries.append({
+  'group': group,
+  'questions': [clean_classic_question_for_import(question)
+                for question in entry.get('questions', [])]
+})
+@
+
+<<functions>>=
+def clean_classic_question_for_import(question):
+  """Keeps only the question fields create_question accepts."""
+  clean_q = {}
+  # Keep essential fields, skip 'id'
+  for key in ['question_name', 'question_text', 'question_type',
+              'points_possible', 'answers', 'correct_comments',
+              'incorrect_comments', 'neutral_comments',
+              'matching_answer_incorrect_matches', 'formulas', 'variables',
+              'formula_decimal_places', 'answer_tolerance']:
+    if key in question:
+      clean_q[key] = question[key]
+  return clean_q
+@
+
+Let's verify that cleaning a grouped export produces exactly the schema that
+[[quizzes create]] documents: ids and positions gone, group nesting intact.
+
+<<test functions>>=
+def test_clean_classic_quiz_for_import_groups():
+  export = {
+    'questions': [
+      {'id': 1, 'position': 1, 'question_name': 'Q1',
+       'question_type': 'essay_question', 'points_possible': 5},
+      {'group': {'id': 5, 'position': 2, 'name': 'pool',
+                 'pick_count': 1, 'question_points': 2},
+       'questions': [
+         {'id': 2, 'position': 1, 'question_name': 'Form A',
+          'question_type': 'essay_question'},
+       ]},
+    ]
+  }
+
+  cleaned = quizzes.clean_classic_quiz_for_import(export)
+
+  assert cleaned == {
+    'questions': [
+      {'question_name': 'Q1', 'question_type': 'essay_question',
+       'points_possible': 5},
+      {'group': {'name': 'pool', 'pick_count': 1, 'question_points': 2},
+       'questions': [
+         {'question_name': 'Form A', 'question_type': 'essay_question'},
+       ]},
+    ]
+  }
 @
 
 
@@ -8243,9 +8301,21 @@ def extract_bank_info(item):
 
 For Classic Quizzes, we export the full question data including answers.
 
+Questions that belong to a question group must be folded back into the
+group-entry format that [[quizzes create]] accepts
+(\cref{sec:classic-question-groups}).  Without this, a grouped quiz would
+silently export as a flat quiz where every student gets \emph{all} pool
+questions instead of a random draw---a particularly insidious loss because
+the export still imports without error.  We first convert every question to
+a dictionary, then fold grouped questions into group entries.
+
 <<functions>>=
 def export_classic_questions(quiz):
-  """Exports questions from a Classic Quiz
+  """Exports questions from a Classic Quiz.
+
+  Questions belonging to a question group are folded into group
+  entries of the form {"group": {...}, "questions": [...]}, the same
+  format that `quizzes create` accepts.
 
   Args:
     quiz: Quiz object
@@ -8261,24 +8331,8 @@ def export_classic_questions(quiz):
     canvaslms.cli.warn(f"Failed to fetch Classic Quiz questions: {e}")
     questions = []
 
-  items = []
-  for q in questions:
-    # Convert canvasapi object to dictionary
-    item = {
-      'id': q.id,
-      'position': getattr(q, 'position', None),
-      'question_name': getattr(q, 'question_name', ''),
-      'question_text': getattr(q, 'question_text', ''),
-      'question_type': getattr(q, 'question_type', ''),
-      'points_possible': getattr(q, 'points_possible', 0),
-      'answers': getattr(q, 'answers', [])
-    }
-    # Include additional fields if present
-    for field in ['correct_comments', 'incorrect_comments', 'neutral_comments',
-                  'matching_answer_incorrect_matches', 'formulas', 'variables']:
-      if hasattr(q, field):
-        item[field] = getattr(q, field)
-    items.append(item)
+  items = [classic_question_to_dict(q) for q in questions]
+  entries = group_classic_questions(quiz, items)
 
   return {
     'quiz_type': 'classic',
@@ -8286,8 +8340,182 @@ def export_classic_questions(quiz):
     'course_id': quiz.course_id if hasattr(quiz, 'course_id') else None,
     'export_date': datetime.datetime.now().isoformat(),
     'question_count': len(items),
-    'questions': items
+    'group_count': sum(1 for entry in entries if 'group' in entry),
+    'questions': entries
   }
+@
+
+The conversion to a dictionary keeps the fields that [[quizzes create]]
+understands.  We also record [[quiz_group_id]] so the grouping step below can
+recover the groups; that step removes it again, since the create side
+receives the group membership from the nesting instead.
+
+<<functions>>=
+def classic_question_to_dict(q):
+  """Converts a canvasapi QuizQuestion to an exportable dictionary."""
+  item = {
+    'id': q.id,
+    'position': getattr(q, 'position', None),
+    'quiz_group_id': getattr(q, 'quiz_group_id', None),
+    'question_name': getattr(q, 'question_name', ''),
+    'question_text': getattr(q, 'question_text', ''),
+    'question_type': getattr(q, 'question_type', ''),
+    'points_possible': getattr(q, 'points_possible', 0),
+    'answers': getattr(q, 'answers', [])
+  }
+  # Include additional fields if present
+  for field in ['correct_comments', 'incorrect_comments', 'neutral_comments',
+                'matching_answer_incorrect_matches', 'formulas', 'variables']:
+    if hasattr(q, field):
+      item[field] = getattr(q, field)
+  return item
+@
+
+\subsubsection{Folding grouped questions into group entries}
+
+The Canvas API has no endpoint to list a quiz's question groups; a group can
+only be fetched by id.  We therefore recover the groups from the questions
+themselves: each question carries a [[quiz_group_id]], and the distinct ids
+tell us which groups to fetch.
+
+Ordering needs care.  One might expect to sort all questions by [[position]]
+and fold adjacent runs sharing a [[quiz_group_id]] into a group, but Canvas
+reports the positions of grouped questions relative to their group (or not
+at all), not interleaved with the ungrouped questions.  Instead we
+partition: pool members are collected per group id regardless of where they
+appear in the list, and each group entry is then placed according to the
+group's own [[position]] attribute, which Canvas tracks in the same sequence
+as the ungrouped questions' positions.  Entries without a position sort
+last, and Python's stable sort preserves the API's order among them.
+
+If fetching a group fails, we still emit the group entry with only its
+[[id]]: flattening the pool into ordinary questions would silently change
+what students see, whereas an entry without [[pick_count]] fails loudly on
+re-import.
+
+<<functions>>=
+def group_classic_questions(quiz, items):
+  """Folds questions sharing a quiz_group_id into group entries.
+
+  Args:
+    quiz: Quiz object (used to fetch the question groups)
+    items: List of question dictionaries carrying quiz_group_id
+
+  Returns:
+    List of entries in quiz order: plain question dictionaries and
+    {"group": {...}, "questions": [...]} group entries.
+  """
+  <<partition questions into ungrouped entries and group pools>>
+  <<fetch each group and append its entry>>
+  <<sort entries by position>>
+  return [entry for _, entry in entries]
+@
+
+<<partition questions into ungrouped entries and group pools>>=
+entries = []  # (position, entry) pairs
+pools = {}    # group id -> list of pool questions
+
+for item in items:
+  group_id = item.pop('quiz_group_id', None)
+  if group_id is None:
+    entries.append((item.get('position'), item))
+  else:
+    pools.setdefault(group_id, []).append(item)
+@
+
+<<fetch each group and append its entry>>=
+for group_id, pool in pools.items():
+  group_info = {'id': group_id}
+  position = None
+  try:
+    group = quiz.get_quiz_group(group_id)
+    group_info['name'] = getattr(group, 'name', None)
+    group_info['pick_count'] = getattr(group, 'pick_count', None)
+    group_info['question_points'] = getattr(group, 'question_points', None)
+    position = getattr(group, 'position', None)
+  except Exception as e:
+    canvaslms.cli.warn(f"Failed to fetch question group {group_id}: {e}")
+
+  pool.sort(key=lambda q: position_sort_key(q.get('position')))
+  entries.append((position, {'group': group_info, 'questions': pool}))
+@
+
+A sort key must never compare [[None]] with [[None]]---Python raises
+[[TypeError]] for that---so we map missing positions to a
+last-sorting key with a comparable second component.
+
+<<functions>>=
+def position_sort_key(position):
+  """Sort key placing None positions last, preserving order among them."""
+  return (position is None, position if position is not None else 0)
+@
+
+<<sort entries by position>>=
+entries.sort(key=lambda pair: position_sort_key(pair[0]))
+@
+
+\subsubsection{Verifying the folding of grouped questions}
+
+Let's verify the folding on the tricky case that motivated the design: pool
+members that are \emph{not} adjacent in the API's question list, and whose
+positions are relative to the group.  The group's own position must place
+the entry among the ungrouped questions, and [[quiz_group_id]] must not leak
+into the export.
+
+Note that [[MagicMock(name=...)]] sets the mock's \emph{mock name}, not a
+[[name]] attribute, so we assign the group's [[name]] after construction.
+
+<<test functions>>=
+def test_group_classic_questions_folds_nonadjacent():
+  group = MagicMock(pick_count=1, question_points=2, position=2)
+  group.name = 'parallel forms'
+  quiz = MagicMock()
+  quiz.get_quiz_group.return_value = group
+
+  items = [
+    {'id': 1, 'position': 1, 'quiz_group_id': None, 'question_name': 'Q1'},
+    {'id': 2, 'position': 2, 'quiz_group_id': 5, 'question_name': 'Form B'},
+    {'id': 3, 'position': 3, 'quiz_group_id': None, 'question_name': 'Q3'},
+    {'id': 4, 'position': 1, 'quiz_group_id': 5, 'question_name': 'Form A'},
+  ]
+
+  entries = quizzes.group_classic_questions(quiz, items)
+
+  quiz.get_quiz_group.assert_called_once_with(5)
+  names = [entry.get('question_name', 'group') for entry in entries]
+  assert names == ['Q1', 'group', 'Q3']
+
+  group_entry = entries[1]
+  assert group_entry['group'] == {'id': 5, 'name': 'parallel forms',
+                                  'pick_count': 1, 'question_points': 2}
+  pool_names = [q['question_name'] for q in group_entry['questions']]
+  assert pool_names == ['Form A', 'Form B']
+
+  for entry in entries:
+    for question in [entry] if 'group' not in entry else entry['questions']:
+      assert 'quiz_group_id' not in question
+@
+
+When the group cannot be fetched, the entry must keep the pool grouped
+(with only the group [[id]]) rather than silently flattening it into
+ordinary questions.
+
+<<test functions>>=
+def test_group_classic_questions_fetch_failure():
+  quiz = MagicMock()
+  quiz.get_quiz_group.side_effect = Exception("API error")
+
+  items = [
+    {'id': 1, 'position': 1, 'quiz_group_id': None, 'question_name': 'Q1'},
+    {'id': 2, 'position': 1, 'quiz_group_id': 9, 'question_name': 'Pooled'},
+  ]
+
+  entries = quizzes.group_classic_questions(quiz, items)
+
+  assert len(entries) == 2
+  assert entries[0]['question_name'] == 'Q1'
+  assert entries[1]['group'] == {'id': 9}
+  assert [q['question_name'] for q in entries[1]['questions']] == ['Pooled']
 @
 
 
