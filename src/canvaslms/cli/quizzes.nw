@@ -8506,15 +8506,17 @@ only be fetched by id.  We therefore recover the groups from the questions
 themselves: each question carries a [[quiz_group_id]], and the distinct ids
 tell us which groups to fetch.
 
-Ordering needs care.  One might expect to sort all questions by [[position]]
-and fold adjacent runs sharing a [[quiz_group_id]] into a group, but Canvas
-reports the positions of grouped questions relative to their group (or not
-at all), not interleaved with the ungrouped questions.  Instead we
-partition: pool members are collected per group id regardless of where they
-appear in the list, and each group entry is then placed according to the
-group's own [[position]] attribute, which Canvas tracks in the same sequence
-as the ungrouped questions' positions.  Entries without a position sort
-last, and Python's stable sort preserves the API's order among them.
+Ordering needs care.  One might expect to sort by the questions' and the
+group's [[position]] attributes, but in practice (verified against KTH
+Canvas, July 2026) the questions index returns \emph{no} positions at all:
+every question's [[position]] is [[None]], and only the group object carries
+one.  A position-based sort therefore cannot interleave the group with the
+ungrouped questions.  What the API does provide reliably is list order:
+[[get_questions]] returns the questions in quiz order, with pool members in
+their group's slot.  So we walk the questions in API order and emit each
+group entry at its \emph{first} member's slot; any later members---adjacent
+in every quiz we have seen, but nothing forces them to be---are folded into
+that same entry.
 
 If fetching a group fails, we still emit the group entry with only its
 [[id]]: flattening the pool into ordinary questions would silently change
@@ -8533,44 +8535,53 @@ def group_classic_questions(quiz, items):
     List of entries in quiz order: plain question dictionaries and
     {"group": {...}, "questions": [...]} group entries.
   """
-  <<partition questions into ungrouped entries and group pools>>
-  <<fetch each group and append its entry>>
-  <<sort entries by position>>
-  return [entry for _, entry in entries]
+  entries = []
+  pools = {}  # group id -> pool list, shared with the group's entry
+
+  for item in items:
+    group_id = item.pop('quiz_group_id', None)
+    if group_id is None:
+      entries.append(item)
+    elif group_id in pools:
+      pools[group_id].append(item)
+    else:
+      pools[group_id] = [item]
+      entries.append({'group': fetch_question_group_info(quiz, group_id),
+                      'questions': pools[group_id]})
+
+  <<sort each pool by position>>
+  return entries
 @
 
-<<partition questions into ungrouped entries and group pools>>=
-entries = []  # (position, entry) pairs
-pools = {}    # group id -> list of pool questions
+Note that each group entry and [[pools]] share the same list object, so
+members found later in the walk still end up inside the already-emitted
+entry.
 
-for item in items:
-  group_id = item.pop('quiz_group_id', None)
-  if group_id is None:
-    entries.append((item.get('position'), item))
-  else:
-    pools.setdefault(group_id, []).append(item)
-@
-
-<<fetch each group and append its entry>>=
-for group_id, pool in pools.items():
+<<functions>>=
+def fetch_question_group_info(quiz, group_id):
+  """Fetches a question group's defining attributes, keeping its id."""
   group_info = {'id': group_id}
-  position = None
   try:
     group = quiz.get_quiz_group(group_id)
     group_info['name'] = getattr(group, 'name', None)
     group_info['pick_count'] = getattr(group, 'pick_count', None)
     group_info['question_points'] = getattr(group, 'question_points', None)
-    position = getattr(group, 'position', None)
   except Exception as e:
     canvaslms.cli.warn(f"Failed to fetch question group {group_id}: {e}")
-
-  pool.sort(key=lambda q: position_sort_key(q.get('position')))
-  entries.append((position, {'group': group_info, 'questions': pool}))
+  return group_info
 @
 
-A sort key must never compare [[None]] with [[None]]---Python raises
-[[TypeError]] for that---so we map missing positions to a
-last-sorting key with a comparable second component.
+Within a pool we do sort by [[position]] when Canvas provides one (the
+positions of pool members, when present, are relative to the group, so they
+are comparable to each other).  A sort key must never compare [[None]] with
+[[None]]---Python raises [[TypeError]] for that---so we map missing
+positions to a last-sorting key with a comparable second component; the
+stable sort then preserves API order among position-less members.
+
+<<sort each pool by position>>=
+for pool in pools.values():
+  pool.sort(key=lambda q: position_sort_key(q.get('position')))
+@
 
 <<functions>>=
 def position_sort_key(position):
@@ -8578,17 +8589,14 @@ def position_sort_key(position):
   return (position is None, position if position is not None else 0)
 @
 
-<<sort entries by position>>=
-entries.sort(key=lambda pair: position_sort_key(pair[0]))
-@
-
 \subsubsection{Verifying the folding of grouped questions}
 
 Let's verify the folding on the tricky case that motivated the design: pool
 members that are \emph{not} adjacent in the API's question list, and whose
-positions are relative to the group.  The group's own position must place
-the entry among the ungrouped questions, and [[quiz_group_id]] must not leak
-into the export.
+positions are relative to the group.  The group entry must appear at its
+first member's slot in the walk order, later members must fold into the
+same entry (sorted by their group-relative positions), and
+[[quiz_group_id]] must not leak into the export.
 
 Note that [[MagicMock(name=...)]] sets the mock's \emph{mock name}, not a
 [[name]] attribute, so we assign the group's [[name]] after construction.
