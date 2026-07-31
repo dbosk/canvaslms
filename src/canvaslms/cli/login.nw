@@ -36,6 +36,7 @@ import appdirs
 import canvaslms.cli
 import json
 import keyring
+import keyring.errors
 import os
 
 dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
@@ -50,6 +51,25 @@ def add_command(subp):
 <<login command description>>
 """)
   login_parser.set_defaults(func=login_command)
+@
+
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing immediately after
+the implementation they verify.
+<<test [[login.py]]>>=
+"""Tests for the login command's handling of credentials."""
+
+import argparse
+import json
+
+import keyring.errors
+import pytest
+
+import canvaslms.cli.login
+
+<<test functions>>
 @
 
 
@@ -74,15 +94,7 @@ def login_command(config, canvas, args):
 
   try:
     <<save [[hostname]] and [[token]] to keyring>>
-  except:
-    canvaslms.cli.warn(f"You don't have a working keyring. "
-                       f"Will write hostname and token to config file "
-                       f"{args.config_file}.")
-
-    config["canvas"]["host"] = hostname
-    config["canvas"]["access_token"] = token
-
-    canvaslms.cli.update_config_file(config, args.config_file)
+  <<fall back to the config file without a keyring>>
 
 <<instructions how to get the token>>=
 Open
@@ -107,6 +119,109 @@ When we need these again, we simply load them.
 <<load [[hostname]] and [[token]] from keyring>>=
 hostname = keyring.get_password("canvaslms", "hostname")
 token = keyring.get_password("canvaslms", "token")
+@
+
+
+\subsection{Falling back to the config file without a keyring}
+
+Not every machine has a working keyring: a headless server, a minimal
+container, or a desktop session without a running secret-service daemon all
+make [[keyring.set_password]] fail.
+We still want [[canvaslms login]] to be useful there, so we fall back to
+storing the credentials in the configuration file---in plaintext, since that
+file has no encryption of its own.
+
+Because the fallback stores the token in the clear, it must trigger for
+exactly one condition: the keyring cannot keep the secret.
+The [[keyring]] package raises all of its own failures as subclasses of
+[[keyring.errors.KeyringError]]; the no-backend case in particular raises
+[[keyring.errors.NoKeyringError]], which is such a subclass.
+Catching the base class therefore covers every way the keyring can decline
+to store the value---missing backend, locked collection, refusing
+backend---and nothing else.
+
+Contrast this with the bare [[except:]] this code used to have.
+A bare handler catches [[BaseException]], which includes the two exceptions
+that do not report a failure of the operation at all: [[KeyboardInterrupt]]
+and [[SystemExit]].
+That distinction is not academic here, because [[keyring.set_password]] can
+block: with a locked keyring the secret-service daemon prompts the user for
+a password and the call does not return until the prompt is answered.
+A user who presses Ctrl-C at that prompt means \enquote{stop, don't store
+this}---and the bare handler turned that request into its exact opposite,
+swallowing the [[KeyboardInterrupt]] and taking the fallback branch, which
+wrote the token in plaintext to the config file.
+With the narrow handler the [[KeyboardInterrupt]] propagates, the command
+aborts, and nothing is written anywhere.
+
+This is why the module outline above imports [[keyring.errors]] explicitly:
+the submodule happens to be bound as a side effect of importing the keyring
+backends, but a handler that guards a credential should not depend on that
+accident.
+<<fall back to the config file without a keyring>>=
+except keyring.errors.KeyringError:
+  canvaslms.cli.warn(f"You don't have a working keyring. "
+                     f"Will write hostname and token to config file "
+                     f"{args.config_file}.")
+
+  config["canvas"]["host"] = hostname
+  config["canvas"]["access_token"] = token
+
+  canvaslms.cli.update_config_file(config, args.config_file)
+@
+
+Let's verify both halves of that distinction.
+Both tests drive [[login_command]] through its two [[input]] prompts, so we
+first need a way to answer them.
+<<test functions>>=
+def answer_prompts(monkeypatch, *answers):
+  """Answers login_command's input() prompts with the given strings."""
+  responses = iter(answers)
+  monkeypatch.setattr("builtins.input", lambda *args: next(responses))
+@
+
+An interrupted keyring call must abort the command and leave nothing behind:
+no config file means no plaintext token.
+<<test functions>>=
+def test_login_aborts_on_keyboard_interrupt(monkeypatch, tmp_path):
+  """Ctrl-C during the keyring call must abort, not write the token."""
+  answer_prompts(monkeypatch, "canvas.example.com", "secret-token")
+
+  def interrupt(*args, **kwargs):
+    raise KeyboardInterrupt
+
+  monkeypatch.setattr(canvaslms.cli.login.keyring, "set_password", interrupt)
+
+  config_file = tmp_path / "config.json"
+  args = argparse.Namespace(config_file=str(config_file))
+
+  with pytest.raises(KeyboardInterrupt):
+    canvaslms.cli.login.login_command({"canvas": {}}, None, args)
+
+  assert not config_file.exists()
+@
+
+A genuine keyring failure, on the other hand, must still leave the user with
+working credentials---in a file only they can read.
+<<test functions>>=
+def test_login_writes_private_config_without_keyring(monkeypatch, tmp_path):
+  """Without a keyring backend, credentials go to a user-only config file."""
+  answer_prompts(monkeypatch, "canvas.example.com", "secret-token")
+
+  def no_backend(*args, **kwargs):
+    raise keyring.errors.NoKeyringError("no backend available")
+
+  monkeypatch.setattr(canvaslms.cli.login.keyring, "set_password", no_backend)
+
+  config_file = tmp_path / "config.json"
+  args = argparse.Namespace(config_file=str(config_file))
+
+  canvaslms.cli.login.login_command({"canvas": {}}, None, args)
+
+  config = json.loads(config_file.read_text())
+  assert config["canvas"]["host"] == "canvas.example.com"
+  assert config["canvas"]["access_token"] == "secret-token"
+  assert config_file.stat().st_mode & 0o777 == 0o600
 @
 
 
