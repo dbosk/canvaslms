@@ -84,11 +84,13 @@ from unittest.mock import Mock
 from canvaslms.cli.submissions import (
     filter_view_submissions,
     format_submission_short,
+    generate_diff,
     get_course_user,
     is_null_submission,
     is_ungraded,
     list_submissions,
     list_ungraded_submissions,
+    match_renamed_files,
     speedgrader,
 )
 
@@ -2437,7 +2439,10 @@ add/delete operations.
 
 The matching algorithm works for any number of files:
 \begin{enumerate}
-\item Compute edit distance between all pairs of files with matching extensions
+\item Set aside every filename that occurs in \emph{both} versions; such a
+  file is already matched---to itself
+\item Compute edit distance between all remaining pairs of files with
+  matching extensions
 \item Sort pairs by edit distance (lowest first)
 \item Accept matches greedily, ensuring one-to-one mapping
 \item Only accept matches below a conservative threshold:
@@ -2475,6 +2480,45 @@ diff_threshold_percent=args.diff_threshold_percent
 The key insight is that by considering lowest-distance pairs first,
 we naturally find the correct matches even when students add or remove
 files with similar names.
+
+\subsubsection{Unchanged filenames are not rename candidates}
+\label{UnchangedNamesNotCandidates}
+
+Step~1 of the matching algorithm---setting aside filenames that occur in
+both versions---looks like a trivial optimisation that saves us a few
+distance computations.
+It is in fact the rule that keeps the last of the scenarios above, adding a
+file with a similar name, from going badly wrong.
+Consider a student who edits [[lab.py]] and adds a new test file:
+\begin{description}
+\item[Version 0] [[lab.py]]
+\item[Version 1] [[lab.py]], [[lab_test.py]]
+\end{description}
+
+Suppose we skipped only the \emph{identical} pair, that is, we refused to
+match [[lab.py]] against itself but still let it be paired with anything
+else.
+Then the sole surviving candidate is [[lab.py]] $\to$ [[lab_test.py]],
+at an edit distance of~5 between the base names [[lab]] and [[lab_test]].
+That is comfortably below the default fixed threshold of
+[[DEFAULT_DIFF_THRESHOLD_FIXED]], so the matcher happily reports
+[[lab_test.py]] as a rename of [[lab.py]].
+The resulting diff then announces that [[lab.py]] is brand new---it has no
+counterpart left in the previous version---and diffs the student's new
+test file against the old lab's contents.
+Both halves of the output are the opposite of what happened.
+
+Raising or lowering the thresholds cannot help here.
+They are deliberately generous, and at the default of
+[[DEFAULT_DIFF_THRESHOLD_FIXED]] essentially any two short filenames
+sharing an extension are within reach of each other.
+What disqualifies this pair is not its distance but its \emph{structure}:
+a name that appears in both versions has already been accounted for, and
+pairing it with a second file would assert that the student simultaneously
+kept the file and renamed it away.
+Since the greedy loop enforces a one-to-one mapping, a file matched to
+itself can be neither a rename source nor a rename target, and we can
+therefore exclude it before computing any distances at all.
 
 \subsubsection{Adjusting matching thresholds}
 
@@ -2533,14 +2577,50 @@ The function uses a conservative threshold to avoid incorrect pairings
 distance is too large).
 
 <<match single files with different names>>=
-# Find renamed files using edit distance matching
 filename_mapping = match_renamed_files(prev_attachments, curr_attachments,
                                       diff_threshold_fixed,
                                       diff_threshold_percent)
 
-# Rename files in prev_attachments to match current names
-for curr_filename, prev_filename in filename_mapping.items():
-  prev_attachments[curr_filename] = prev_attachments.pop(prev_filename)
+<<rekey [[prev_attachments]] under the current names>>
+@
+
+Having found the renames, we re-key the previous version's attachments so
+that each old file sits under the name it carries in the current version.
+That way the comparison loop below can simply look both versions up by the
+same key, and the mapping is consulted only to label the diff header with
+the file's original name.
+
+The tempting way to do this is to move each entry as we walk the mapping,
+[[prev_attachments[curr] = prev_attachments.pop(prev)]].
+We build a fresh dictionary instead, because the in-place version reads
+from and writes to the same dictionary it is iterating over: whether it is
+correct depends on the order the mapping happens to enumerate its keys, and
+on the guarantee---established over in [[match_renamed_files]], not
+here---that no current name it writes is already a key of
+[[prev_attachments]].
+When that guarantee fails, a [[pop]] can carry away an entry a later
+iteration still needs, and the baseline for a file the student never
+renamed is silently destroyed.
+The discussion under \nameref{UnchangedNamesNotCandidates} above explains
+why the matcher used to produce exactly such mappings.
+Rebuilding the dictionary makes this step correct on its own terms, for any
+mapping whatsoever, so a future change to the matcher cannot resurrect the
+data loss.
+It also leaves the caller's [[prev_content]] untouched, which matters
+because [[format_submission]] hands the same content dictionary to
+[[generate_diff]] that [[extract_submission_text]] produced.
+
+We invert the mapping to get the new name for each old file, then copy
+every entry across under that name, defaulting to its existing name for
+files that were not renamed.
+
+<<rekey [[prev_attachments]] under the current names>>=
+rename_targets = {prev_filename: curr_filename
+                  for curr_filename, prev_filename
+                  in filename_mapping.items()}
+
+prev_attachments = {rename_targets.get(filename, filename): content
+                    for filename, content in prev_attachments.items()}
 @
 
 Each attachment file is compared individually.
@@ -2582,6 +2662,79 @@ if diff_lines:
       formatted_lines.append(line)
   return "```diff\n" + "".join(formatted_lines) + "```"
 return None
+@
+
+\subsubsection{Verifying attachment diffs across renames}
+
+With [[generate_diff]] complete, we can check the property that matters to
+the grader reading the output: every hunk must be labelled with the pair of
+files it actually came from.
+Getting a rename wrong is worse than not detecting it, because the diff then
+looks plausible while describing changes the student never made.
+
+We start from the two situations that used to be mislabelled.
+In the first, the student edits [[lab.py]] and adds [[lab_test.py]]; the
+diff must show an edit to [[lab.py]] and a wholly new [[lab_test.py]], and
+in particular must never diff the new test file against the old lab.
+
+<<test functions>>=
+class TestGenerateDiffAttachmentNames:
+    """Test that attachment diffs are attributed to the right files"""
+
+    <<attachment naming test methods>>
+@
+
+<<attachment naming test methods>>=
+def test_added_file_does_not_steal_an_edited_file(self):
+    """Editing lab.py and adding lab_test.py is not a rename"""
+    prev = {"attachments": {"lab.py": "old lab\n"}}
+    curr = {"attachments": {"lab.py": "new lab\n",
+                            "lab_test.py": "tests\n"}}
+
+    diff = generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert "--- Version 0/lab.py\n+++ Version 1/lab.py\n" in diff
+    assert "--- Version 0/lab_test.py\n" \
+           "+++ Version 1/lab_test.py\n" in diff
+    assert "--- Version 0/lab.py\n+++ Version 1/lab_test.py\n" not in diff
+    assert "-old lab\n" in diff
+    assert "+new lab\n" in diff
+@
+
+In the second, the student keeps [[a.py]], drops [[b.py]] and adds
+[[c.py]].
+The kept file must be diffed against its own baseline, and only the
+genuinely renamed pair may carry two different names in its header.
+
+<<attachment naming test methods>>=
+def test_kept_file_keeps_its_own_baseline(self):
+    """A rename elsewhere must not disturb an unrenamed file"""
+    prev = {"attachments": {"a.py": "A old\n", "b.py": "B old\n"}}
+    curr = {"attachments": {"a.py": "A new\n", "c.py": "C new\n"}}
+
+    diff = generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert "--- Version 0/a.py\n+++ Version 1/a.py\n" in diff
+    assert "-A old\n" in diff
+    assert "+A new\n" in diff
+    assert "--- Version 0/b.py\n+++ Version 1/c.py\n" in diff
+    assert "--- Version 0/b.py\n+++ Version 1/a.py\n" not in diff
+@
+
+Finally, since we rebuild the attachment dictionary rather than renaming
+its keys, the content dictionaries we were handed must come back
+untouched.
+
+<<attachment naming test methods>>=
+def test_does_not_mutate_its_arguments(self):
+    """generate_diff must leave the caller's content dictionaries alone"""
+    prev = {"attachments": {"lab.py": "code\n"}}
+    curr = {"attachments": {"lab_final.py": "new code\n"}}
+
+    generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert prev == {"attachments": {"lab.py": "code\n"}}
+    assert curr == {"attachments": {"lab_final.py": "new code\n"}}
 @
 
 \subsection{Limitations and edge cases}
@@ -2818,6 +2971,15 @@ First, we compute edit distances for all candidate pairs.
 We only consider pairs with matching file extensions, since students rarely
 change extensions when renaming (\eg [[.py]] to [[.txt]]).
 
+We also drop any pair involving a filename that occurs in both versions,
+for the reasons given under \nameref{UnchangedNamesNotCandidates}: such a
+file is matched to itself, so it can be neither the source nor the target
+of a rename.
+Note that testing both endpoints is what makes this work, and that a weaker
+test comparing the two names to \emph{each other} would not: it is precisely
+when the names differ---[[lab.py]] paired with the newly added
+[[lab_test.py]]---that an unchanged file gets dragged into a bogus rename.
+
 <<build candidate matches with distances>>=
 candidates = []
 
@@ -2831,8 +2993,9 @@ for curr_filename in curr_attachments:
     if prev_ext != curr_ext or not prev_ext:
       continue
 
-    # Skip if names are identical (will be matched automatically later)
-    if curr_filename == prev_filename:
+    # A name present in both versions is matched to itself
+    if curr_filename in prev_attachments \
+          or prev_filename in curr_attachments:
       continue
 
     prev_base = get_file_base(prev_filename)
@@ -2880,6 +3043,54 @@ for distance, curr_filename, prev_filename in candidates:
     matched_prev.add(prev_filename)
 
 return filename_mapping
+@
+
+\subsubsection{Verifying the matching rules}
+
+Let us now check that the matcher still detects genuine renames while
+leaving files that survived under their own name alone.
+The first test is the scenario from
+\nameref{UnchangedNamesNotCandidates}, which is the case the exclusion rule
+exists for; the remaining ones guard the behaviour it must not break.
+
+<<test functions>>=
+class TestMatchRenamedFiles:
+    """Test the rename detection heuristic"""
+
+    def test_unchanged_file_is_not_a_rename_source(self):
+        """A file kept under its own name must not be paired with another"""
+        prev = {"lab.py": "old lab\n"}
+        curr = {"lab.py": "new lab\n", "lab_test.py": "tests\n"}
+
+        assert match_renamed_files(prev, curr) == {}
+
+    def test_unchanged_file_is_not_a_rename_target(self):
+        """The symmetric case: a removed file must not claim a kept name"""
+        prev = {"lab.py": "old lab\n", "lab_old.py": "scratch\n"}
+        curr = {"lab.py": "new lab\n"}
+
+        assert match_renamed_files(prev, curr) == {}
+
+    def test_detects_genuine_rename(self):
+        """A file that disappears and reappears renamed is still matched"""
+        prev = {"lab.py": "code\n"}
+        curr = {"lab_final.py": "code\n"}
+
+        assert match_renamed_files(prev, curr) == {"lab_final.py": "lab.py"}
+
+    def test_rename_alongside_unchanged_file(self):
+        """Only the renamed file is matched when another name is kept"""
+        prev = {"lab.py": "code\n", "test.py": "tests\n"}
+        curr = {"lab_final.py": "code\n", "test.py": "tests\n"}
+
+        assert match_renamed_files(prev, curr) == {"lab_final.py": "lab.py"}
+
+    def test_ignores_pairs_with_different_extensions(self):
+        """Students rarely change the extension when renaming"""
+        prev = {"lab.py": "code\n"}
+        curr = {"lab.txt": "code\n"}
+
+        assert match_renamed_files(prev, curr) == {}
 @
 
 
