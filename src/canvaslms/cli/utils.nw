@@ -614,6 +614,8 @@ We use conditional timezone interpretation:
 \item For explicit timezone strings, use default parsing to preserve the timezone
 \item For format-specific parsing, always apply [[tzinfo='local']] since those
       formats never include timezone information
+\item For natural-language input, hand the naive [[datetime]] we get back to
+      [[format_canvas_time]], which applies the very same local-time rule
 \end{enumerate}
 
 <<functions>>=
@@ -654,17 +656,52 @@ def parse_date(date_str):
     except (arrow.parser.ParserError, ValueError):
       continue
 
-  # If nothing worked, try natural language parsing
-  try:
-    import dateutil.parser
-    parsed_date = dateutil.parser.parse(date_str)
-    # Use format_canvas_time for Canvas compatibility
-    return format_canvas_time(arrow.get(parsed_date))
-  except (ImportError, ValueError):
-    pass
+  <<fall back to natural-language parsing>>
 
   raise ValueError(f"Could not parse date: '{date_str}'. "
                   "Try formats like: YYYY-MM-DD, YYYY-MM-DD HH:MM, or MM/DD/YYYY")
+@
+
+\subsection{Falling back to natural-language parsing}
+
+The format list above is deliberately short, so it misses spellings that are
+perfectly ordinary to a human: [[December 15 2023]] writes the month in full
+but omits the comma that [[MMMM DD, YYYY]] demands, and none of the other
+formats matches it either. Rather than reject such input, we let [[dateutil]]
+make a final attempt---it recognizes far more phrasings than we would care to
+enumerate ourselves.
+
+What [[dateutil]] hands back is a plain [[datetime]] object, and unless the
+input carried an explicit offset, that object is naive. Naive input is
+precisely what our local-time rule governs, so the only remaining question is
+which code path gets to interpret it---and the two candidates disagree:
+
+\begin{description}
+\item[Through [[arrow.get()]] ] Arrow reads a naive [[datetime]] as UTC.
+  [[December 15 2023]] becomes [[2023-12-15T00:00:00Z]]: midnight in
+  Greenwich, not midnight where the user is.
+\item[Through [[format_canvas_time()]] ] Its [[datetime]] branch attaches the
+  local offset first and converts afterwards. In CET the same input becomes
+  [[2023-12-14T23:00:00Z]]---the very instant that the plain [[2023-12-15]]
+  yields through the format list.
+\end{description}
+
+We therefore pass the naive [[datetime]] straight to [[format_canvas_time]].
+Routing it through [[arrow.get()]] first looks like a harmless change of
+type, since the same conversion runs either way, but it settles the timezone
+question before [[format_canvas_time]] ever sees a naive object---and settles
+it the wrong way. The consequence is not cosmetic: [[assignments set-dates]]
+would push due dates to Canvas shifted by the user's UTC offset, so a
+deadline written as [[December 15 2023]] would fall due at the wrong hour
+while the same deadline written as [[2023-12-15]] would not.
+
+<<fall back to natural-language parsing>>=
+try:
+  import dateutil.parser
+  parsed_date = dateutil.parser.parse(date_str)
+  return format_canvas_time(parsed_date)
+except (ImportError, ValueError):
+  pass
 @
 
 \subsection{Verifying [[parse_date]]}
@@ -731,6 +768,19 @@ class TestParseDate:
         # Date interpreted as start of day local time (CET = UTC+1)
         # 2023-12-15 00:00 CET = 2023-12-14 23:00 UTC
         assert "2023-12-14T23:00:00Z" == result
+
+    @freeze_time("2023-12-15 10:00:00")
+    def test_natural_language_agrees_with_iso(self):
+        """
+        Natural language must denote the same instant as the ISO spelling.
+
+        'December 15 2023' matches no format in the list (the full month name
+        without a comma), so it reaches the dateutil fallback.  Taking that
+        path must not change the meaning of the date: both spellings name
+        midnight local time, which in CET (UTC+1) is 23:00 UTC the day before.
+        """
+        assert parse_date("December 15 2023") == parse_date("2023-12-15")
+        assert parse_date("December 15 2023") == "2023-12-14T23:00:00Z"
 
     def test_invalid_format_raises_error(self):
         """Completely invalid string should raise ValueError"""
