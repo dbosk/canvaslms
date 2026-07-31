@@ -224,17 +224,117 @@ if args.email:
     row.append(None)
 @
 
-The name attribute always exists, but we must check if we want first and last 
+The name attribute always exists, but we must check if we want first and last
 names separately or as one string.
-To split them, we can use the [[sortable_name]] attribute and split on the [[, 
-]] following the last name and preceding the first name.
+To split them, we can use the [[sortable_name]] attribute, which Canvas
+composes by putting the surname first and the given names after a [[,
+]] separator: \enquote{Anderson, Alice}.
+
+\subsubsection{Sortable names that break the convention}
+
+That convention is a convention, not a guarantee.
+Canvas has nothing to put before the separator for a person with a
+single-token name, so \enquote{Cher} arrives with no separator at all.
+And since [[sortable_name]] is an ordinary profile field that users may edit
+themselves, a name such as \enquote{Doe, Jr., John} arrives with two.
+
+The obvious [[user.sortable_name.split(", ")]] cannot express either case.
+It insists on exactly one separator and raises [[ValueError]] on anything
+else, and the surrounding [[try]] catches only [[AttributeError]]---it is
+there to tolerate the [[None]]s that [[ensure_user_attrs]] leaves behind, not
+to repair malformed strings.
+The [[ValueError]] therefore escapes the generator, and because the command
+materializes it with [[list(rows)]] before writing anything, one unusual name
+aborts the entire listing with a traceback and takes every other user down
+with it.
+
+We instead split on the \emph{first} separator only, using [[partition]],
+which always returns three parts regardless of how many separators the string
+contains:
+\begin{description}
+\item[ [[Anderson, Alice]] ] splits exactly as before, into the last name
+  [[Anderson]] and the first name [[Alice]]; well-formed names see no change
+  at all.
+\item[ [[Cher]] ] yields the whole string as the last name and an empty first
+  name.  The leading segment of a sortable name is what the sorting is keyed
+  on, so a mononym belongs in the surname column---that is where a script
+  sorting our output expects to find the name.
+\item[ [[Doe, Jr., John]] ] yields the last name [[Doe]] and the first name
+  [[Jr., John]].  We cannot know which comma the writer intended as the
+  separator, so we pick the one that agrees with the well-formed case.  No
+  part of the name is discarded; the ambiguity is merely pushed into the
+  first-name field, which is the field we were less certain about anyway.
+\end{description}
+
+A [[None]] sortable name---a user whom Canvas returned without the field,
+normalized by [[ensure_user_attrs]]---becomes two empty columns rather than a
+skipped row.
+That matches how every other optional attribute above degrades: a missing
+[[login_id]] or [[email]] leaves its column empty and keeps the user in the
+listing.
+Dropping the row instead, which is what the [[AttributeError]] handler
+happened to do before, silently removes a user from a listing whose entire
+purpose is to be complete.
 <<append name>>=
 if args.split_name:
-  lastnames, firstnames = user.sortable_name.split(", ")
+  lastnames, _, firstnames = (user.sortable_name or "").partition(", ")
   row.append(firstnames.strip())
   row.append(lastnames.strip())
 else:
   row.append(user.name)
+@
+
+Let's verify that each of those names produces a row instead of a traceback.
+The splitting happens inside [[make_user_rows]], so we drive it through that
+generator with a single user whose sortable name we control, stubbing out the
+course lookup and the role filtering that we test elsewhere.
+
+<<test functions>>=
+def split_name_rows(monkeypatch, sortable_name):
+    """Return the --split-name rows for one user with this sortable name"""
+    user = Mock()
+    user.course = Mock()
+    user.course.course_code = "prgi25"
+    user.login_id = "user@example.com"
+    user.sortable_name = sortable_name
+
+    args = Mock()
+    args.regex = ".*"
+    args.canvas_id = False
+    args.ladok = False
+    args.split_name = True
+    args.email = False
+
+    monkeypatch.setattr(users_module.courses, "process_course_option",
+                        lambda canvas, args: [Mock()])
+    monkeypatch.setattr(users_module, "filter_users",
+                        lambda course_list, regex, roles: [user])
+
+    return list(users_module.make_user_rows(Mock(), args, ["student"]))
+
+def test_split_name_separates_first_and_last_name(monkeypatch):
+    """A well-formed sortable name splits into its two parts"""
+    assert split_name_rows(monkeypatch, "Anderson, Alice") == [
+        ["prgi25", "user@example.com", "Alice", "Anderson"]
+    ]
+
+def test_split_name_keeps_mononym_as_last_name(monkeypatch):
+    """A name without a separator is all last name, and is not dropped"""
+    assert split_name_rows(monkeypatch, "Cher") == [
+        ["prgi25", "user@example.com", "", "Cher"]
+    ]
+
+def test_split_name_splits_on_first_separator_only(monkeypatch):
+    """Extra separators stay in the first-name field"""
+    assert split_name_rows(monkeypatch, "Doe, Jr., John") == [
+        ["prgi25", "user@example.com", "Jr., John", "Doe"]
+    ]
+
+def test_split_name_tolerates_missing_sortable_name(monkeypatch):
+    """A None sortable name empties both columns but keeps the row"""
+    assert split_name_rows(monkeypatch, None) == [
+        ["prgi25", "user@example.com", "", ""]
+    ]
 @
 
 If we filter by groups, then we must still include the group information in
