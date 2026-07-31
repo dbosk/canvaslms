@@ -60,11 +60,14 @@ Tests are distributed throughout this chapter, appearing immediately after each 
 Tests for canvaslms.cli verbosity system.
 
 These tests verify the multi-level verbosity system that maps -v and -q flags
-to Python logging levels.
+to Python logging levels, and the rule that keeps global options global.
 """
 import pytest
 import logging
 import argparse
+
+from canvaslms.cli import dirs
+<<modules>>
 
 <<test functions>>
 @
@@ -373,6 +376,137 @@ for example right after creating or updating objects.
 argp.add_argument("--no-cache",
   action="store_true",
   help="Do not read or write the persistent Canvas object cache")
+@
+
+
+\subsection{Why global options must stay global}%
+\label{sec:global-options-are-global}
+
+Every option above is attached to [[argp]], the top-level parser, and that is
+exactly what makes it available to all subcommands.
+The reach comes with an obligation on the subcommand modules: no subparser may
+declare an option that shares a [[dest]] with a global one.
+
+The reason lies in how argparse hands control over to a subparser.
+When [[argp.parse_args]] reaches the subcommand name, it does not keep filling
+in the namespace it has built so far.
+It lets the subparser parse the remaining words into a \emph{fresh} namespace,
+then copies every attribute of that namespace onto the outer one.
+That copy is unconditional: it also covers options the user never wrote, whose
+values are nothing but the subparser's defaults.
+A duplicated option therefore does not merely shadow the global one---its
+default silently overwrites what the global option had already computed.
+
+The symptom is quiet, and it points away from the cause.
+Consider a subcommand that declares a [[-v]] of its own with
+[[default=False]]:
+\begin{center}
+[[canvaslms -vv grade -c prgi -a lab1 -u alice]]
+\end{center}
+The leading [[-vv]] really does set [[args.verbose]] to~2.
+The [[grade]] subparser then resets it to [[False]], so what the user sees is
+a command that accepted the flag and ignored it.
+Nothing in the output suggests that a parser, rather than the command's own
+logic, discarded the request.
+
+We cannot lean on argparse to catch this for us.
+Two options sharing a [[dest]] within \emph{one} parser raise
+[[argparse.ArgumentError]]\,---\,that is the error
+[[add_submission_options]] guards against when the same option might be
+registered twice on one subparser.
+A parser and its subparser, however, are separate objects, so the same
+collision between them is perfectly legal and passes unremarked.
+The invariant has to be maintained by hand instead: a subcommand that wants
+verbosity or a delimiter simply reads [[args.verbose]] or [[args.delimiter]]
+and lets the global option supply the value.
+
+\subsubsection{Guarding the invariant}
+
+A rule that argparse will not enforce, and whose violation leaves no trace at
+run time, is exactly the kind of rule that decays.
+So we check it.
+We assemble the same parser tree that [[main]] assembles---by reusing the very
+chunks [[main]] uses, so that a new global option or a newly registered
+subcommand is covered the moment someone adds it---and then walk that tree
+looking for a subparser that declares a global option's [[dest]].
+
+Matching on [[dest]] rather than on how the flag is spelled is what makes the
+test mean anything.
+It is [[dest]] that names the namespace attribute, and the namespace attribute
+is what gets overwritten.
+A subcommand remains free to spend a short flag such as [[-f]] on its own
+[[--file]] option: that lands in a different attribute and destroys nothing,
+even though the top-level [[-f]] is spelled the same way.
+
+<<test functions>>=
+class TestGlobalOptionsAreNotShadowed:
+    """Verify that no subcommand redeclares a global option"""
+
+    <<shadowing test helpers>>
+    <<shadowing test>>
+@
+
+We build the tree the way [[main]] does, with the global options on [[argp]]
+and every subcommand's [[add_command]] on [[subp]]:
+<<shadowing test helpers>>=
+def build_parser(self):
+    """Build the full parser tree, the way main() does."""
+    argp = argparse.ArgumentParser()
+    subp = argp.add_subparsers(title="commands", dest="command",
+                               required=True)
+    <<add global options to argp>>
+    <<add subcommands to subp>>
+    return argp
+
+@
+
+An action reaches the namespace---and can therefore clobber something---only
+when it has a real destination and a default that argparse does not suppress.
+The [[-h]] action fails the second condition, which is why every parser can
+carry one without conflicting with its parent.
+<<shadowing test helpers>>=
+def declared_dests(self, parser):
+    """Return the namespace attributes that parser itself fills in."""
+    return {
+        action.dest
+        for action in parser._actions
+        if action.dest is not argparse.SUPPRESS
+        and action.default is not argparse.SUPPRESS
+    }
+
+@
+
+Subcommands nest---[[submissions grade]], [[quizzes items list]]---so we
+recurse, carrying the command path along to make a failure report readable.
+<<shadowing test helpers>>=
+def walk_subparsers(self, parser, path=""):
+    """Yield (command path, parser) for every subparser, recursively."""
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for name, subparser in action.choices.items():
+            subpath = f"{path} {name}".strip()
+            yield subpath, subparser
+            yield from self.walk_subparsers(subparser, subpath)
+
+@
+
+With those pieces the check itself is a single intersection per subparser:
+<<shadowing test>>=
+def test_no_subcommand_redeclares_a_global_option(self):
+    """No subparser may declare a dest that a global option owns"""
+    argp = self.build_parser()
+    global_dests = self.declared_dests(argp)
+
+    offenders = {}
+    for path, subparser in self.walk_subparsers(argp):
+        clashes = self.declared_dests(subparser) & global_dests
+        if clashes:
+            offenders[path] = sorted(clashes)
+
+    assert not offenders, (
+        "these subcommands redeclare global options, so their defaults "
+        f"silently overwrite the global values: {offenders}")
 @
 
 
