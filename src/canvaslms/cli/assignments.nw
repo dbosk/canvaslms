@@ -77,10 +77,12 @@ the helpers they verify.
 
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
+import requests
 from unittest.mock import MagicMock, Mock, patch
 
 from canvasapi.assignment import Assignment
 from canvasapi.course import Course
+from canvasapi.util import combine_kwargs
 
 from canvaslms.cli.assignments import *
 
@@ -1184,47 +1186,139 @@ if not assignment_data:
 updates = {"assignment": assignment_data}
 @
 
-For each date argument, we check if it was provided, and if so, either parse it 
-as a date or set it to None if the user wants to clear it. We use the 
-[[parse_date]] function from the utils module for flexible date parsing.
+For each date argument we first check whether the user passed it at all; only
+then does the field enter [[assignment_data]]. That guard is what keeps an
+omitted option from disturbing a date nobody mentioned: the update we send
+contains exactly the fields named on the command line, and Canvas leaves every
+other field alone.
 
-The date parsing logic handles multiple common date formats and converts them 
-to Canvas-compatible UTC timestamps.
+Each named field is then converted by [[canvas_date_value]], which accepts the
+many human-readable formats the rest of the tool accepts and, in addition,
+understands a request to clear the date. That second job turns out to be
+subtler than it looks, so it gets its own discussion in
+\cref{clearing-a-date}.
 <<parse due date argument>>=
 if args.due_at is not None:
   try:
-    assignment_data['due_at'] = canvaslms.cli.utils.parse_date(args.due_at)
+    assignment_data['due_at'] = canvas_date_value(args.due_at)
   except ValueError as e:
     logger.error(f"Error parsing due date: {e}")
     return
 <<parse unlock date argument>>=
 if args.unlock_at is not None:
   try:
-    assignment_data['unlock_at'] = canvaslms.cli.utils.parse_date(args.unlock_at)
+    assignment_data['unlock_at'] = canvas_date_value(args.unlock_at)
   except ValueError as e:
     logger.error(f"Error parsing unlock date: {e}")
     return
 <<parse lock date argument>>=
 if args.lock_at is not None:
   try:
-    assignment_data['lock_at'] = canvaslms.cli.utils.parse_date(args.lock_at)
+    assignment_data['lock_at'] = canvas_date_value(args.lock_at)
   except ValueError as e:
     logger.error(f"Error parsing lock date: {e}")
     return
 @
 
+\subsection{Clearing a date}%
+\label{clearing-a-date}
+
+A user clears a date by passing [[none]] or [[clear]] as its value, and
+[[parse_date]] reports that request by returning [[None]].  The obvious move is
+to store that [[None]] in [[assignment_data]] and let it stand for
+\enquote{no date}.  That is what this command used to do, and it quietly did
+nothing at all: the command logged that it was clearing the date, reported
+success, and left the date exactly where it was.
+
+The explanation is a chain of three layers, each reasonable on its own.
+[[canvasapi]] flattens the nested update dictionary into a list of form fields,
+so [[{"assignment": {"due_at": None}}]] becomes the single field
+[[('assignment[due_at]', None)]].  [[requests]] then encodes that list into the
+request body---and it \emph{drops} every field whose value is [[None]], because
+that is how it lets callers leave optional parameters out.  The prepared
+[[PUT]] therefore carries an empty body.  Canvas receives a request that names
+no parameters, finds nothing to change, and answers with the unmodified
+assignment.  No layer sees anything wrong, which is precisely why the failure
+was silent.
+
+The empty string survives the same journey.  [[requests]] encodes it as
+[[assignment%5Bdue_at%5D=]], so the field does reach Canvas, and Canvas reads an
+empty value in a date field as an instruction to clear that date.  The
+distinction that matters is thus not \enquote{no date} against \enquote{a
+date}, but whether the field appears in the request at all:
+\begin{description}
+\item[ [[None]] ] the field disappears before the request leaves the machine,
+  so Canvas never learns that the user asked for anything.
+\item[ [[""]] ] the field is transmitted with an empty value, which Canvas
+  reads as \enquote{clear this date}.
+\end{description}
+
+All three date fields need this same translation, so we perform it once, in a
+wrapper around [[parse_date]].  Routing every date through the wrapper is also
+what stops a fourth date field, added later, from reintroducing the bug by
+forgetting the conversion.
+<<functions>>=
+def canvas_date_value(date_str):
+  """Return the value Canvas should receive for the date string date_str.
+
+  Returns a Canvas-compatible UTC timestamp, or the empty string when
+  date_str asks for the date to be cleared ('none' or 'clear').  The
+  empty string is used rather than None because form fields whose value
+  is None are dropped before the request is sent, which would leave the
+  date unchanged.
+  """
+  parsed = canvaslms.cli.utils.parse_date(date_str)
+  if parsed is None:
+    return ""
+  return parsed
+@
+
+Now let us verify the translation and, more importantly, that the translated
+value really does survive encoding into a request body.  That last test is the
+one that would have caught the original bug: it drives the exact pipeline,
+[[combine_kwargs]] followed by the [[requests]] encoder, that used to swallow
+the field.
+<<test functions>>=
+class TestCanvasDateValue:
+    """Test the translation from user input to Canvas payload values."""
+
+    def test_clear_keyword_becomes_empty_string(self):
+        """The word 'clear' must become '' rather than None."""
+        assert canvas_date_value("clear") == ""
+
+    def test_none_keyword_becomes_empty_string(self):
+        """The word 'none' must become '' rather than None."""
+        assert canvas_date_value("none") == ""
+
+    def test_real_date_becomes_canvas_timestamp(self):
+        """An ordinary date still becomes a Canvas UTC timestamp."""
+        assert canvas_date_value("2023-12-15").endswith("Z")
+
+    def test_cleared_date_survives_form_encoding(self):
+        """A cleared field must still be present in the request body."""
+        updates = {"assignment": {"due_at": canvas_date_value("none")}}
+        request = requests.Request(
+            "PUT", "https://example.com/api/v1/courses/1/assignments/2",
+            data=combine_kwargs(**updates))
+
+        assert "assignment%5Bdue_at%5D=" in request.prepare().body
+@
+
+
 \subsection{Updating assignment dates}
 
-Finally, we iterate through the selected assignments and update their dates 
-using the Canvas API.
+Finally, we iterate through the selected assignments and update their dates
+using the Canvas API.  When we report what we are about to do, we recognise a
+clearing request by the empty string that \cref{clearing-a-date} introduced;
+any other value is a timestamp we are setting.
 <<update assignment dates>>=
 for assignment in assignment_list:
   logger.info(f"Updating assignment '{assignment.name}' (ID: {assignment.id})")
   for field, value in assignment_data.items():
-    if value is None:
-      logger.info(f"  Clearing {field}")
-    else:
+    if value:
       logger.info(f"  Setting {field} to {value}")
+    else:
+      logger.info(f"  Clearing {field}")
 
   try:
     assignment.edit(**updates)
