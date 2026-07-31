@@ -178,6 +178,7 @@ end_time = utils.format_canvas_time(end_time)
 
 
 \section{Processing course options for calendar events}
+\label{sec:calendar:course-default}
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
@@ -690,8 +691,50 @@ except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to create calendar event: {e}")
 @
 
+\subsection{Distinguishing no course from all courses}
+
+Both event types must know which course contexts the new event belongs
+to, and both learn it from the [[-c]] option added by
+[[courses.add_course_option]].
+That option is never absent from [[args]]: it defaults to the regex
+[[.*]], the very value we keep in [[DEFAULT_COURSE_REGEX]].
+So [[args.course]] is a non-empty---hence truthy---string even when the
+user never wrote [[-c]] on the command line, and a truthiness test alone
+cannot separate \enquote{match every course} from \enquote{I said
+nothing about courses}.
+
+This is why [[calendar list]] and [[calendar view]] compare
+[[args.course]] against [[DEFAULT_COURSE_REGEX]] before they call
+[[process_course_option]], see \cref{sec:calendar:course-default}.
+For those two the comparison is a mere convenience: they only read, so
+mistaking the default for a filter would at worst make us enumerate the
+user's courses in order to build a context filter that Canvas would have
+applied anyway.
+
+Creating is not so forgiving, and [[calendar create]] used to test
+[[args.course]] for truthiness only.
+Since the default regex matches every course the user is enrolled in,
+\begin{verbatim}
+canvaslms calendar create "Meeting" --start-time "2026-08-01 10:00" \
+                                    --end-time "2026-08-01 11:00"
+\end{verbatim}
+looped over all of them and created one copy of \enquote{Meeting} in
+each---silently, with no confirmation, and with no bulk delete to undo
+it.
+Both branches below therefore reuse the listing commands' comparison, so
+that the default regex again means \enquote{the user chose no course}.
+
+\subsection{Regular calendar events}
+
 We first look at how we create a regular calendar event.
-We set the data required and create \emph{one} event for \emph{every} course.
+A Canvas calendar event lives in exactly one context, so an explicit
+[[-c]] regex matching several courses means several events: we set the
+shared data once and then create \emph{one} event for \emph{every}
+matched course.
+When no course was selected we make a single call and omit
+[[context_code]] entirely, which makes Canvas file the event in the
+user's own calendar---the natural reading of a [[calendar create]] that
+never mentions a course.
 <<create regular calendar event>>=
 params = {
   'calendar_event': {
@@ -707,8 +750,7 @@ if args.description:
 if args.location:
   params['calendar_event']['location_name'] = args.location
   
-# Set context if course is specified
-if hasattr(args, 'course') and args.course:
+if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
   course_list = courses.process_course_option(canvas, args)
   for course in course_list:
     params['calendar_event']['context_code'] = f"course_{course.id}"
@@ -717,10 +759,22 @@ else:
   event = canvas.create_calendar_event(**params)
 @
 
-Appointment groups (bookable timeslots) , on the other hand, are created 
+\subsection{Appointment groups}
+
+Appointment groups (bookable timeslots) , on the other hand, are created
 differently.
-Here we can create one appointment group for many course contexts---thus having 
+Here we can create one appointment group for many course contexts---thus having
 one appointment group joint for several courses.
+
+The user's own calendar is no fallback here.
+An appointment group exists so that participants can book its slots, and
+Canvas accordingly requires at least one context code: without a course
+there is no set of students who could book anything.
+That leaves us two ways to react to a missing [[-c]], guess or stop.
+Guessing means every course the user is enrolled in---exactly the
+accident we set out to prevent, only now the user has also published
+bookable office hours to strangers.
+So we stop, and we name the option the user has to supply.
 <<create appointment group>>=
 params = {
   'appointment_group': {
@@ -739,14 +793,17 @@ if args.location:
 
 <<compute time slots>>
   
-# Set context if course is specified
-if hasattr(args, 'course') and args.course:
-  course_list = courses.process_course_option(canvas, args)
-  for course in course_list:
-    try:
-      params['appointment_group']['context_codes'].append(f"course_{course.id}")
-    except KeyError:
-      params['appointment_group']['context_codes'] = [f"course_{course.id}"]
+if not (hasattr(args, 'course') and args.course
+        and args.course != DEFAULT_COURSE_REGEX):
+  canvaslms.cli.err(1, "An appointment group must belong to at least one "
+                       "course; select the course(s) with -c/--course.")
+
+course_list = courses.process_course_option(canvas, args)
+for course in course_list:
+  try:
+    params['appointment_group']['context_codes'].append(f"course_{course.id}")
+  except KeyError:
+    params['appointment_group']['context_codes'] = [f"course_{course.id}"]
 
 appointment_group = canvas.create_appointment_group(**params)
 @
@@ -777,3 +834,137 @@ while current_start + slot_duration <= end:
   params["appointment_group"]["new_appointments"][str(slot_num)] = slot
   current_start += slot_duration
   slot_num += 1
+@
+
+
+\section{Verifying the course guard on \texttt{calendar create}}
+
+The broadcast failure is expensive precisely because it is silent:
+a successful run prints nothing that would reveal that the event was
+created seventeen times.
+Tests are thus the only cheap way to keep the guard honest, so we pin
+down the three cases that carry the decision---the default regex, an
+explicit regex, and an appointment group with no course at all.
+
+<<test [[calendar.py]]>>=
+"""Tests for creating calendar events"""
+import argparse
+import copy
+
+import pytest
+
+import canvaslms.cli.calendar as calendar
+
+<<test helper functions>>
+<<test functions>>
+@
+
+Recording the calls to [[create_calendar_event]] is not enough by
+itself.
+The command builds a single [[params]] dictionary and mutates its
+[[context_code]] between calls, so a mock would hand us the same
+dictionary several times and every recorded call would show the
+\emph{last} course.
+We therefore copy each call's arguments as they arrive.
+
+<<test helper functions>>=
+def record_created_events(canvas):
+    """Make canvas record copies of create_calendar_event arguments"""
+    created = []
+    canvas.create_calendar_event.side_effect = \
+        lambda **kwargs: created.append(copy.deepcopy(kwargs))
+    return created
+
+@
+
+The command reads its arguments straight off [[args]], so we build the
+namespace that [[argparse]] would have produced.
+The defaults spell out the interesting case---no [[-c]] on the command
+line, which argparse turns into [[DEFAULT_COURSE_REGEX]]---and each test
+overrides only what it varies.
+
+<<test helper functions>>=
+def create_args(**overrides):
+    """Build the args namespace that `calendar create` would receive"""
+    args = argparse.Namespace(
+        title="Meeting",
+        start_time="2026-08-01 10:00",
+        end_time="2026-08-01 11:00",
+        description=None,
+        location=None,
+        event_type="event",
+        course=calendar.DEFAULT_COURSE_REGEX,
+        time_slot_duration=None,
+        max_appointments=1,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+The [[mock_courses]] fixture supplies three courses, all matching the
+regex [[CS]], which makes the difference between the two regexes
+visible: the default must yield one event, the explicit one three.
+
+<<test functions>>=
+class TestCalendarCreateCourseGuard:
+    """The default -c regex must not broadcast events to every course"""
+
+    <<course guard test methods>>
+@
+
+Without a course the event belongs to the user, so we expect exactly one
+call and no [[context_code]] in it.
+
+<<course guard test methods>>=
+def test_default_regex_creates_one_user_event(self, mock_canvas,
+                                              mock_courses):
+    """Default -c should create a single event without a course context"""
+    mock_canvas.get_courses.return_value = mock_courses
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas, create_args())
+
+    assert len(created) == 1
+    assert "context_code" not in created[0]["calendar_event"]
+
+@
+
+An explicit regex, on the other hand, keeps the per-course behaviour:
+one event in each matched course, in the order the courses arrive.
+
+<<course guard test methods>>=
+def test_explicit_regex_creates_one_event_per_course(self, mock_canvas,
+                                                     mock_courses):
+    """An explicit -c should create one event per matching course"""
+    mock_canvas.get_courses.return_value = mock_courses
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas,
+                                     create_args(course="CS"))
+
+    assert [event["calendar_event"]["context_code"]
+            for event in created] == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+Appointment groups have no user-calendar fallback, so the same default
+must abort the command instead.
+[[canvaslms.cli.err]] exits, which surfaces as [[SystemExit]], and
+nothing may reach Canvas.
+
+<<course guard test methods>>=
+def test_appointment_group_requires_explicit_course(self, mock_canvas,
+                                                    mock_courses):
+    """An appointment group without -c should fail, not use all courses"""
+    mock_canvas.get_courses.return_value = mock_courses
+
+    with pytest.raises(SystemExit):
+        calendar.calendar_create_command(
+            {}, mock_canvas,
+            create_args(event_type="appointment_group",
+                        time_slot_duration=30))
+
+    mock_canvas.create_appointment_group.assert_not_called()
