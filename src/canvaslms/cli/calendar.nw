@@ -645,7 +645,24 @@ def calendar_create_command(config, canvas, args):
   <<create calendar event>>
 @
 
-The create command requires title and start time and quite a few other options.
+The create command requires only a title and a start time; everything else is
+optional.
+In particular, Canvas happily stores an event that has no end time at all---an
+open-ended entry such as a deadline or a reminder, which the calendar renders
+as a point in time rather than as an interval.
+We therefore declare [[--end-time]] without [[required=True]], which makes
+\begin{quote}
+[[canvaslms calendar create "Assignment 3 due" --start-time "2026-08-15 17:00"]]
+\end{quote}
+a complete command line.
+
+Appointment groups are the exception: they subdivide an interval into bookable
+slots, so they need both bounds.
+Making [[--end-time]] mandatory for every event type would be the easy way to
+guarantee that, but it would also take open-ended events away from everyone to
+serve one event type.
+We instead let the appointment-group code demand an end time where it needs
+one, when it computes the slots below.
 <<add calendar create arguments>>=
 calendar_create_parser.add_argument("title",
   help="Title of the calendar event")
@@ -667,19 +684,12 @@ calendar_create_parser.add_argument("--max-appointments", type=int, default=1,
   help="Maximum appointments per time slot (only for appointment_group type, default: 1)")
 @
 
-We create the calendar event with the specified parameters.
-We interpret the start and end times ([[args.start_time]] and 
-[[args.end_time]]) as local time in the system timezone.
+Creating an event takes three steps: we turn the user's date and time strings
+into Canvas timestamps, we sanity-check them against each other, and only then
+do we call the API for the requested event type.
 <<create calendar event>>=
-try:
-  start_time = utils.format_canvas_time(arrow.get(args.start_time, tzinfo='local'))
-  end_time = utils.format_canvas_time(arrow.get(args.end_time, tzinfo='local'))
-except Exception as e:
-  canvaslms.cli.err(1, f"Invalid date/time format: {e} "
-                       f"(did you write 8:15 instead of 08:15?)")
-
-if end_time < start_time:
-  canvaslms.cli.err(1, "End time cannot be before start time.")
+<<parse start and end times>>
+<<reject events that end before they start>>
 
 try:
   if args.event_type == "appointment_group":
@@ -690,8 +700,53 @@ except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to create calendar event: {e}")
 @
 
+We interpret the start and end times ([[args.start_time]] and
+[[args.end_time]]) as local time in the system timezone.
+The start time is always there, since [[--start-time]] is required, but the end
+time is [[None]] whenever the user omitted [[--end-time]]---and [[arrow.get]]
+does not parse [[None]], it raises a [[TypeError]] instead.
+We must therefore ask whether we have an end time \emph{before} we try to parse
+one; the conditional expression lets a missing end time travel onwards as
+[[end_time = None]] rather than as an exception.
+
+Guarding the parse is what makes the absent end time visible at all.
+The [[except]] clause is deliberately broad, because [[arrow]] reports every
+malformed input differently, but that breadth means it cannot distinguish a
+typo from a missing value: parsing [[None]] unconditionally reported
+\enquote{no end time given} as the fatal and misleading
+\enquote{Invalid date/time format: Cannot parse argument of type None},
+which made open-ended events impossible to create at all.
+<<parse start and end times>>=
+try:
+  start_time = utils.format_canvas_time(
+    arrow.get(args.start_time, tzinfo='local'))
+  end_time = utils.format_canvas_time(
+    arrow.get(args.end_time, tzinfo='local')) if args.end_time else None
+except Exception as e:
+  canvaslms.cli.err(1, f"Invalid date/time format: {e} "
+                       f"(did you write 8:15 instead of 08:15?)")
+@
+
+Both timestamps come out of [[format_canvas_time]] in the same shape, a UTC ISO
+string ending in [[Z]], so comparing them as strings orders them
+chronologically---no reparsing needed.
+An event that never ends cannot end too early, so the ordering check applies
+only when the user actually gave us an end time.
+<<reject events that end before they start>>=
+if end_time and end_time < start_time:
+  canvaslms.cli.err(1, "End time cannot be before start time.")
+@
+
 We first look at how we create a regular calendar event.
 We set the data required and create \emph{one} event for \emph{every} course.
+
+Only the title and the start time go into [[params]] unconditionally; each
+optional field is added only when the user supplied it.
+That is what carries an open-ended event through to Canvas: we say
+\enquote{this event has no end} by leaving [[end_at]] out of the request
+altogether, rather than by sending a key whose value is [[None]].
+The parse above and this assembly thus agree---when [[args.end_time]] is
+missing, [[end_time]] stays [[None]] and never reaches the request.
 <<create regular calendar event>>=
 params = {
   'calendar_event': {
@@ -754,11 +809,26 @@ appointment_group = canvas.create_appointment_group(**params)
 We get the duration from the [[args.time_slot_duration]] option.
 Now we simply need to compute the time slots between the start and end times.
 
-The timeslots should be added to a \emph{dictionary} called 
+This is where an appointment group parts ways with a regular event.
+We fill the interval by stepping from the start until the next slot no longer
+fits, so the loop is bounded by the end time: without one there is no last
+slot, and the list of appointments we have to send would never terminate.
+An appointment group therefore cannot be open-ended the way a plain event can.
+
+The end time and the slot duration are therefore preconditions rather than
+options here, and we say so before computing anything.
+We could instead let the arithmetic fail on the missing values, but [[end_time]]
+is [[None]] here for exactly the reason the user cares about---they forgot a
+flag---and a [[TypeError]] from deep inside [[arrow]] does not say which flag.
+Naming the missing option is what turns a crash into an instruction.
+
+The timeslots should be added to a \emph{dictionary} called
 [[new_appointments]].
-Although numbered by index, as a list, the API requires a dictionary with 
+Although numbered by index, as a list, the API requires a dictionary with
 string keys.
 <<compute time slots>>=
+if not args.end_time:
+  canvaslms.cli.err(1, "--end-time is required for appointment groups")
 if not args.time_slot_duration:
   canvaslms.cli.err(1, "--time-slot-duration is required for appointment groups")
 
