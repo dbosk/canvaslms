@@ -276,16 +276,40 @@ list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
 @
 
+The guard on this resolution must ask whether a filter was \emph{given}, not
+whether its value looks non-empty.
+The two questions differ for exactly one input: the empty regular expression
+matches every string, so [[-u '']] is a legitimate way to spell \enquote{all
+users}, just like [[-u '.*']]---yet the empty string is falsy.
+A truthiness test therefore treats [[-u '']] as \enquote{no filter given} and
+leaves [[user_list]] as [[None]], skipping the filtering below.
+That is worse than a missed filter: [[filter_submissions]] is the only place
+that attaches a [[user]] attribute to a submission, so skipping it makes the
+printing step fail with an [[AttributeError]] on [[submission.user.name]].
+Comparing against [[None]] keeps the empty regex on the filtering path, where
+[[filter_users]] reads it as [[.*]] and matches everyone, which is what the
+user asked for.
+
 When no user or group options are set, both [[user_list]] and [[student_ids]]
 stay [[None]]: the listing helpers then treat the whole assignment as in scope,
 and we skip filtering entirely.
 <<resolve user filter and student ids>>=
 user_list = None
 student_ids = None
-if args.user or args.category or args.group:
+if args.user is not None or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
   student_ids = {user.id for user in user_list}
 @
+
+That [[None]] branch is unreachable for this command today: the [[users]]
+module registers [[--user]] with the default [[.*]], so [[args.user]] is a
+string on every invocation and the guard is always true---which is also why the
+truthiness tests on [[--group]] and [[--category]] can never decide the
+outcome, short-circuited as they are by the test on [[args.user]].
+We keep the branch nonetheless, because it documents the contract with the
+listing helpers---[[student_ids]] of [[None]] means \enquote{the whole
+assignment is in scope}---and keeps this chunk correct should the default ever
+be dropped.
 
 If a user or group filter was set, we now restrict the submissions to the users
 we resolved above.  We reuse [[user_list]] rather than querying Canvas again.
@@ -342,6 +366,73 @@ for submission in submissions:
 list_parser.add_argument("-l", "--login-id",
   help="Print login ID instead of name.",
   default=False, action="store_true")
+@
+
+\subsection{Verifying that every listed submission has a user}
+
+Now that we have seen the command end to end, we can verify the property that
+ties its two halves together: whatever the user filter says, every submission
+that reaches the printing step must carry a [[user]] attribute.
+We stub out the three Canvas round-trips---the assignment lookup, the user
+lookup and the submission listing---so that the test exercises only the
+resolution and filtering logic in between.
+The stubbed submission deliberately has no [[user]] attribute, mirroring what
+the listing helpers return, so the test fails loudly if the filtering step is
+skipped.
+
+Contrasting the empty regex with the default [[.*]] shows that the two spell
+the same request:
+
+<<test functions>>=
+class TestListCommandUserResolution:
+    """Test user resolution in submissions_list_command()"""
+
+    def run_list_command(self, monkeypatch, user_regex):
+        """Run the list command with all Canvas access stubbed out"""
+        import argparse
+        import types
+        from unittest.mock import MagicMock
+
+        import canvaslms.cli.submissions as submissions_module
+
+        user = MagicMock()
+        user.id = 1
+        user.name = "Alice Anderson"
+
+        assignment = MagicMock()
+        assignment.course.course_code = "DD1234"
+        assignment.name = "Lab 1"
+
+        # As the listing helpers return it: no user attached yet
+        submission = types.SimpleNamespace(user_id=1, assignment=assignment,
+                                           grade="P", submitted_at=None,
+                                           graded_at=None)
+
+        monkeypatch.setattr(submissions_module.assignments,
+                            "process_assignment_option",
+                            lambda canvas, args: [assignment])
+        monkeypatch.setattr(submissions_module.users,
+                            "process_user_or_group_option",
+                            lambda canvas, args: [user])
+        monkeypatch.setattr(submissions_module, "list_submissions",
+                            lambda *args, **kwargs: [submission])
+
+        args = argparse.Namespace(user=user_regex, category=None, group=None,
+                                  history=False, ungraded=False,
+                                  login_id=False, delimiter="\t")
+        submissions_module.submissions_list_command(None, None, args)
+
+    def test_empty_user_regex_matches_everyone(self, monkeypatch, capsys):
+        """An explicit -u '' must filter, not skip filtering"""
+        self.run_list_command(monkeypatch, "")
+
+        assert "Alice Anderson" in capsys.readouterr().out
+
+    def test_default_user_regex_matches_everyone(self, monkeypatch, capsys):
+        """The default -u '.*' asks for the same thing"""
+        self.run_list_command(monkeypatch, ".*")
+
+        assert "Alice Anderson" in capsys.readouterr().out
 @
 
 
