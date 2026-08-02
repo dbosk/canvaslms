@@ -83,6 +83,8 @@ from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
     filter_view_submissions,
+    format_rubric,
+    format_submission,
     format_submission_short,
     get_course_user,
     is_null_submission,
@@ -1727,7 +1729,28 @@ return get_course_user(submission.assignment.course, submission.grader_id)
 @
 
 
-\subsection{Rubric data}
+\subsection{Rubric data}\label{RubricData}
+
+The rubric section is the only one whose body is structured data in its own
+right rather than a plain string, so the output format must be threaded through
+two calls: [[format_rubric]] builds the assessment, and [[format_section]]
+wraps it under a section title.
+Getting the parentheses wrong here is easy, and we did: the closing parenthesis
+used to sit one argument too early, so [[json_format=True]] was passed to
+[[dict.update]] instead of to [[format_section]].
+[[format_section]] would then have rendered the assessment as Markdown, and
+[[dict.update]] cannot build a dictionary out of the resulting string.
+
+That failure never occurred, because [[format_rubric]] raised an
+[[AttributeError]] before [[format_section]] was ever reached
+(\cref{FormattingRubrics}), and the [[except AttributeError]] that lets us skip
+submissions with no rubric data at all caught it.
+The visible symptom was therefore neither exception but silence:
+[[canvaslms submission --json]] dropped the whole rubric assessment from its
+output.
+The two defects have to be repaired in one go.
+Repairing only the parenthesis leaves the data loss untouched, and repairing
+only [[format_rubric]] promotes the data loss into a crash.
 
 <<add rubric assessment to output>>=
 try:
@@ -1735,8 +1758,8 @@ try:
     if json_format:
       formatted_submission.update(format_section(
         "rubric_assessment",
-        format_rubric(submission, json_format=True)),
-        json_format=True)
+        format_rubric(submission, json_format=True),
+        json_format=True))
     else:
       formatted_submission += format_section(
         "Rubric assessment",
@@ -3051,7 +3074,7 @@ return filename_mapping
 @
 
 
-\section{Formatting rubrics}
+\section{Formatting rubrics}\label{FormattingRubrics}
 
 For assignments that use rubrics, we want to format those rubrics so that we 
 can read the results instead of just the cumulated grade.
@@ -3084,7 +3107,7 @@ def format_rubric(submission, json_format=False):
     if not json_format:
       result += "\n"
 
-  return result.strip()
+  <<return [[result]] in the requested format>>
 @
 
 Sometimes Canvas is missing some data.
@@ -3124,6 +3147,28 @@ else:
     result += textwrap.indent(textwrap.fill(f"- Comment: {comments}"),
                               "  ")
     result += "\n"
+@
+
+The two accumulators have different types, so they cannot share a return
+statement.
+Only the Markdown string carries formatting artefacts worth removing: we append
+a blank line after every criterion, so without trimming the output would end in
+stray newlines.
+A dictionary has no such artefacts---its keys and values are already exactly
+what the caller asked for---so we hand it back untouched.
+
+Returning [[result.strip()]] unconditionally, as this function used to, is
+worse than redundant in JSON mode: dictionaries have no [[strip]] method, so
+the JSON branch raised an [[AttributeError]] instead of returning the
+assessment it had just built.
+The caller swallows that exception, which is why the defect surfaced as missing
+rubric data rather than as a crash (\cref{RubricData}).
+
+<<return [[result]] in the requested format>>=
+if json_format:
+  return result
+
+return result.strip()
 @
 
 We can get the rating of a rubric from the rubric assessment.
@@ -3171,6 +3216,94 @@ def get_rating(rating_id, criterion):
       return rating
 
   return None
+@
+
+\subsection{Verifying rubric output in both formats}
+
+Let's verify that a rubric-graded submission survives both output formats.
+The first test pins down [[format_rubric]] on its own; the second follows the
+same assessment through [[format_submission]] to confirm that it really reaches
+the JSON document, which is where it went missing before; the third checks that
+the Markdown rendering is unaffected.
+
+<<test functions>>=
+class TestRubricOutput:
+    """Test rubric rendering in JSON and Markdown output"""
+
+    RUBRIC = [{
+        "id": "_7957",
+        "points": 1.0,
+        "description": "Correctness",
+        "ratings": [
+            {"id": "_6397", "points": 1.0, "description": "OK"},
+            {"id": "_7836", "points": 0.0, "description": "Remark"},
+        ],
+    }]
+
+    ASSESSMENT = {
+        "_7957": {"rating_id": "_6397", "points": 1.0,
+                  "comments": "Well done"},
+    }
+
+    EXPECTED = {
+        "Correctness": {"rating": "OK", "points": 1.0,
+                        "comments": "Well done"},
+    }
+
+    def make_submission(self):
+        """Build a stub submission graded with a one-criterion rubric"""
+        student = Mock(spec=["id", "name", "login_id"])
+        student.id = 23
+        student.name = "Alice Anderson"
+        student.login_id = "alice"
+
+        course = Mock(spec=["course_code", "get_user"])
+        course.course_code = "DD1234"
+        course.get_user.return_value = student
+
+        assignment = Mock(spec=["course", "name", "rubric"])
+        assignment.course = course
+        assignment.name = "Lab 1"
+        assignment.rubric = self.RUBRIC
+
+        submission = Mock(spec=[
+            "assignment", "user_id", "id", "submitted_at", "graded_at",
+            "grade", "grader_id", "preview_url", "rubric_assessment",
+            "submission_comments", "body", "attachments"])
+        submission.assignment = assignment
+        submission.user_id = 23
+        submission.id = 4711
+        submission.submitted_at = "2023-12-15T10:30:00Z"
+        submission.graded_at = "2023-12-15T14:00:00Z"
+        submission.grade = "P"
+        submission.grader_id = -1
+        submission.preview_url = ("https://canvas.kth.se/courses/26930"
+                                  "/assignments/173825/submissions/108849"
+                                  "?preview=1")
+        submission.rubric_assessment = self.ASSESSMENT
+        submission.submission_comments = []
+        submission.body = None
+        submission.attachments = []
+        return submission
+
+    def test_json_rubric_is_a_dictionary(self):
+        """format_rubric should hand back the assessment dict unchanged"""
+        assert format_rubric(self.make_submission(),
+                             json_format=True) == self.EXPECTED
+
+    def test_json_submission_keeps_rubric_assessment(self):
+        """JSON output should contain the rubric assessment section"""
+        result = format_submission(self.make_submission(), json_format=True)
+
+        assert result["rubric_assessment"] == self.EXPECTED
+
+    def test_markdown_submission_still_renders_rubric(self):
+        """Markdown output should be unchanged by the JSON fix"""
+        result = format_submission(self.make_submission())
+
+        assert "# Rubric assessment" in result
+        assert "- Correctness: OK (1.0)" in result
+        assert "- Comment: Well done" in result
 @
 
 
