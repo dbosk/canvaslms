@@ -79,7 +79,7 @@ the helpers they verify.
 """Tests for assignment listing and filtering helpers."""
 from unittest.mock import MagicMock, Mock, patch
 
-from canvasapi.assignment import Assignment
+from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.course import Course
 
 from canvaslms.cli.assignments import *
@@ -756,21 +756,91 @@ groups, we return assignments from either group.
 But if we also specify [[-a "Lab"]], we only return Lab assignments from those
 groups.
 
-The key difference from [[filter_assignments_by_group]] is that this function
-takes a list of groups and builds a set of group IDs for efficient membership
-testing.
+The key difference from [[filter_assignments_by_group]] is that the singular
+version receives one group object, whereas this one receives a whole sequence
+of them---and that sequence must be traversed with care.
+The name says \emph{list}, but [[filter_assignment_groups]] is a generator
+function, so the caller above hands us a generator.
+A generator can only be traversed once: whichever loop reads it first consumes
+it, and every later loop sees an empty sequence.
+An implementation that first collected the group identifiers for the membership
+test and then rescanned the groups to find the matching object would therefore
+work when handed a list and fail silently when handed a generator---the
+membership test would be exhausted before the lookup ever ran, so
+[[assignment.assignment_group]] would never be attached.
+
+The failure is silent because the right assignments are still yielded; only the
+attached group object goes missing.
+The damage shows up one level up, in [[assignments_list_command]], whose
+[[hasattr]] check then falls through to an extra [[get_assignment_group]] API
+call per assignment---and prints the placeholder [[Group 12345]] instead of the
+group's name whenever that call fails.
+
+We avoid the trap by traversing the groups exactly once, into a dictionary
+keyed by group identifier.
+A single traversal is what makes the function correct for generators as well as
+lists, and the dictionary answers both questions we have about an assignment's
+group---is it among the filtered ones, and which object is it---in one constant
+time lookup, instead of the linear rescan per assignment that a plain set of
+identifiers would force.
 <<functions>>=
 def filter_assignments_by_group_list(assignment_groups, assignments):
   """Returns elements in assignments that belong to any of the assignment_groups"""
-  group_ids = {group.id for group in assignment_groups}
+  groups_by_id = {group.id: group for group in assignment_groups}
 
   for assignment in assignments:
-    if assignment.assignment_group_id in group_ids:
-      for group in assignment_groups:
-        if assignment.assignment_group_id == group.id:
-          assignment.assignment_group = group
-          break
+    group = groups_by_id.get(assignment.assignment_group_id)
+    if group is not None:
+      assignment.assignment_group = group
       yield assignment
+@
+
+\subsection{Verifying group attachment for generator input}
+
+The regression we must guard against is exactly the one described above, so the
+test feeds the function a generator rather than a list---a list would pass even
+with the exhausted-generator bug---and asserts that the matching group object
+was attached, not merely that the assignment survived the filter.
+
+<<test functions>>=
+class TestFilterAssignmentsByGroupList:
+    """Test filtering assignments by a sequence of assignment groups."""
+
+    def make_group(self, group_id, name):
+        """Create a real Canvas assignment group instance."""
+        return AssignmentGroup(MagicMock(), {"id": group_id, "name": name})
+
+    def make_assignment(self, assignment_id, name, group_id):
+        """Create a real Canvas assignment instance belonging to a group."""
+        return Assignment(MagicMock(), {
+            "id": assignment_id,
+            "name": name,
+            "assignment_group_id": group_id,
+        })
+
+    def test_attaches_group_when_given_a_generator(self):
+        """A one-shot generator of groups must still attach the group object."""
+        graded = self.make_group(1, "Graded")
+        homework = self.make_group(2, "Homework")
+        in_group = self.make_assignment(10, "Lab 1", 1)
+        out_of_group = self.make_assignment(11, "Lab 2", 3)
+
+        groups = (group for group in [graded, homework])
+        result = list(filter_assignments_by_group_list(
+            groups, [in_group, out_of_group]))
+
+        assert result == [in_group]
+        assert result[0].assignment_group is graded
+
+    def test_attaches_group_when_given_a_list(self):
+        """Lists behave like generators, so both call styles stay supported."""
+        homework = self.make_group(2, "Homework")
+        assignment = self.make_assignment(10, "Lab 1", 2)
+
+        result = list(filter_assignments_by_group_list(
+            [homework], [assignment]))
+
+        assert result[0].assignment_group is homework
 @
 
 
