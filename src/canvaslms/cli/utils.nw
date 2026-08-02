@@ -433,12 +433,57 @@ class TestFormatLocalTime:
         assert result == invalid
 @
 
-Function to format timestamps in Canvas-compatible UTC format ending with 'Z'.
+Canvas expects every timestamp as an ISO~8601 string in UTC ending with
+\enquote{Z}. The values we must convert reach us from several directions:
+YAML front matter yields [[datetime.date]] and [[datetime.datetime]] objects,
+our own date parsing yields [[arrow.Arrow]] objects, and both users and Canvas
+hand us strings. So [[format_canvas_time]] dispatches on the type of its
+argument and normalizes all four representations to that one output format.
+
+A falsy argument---[[None]] or the empty string---means \enquote{no date was
+given}, and we answer with [[None]] so that callers can leave the field out of
+the request they are building.
+
+Because [[None]] already carries that meaning, the type dispatch must be
+\emph{total}. Any value that falls off the end of the [[if]]-chain makes Python
+return [[None]] implicitly, and the caller cannot tell that answer apart from
+\enquote{no date was given}. This is not a hypothetical: YAML's [[safe_load]]
+resolves scalar types on its own, and it resolves several date-like things to
+integers. The front matter line [[due_at: 20260306]] becomes the integer
+20260306, and [[due_at: 19:00]] becomes 1140, because YAML~1.1 reads a
+colon-separated scalar as a sexagesimal number. Both look like dates to whoever
+wrote the front matter; both arrive here as [[int]].
+
+The contrast between the two possible answers is what makes this worth getting
+right. A silent [[None]] propagates: [[assignments edit]] stores it in the
+update it builds, [[canvasapi]] passes it along, and [[requests]] omits
+null-valued fields when it encodes the request body---so the date never reaches
+Canvas at all. Canvas answers success, the command logs the assignment as
+updated, and the deadline the user meant to change is still the old one. A loud
+[[ValueError]] instead names the type of the offending value, which is exactly
+what the user needs in order to fix the front matter.
+
+We therefore close the chain with an [[else]] branch that rejects everything
+else. An unparseable \emph{string} already raises [[ValueError]]; an
+unsupported \emph{type} is the same kind of user error, so it deserves the same
+answer rather than a second, quieter one. We place the [[raise]] inside the
+[[try]], as the chain's final branch, for two reasons. It keeps the dispatch
+visibly complete at exactly the spot where a maintainer would add a fifth
+accepted type. And the surrounding handler wraps it, so it reads
+\enquote{Invalid date/time format: Unsupported date/time type: int}: every
+rejection from this function then shares one prefix. Raising after the [[try]]
+would yield a slightly shorter message, but at the price of two message shapes
+for callers to recognize---and some callers only forward what they catch, like
+[[parse_date_attribute]] in the [[discussions]] module, which logs it as a
+warning.
 <<functions>>=
 def format_canvas_time(iso_ts):
   """
   Parses an ISO timestamp string as local time and converts to UTC ISO format.
   Returns Canvas-compatible UTC timestamp ending with 'Z'.
+
+  Accepts datetime, date, arrow.Arrow and str values; falsy values give None.
+  Raises ValueError for unparseable strings and for unsupported types.
   """
   if not iso_ts:
     return None
@@ -462,6 +507,9 @@ def format_canvas_time(iso_ts):
       return arrow.get(iso_ts,
                        tzinfo='local').to('utc').isoformat().replace("+00:00",
                                                                      "Z")
+    else:
+      raise ValueError(
+        f"Unsupported date/time type: {type(iso_ts).__name__}")
   except Exception as e:
     raise ValueError(f"Invalid date/time format: {e}")
 @
@@ -472,6 +520,13 @@ Now let's verify this more complex function handles multiple input types correct
 The [[format_canvas_time()]] function accepts datetime objects, arrow objects, date objects, and strings, converting them all to Canvas's expected UTC format ending with 'Z'.
 
 This is a perfect example of variation theory in action---we test the same conversion logic with many different input types, maintaining the invariant: always produce Canvas-compatible UTC timestamps ending with 'Z'.
+
+The last two tests vary the input in the opposite direction: a string that is
+not a date, and a value whose type is not a date at all. Here the invariant is
+that both are rejected the same way, with a [[ValueError]] carrying the same
+message prefix. The type test is the regression test for the silent [[None]]
+described above; asserting on the message keeps the two failure modes from
+drifting apart again.
 
 <<test functions>>=
 class TestFormatCanvasTime:
@@ -548,6 +603,19 @@ class TestFormatCanvasTime:
         """Invalid date string should raise ValueError"""
         with pytest.raises(ValueError, match="Invalid date/time format"):
             format_canvas_time("not a date")
+
+    def test_unsupported_type_raises_error(self):
+        """
+        Unsupported types should raise ValueError, never return None.
+
+        YAML front matter turns `due_at: 20260306` into an int, and
+        returning None for it would be indistinguishable from 'no date
+        given', silently dropping the date instead of reporting it.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            format_canvas_time(20260306)
+        assert "Invalid date/time format" in str(excinfo.value)
+        assert "int" in str(excinfo.value)
 @
 
 \section{Timezone detection utilities}
