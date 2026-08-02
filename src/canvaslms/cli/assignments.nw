@@ -1122,30 +1122,20 @@ the shared [[submissions.is_ungraded()]] predicate.
 We still attach [[assignment.course]] and [[assignment.assignment_group]]
 before filtering so cached assignment objects expose the same attributes
 regardless of which listing path fetched them.
+Exactly which of the two we can attach depends on the container at hand, so
+we defer that question, and its answer, to the two chunks that follow.
 <<functions>>=
 def list_assignments(assignments_containers, ungraded=False):
   """Lists all assignments in all assignments containers (courses or
   assignement groups)"""
   for container in assignments_containers:
-    if isinstance(container, canvasapi.course.Course):
-      course = container
-    elif isinstance(container, canvasapi.assignment.AssignmentGroup):
-      assignment_group = container
-      course = assignment_group.course
+    <<identify the container's course and group>>
 
     assignments = container.get_assignments()
 
     for assignment in assignments:
       assignment = canvaslms.cli.utils.ensure_assignment_attrs(assignment)
-      try:
-        assignment.course = course
-      except NameError:
-        pass
-
-      try:
-        assignment.assignment_group = assignment_group
-      except NameError:
-        pass
+      <<attach container context to assignment>>
 
       if ungraded and not has_ungraded_submissions(assignment):
         continue
@@ -1154,6 +1144,90 @@ def list_assignments(assignments_containers, ungraded=False):
 
 def list_ungraded_assignments(assignments_containers):
   return list_assignments(assignments_containers, ungraded=True)
+@
+
+\subsection{Attaching container context, one container at a time}
+
+The two containers carry different amounts of context.
+A course tells us only which course an assignment belongs to.
+An assignment group tells us both the group and, through the [[course]]
+attribute that [[filter_assignment_groups]] attaches to it, the course as
+well.
+So the context to attach is a property of the \emph{current} container, and
+the listing must attach whatever this container determines---and nothing
+else.
+
+The natural way to say \enquote{nothing else} in Python would seem to be to
+leave the name unassigned and catch the resulting error, and that is what an
+earlier version of this function did:
+\begin{quote}
+[[try: assignment.assignment_group = assignment_group]] \\
+[[except NameError: pass]]
+\end{quote}
+This is the wrong tool, because [[NameError]] answers a different question
+than the one we are asking.
+It reports whether the name is bound anywhere in the function's scope, not
+whether \emph{this} iteration bound it---and a local variable outlives the
+loop iteration that created it.
+So the guard holds only until the first assignment group appears in
+[[assignments_containers]].
+From that container onward [[assignment_group]] stays bound, the
+[[except NameError]] branch becomes unreachable, and every subsequent plain
+course has its assignments stamped with the previous container's group.
+
+We therefore make the per-iteration question explicit.
+Clearing both names at the top of each iteration turns \enquote{not
+determined by this container} into an ordinary value we can test, so a
+container that determines no group leaves [[assignment_group]] as [[None]]
+no matter what earlier containers did.
+<<identify the container's course and group>>=
+course = assignment_group = None
+
+if isinstance(container, canvasapi.course.Course):
+  course = container
+elif isinstance(container, canvasapi.assignment.AssignmentGroup):
+  assignment_group = container
+  course = assignment_group.course
+@
+
+Attaching is then a pair of ordinary conditionals.
+Note that we skip the attribute rather than assigning [[None]] to it: the
+assignment objects are cached and shared, so an earlier listing path may
+already have attached a correct group, and overwriting it with [[None]]
+would lose information that no later path can recover.
+<<attach container context to assignment>>=
+if course is not None:
+  assignment.course = course
+
+if assignment_group is not None:
+  assignment.assignment_group = assignment_group
+@
+
+Let's verify that context no longer leaks across containers.
+The mixed list below is the smallest case that exercises the bug: the
+assignment group comes first and binds [[assignment_group]], and the plain
+course that follows must still yield assignments with no group attached.
+
+<<test functions>>=
+def test_container_context_does_not_leak_across_containers():
+    """Each container attaches only the context it determines itself."""
+    group_course = Course(MagicMock(), {"id": 11, "name": "Group course"})
+    group = AssignmentGroup(MagicMock(), {"id": 5, "name": "Graded"})
+    group.course = group_course
+    plain_course = Course(MagicMock(), {"id": 12, "name": "Plain course"})
+
+    grouped = Assignment(MagicMock(), {"id": 1, "name": "Lab 1"})
+    ungrouped = Assignment(MagicMock(), {"id": 2, "name": "Lab 2"})
+    group.get_assignments = Mock(return_value=[grouped])
+    plain_course.get_assignments = Mock(return_value=[ungrouped])
+
+    result = list(list_assignments([group, plain_course]))
+
+    assert result == [grouped, ungrouped]
+    assert grouped.assignment_group is group
+    assert grouped.course is group_course
+    assert ungrouped.course is plain_course
+    assert not hasattr(ungrouped, "assignment_group")
 @
 
 We determine whether an assignment is ungraded by looking at its submissions,
