@@ -57,14 +57,18 @@ Tests are distributed throughout this chapter, appearing immediately after each 
 
 <<test [[cli.py]]>>=
 """
-Tests for canvaslms.cli verbosity system.
+Tests for canvaslms.cli.
 
-These tests verify the multi-level verbosity system that maps -v and -q flags
-to Python logging levels, and the rule that keeps global options global.
+These tests verify the configuration handling, the multi-level verbosity
+system that maps -v and -q flags to Python logging levels, and the rule that
+keeps global options global.
 """
 import pytest
-import logging
 import argparse
+import json
+import logging
+
+import canvaslms.cli
 
 from canvaslms.cli import dirs
 <<modules>>
@@ -161,7 +165,7 @@ When we update the config file, we must ensure that any other part of the
 configuration file is kept, so we write the [[config]] dictionary to the config 
 file.
 
-If we get a [[FileNotFoundError]], that means the config directory doesn't 
+If we get a [[FileNotFoundError]], that means the config directory doesn't
 exist and we must create it.
 <<functions>>=
 def update_config_file(config, config_file):
@@ -173,9 +177,70 @@ def update_config_file(config, config_file):
     <<open and write config to config file>>
 <<create file's parent directories>>=
 os.makedirs(pathlib.PurePath(config_file).parent)
+@
+
+\subsection{Keeping the config file private}
+
+The config file is the last-resort credential store: when [[canvaslms login]]
+finds no working keyring, it writes the Canvas access token there in
+plaintext.
+That token is a bearer credential---anyone who can read the file can act as
+the user in Canvas until the token is revoked.
+We already keep the Canvas cache at mode [[0o600]] even though its contents
+are encrypted; the file that holds the token in the clear cannot be less
+protected than that.
+
+Plain [[open(config_file, "w")]] cannot give us that guarantee.
+It creates the file with mode [[0o666]] masked by the process umask, so under
+the usual umasks of [[0o022]] or [[0o002]] the token ends up readable by the
+user's group, or by every account on the machine.
+Creating the file with [[os.open]] instead lets us state the mode we want
+when the file comes into existence, so there is never a moment where the
+token sits in a world-readable file.
+
+The mode argument to [[os.open]] only applies when the file is created,
+though, which leaves out the users who need this most: everyone whose config
+file already exists with the loose permissions an earlier version gave it.
+So we also [[os.chmod]] the file, before writing anything into it, to tighten
+an existing file on the next update rather than letting it stay readable
+forever.
+(We chmod the path rather than the descriptor because [[os.fchmod]] is
+Unix-only, and this program also runs on Windows.)
 <<open and write config to config file>>=
-with open(config_file, "w") as fd:
-  json.dump(config, fd)
+fd = os.open(config_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.chmod(config_file, 0o600)
+with os.fdopen(fd, "w") as file:
+  json.dump(config, file)
+@
+
+Let's verify that both paths through [[update_config_file]] produce a private
+file: the one that creates the file (and its directory) from scratch, and the
+one that overwrites a file someone left group- and world-readable.
+<<test functions>>=
+class TestConfigFilePermissions:
+    """Test that the config file never exposes the access token"""
+
+    def test_new_config_file_is_user_only(self, tmp_path):
+        """A config file we create must be readable by its owner only"""
+        config_file = tmp_path / "canvaslms" / "config.json"
+
+        canvaslms.cli.update_config_file(
+            {"canvas": {"access_token": "secret"}}, str(config_file))
+
+        assert config_file.stat().st_mode & 0o777 == 0o600
+        assert json.loads(config_file.read_text()) == {
+            "canvas": {"access_token": "secret"}}
+
+    def test_existing_config_file_is_tightened(self, tmp_path):
+        """A pre-existing world-readable config file must be tightened"""
+        config_file = tmp_path / "config.json"
+        config_file.write_text("{}")
+        config_file.chmod(0o644)
+
+        canvaslms.cli.update_config_file(
+            {"canvas": {"access_token": "secret"}}, str(config_file))
+
+        assert config_file.stat().st_mode & 0o777 == 0o600
 @
 
 
