@@ -342,7 +342,8 @@ argp.add_argument("-f", "--config-file",
 @
 
 
-\subsection{Output format}
+\subsection{Output format}%
+\label{output-format}
 
 Many commands output data in CSV format.
 By default we use the tab character as the delimiter, since this gives us 
@@ -391,8 +392,11 @@ canvaslms.cli.login.add_command(subp)
 
 In short, each [[add_command]] must add a subparser 
 ([[subp.add_parser]]) that will set the [[func]] attribute.
-Then we can execute the correct function and let that function check the 
+Then we can execute the correct function and let that function check the
 remaining arguments.
+Not every command line reaches such a subparser, though, so we must be
+prepared for a missing [[func]] before we run anything
+(\cref{missing-subcommand}).
 
 Each command function must take three arguments:
 \begin{enumerate}
@@ -404,34 +408,124 @@ This means that we must read the credentials to create the Canvas object.
 One exception is the [[login]] command: this command doesn't need the Canvas 
 object as it will be run before there are credentials.
 <<run subcommands>>=
+<<look up the command function as [[func]]>>
+
+if func is None:
+  <<report the missing subcommand>>
+
 if (<<we don't need [[canvas]]>>):
   canvas = None
 else:
   <<create canvas object>>
 
-if args.func:
-  try:
-    args.func(config, canvas, args)
-  except EmptyListError as e:
-    if args.quiet == 0:
-      err(1, str(e))
-    else:
-      sys.exit(1)
-  except MultipleMatchesError as e:
-    if args.quiet == 0:
-      err(1, str(e))
-    else:
-      sys.exit(1)
-  finally:
-    <<save canvas to cache after command>>
+try:
+  func(config, canvas, args)
+except EmptyListError as e:
+  if args.quiet == 0:
+    err(1, str(e))
+  else:
+    sys.exit(1)
+except MultipleMatchesError as e:
+  if args.quiet == 0:
+    err(1, str(e))
+  else:
+    sys.exit(1)
+finally:
+  <<save canvas to cache after command>>
 @
 
+
+\subsubsection{When no command function was set}%
+\label{missing-subcommand}
+
+The protocol above assumes that [[func]] is always set, but nothing in
+argparse guarantees it.
+A command that has subcommands of its own, like [[modules]], sets [[func]] on
+each of \emph{its} subparsers: [[canvaslms modules list]] sets it, whereas
+[[canvaslms modules]] on its own never reaches a subparser that would.
+The resulting [[args]] then lacks the attribute altogether, so the very first
+mention of [[args.func]]---the test for whether we need the Canvas object,
+below---raises [[AttributeError]] and dumps a traceback on a user who merely
+mistyped a command.
+
+Each such command should of course require its subcommand (as [[modules]] now
+does, \cref{modules-subcommand}), but the main program is where every command
+ends up, so this is also where we can stop \emph{any} future subcommand from
+crashing the same way.
+We therefore ask for [[func]] in a way that tolerates its absence.
+<<look up the command function as [[func]]>>=
+func = getattr(args, "func", None)
+@
+
+The default matters more than it looks: the attribute is \emph{missing}, not
+falsy, so no test of the form [[if args.func]] can help---such a test crashes
+while evaluating its own condition.
+And even when [[func]] is present, that test says nothing, since every
+function object is truthy.
+Only [[getattr]] with a default distinguishes the two cases.
+
+Once [[func]] is [[None]] we know the user gave an incomplete command line, so
+we do what argparse does for a missing required argument: show the help and
+exit non-zero, letting the shell and any surrounding script see the failure.
+We print to standard error, because standard output belongs to the CSV data
+that pipelines consume (\cref{output-format}), and a failed run should not put
+anything there.
+The help we can print is the top-level one; the subparser that knows which
+subcommands were available is local to the [[add_command]] call that created
+it.
+We therefore name the offending command from [[args.command]], which the
+top-level subparser always sets, so the message points at the right place even
+though the help is general.
+<<report the missing subcommand>>=
+argp.print_help(sys.stderr)
+err(1, f"{args.command}: missing subcommand")
+@
+
+Let's verify that the lookup survives the [[Namespace]] shape that caused the
+crash, namely one where argparse never set [[func]] at all:
+
+<<test functions>>=
+class TestCommandFunctionLookup:
+    """Test how the CLI looks up the function to run"""
+
+    def test_missing_func_gives_none(self):
+        """
+        A Namespace without func must yield None.
+
+        This is what argparse produces for a command whose subcommand
+        was omitted; reading args.func directly raises AttributeError.
+        """
+        args = argparse.Namespace(command="modules")
+
+        # Use the same lookup as in the implementation
+        <<look up the command function as [[func]]>>
+
+        assert func is None
+
+    def test_present_func_is_used(self):
+        """A Namespace with func must yield that function"""
+        def some_command(config, canvas, args):
+            pass
+
+        args = argparse.Namespace(command="courses", func=some_command)
+
+        # Use the same lookup as in the implementation
+        <<look up the command function as [[func]]>>
+
+        assert func is some_command
+@
+
+
+\subsubsection{Which commands need the Canvas object}
+
 We know that the [[login]] command doesn't need the Canvas object.
-So we don't want to uncessarily create it (and fail) if the command is 
+So we don't want to uncessarily create it (and fail) if the command is
 [[login]] (that means the user is trying to set up Canvas).
 (There will be more cases, but we'll return to them later.)
+We compare against [[func]] rather than [[args.func]], for the reasons given
+above; the same holds for every later addition to this chunk.
 <<we don't need [[canvas]]>>=
-args.func == canvaslms.cli.login.login_command
+func == canvaslms.cli.login.login_command
 @
 
 To create the Canvas object, we must read the credentials using the
@@ -459,7 +553,7 @@ so it runs whether the command succeeded, raised [[EmptyListError]] or
 
 The reason is that the cache state is monotonically improving: the decorators
 in [[hacks/canvasapi.nw]] only \emph{add} or \emph{refresh} entries---never
-corrupt or remove valid ones---so whatever new objects [[args.func]] managed
+corrupt or remove valid ones---so whatever new objects [[func]] managed
 to fetch before an error are still worth persisting.
 This matters in particular for long-running queries that filter a large
 result set down to nothing: they raise [[EmptyListError]] only after warming
@@ -605,7 +699,7 @@ Canvas.
 So we don't want to unnecessarily create the Canvas object in that case (and
 possibly fail).
 <<we don't need [[canvas]]>>=
-or (args.func == canvaslms.cli.quizzes.analyse_command
+or (func == canvaslms.cli.quizzes.analyse_command
     and args.csv)
 @
 
@@ -622,4 +716,4 @@ The [[cache]] command doesn't need a Canvas object, as it just manages the
 cache files.
 So we don't want to unnecessarily create the Canvas object in that case.
 <<we don't need [[canvas]]>>=
-or args.func == canvaslms.cli.cache.clear_command
+or func == canvaslms.cli.cache.clear_command
