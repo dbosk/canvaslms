@@ -30,6 +30,8 @@ import operator
 import re
 import sys
 
+<<constants>>
+
 <<functions>>
 
 def add_command(subp):
@@ -44,6 +46,7 @@ appear after their corresponding functionality:
 <<test [[users.py]]>>=
 """Tests for user caching and role filtering"""
 
+import argparse
 import pytest
 from unittest.mock import Mock, MagicMock
 import canvaslms.cli.users as users_module
@@ -1042,14 +1045,24 @@ Second, we provide the most general function, [[filter_users]], which takes a
 list of courses, a list of Canvas roles and a regex as arguments.
 It returns the matching users.
 
+Where the users come from and how we match them are separate concerns, and we
+need the matching half on its own: users selected by group membership arrive as
+a plain list, not as a course to enumerate, yet they must be matched by exactly
+the same rules (\cref{sec:user-or-group-option}).
+We therefore split the matching into [[filter_users_by_regex]] and let
+[[filter_users]] supply the users.
+Sharing a \emph{function} rather than a chunk keeps the two call sites honest:
+a caller that forgets an argument fails immediately instead of matching by
+different rules.
+
 We compile the regex to a pattern.
-This is because it's slightly faster, since we reuse the regex for several 
+This is because it's slightly faster, since we reuse the regex for several
 searches.
 We'll ignore case.
 <<functions>>=
-def filter_users(course_list, regex, roles=[]):
+def filter_users_by_regex(user_list, regex):
   """
-  Filter users in courses with roles based on regex. `regex` is matched on 
+  Filter an iterable of users based on regex. `regex` is matched on
   - Canvas ID (exact match),
   - name (regex),
   - login ID (regex),
@@ -1058,8 +1071,15 @@ def filter_users(course_list, regex, roles=[]):
   """
   pattern = re.compile(regex or ".*", re.IGNORECASE)
 
-  for user in list_users(course_list, roles):
+  for user in user_list:
     <<yield [[user]] if match>>
+
+def filter_users(course_list, regex, roles=[]):
+  """
+  Filter users in courses with roles based on regex, see
+  filter_users_by_regex for how regex is matched.
+  """
+  return filter_users_by_regex(list_users(course_list, roles), regex)
 @
 
 Now to check if the user matches, we want to match some things by regular 
@@ -1173,14 +1193,45 @@ class TestGetUid:
 
 \section{Options for the command line}
 
-We provide two ways to filter out users by command-line option:
-\begin{itemize}
-\item just filter among all users in a course directly, or
-\item filter by groups in a course and select all users in the groups that 
-match.
-\end{itemize}
-We provide functions that add either option, but we also provide a function 
-which add these as mutually exclusive options.
+A command that operates on users must let its caller say \emph{which} users.
+We provide four options for saying it, and the point of this section is that
+all four \emph{narrow} the same set: none of them replaces another, so any
+combination of them is meaningful.
+
+Two of the options answer \enquote{which users?} directly:
+\begin{description}
+\item[The user option] [[-u]] names users by matching a regex against their
+identifiers.
+\item[The group option] [[-G]] names users as the members of the groups whose
+names match a regex.
+\end{description}
+The other two refine one of those:
+\begin{description}
+\item[The role filter] [[-r]] restricts which enrolments count when we look
+users up by identifier.
+\item[The category filter] [[-C]] restricts which group categories we search
+for groups.
+\end{description}
+
+It is tempting to read [[-u]] and [[-G]] as an either--or: either you name
+users or you name groups.
+Vary one option at a time in a course that has several students called Daniel
+and a set of lab groups, and it becomes clear that they are not:
+\begin{description}
+\item[ [[-u Daniel]] ] every Daniel in the course, in any group or none.
+\item[ [[-G 'Group X']] ] every member of Group X, called Daniel or not.
+\item[ [[-u Daniel -G 'Group X']] ] the Daniels \emph{in} Group X.
+\end{description}
+The third line is the one a teacher grading Group X actually wants, and it is
+unreachable if the two options exclude each other.
+So the group options choose \emph{where} to look and the user options choose
+\emph{whom} to accept there: given both, we take the members of the matching
+groups and keep those matching the user regex.
+\Cref{sec:user-or-group-option} implements that intersection.
+
+Giving neither is meaningful too---it denotes every user in the course---which
+is why [[-u]] carries a match-all default and why requiring a selection takes a
+little care; we come back to both below.
 
 \subsection{The user option}
 
@@ -1193,7 +1244,8 @@ option.
 The more useful function, [[add_user_option]], will also try to add the other 
 required options, like the course(s) where to find users.
 <<functions>>=
-def add_user_option_wo_depends(parser, required=False, suppress_help=False):
+def add_user_option_wo_depends(parser, required=False, suppress_help=False,
+                               default=DEFAULT_USER_REGEX):
   """
   Adds the -u option to argparse parser, without adding
   other required options.
@@ -1202,6 +1254,9 @@ def add_user_option_wo_depends(parser, required=False, suppress_help=False):
     parser: The argparse parser to add options to
     required: Whether the user option should be required (default: False)
     suppress_help: If True, hide this option from help output (default: False)
+    default: The regex to use when -u is omitted; None means omitting it
+      selects nothing, leaving it to the caller to check that something else
+      did
 
   <<user roles option doc>>
   """
@@ -1214,11 +1269,14 @@ def add_user_option_wo_depends(parser, required=False, suppress_help=False):
        "leading ^. The regex allows matching using ^son@, thus skipping " \
        "any domain in this case."
   options = {"required": required}
-  if not required:
-    options["default"] = ".*"
-    help += ", default: '.*'"
-  else:
+  if required:
     help += ", required: use '.*' to match all students"
+  else:
+    options["default"] = default
+    if default:
+      help += f", default: '{default}'"
+    else:
+      help += ", required unless groups are selected with --group or --category"
 
   parser.add_argument("-u", "--user", metavar="user_regex",
     help=argparse.SUPPRESS if suppress_help else help, **options)
@@ -1235,15 +1293,24 @@ def add_user_option(parser, required=False):
   add_user_option_wo_depends(parser, required)
 @
 
-When processing this option, we need to filter by course first, so we use the 
+The default regex matches every user, so omitting [[-u]] asks for all of them.
+We name it rather than repeating the literal, because the value is load-bearing
+in two places at once: it is the help text's promise to the user, and it is
+what makes \enquote{the caller selected nothing} an unreachable state on an
+ordinary parser (\cref{sec:requiring-a-selection}).
+<<constants>>=
+DEFAULT_USER_REGEX = ".*"
+@
+
+When processing this option, we need to filter by course first, so we use the
 processing from the [[courses]] module to get the list of courses matching the 
 courses options.
 Then we simply filter all users.
 
 \subsubsection{Converting role string to list}
 
-The [[--role]] option (defined in [[add_user_roles_option]]) accepts a single 
-role string like [["student"]] or [["ta"]] via argparse.
+The [[--role]] option (added by [[add_user_option_wo_depends]]) accepts a
+single role string like [["student"]] or [["ta"]] via argparse.
 However, [[filter_users]] and [[list_users]] expect a list of role names, 
 since they need to iterate over roles when checking if any role matches a 
 user's enrollments.
@@ -1276,8 +1343,13 @@ def process_user_option(canvas, args):
 We note that we need the roles.
 Sometimes we want to be able to filter based on role.
 However, most of the time, we just want the students, so we'll default to that.
+
+The role only ever narrows the lookup by identifier, so it belongs to [[-u]];
+it says nothing about group membership, which Canvas already resolves for us.
+Selecting by group therefore ignores it, as we note in
+\cref{sec:user-or-group-option}.
 <<user roles option doc>>=
-The `role` option allows specifying which roles to include, for instance 
+The `role` option allows specifying which roles to include, for instance
 students or TAs.
 <<add user roles option>>=
 parser.add_argument("-r", "--role",
@@ -1290,12 +1362,15 @@ parser.add_argument("-r", "--role",
 
 \subsection{The group option}
 
-The group option is a bit more complex.
-We can choose groups by either filtering on the group names directly or by 
-first filtering on the group categories and filtering only groups in a given 
-category.
-The latter is useful as students can change the name of a group so it doesn't 
-match the group category by prefix.
+The group option is a bit more complex, because the group selection [[-G]]
+comes with a filter of its own: the group category [[-C]].
+The two \emph{compose}, they are not alternatives.
+Filtering on the category first is useful because students can rename a group
+so that its name no longer matches the category by prefix; narrowing to the
+category recovers those groups, and the group regex then picks among what is
+left.
+Since [[filter_groups]] turns an omitted group regex into [[".*"]], giving only
+[[-C]] means \enquote{every group in these categories}.
 <<functions>>=
 def add_group_category_option_wo_depends(parser, suppress_help=False):
   """Adds the group category option, without adding required other options
@@ -1378,19 +1453,24 @@ def process_group_options(canvas, args):
   return group_list
 @
 
-\subsection{An option for user or group}
+\subsection{An option for user or group}%
+\label{sec:user-or-group-option}
 
-Finally, we can provide both options together, but mutually exclusive so that 
-only one option can be used at a time.
-The processing must return a list of users, so in case of the group option we 
-must extract the users.
+Finally, we offer both selections through one function, so that a command picks
+up all four options with a single call.
+Since every option narrows rather than replaces, the function has nothing to
+arrange: the four options simply go on the parser, and argparse imposes no
+relationship between them.
 <<functions>>=
 def add_user_or_group_option(parser, required=False, suppress_help=False):
-  """Adds user and group options as mutually exclusive options to parser
+  """Adds the user and group selection options to argparse parser
+
+  The options combine: given both -u and -G, the selection is the members of
+  the matching groups that also match the user regex.
 
   Args:
     parser: The argparse parser to add options to
-    required: Whether to require one of user/group options (default: False)
+    required: Whether to require that some selection is made (default: False)
     suppress_help: If True, hide these options from help output (default: False)
   """
   try:
@@ -1398,10 +1478,9 @@ def add_user_or_group_option(parser, required=False, suppress_help=False):
   except argparse.ArgumentError:
     pass
 
-  parser = parser.add_mutually_exclusive_group(required=required)
-
   try:
-    add_user_option_wo_depends(parser, suppress_help=suppress_help)
+    add_user_option_wo_depends(parser, suppress_help=suppress_help,
+      default=None if required else DEFAULT_USER_REGEX)
   except argparse.ArgumentError:
     pass
 
@@ -1409,20 +1488,206 @@ def add_user_or_group_option(parser, required=False, suppress_help=False):
     add_group_option_wo_depends(parser, suppress_help=suppress_help)
   except argparse.ArgumentError:
     pass
+@
 
+An earlier version of this function made [[-u]] and [[-G]] mutually exclusive,
+which is what the phrase \enquote{user \emph{or} group} suggests.
+That reading cost us the case the previous page argued for---the Daniels in
+Group X---so the exclusivity is gone, and with it the [[default]] argument
+above is the only trace of [[required]] left in the parser.
+The next subsection explains why.
+
+\subsubsection{Requiring a selection}%
+\label{sec:requiring-a-selection}
+
+The [[grade]] and [[submissions grade]] commands pass [[required=True]],
+because grading whatever happens to match is not a mistake we want to make easy.
+Argparse can require an individual option, and it can require one member of a
+mutually exclusive group, but it has no way to say \enquote{at least one of
+these, and any combination is fine}---which is precisely the constraint we are
+left with once the options compose.
+
+So we express requiredness by \emph{withholding a default} rather than by
+asking argparse for it.
+On an ordinary parser [[-u]] defaults to [[DEFAULT_USER_REGEX]], so omitting
+every option still denotes a set, namely everyone; the caller can never be in a
+state where nothing was selected.
+On a parser that requires a selection we give [[-u]] no default at all, and
+that state becomes both reachable and recognisable: [[args.user]] is [[None]]
+and neither group option was given.
+The check below is therefore dead code exactly when it should be---a
+non-required command cannot reach it---and we do not need to smuggle the
+[[required]] flag into [[args]] to know whether to apply it.
+
+We report it with [[err]] rather than raising [[EmptyListError]], because the
+caller made a usage mistake and did not merely ask for something that turned
+out to be empty; [[EmptyListError]] is also silenced by [[--quiet]], which
+would hide it.
+<<check that something was selected>>=
+if args.user is None and not args.group and not args.category:
+  canvaslms.cli.err(1, "you must select users with --user or groups with "
+    "--group or --category; use --user '.*' to select everyone")
+@
+
+\subsubsection{Intersecting the two selections}
+
+The processing must return a list of users, so when groups are involved we go
+on to extract their members---and then keep only those the user regex accepts.
+Doing it in that order matters: it is what makes [[-u Daniel -G 'Group X']]
+mean \enquote{the Daniels in Group X} instead of \enquote{every Daniel} or
+\enquote{everyone in Group X}.
+<<functions>>=
 def process_user_or_group_option(canvas, args):
-  """Returns a list of users, filtered either by user regex or by groups"""
-  if args.group or args.category:
-    users = list()
-    for group in process_group_options(canvas, args):
-      group_users = list(group.get_users())
-      for user in group_users:
-        canvaslms.cli.utils.ensure_user_attrs(user)
-      users.extend(group_users)
+  """Returns a list of users selected by the user regex, by groups, or by both
 
-    if not users:
-      raise canvaslms.cli.EmptyListError("No users found in the specified groups")
-    return users
+  Given both, returns the members of the matching groups that also match the
+  user regex.
+  """
+  <<check that something was selected>>
+
+  if args.group or args.category:
+    <<return the group members matching the user regex>>
 
   return process_user_option(canvas, args)
+@
+
+Either group option is enough to mean \enquote{look in groups}: [[-C]] without
+[[-G]] is the \enquote{whole category} case from the previous subsection.
+
+The user regex needs no special case for \enquote{not given}.
+When the caller omits [[-u]] it is either [[DEFAULT_USER_REGEX]] or [[None]],
+and [[filter_users_by_regex]] treats both as matching everything, so the
+intersection degenerates to the plain group selection on its own.
+That is why the same two lines serve all three combinations.
+
+Note also what does \emph{not} carry over: [[-r]] restricts an enrolment
+lookup, and group membership is not one.
+Canvas has already decided who is in a group, so the role plays no part here.
+<<return the group members matching the user regex>>=
+users = list()
+for group in process_group_options(canvas, args):
+  group_users = list(group.get_users())
+  for user in group_users:
+    canvaslms.cli.utils.ensure_user_attrs(user)
+  users.extend(filter_users_by_regex(group_users, args.user))
+
+if not users:
+  raise canvaslms.cli.EmptyListError("No users found in the specified groups")
+return users
+@
+
+Normalizing the members before matching is not optional:
+[[filter_users_by_regex]] reads [[login_id]] and the other identifier
+attributes, and Canvas omits them from group listings often enough that the
+lookup would otherwise raise.
+
+\subsubsection{Verifying that the options combine}
+
+What this section really claims is a set of command lines and what each of them
+denotes, so that is what we test: first that the parser accepts every
+combination, then that the intersection actually intersects, then that
+requiring a selection recognises the empty one.
+
+<<test functions>>=
+class TestUserOrGroupOption:
+    """Test how add_user_or_group_option combines its four options."""
+
+    def parser(self, required=False):
+        parser = argparse.ArgumentParser()
+        users_module.add_user_or_group_option(parser, required=required)
+        return parser
+
+    <<user or group option test methods>>
+@
+
+Each filter must combine with the selection it refines, and---the case that
+motivated this design---the two selections must combine with each other.
+
+<<user or group option test methods>>=
+def test_role_filter_combines_with_user(self):
+    args = self.parser().parse_args(["-u", "alice", "-r", "ta"])
+    assert args.user == "alice"
+    assert args.role == "ta"
+
+def test_category_filter_combines_with_group(self):
+    args = self.parser().parse_args(["-G", "Labb", "-C", "Labbgrupper"])
+    assert args.group == "Labb"
+    assert args.category == "Labbgrupper"
+
+def test_user_and_group_combine(self):
+    args = self.parser().parse_args(["-u", "Daniel", "-G", "Group X"])
+    assert args.user == "Daniel"
+    assert args.group == "Group X"
+@
+
+Accepting the combination is only half of it; the result must be the
+intersection.
+We stand in for Canvas with a group holding two members and check that naming
+Daniel leaves only Daniel, while naming nobody leaves both.
+Note that [[name]] has to be assigned after construction: passing it to
+[[Mock]] would name the mock itself rather than set the attribute we match on.
+
+<<user or group option test methods>>=
+def group_of(self, monkeypatch, *names):
+    members = []
+    for index, name in enumerate(names):
+        member = Mock()
+        member.id = 100 + index
+        member.name = name
+        member.login_id = f"{index}@example.com"
+        members.append(member)
+
+    group = Mock()
+    group.get_users.return_value = members
+    monkeypatch.setattr(users_module, "process_group_options",
+                        lambda canvas, args: [group])
+    return group
+
+def test_user_regex_narrows_the_group_members(self, monkeypatch):
+    self.group_of(monkeypatch, "Daniel Bosk", "Alice Student")
+    args = self.parser().parse_args(["-u", "Daniel", "-G", "Group X"])
+
+    result = users_module.process_user_or_group_option(None, args)
+
+    assert [user.name for user in result] == ["Daniel Bosk"]
+
+def test_group_alone_keeps_every_member(self, monkeypatch):
+    self.group_of(monkeypatch, "Daniel Bosk", "Alice Student")
+    args = self.parser().parse_args(["-G", "Group X"])
+
+    result = users_module.process_user_or_group_option(None, args)
+
+    assert len(result) == 2
+@
+
+Finally, requiring a selection: a group alone must satisfy it, while a bare
+filter---or nothing at all---must not.
+The first case doubles as proof that the check does not fire spuriously, since
+it gets far enough to reach the group members.
+
+<<user or group option test methods>>=
+def test_group_alone_satisfies_the_requirement(self, monkeypatch):
+    self.group_of(monkeypatch, "Daniel Bosk")
+    args = self.parser(required=True).parse_args(["-G", "Labb"])
+
+    assert users_module.process_user_or_group_option(None, args)
+
+def test_filter_alone_is_not_a_selection(self):
+    args = self.parser(required=True).parse_args(["-r", "student"])
+    with pytest.raises(SystemExit):
+        users_module.process_user_or_group_option(None, args)
+
+def test_selecting_nothing_is_refused(self):
+    args = self.parser(required=True).parse_args([])
+    with pytest.raises(SystemExit):
+        users_module.process_user_or_group_option(None, args)
+@
+
+An ordinary parser cannot reach that check, and the match-all default is what
+guarantees it.
+
+<<user or group option test methods>>=
+def test_omitting_everything_selects_everyone(self):
+    args = self.parser().parse_args([])
+    assert args.user == users_module.DEFAULT_USER_REGEX
 @
