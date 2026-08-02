@@ -116,9 +116,9 @@ import canvaslms.cli.content as content
 \section{YAML front matter: a familiar solution}
 
 YAML front matter is a convention from static site generators where metadata
-appears at the beginning of a file, delimited by \texttt{---} markers. This
-format is familiar to developers and provides a clear separation between
-structured attributes and free-form content.
+appears at the beginning of a file, delimited by lines that contain nothing
+but \texttt{---}. This format is familiar to developers and provides a clear
+separation between structured attributes and free-form content.
 
 \begin{verbatim}
 ---
@@ -135,9 +135,58 @@ The [[parse_yaml_front_matter]] function extracts the YAML section from content
 and returns both the parsed attributes and the remaining content. If no front
 matter is present, it returns an empty dictionary and the original content
 unchanged.
+
+The delicate part is deciding where the front matter ends, and it is easy to
+get subtly wrong. The tempting reading of the format is \enquote{split the
+text on \texttt{---}}, but \texttt{---} is not the delimiter: a \emph{line}
+consisting of \texttt{---} is. The distinction stays invisible until some
+value contains those three characters---which is entirely ordinary, since
+\texttt{---} is how one writes an em dash in Markdown:
+
+\begin{verbatim}
+---
+title: Week 1 --- Introduction
+regex: ^Week 1
+---
+Body text
+\end{verbatim}
+
+Splitting on the substring ends the front matter at the occurrence inside the
+title. The parser then sees only [[title: Week 1]], and everything from
+\enquote{Introduction} onwards---including the [[regex]] line and the second
+delimiter---is handed back as the body. The failure is silent and destructive:
+a user who exports a page with \texttt{pages view > page.md} and re-imports it
+with \texttt{pages edit -f page.md} loses the [[regex]] field that identifies
+the page, and pushes the leaked YAML text into the Canvas page body.
+
+Splitting on delimiter \emph{lines} is immune to this, and not by luck: a
+delimiter is only recognised in column one on a line of its own, while
+[[yaml.dump]] indents any continuation line of a multi-line scalar. No value
+we write can therefore forge a delimiter, so the only lines that can end the
+front matter are the ones [[format_yaml_front_matter]] put there.
+
+<<content constants>>=
+FRONT_MATTER_DELIMITER = re.compile(r"^---[ \t\r]*$\n?", re.MULTILINE)
+@
+
+The trailing whitespace and the optional newline belong to the delimiter
+itself: consuming them keeps the YAML block and the body free of the
+delimiter's own line ending, and tolerates both Unix and Windows line endings
+in files that have made a round trip through a foreign editor.
+
+Splitting also subsumes the question of whether the content has front matter
+at all. Front matter must \emph{open} the file, so the text before the first
+delimiter line---the first element of [[parts]]---has to be blank; anything
+else means the [[---]] lines we found are prose, such as a Markdown
+horizontal rule further down the document. This test is stricter than the
+[[content.strip().startswith('---')]] check it replaces, which also accepted
+a first line of, say, [[---title]] and then split in the middle of the text.
 <<yaml front matter functions>>=
 def parse_yaml_front_matter(content):
     """Parse YAML front matter from content.
+
+    Front matter is the block between a line containing only ``---`` at the
+    very start of the content and the next such line.
 
     Args:
         content: String containing optional YAML front matter followed by content
@@ -145,11 +194,8 @@ def parse_yaml_front_matter(content):
     Returns:
         Tuple of (attributes dict, content string without front matter)
     """
-    if not content.strip().startswith('---'):
-        return {}, content
-
-    parts = content.split('---', 2)
-    if len(parts) < 3:
+    parts = FRONT_MATTER_DELIMITER.split(content, maxsplit=2)
+    if len(parts) < 3 or parts[0].strip():
         return {}, content
 
     try:
@@ -189,7 +235,10 @@ def format_yaml_front_matter(attributes, message_content):
 
 \subsection{Verifying YAML functions}
 
-We verify the parsing handles various edge cases correctly.
+We verify the parsing handles various edge cases correctly. The property that
+ultimately matters for file editing is the round trip: whatever
+[[format_yaml_front_matter]] writes, [[parse_yaml_front_matter]] must read
+back unchanged, no matter what the attribute values contain.
 <<test yaml functions>>=
 class TestParseYamlFrontMatter:
     """Tests for parse_yaml_front_matter function."""
@@ -228,6 +277,25 @@ Content"""
         attrs, _ = content.parse_yaml_front_matter(text)
         assert attrs['delayed_post_at'] is None
 
+    def test_dashes_inside_value_do_not_end_frontmatter(self):
+        """Only a line of its own delimits the front matter."""
+        text = """---
+title: Week 1 --- Introduction
+regex: ^Week 1
+---
+Body text"""
+        attrs, result = content.parse_yaml_front_matter(text)
+        assert attrs == {'title': 'Week 1 --- Introduction',
+                         'regex': '^Week 1'}
+        assert result == "Body text"
+
+    def test_delimiters_later_in_body_are_ignored(self):
+        """Horizontal rules in a body without front matter are left alone."""
+        original = "Intro\n\n---\n\nMore text\n\n---\n\nEnd"
+        attrs, result = content.parse_yaml_front_matter(original)
+        assert attrs == {}
+        assert result == original
+
 
 class TestFormatYamlFrontMatter:
     """Tests for format_yaml_front_matter function."""
@@ -244,6 +312,15 @@ class TestFormatYamlFrontMatter:
         assert result.startswith("---\n")
         assert "title: Test" in result
         assert result.endswith("---\nContent")
+
+    def test_roundtrip_preserves_dashes_in_values(self):
+        """A view/edit round trip keeps every attribute intact."""
+        attrs = {'title': 'Week 1 --- Introduction', 'regex': '^Week 1',
+                 'published': True}
+        text = content.format_yaml_front_matter(attrs, "Body")
+        parsed_attrs, parsed_body = content.parse_yaml_front_matter(text)
+        assert parsed_attrs == attrs
+        assert parsed_body == "Body"
 
 @
 
