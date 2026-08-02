@@ -440,8 +440,6 @@ class TestListCommandUserResolution:
 
 Sometimes we want to compute the URL for SpeedGrader for a submission.
 The [[Submission]] objects come with an attribute [[preview_url]].
-(However, previous submissions don't have this, so if it doesn't exist, we use 
-[[None]].)
 We want to turn that one into the SpeedGrader URL.
 The [[preview_url]] looks like this:
 \begin{minted}{text}
@@ -454,13 +452,19 @@ https://canvas.kth.se/courses/26930/gradebook/speed_grader?
   assignment_id=173825&student_id=108849
 \end{minted}
 We use Python's regex abilities to rewrite the URL.
+
+Not every submission has a preview URL, though, and then there is no SpeedGrader
+page to point at either.
+We return [[None]] for those, which is the contract the callers must respect;
+\cref{MissingPreviewURL} explains which submissions those are, and why detecting
+them is trickier than it looks.
 <<functions>>=
 def speedgrader(submission):
-  """Returns the SpeedGrader URL of the submission"""
-  try:
-    speedgrader_url = submission.preview_url
-  except AttributeError:
-    return None
+  """
+  Returns the SpeedGrader URL of the submission.
+  Returns None if the submission has no preview URL.
+  """
+  <<return [[None]] when there is no preview URL>>
 
   speedgrader_url = re.sub("assignments/",
     "gradebook/speed_grader?assignment_id=",
@@ -473,6 +477,51 @@ def speedgrader(submission):
   speedgrader_url = re.sub(r"\?preview.*$", "", speedgrader_url)
 
   return speedgrader_url
+@
+
+\subsection{Submissions without a preview URL}\label{MissingPreviewURL}
+
+Canvas attaches [[preview_url]] to the current version of a submission only.
+The historical versions in [[submission_history]] therefore arrive without one,
+and those are exactly the submissions that [[format_submission]] renders for
+[[canvaslms submission --history]] and [[--diff]].
+So the empty case is not an exotic corner: it is one whole command.
+
+Detecting it used to be a matter of catching the failed attribute access:
+\begin{minted}{python}
+try:
+  speedgrader_url = submission.preview_url
+except AttributeError:
+  return None
+\end{minted}
+That guard was correct as long as \enquote{Canvas did not send this field} meant
+\enquote{this Python object has no such attribute}.
+Normalizing Canvas objects at ingress broke that equivalence.
+[[ensure_submission_attrs]] lists [[preview_url]] among [[SUBMISSION_ATTRS]] and
+fills in every missing attribute with [[None]], and [[format_submission]]
+normalizes each submission before formatting it.
+By the time [[speedgrader]] is called, the attribute always exists.
+
+The guard thus became dead code without any change to [[speedgrader]] itself:
+[[AttributeError]] can no longer be raised, so [[None]] flows past the [[try]]
+block into [[re.sub]], which raises [[TypeError]] instead
+(\enquote{expected string or bytes-like object}).
+The failure mode moved from \enquote{handled} to \enquote{crash} while the
+handling code still looked right.
+
+The general lesson is worth stating, because it applies to every guard written
+against a Canvas attribute: once objects are normalized at ingress, absence is a
+\emph{value}, not a missing attribute, so guards must test the value.
+We test for a falsy URL, which covers both the normalized [[None]] and an empty
+string from Canvas.
+We still read the attribute with a [[getattr]] default, because [[speedgrader]]
+is a small public helper that callers may reach with an object that never passed
+through normalization; falling back to [[None]] keeps its documented contract in
+that case too.
+<<return [[None]] when there is no preview URL>>=
+speedgrader_url = getattr(submission, "preview_url", None)
+if not speedgrader_url:
+  return None
 @
 
 \subsection{Verifying [[speedgrader]] URL generation}
@@ -506,6 +555,24 @@ class TestSpeedgraderURL:
         result = speedgrader(submission)
         
         assert result is None
+@
+
+Absence has two shapes, and the second one is the one that used to crash: a
+normalized submission carries [[preview_url]] with an empty value rather than no
+attribute at all.
+Both shapes must yield [[None]], and neither may raise.
+
+<<test functions>>=
+class TestSpeedgraderWithoutPreviewURL:
+    """Test speedgrader() on submissions Canvas gave no preview URL."""
+
+    @pytest.mark.parametrize("preview_url", [None, ""])
+    def test_returns_none_for_empty_preview_url(self, preview_url):
+        """Normalized submissions carry an empty preview_url, not no attr."""
+        submission = Mock(spec=["preview_url"])
+        submission.preview_url = preview_url
+
+        assert speedgrader(submission) is None
 @
 
 
@@ -1576,6 +1643,19 @@ def format_section(title, body, json_format=False, md_title_level="#"):
 
 To format the metadata section, we simply pass the right strings to the section 
 formatting function.
+
+One of those strings can be absent.
+[[speedgrader]] returns [[None]] for the history versions that carry no preview
+URL (\cref{MissingPreviewURL}), and this section is precisely where those
+versions are rendered, so the Markdown output would show a bare [[None]] as if
+that were the URL.
+We substitute the same [[N/A]] placeholder that [[format_local_time]] already
+produces for absent timestamps in this very dictionary, so that every absent
+field of the metadata section reads the same way.
+The trade-off is that the JSON output carries the string [[N/A]] here rather
+than [[null]]; we accept it because the timestamps in this dictionary already
+behave that way, and consistency within the section is worth more than a null
+for a field that only ever means \enquote{no page to link to}.
 <<add metadata to output>>=
 metadata = {
   "course": submission.assignment.course.course_code,
@@ -1588,7 +1668,7 @@ metadata = {
     submission.graded_at),
   "grade": submission.grade,
   "graded_by": str(resolve_grader(submission)),
-  "speedgrader": speedgrader(submission)
+  "speedgrader": speedgrader(submission) or "N/A"
 }
 
 if json_format:
@@ -3148,11 +3228,31 @@ or message options were given, or open the submission in SpeedGrader.
 <<grade the submissions>>=
 if not args.grade and not args.message:
   for submission in submission_list:
-    webbrowser.open(speedgrader(submission))
+    <<open [[submission]] in SpeedGrader>>
 else:
   for submission in submission_list:
     <<if verbose, print [[submission]] and [[results]] to stdout>>
     <<grade submission with error handling>>
+@
+
+Opening SpeedGrader means honouring [[speedgrader]]'s contract that there might
+be no URL to open (\cref{MissingPreviewURL}).
+Passing [[None]] to [[webbrowser.open]] does not fail politely: it raises
+[[TypeError]] from deep inside the standard library while substituting the URL
+into a browser command line.
+That would abort the whole loop, so one submission Canvas gave no preview URL
+for would keep every later submission from opening---the opposite of what a
+grader running this over a batch wants.
+We therefore skip such submissions with a warning, naming the submission so the
+grader can open it manually, and carry on with the rest.
+<<open [[submission]] in SpeedGrader>>=
+speedgrader_url = speedgrader(submission)
+if speedgrader_url:
+  webbrowser.open(speedgrader_url)
+else:
+  canvaslms.cli.warn(f"No SpeedGrader URL for "
+                     f"{submission.assignment.name} "
+                     f"for {submission.user}, skipping.")
 @
 
 \subsection{Verbose output when setting grades}
