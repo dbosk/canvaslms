@@ -82,6 +82,7 @@ import pytest
 from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
+    convert_to_md,
     filter_view_submissions,
     format_rubric,
     format_submission,
@@ -2034,14 +2035,32 @@ except ValueError:
 Now we'll do the same for PDF files.
 We'll use [[pdf2txt]] to convert the PDF to text.
 However, here we'll use an if statement.
-We'll check for the content type to end with [[pdf]], that will capture also 
+We'll check for the content type to end with [[pdf]], that will capture also
 [[x-pdf]].
+
+Unlike [[pypandoc]], [[pdf2txt]] is not something we depend on: it ships with
+pdfminer.six, which we never declare as a dependency, so the user may or may
+not have it.  That gives this step two distinct ways to come up empty.  If
+[[pdf2txt]] is installed but chokes on the file, Python raises
+[[subprocess.CalledProcessError]]; if it was never installed, the exec fails
+before the tool ever runs and Python raises [[FileNotFoundError]] instead.
+Both outcomes mean the same thing to us---this converter cannot produce text
+for this attachment---so both must fall through to the [[pypandoc]] attempt
+below.  That is exactly what the fallback chain exists for: a missing optional
+tool must degrade like a failing one.
+
+Catching only [[subprocess.CalledProcessError]] would instead make the absent
+tool fatal rather than merely unhelpful.  The [[FileNotFoundError]] escapes
+[[convert_to_md]], and the attachment loop that calls it guards only against
+[[AttributeError]], so a single PDF attachment would abort the whole
+[[submission]] command with a traceback---on precisely the machines where the
+graceful \enquote{Cannot convert this file} pointer was the right answer.
 <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>=
 if content_type.endswith("pdf"):
   try:
     return subprocess.check_output(["pdf2txt", str(outfile)],
                                     text=True)
-  except subprocess.CalledProcessError:
+  except (subprocess.CalledProcessError, FileNotFoundError):
     pass
 @
 
@@ -2056,6 +2075,44 @@ try:
 except Exception as err:
   return f"Cannot convert this file. " \
          f"The file is located at\n\n  {outfile}\n\n"
+@
+
+Now that the whole chain is in place, let's verify that an uninstalled
+[[pdf2txt]] really does end up in that last-resort message rather than
+escaping as an exception.  We pretend the attachment is already cached, so
+nothing is downloaded, and then make both converters fail the way they would
+on a machine with neither tool installed: the missing [[pdf2txt]] surfaces as
+[[FileNotFoundError]] from [[subprocess.check_output]], which is the failure
+mode that used to abort the command.
+
+<<test functions>>=
+class TestPDFConversionWithoutPdf2txt:
+    """Test that a missing pdf2txt degrades like a failing one"""
+
+    def test_missing_pdf2txt_falls_through(self, tmp_path, monkeypatch):
+        """convert_to_md returns the pointer message instead of raising"""
+        def missing_tool(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory: 'pdf2txt'")
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.attachment_cache"
+            ".restore_cached_attachment",
+            lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.subprocess.check_output",
+            missing_tool)
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.pypandoc.convert_file",
+            missing_tool)
+
+        attachment = Mock()
+        attachment.id = 1
+        attachment.filename = "report.pdf"
+        setattr(attachment, "content-type", "application/pdf")
+
+        contents = convert_to_md(attachment, tmp_path)
+
+        assert contents.startswith("Cannot convert this file")
 @
 
 
