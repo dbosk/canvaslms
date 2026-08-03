@@ -638,7 +638,7 @@ def add_calendar_create_command(subp):
     help="Creates a new calendar event", 
     description="Creates a new calendar event or appointment group for bookable time slots")
   calendar_create_parser.set_defaults(func=calendar_create_command)
-  courses.add_course_option(calendar_create_parser)
+  courses.add_course_option(calendar_create_parser, default=None)
   <<add calendar create arguments>>
 
 def calendar_create_command(config, canvas, args):
@@ -696,24 +696,15 @@ except canvasapi.exceptions.CanvasException as e:
 Both event types must know which course contexts the new event belongs
 to, and both learn it from the [[-c]] option added by
 [[courses.add_course_option]].
-That option is never absent from [[args]]: it defaults to the regex
-[[.*]], the very value we keep in [[DEFAULT_COURSE_REGEX]].
-So [[args.course]] is a non-empty---hence truthy---string even when the
-user never wrote [[-c]] on the command line, and a truthiness test alone
-cannot separate \enquote{match every course} from \enquote{I said
-nothing about courses}.
+For the listing commands that option defaults to the match-all regex
+[[.*]] (\cref{sec:calendar:course-default}), and for them the default is
+harmless: reading every calendar and reading with no filter are the same
+request.
 
-This is why [[calendar list]] and [[calendar view]] compare
-[[args.course]] against [[DEFAULT_COURSE_REGEX]] before they call
-[[process_course_option]], see \cref{sec:calendar:course-default}.
-For those two the comparison is a mere convenience: they only read, so
-mistaking the default for a filter would at worst make us enumerate the
-user's courses in order to build a context filter that Canvas would have
-applied anyway.
-
-Creating is not so forgiving, and [[calendar create]] used to test
-[[args.course]] for truthiness only.
-Since the default regex matches every course the user is enrolled in,
+Creating is not so forgiving.
+[[calendar create]] used to share that default and test [[args.course]]
+for truthiness only; since the default regex matches every course the
+user is enrolled in,
 \begin{verbatim}
 canvaslms calendar create "Meeting" --start-time "2026-08-01 10:00" \
                                     --end-time "2026-08-01 11:00"
@@ -721,8 +712,19 @@ canvaslms calendar create "Meeting" --start-time "2026-08-01 10:00" \
 looped over all of them and created one copy of \enquote{Meeting} in
 each---silently, with no confirmation, and with no bulk delete to undo
 it.
-Both branches below therefore reuse the listing commands' comparison, so
-that the default regex again means \enquote{the user chose no course}.
+Nor can the command recover by comparing [[args.course]] against the
+default regex: an explicit [[-c '.*']]---a user who really does want the
+event in every course---produces exactly the same [[args]] as no [[-c]]
+at all, so the comparison silently takes that ability away.
+
+The distinction the command needs can only live in the default itself.
+[[calendar create]] therefore registers its course option with
+[[default=None]]: a [[None]] means the user never mentioned courses, and
+any string---the match-all [[.*]] included---is an explicit request that
+we honour by creating the event in every matching course.
+Both branches below test [[args.course]] against [[None]] by truthiness,
+which is now sound because argparse never turns an absent [[-c]] into a
+non-empty string.
 
 \subsection{Regular calendar events}
 
@@ -754,7 +756,7 @@ if args.description:
 if args.location:
   params['calendar_event']['location_name'] = args.location
   
-if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+if args.course:
   course_list = courses.process_course_option(canvas, args)
   for course in course_list:
     params['calendar_event']['context_code'] = f"course_{course.id}"
@@ -799,8 +801,7 @@ if args.location:
 
 <<compute time slots>>
   
-if not (hasattr(args, 'course') and args.course
-        and args.course != DEFAULT_COURSE_REGEX):
+if not args.course:
   canvaslms.cli.err(1, "An appointment group must belong to at least one "
                        "course; select the course(s) with -c/--course.")
 
@@ -886,8 +887,9 @@ def record_created_events(canvas):
 The command reads its arguments straight off [[args]], so we build the
 namespace that [[argparse]] would have produced.
 The defaults spell out the interesting case---no [[-c]] on the command
-line, which argparse turns into [[DEFAULT_COURSE_REGEX]]---and each test
-overrides only what it varies.
+line, which argparse leaves as [[None]] now that the create parser
+registers the option with [[default=None]]---and each test overrides
+only what it varies.
 
 <<test helper functions>>=
 def create_args(**overrides):
@@ -899,7 +901,7 @@ def create_args(**overrides):
         description=None,
         location=None,
         event_type="event",
-        course=calendar.DEFAULT_COURSE_REGEX,
+        course=None,
         time_slot_duration=None,
         max_appointments=1,
     )
@@ -955,6 +957,27 @@ def test_explicit_regex_creates_one_event_per_course(self, mock_canvas,
     assert [event["calendar_event"]["context_code"]
             for event in created] == \
         ["course_1001", "course_1002", "course_1003"]
+
+@
+
+The match-all regex gets no special treatment: written out explicitly it
+is a course selection like any other, so the user who really wants the
+event everywhere can say so.
+This is the case the earlier compare-against-the-default guard got
+wrong---it read an explicit [[-c '.*']] as if no course had been given.
+
+<<course guard test methods>>=
+def test_explicit_match_all_broadcasts(self, mock_canvas, mock_courses):
+    """An explicit -c '.*' should create one event per course"""
+    mock_canvas.get_courses.return_value = mock_courses
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas,
+                                     create_args(course=".*"))
+
+    assert len(created) == len(mock_courses)
+    assert all(event["calendar_event"]["context_code"].startswith("course_")
+               for event in created)
 
 @
 
