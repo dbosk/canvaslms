@@ -3478,15 +3478,57 @@ elif items:
 @
 
 The settings are applied using [[apply_quiz_edit]].  For frontmatter format,
-the body (instructions) is separate; for JSON/YAML it's in settings.
+the body is the Markdown following the front matter; for JSON and YAML it is
+one of the settings---and we must know which one.
 
+\paragraph{The export--edit round-trip invariant.}
+The file read here is normally one that [[quizzes export]] wrote, so the two
+commands have to agree about where the body lives.  We state that agreement
+as an invariant:
+\begin{quote}
+  A no-op round trip is a no-op on Canvas: [[quizzes export -a Q > q.json]]
+  followed by [[quizzes edit -f q.json]], with nothing edited in between,
+  must leave the quiz exactly as it was.
+\end{quote}
+
+The invariant does not hold by itself, because the two quiz systems name the
+body differently: [[export_full_new_quiz]] writes it under [[instructions]],
+[[export_full_classic_quiz]] under [[description]].  Looking only under
+[[instructions]] finds nothing in a Classic file and yields an empty body,
+which [[apply_quiz_edit]] then writes over the description the file
+carried---the round trip erasing the very text it had just exported.  Nothing
+in the output says so; the quiz simply loses its instructions.
+
+Reading whichever key the file uses restores the invariant.  We put that
+choice in one function, so that every site deriving a body from a settings
+dictionary derives it the same way:
+
+<<functions>>=
+def quiz_body_from_settings(settings):
+  """Return the body carried by a quiz settings dictionary
+
+  New Quiz exports store the body under 'instructions', Classic Quiz
+  exports under 'description'.  Returns the empty string if the settings
+  carry neither.
+  """
+  return settings.get('instructions') or settings.get('description') or ''
+@
+
+Let's verify that both spellings are found:
+
+<<test functions>>=
+def test_quiz_body_from_settings_reads_either_key():
+  body = '<p>Read carefully.</p>'
+
+  assert quizzes.quiz_body_from_settings({'description': body}) == body
+  assert quizzes.quiz_body_from_settings({'instructions': body}) == body
+  assert quizzes.quiz_body_from_settings({'title': 'Exam'}) == ''
 <<apply settings from file>>=
 body = quiz_data.get('instructions') or ''
 
 for quiz in quiz_list:
-  # For JSON/YAML, instructions may be in settings; extract it for body
   if quiz_data['format'] in ('json', 'yaml'):
-    body = settings.get('instructions', '') or ''
+    body = quiz_body_from_settings(settings)
 
   success = apply_quiz_edit(quiz, settings, body, requester, args.html)
   if success:
@@ -3801,6 +3843,13 @@ def show_json_diff_and_confirm(original, edited, title):
 We extract settings from the edited JSON and apply them.  If
 [[replace_items]] is True and items are present, we also update questions.
 
+The dictionary reaching this function is a quiz export the user has just
+edited, so the body arrives under whichever key the export used and we read
+it with [[quiz_body_from_settings]].  Here the round-trip invariant binds
+hardest: the user accepted a diff in which the description was plainly
+visible and unchanged, so writing anything else back would contradict the
+very thing they approved.
+
 <<functions>>=
 def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
   """Apply quiz changes from a dictionary (parsed JSON/YAML)
@@ -3822,8 +3871,7 @@ def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
     settings = {k: v for k, v in data.items()
                 if k not in ('items', 'questions', 'quiz_type')}
 
-  # Extract instructions/body
-  body = settings.get('instructions', '') or ''
+  body = quiz_body_from_settings(settings)
 
   # Apply settings
   success = apply_quiz_edit(quiz, settings, body, requester, html_mode=True)
@@ -3840,6 +3888,34 @@ def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
       return False
 
   return True
+@
+
+Let's verify the invariant end to end on the path where it matters most.  We
+feed an untouched Classic export straight back in---the no-op round trip---and
+check that the description Canvas receives is the one the export carried.  A
+plain [[MagicMock]] stands in for the quiz: [[is_new_quiz]] recognises New
+Quizzes by class name, so the mock is treated as Classic and the update lands
+in [[quiz.edit]], where we can inspect what would have been sent.
+
+<<test functions>>=
+def test_apply_quiz_from_dict_keeps_classic_description():
+  body = '<p>Read carefully.</p>'
+  exported = {
+    'quiz_type': 'classic',
+    'settings': {
+      'title': 'Exam',
+      'description': body,
+      'quiz_type': 'assignment',
+      'time_limit': 60,
+    },
+  }
+  quiz = MagicMock()
+
+  assert quizzes.apply_quiz_from_dict(quiz, exported, MagicMock())
+
+  sent = quiz.edit.call_args.kwargs['quiz']
+  assert sent['description'] == body
+  assert sent['title'] == 'Exam'
 @
 
 
@@ -4207,6 +4283,24 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
     return update_classic_quiz(quiz, quiz_params)
 @
 
+\paragraph{From attributes to API parameters.}
+The body reaches Canvas through exactly one channel, the [[html_body]]
+argument.  The attribute loop therefore skips \emph{both} of its spellings,
+and the trailing assignment writes it back under the name the quiz system
+expects.
+
+Letting [[description]] through the loop instead would put one field in two
+places with the last write winning, and that is precisely how the round trip
+came to erase quiz text: a caller that had derived the body correctly and one
+that had derived nothing produced the same parameters, so whether the
+description survived depended on statement order rather than on any decision.
+With a single channel the two cases are distinguishable, and preserving the
+body becomes the caller's job---which is what
+[[quiz_body_from_settings]] discharges.
+
+We still send an empty body rather than omitting the key, so that clearing
+the Markdown body in the editor clears the description on Canvas.
+
 <<functions>>=
 def quiz_attributes_to_api_params(attributes, is_new, html_body):
   """Convert schema attributes to Canvas API parameters
@@ -4255,19 +4349,49 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
       params['quiz_settings'] = value
       continue
 
-    # Skip instructions - handled separately as body
-    if key == 'instructions':
+    # Skip both spellings of the body - it arrives via html_body
+    if key in ('instructions', 'description'):
       continue
 
     params[key] = value
 
   # Add body with appropriate field name (include even if empty to allow clearing)
-  if is_new:
-    params['instructions'] = html_body
-  else:
-    params['description'] = html_body
+  params['instructions' if is_new else 'description'] = html_body
 
   return params
+@
+
+Let's verify the round trip through both quiz systems, and that an explicitly
+empty body still clears the description:
+
+<<test functions>>=
+def test_classic_settings_round_trip_keeps_description():
+  body = '<p>Read carefully.</p>'
+  settings = {'title': 'Exam', 'description': body, 'time_limit': 60}
+
+  params = quizzes.quiz_attributes_to_api_params(
+    settings, False, quizzes.quiz_body_from_settings(settings))
+
+  assert params['description'] == body
+  assert params['time_limit'] == 60
+
+
+def test_new_settings_round_trip_keeps_instructions():
+  body = '<p>Read carefully.</p>'
+  settings = {'title': 'Exam', 'instructions': body}
+
+  params = quizzes.quiz_attributes_to_api_params(
+    settings, True, quizzes.quiz_body_from_settings(settings))
+
+  assert params['instructions'] == body
+  assert 'description' not in params
+
+
+def test_empty_body_clears_the_description():
+  params = quizzes.quiz_attributes_to_api_params(
+    {'title': 'Exam', 'description': '<p>Old text.</p>'}, False, '')
+
+  assert params['description'] == ''
 @
 
 
