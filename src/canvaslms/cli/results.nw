@@ -281,6 +281,12 @@ output.
 By default, we ignore F and Fx grades.
 If the user supplies [[-F]], we include all grades.
 If the user supplies [[-F regex]], we use regex to filter grades.
+
+This option shapes the \emph{output} of a grade export, and nothing else.
+In particular it says nothing about which grades are passing, so the
+[[--missing]] report ignores it;
+\cref{sec:missing-passing-predicate} explains why the two must not be
+conflated, even though their defaults coincide.
 <<add option to include Fs>>=
 results_parser.add_argument("-F", "--filter-grades",
   required=False, action="store", nargs="?",
@@ -1137,6 +1143,8 @@ results_parser.add_argument("--missing",
        "Uses the summary module's missing_assignments() if available, "
        "otherwise uses the default implementation. "
        <<missing module behaviour>>
+       "What counts as a passing grade is decided by the summary module, "
+       "not by -F/--filter-grades, which only filters grade output. "
        "Works with -a (single assignments), -A (assignment groups), and "
        "-M (modules).")
 @
@@ -1353,20 +1361,126 @@ class TestMissingAssignments:
         assert missing[0][2] == "not a passing grade (F)"
 @
 
-This allows us to make the call to the function as follows.
-We check if it's the default function or not.
-If it is, we pass additional arguments from the CLI.
-If not, the module provides its own implementation with module-specific
-semantics (which may or may not use these arguments).
+\subsubsection{What counts as passing on the missing path}
+\label{sec:missing-passing-predicate}
 
-We always pass [[passing_regex]] and [[optional_assignments]] since these are
-CLI-level concerns that any module might want to honor.
+This allows us to make the call to the function.
+The same call serves both implementations---the default one above and a
+module's own---since a module is free to ignore the arguments it does not
+need; all six bundled modules accept them and ignore them.
+
+Which assignments are optional is a genuine command-line concern:
+[[-O]] describes the course, not the grading policy, so
+[[args.optional_assignments]] goes to whichever implementation runs.
+
+Which grades count as passing must \emph{not} come from [[-F]], even though
+the two look interchangeable at a glance.
+Both are regexes over grades, and their defaults are the very same
+[[PASSING_REGEX]].
+But they answer different questions.
+[[-F]] is a \emph{display} filter: it decides which rows of a grade export
+the user cares to see.
+[[passing_regex]] is a \emph{predicate}: it decides which submissions are
+done.
+
+Conflating them inverts the report exactly when it matters most.
+Bare [[-F]] means \enquote{also show F grades in the export}, that is,
+[[ALL_GRADES_REGEX]]---a regex that matches [[F]] by design.
+Read as a passing predicate, it asserts that an F is a pass, so a student
+who failed everything has nothing missing, and
+[[canvaslms results -a 'Homework 1' --missing -F -S mymodule]] prints
+nothing at all for them.
+
+A custom [[-F regex]] is no better a predicate than the constant, only
+quieter about it: [[-F '^[AB]$']] asks to see just the top grades, and
+reading it as a predicate would report every C, D and E as missing work.
+So we settle the ambiguity once, in favour of the option's documented
+purpose: [[--filter-grades]] filters output, always, and never defines
+passing.
+
+The missing path takes its predicate from the grading module instead.
+A module that knows its own policy supplies [[is_passing]]; when none does,
+we fall back to [[PASSING_REGEX]], the same A--E/P/complete scale the rest
+of this module calls passing.
+That is not a loss of expressiveness: a user who needs a different notion
+of passing states it in a [[-S]] module, which is the mechanism
+\cref{custom-summary-modules} provides for exactly this purpose.
+
+We still pass the regex explicitly rather than leaning on the default in
+the signature.
+A third-party [[missing_assignments]] that mirrors the bundled signature
+declares [[passing_regex=None]], so omitting the argument would hand
+[[None]] to any module that actually honours it.
 <<let [[missing_results]] be the result of [[missing.missing_assignments]]>>=
 missing_results = missing.missing_assignments(
   assignments_list, users_list,
-  passing_regex=args.filter_grades,
+  passing_regex=PASSING_REGEX,
   optional_assignments=args.optional_assignments
 )
+@
+
+The two regexes differ precisely on the grade that decides this report,
+which is why one cannot stand in for the other.
+
+<<test functions>>=
+def test_passing_regex_rejects_the_grade_the_display_filter_admits():
+  assert not results_module.filter_grade("F", results_module.PASSING_REGEX)
+  assert results_module.filter_grade("F", results_module.ALL_GRADES_REGEX)
+@
+
+Let's verify the whole path end to end, in the configuration where the bug
+bit: a [[-S]] module without its own [[missing_assignments]], so the
+fallback runs, and [[-F]] on the command line.
+The student failed the only assignment, so the report must name it.
+
+<<test functions>>=
+def test_missing_report_ignores_the_display_filter(monkeypatch):
+  class _User:
+    # The path collects users in a set, so they must be hashable.
+    def __init__(self, id, login_id):
+      self.id = id
+      self.login_id = login_id
+
+  course = SimpleNamespace(id=5, course_code="DD1301")
+  user = _User(1, "student1")
+  assignment = SimpleNamespace(name="Homework 1", course=course)
+  assignment.get_submission = Mock(
+    return_value=SimpleNamespace(
+      grade="F",
+      submitted_at=None,
+      graded_at="2026-01-10T10:00:00Z",
+    )
+  )
+
+  monkeypatch.setattr(
+    results_module.assignments, "process_assignment_option",
+    lambda canvas, args: [assignment])
+  monkeypatch.setattr(
+    results_module.users, "process_user_or_group_option",
+    lambda canvas, args: [user])
+  monkeypatch.setattr(
+    results_module.users, "list_users",
+    lambda courses, roles: [user])
+  monkeypatch.setattr(
+    results_module, "prefetch_submissions",
+    lambda assignments_list, users_list: None)
+  # A -S module that provides no missing_assignments(), so the default
+  # implementation in this module runs.
+  monkeypatch.setattr(
+    results_module, "load_module",
+    lambda name: SimpleNamespace(summarize_group=None))
+
+  args = argparse.Namespace(
+    missing=True,
+    identifier=None,
+    filter_grades=results_module.ALL_GRADES_REGEX,
+    optional_assignments=[],
+    summary_module="custom.module")
+
+  rows = list(results_module.summarize_assignments(None, args))
+
+  assert rows == [["DD1301", "Homework 1", "student1", "Homework 1",
+                   "not a passing grade (F)"]]
 @
 
 All that is missing now is the optional assignments argument for the parser.
