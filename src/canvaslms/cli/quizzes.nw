@@ -7150,94 +7150,238 @@ def add_new_quiz_items(course, assignment_id, requester, items):
 
 @
 The [[ensure_uuids_in_entry]] function handles the UUID requirements described in
-\cref{sec:importable-flag}.  It processes an entry dictionary and ensures all
-choices have UUIDs, generating fresh ones where missing.  More importantly, it
-maps position-based [[scoring_data]] references (from cleaned exports) back to
-the newly generated UUIDs.
+\cref{sec:importable-flag}.  It gives every choice a UUID---keeping the ones
+that already are UUIDs, minting the rest---and, in the same pass, rewrites the
+references in [[scoring_data]] so that they still name the same choices
+afterwards.
 
-The function handles two question types differently:
+Those two steps cannot be separated, because a choice is always named from
+outside itself: by its position in a cleaned export, by its identifier in a
+hand-written or round-tripped one.  Renaming the choices without rewriting the
+references leaves an answer key pointing at choices that no longer exist---the
+question imports, but nothing is correct any more.
+
+New Quizzes present the choices in one of two shapes, and the shape decides how
+the answer key names them:
 \begin{description}
-\item[choice] Single correct answer---[[scoring_data.value]] is a single UUID
-  (or position integer to convert).
-\item[multi-answer] Multiple correct answers---[[scoring_data.value]] is a list
-  of UUIDs (or position integers to convert).
+\item[A list of choices] Choice and multi-answer questions.  Each choice is a
+  dictionary carrying its own [[id]] and [[position]], and a cleaned export
+  refers to them by position (\cref{sec:cleaning-export}).
+\item[A mapping keyed by choice identifier] Ordering questions.  Here the key
+  \emph{is} the identity of the choice, and [[scoring_data.value]] lists those
+  keys in the correct order---the answer key is a permutation of the choice
+  identifiers rather than a selection among them.
 \end{description}
+
+We give each shape its own function, and let both return the same pair of
+translation tables: position to new UUID, and old identifier to new UUID.  With
+both tables at hand, one rule covers every reference and the interaction type
+need not be consulted at all: the shape of [[scoring_data.value]]---a scalar for
+[[choice]], a list for [[multi-answer]] and [[ordering]]---already says whether
+we translate one reference or many.
 
 <<functions>>=
 def ensure_uuids_in_entry(entry):
   """Ensures all choices have UUIDs, generating fresh ones if missing
 
   This allows importing from cleaned exports or manually created JSON.
-  When scoring_data contains position indices (from cleaned exports),
-  they are mapped to the newly generated UUIDs.
+  The references in scoring_data are translated along with the choices,
+  whether they are positions (from a cleaned export) or identifiers (from a
+  hand-written or round-tripped one).
   """
-  import uuid
   import copy
 
   entry = copy.deepcopy(entry)
   interaction_data = entry.get('interaction_data', {})
   scoring_data = entry.get('scoring_data', {})
-  interaction_type = entry.get('interaction_type_slug', '')
+  choices = interaction_data.get('choices')
 
-  # Handle choice-based questions (choice, multi-answer)
-  if 'choices' in interaction_data:
-    position_to_uuid = {}  # position -> new_uuid
-    new_choices = []
+  if choices is None:
+    return entry
 
-    for i, choice in enumerate(interaction_data['choices']):
-      # Handle both dict choices (choice, multi-answer) and string choices (ordering)
-      if isinstance(choice, str):
-        # Ordering questions have choices as plain UUIDs/strings
-        # The string itself is the ID - keep it or generate new if invalid
-        if choice and len(choice) > 10:  # Looks like a UUID
-          new_id = choice
-        else:
-          new_id = str(uuid.uuid4())
-        position_to_uuid[i + 1] = new_id
-        new_choices.append(new_id)
-      else:
-        # Regular choice dict
-        old_id = choice.get('id')
-        position = choice.get('position', i + 1)
+  if isinstance(choices, dict):
+    choices, position_to_uuid, id_to_uuid = uuidify_choice_mapping(choices)
+  else:
+    choices, position_to_uuid, id_to_uuid = uuidify_choice_list(choices)
 
-        # Generate new UUID if missing
-        if not old_id:
-          new_id = str(uuid.uuid4())
-        else:
-          new_id = old_id
+  interaction_data['choices'] = choices
+  entry['interaction_data'] = interaction_data
 
-        position_to_uuid[position] = new_id
-
-        new_choice = dict(choice)
-        new_choice['id'] = new_id
-        new_choice['position'] = position
-        new_choices.append(new_choice)
-
-    interaction_data['choices'] = new_choices
-    entry['interaction_data'] = interaction_data
-
-    # Update scoring_data to use new UUIDs
-    if scoring_data and 'value' in scoring_data:
-      value = scoring_data['value']
-
-      if interaction_type == 'choice':
-        # Single correct answer - could be position index or UUID
-        if isinstance(value, int) and value in position_to_uuid:
-          scoring_data['value'] = position_to_uuid[value]
-      elif interaction_type == 'multi-answer':
-        # Multiple correct answers - could be position indices or UUIDs
-        if isinstance(value, list):
-          new_value = []
-          for v in value:
-            if isinstance(v, int) and v in position_to_uuid:
-              new_value.append(position_to_uuid[v])
-            else:
-              new_value.append(v)
-          scoring_data['value'] = new_value
-
-      entry['scoring_data'] = scoring_data
+  if scoring_data and 'value' in scoring_data:
+    <<translate the answer key to the new UUIDs>>
+    entry['scoring_data'] = scoring_data
 
   return entry
+@
+
+A single reference is translated for [[choice]], a whole list for the types
+whose answer key is a set or a sequence of choices.
+
+<<translate the answer key to the new UUIDs>>=
+value = scoring_data['value']
+if isinstance(value, list):
+  scoring_data['value'] = [
+    remap_choice_reference(reference, position_to_uuid, id_to_uuid)
+    for reference in value]
+else:
+  scoring_data['value'] = remap_choice_reference(
+    value, position_to_uuid, id_to_uuid)
+@
+
+An ordering question is the shape the export must not flatten
+(\cref{sec:cleaning-export}), and the shape we rebuild here: the new UUID
+becomes both the key of the mapping and the choice's own [[id]], so the mapping
+stays self-describing.  An identifier that already is a UUID is kept, exactly as
+for listed choices---re-importing an untouched export therefore leaves the
+question byte-identical.
+
+<<functions>>=
+def uuidify_choice_mapping(choices):
+  """Rekeys an id-keyed choice mapping (ordering) by canonical UUIDs
+
+  Returns the rebuilt mapping together with the two translation tables
+  remap_choice_reference needs: position to UUID, and old id to UUID.
+  """
+  import uuid
+
+  new_choices = {}
+  position_to_uuid = {}
+  id_to_uuid = {}
+
+  for position, (old_id, choice) in enumerate(choices.items(), 1):
+    new_id = old_id if looks_like_uuid(old_id) else str(uuid.uuid4())
+    if isinstance(choice, dict):
+      new_choices[new_id] = dict(choice, id=new_id)
+    else:
+      new_choices[new_id] = choice
+    position_to_uuid[position] = new_id
+    id_to_uuid[old_id] = new_id
+
+  return new_choices, position_to_uuid, id_to_uuid
+@
+
+Listed choices keep the identifiers they arrive with and get fresh ones only
+where an identifier is missing---which is what a cleaned export leaves behind.
+The list may also hold bare identifier strings instead of dictionaries; that is
+what exports written before the ordering mapping was handled correctly contain,
+and while the choice texts they dropped are unrecoverable, translating their
+identifiers at least keeps the answer key pointing at the right choices.
+
+<<functions>>=
+def uuidify_choice_list(choices):
+  """Gives every choice in a choice list an id, preserving list order
+
+  Returns the rebuilt list together with the two translation tables
+  remap_choice_reference needs: position to UUID, and old id to UUID.
+  """
+  import uuid
+
+  new_choices = []
+  position_to_uuid = {}
+  id_to_uuid = {}
+
+  for index, choice in enumerate(choices, 1):
+    if isinstance(choice, dict):
+      old_id = choice.get('id')
+      position = choice.get('position', index)
+      new_id = old_id or str(uuid.uuid4())
+      new_choices.append(dict(choice, id=new_id, position=position))
+    else:
+      old_id = choice
+      position = index
+      new_id = choice if looks_like_uuid(choice) else str(uuid.uuid4())
+      new_choices.append(new_id)
+    position_to_uuid[position] = new_id
+    if old_id:
+      id_to_uuid[old_id] = new_id
+
+  return new_choices, position_to_uuid, id_to_uuid
+@
+
+Translating one reference is then a matter of asking how it was written.  The
+[[bool]] test has to come first: [[isinstance(True, int)]] holds in Python, and
+a true/false answer must not be read as \enquote{position~1}.  A reference we
+cannot resolve---the answer text of a matching question, a value from a
+question type we do not know---is returned untouched rather than dropped, since
+guessing wrong is worse than leaving the entry as the author wrote it.
+
+<<functions>>=
+def remap_choice_reference(reference, position_to_uuid, id_to_uuid):
+  """Translates one scoring_data reference to the choice's new UUID
+
+  A cleaned export names a choice by its position (an integer); an export
+  that kept its identifiers names it by that identifier (a string).
+  Anything else is returned unchanged.
+  """
+  if isinstance(reference, bool):
+    return reference
+  if isinstance(reference, int):
+    return position_to_uuid.get(reference, reference)
+  if isinstance(reference, str):
+    return id_to_uuid.get(reference, reference)
+  return reference
+@
+
+Whether an identifier must be replaced is a question about its form, not its
+length.  An earlier version of this code guessed with [[len(choice) > 10]],
+which accepts anything long enough---so a Canvas identifier that is not a UUID
+would be handed on to an API that demands one.  Parsing settles it exactly.
+
+<<functions>>=
+def looks_like_uuid(value):
+  """Tells whether value is written in canonical UUID form"""
+  import uuid
+
+  try:
+    uuid.UUID(str(value))
+  except (AttributeError, TypeError, ValueError):
+    return False
+  return True
+@
+
+Let's verify the import side on the example ordering question.  What has to
+survive is not the identifiers---those are meant to change---but the order the
+students must produce, that is, the sequence of choice \emph{texts} that
+[[scoring_data.value]] names.
+
+<<test functions>>=
+def example_new_quiz_item(title):
+  """Returns the example New Quiz item carrying the given title."""
+  for item in quizzes.EXAMPLE_NEW_QUIZ_JSON['items']:
+    if item['entry']['title'] == title:
+      return item
+  raise KeyError(title)
+
+def ordering_answer_key(entry):
+  """Returns the correct order of an ordering entry, as choice texts."""
+  choices = entry['interaction_data']['choices']
+  return [choices[reference]['item_body']
+          for reference in entry['scoring_data']['value']]
+
+def test_ensure_uuids_keeps_ordering_answer_key():
+  entry = example_new_quiz_item('Ordering Example')['entry']
+  expected_order = ordering_answer_key(entry)
+
+  imported = quizzes.ensure_uuids_in_entry(entry)
+
+  choices = imported['interaction_data']['choices']
+  assert len(choices) == len(entry['interaction_data']['choices'])
+  assert all(quizzes.looks_like_uuid(choice_id) for choice_id in choices)
+  assert all(choice['id'] == choice_id
+             for choice_id, choice in choices.items())
+  assert ordering_answer_key(imported) == expected_order
+
+def test_remap_choice_reference_reads_each_form_of_reference():
+  positions = {1: 'first-uuid'}
+  identifiers = {'ord-1': 'first-uuid'}
+
+  assert quizzes.remap_choice_reference(1, positions, identifiers) \
+      == 'first-uuid'
+  assert quizzes.remap_choice_reference('ord-1', positions, identifiers) \
+      == 'first-uuid'
+  assert quizzes.remap_choice_reference(True, positions, identifiers) is True
+  assert quizzes.remap_choice_reference('Berlin', positions, identifiers) \
+      == 'Berlin'
 @
 
 
@@ -7842,6 +7986,18 @@ function generates fresh UUIDs for each choice and maps the position-based
 workflow: export a quiz, edit the questions, and import them to a different
 quiz without UUID conflicts.
 
+\subparagraph{Where positions cannot replace identifiers}
+A position can stand in for an identifier only when the identifier means nothing
+beyond \enquote{this choice}.  Two question types break that assumption.  An
+ordering question stores its choices in a mapping \emph{keyed} by identifier and
+writes its answer key as the list of those keys in the correct order; a matching
+question names its stems from two places at once, the keys of
+[[scoring_data.value]] and the [[question_id]] fields under
+[[scoring_data.edit_data]].  Rewriting one side without the others silently
+severs the answer from its question, so for these types [[--importable]] keeps
+the identifiers, and the import side regenerates them consistently everywhere
+they occur (\cref{sec:cleaning-export}).
+
 
 \subsection{The export command}
 
@@ -7889,8 +8045,10 @@ For New Quizzes, we remove:
 \item Per-item metadata: [[id]], [[entry_type]], [[source]], [[bank_reference]]
 \item Entry metadata: [[calculator_type]], [[answer_feedback]], [[feedback]]
   (when empty)
-\item Choice IDs: UUIDs in [[interaction_data.choices]] are removed; fresh UUIDs
-  will be generated when adding questions
+\item Choice IDs: the identifiers of choice and multi-answer choices are
+  replaced by positions; the identifiers that an answer key names---ordering
+  choices and matching stems---are kept, and fresh UUIDs are generated for them
+  when adding questions
 \end{itemize}
 
 For Classic Quizzes, we remove the [[id]] field from each question.
@@ -7974,61 +8132,109 @@ def clean_new_quiz_for_import(export):
   return {'items': clean_items}
 @
 
-The [[clean_interaction_data]] function strips UUIDs from choices, keeping only
-the [[position]] and [[item_body]] fields.  This makes the JSON human-readable
-and avoids UUID conflicts when importing to a different quiz.
-
-Some question types use different structures:
+The [[clean_interaction_data]] function decides which identifiers may go.  The
+rule is narrower than \enquote{strip the UUIDs}: an identifier may disappear
+only when nothing else in the entry names it, or when we rewrite every reference
+to it in the same breath.  The three structures New Quizzes use answer that
+question differently:
 \begin{description}
-\item[choices] Multiple choice and multi-answer questions use a list of
-  dictionaries with [[id]], [[position]], and [[item_body]].
-\item[answers] Matching questions use [[answers]] (a list of strings for the
-  right column) and [[questions]] (a list of dicts for the left column).
+\item[Choice and multi-answer] [[choices]] is a list of dictionaries, and
+  [[scoring_data.value]] names the correct ones by [[id]].  Both sides are
+  rewritten together---identifiers out, positions in---so the identifiers can
+  go.
+\item[Ordering] [[choices]] is a \emph{mapping} whose keys are the choice
+  identifiers, and [[scoring_data.value]] is the list of those keys in the
+  correct order.  The keys carry the identity \emph{and} the answer key, so they
+  stay.
+\item[Matching] [[questions]] holds the stems, and their identifiers are named
+  from two places at once: the keys of [[scoring_data.value]] and the
+  [[question_id]] fields under [[scoring_data.edit_data]].  They stay as well.
 \end{description}
 
-We handle both cases, preserving string arrays as-is while cleaning dict-based
-choices.
+Ordering is where the difference bites, because its choices are a mapping where
+every other type has a list:
+\begin{minted}{json}
+{
+  "choices": {
+    "ord-1": {"id": "ord-1", "item_body": "5"},
+    "ord-2": {"id": "ord-2", "item_body": "2"}
+  }
+}
+\end{minted}
+Iterating that mapping the way one iterates a list yields the keys
+[["ord-1"]], [["ord-2"]], \dots---not the choices.  Treating it as a list
+therefore replaces every choice with its own identifier and throws the texts
+[["5"]] and [["2"]] away, leaving an answer key that orders four items nobody
+can read.  Testing the structure before iterating it is what prevents that.
 
 <<functions>>=
 def clean_interaction_data(interaction_data):
-  """Removes UUIDs from interaction_data choices"""
+  """Removes the identifiers that the import side can regenerate
+
+  Choice and multi-answer choices lose their ids, which clean_scoring_data
+  replaces with positions.  Ordering choices and matching stems keep theirs,
+  because scoring_data names them.
+  """
   if not interaction_data:
     return interaction_data
 
   clean = dict(interaction_data)
 
-  # Handle choices array (multiple choice, multi-answer)
-  # Choices are dicts with id, position, item_body
   if 'choices' in clean:
-    clean_choices = []
-    for i, choice in enumerate(clean['choices']):
-      # Skip if choice is not a dict (shouldn't happen, but be safe)
-      if not isinstance(choice, dict):
-        clean_choices.append(choice)
-        continue
-      clean_choice = {'position': choice.get('position', i + 1)}
-      if 'item_body' in choice:
-        clean_choice['item_body'] = choice['item_body']
-      clean_choices.append(clean_choice)
-    clean['choices'] = clean_choices
-
-  # Handle questions array (matching questions)
-  # Questions are dicts with id, item_body - we keep item_body, drop id
+    <<clean the choices of a choice or ordering question>>
   if 'questions' in clean:
-    clean_questions = []
-    for i, question in enumerate(clean['questions']):
-      if not isinstance(question, dict):
-        clean_questions.append(question)
-        continue
-      clean_q = {}
-      if 'item_body' in question:
-        clean_q['item_body'] = question['item_body']
-      clean_questions.append(clean_q)
-    clean['questions'] = clean_questions
-
-  # 'answers' is a list of strings (matching questions) - keep as-is
+    <<clean the stems of a matching question>>
 
   return clean
+@
+
+An ordering question needs nothing stripped: everything in one of its choices is
+either the identity its answer key names or the text the student reads.  We
+still rebuild the mapping rather than pass it through, so the exported structure
+does not alias the item we were handed.
+
+<<clean the choices of a choice or ordering question>>=
+if isinstance(clean['choices'], dict):
+  clean['choices'] = {
+    choice_id: dict(choice) if isinstance(choice, dict) else choice
+    for choice_id, choice in clean['choices'].items()}
+else:
+  <<replace the id of each listed choice with its position>>
+@
+
+A listed choice, in contrast, is reduced to what a human wants to read and
+edit---its position and its text.  A choice that is not a dictionary has no
+field to strip, so it is passed through as it stands.
+
+<<replace the id of each listed choice with its position>>=
+clean_choices = []
+for i, choice in enumerate(clean['choices']):
+  if not isinstance(choice, dict):
+    clean_choices.append(choice)
+    continue
+  clean_choice = {'position': choice.get('position', i + 1)}
+  if 'item_body' in choice:
+    clean_choice['item_body'] = choice['item_body']
+  clean_choices.append(clean_choice)
+clean['choices'] = clean_choices
+@
+
+The stems of a matching question keep their identifiers for the reason given
+above; what they shed is whatever Canvas attached beyond identity and text.
+Their counterparts, the [[answers]], are plain strings---the right-hand column,
+distractors included---and [[scoring_data.value]] names them by that very text,
+so they are left exactly as they are.
+
+<<clean the stems of a matching question>>=
+clean_questions = []
+for question in clean['questions']:
+  if not isinstance(question, dict):
+    clean_questions.append(question)
+    continue
+  clean_questions.append({key: question[key]
+                          for key in ('id', 'item_body')
+                          if key in question})
+clean['questions'] = clean_questions
 @
 
 The [[clean_scoring_data]] function converts UUID references in
@@ -8036,6 +8242,11 @@ The [[clean_scoring_data]] function converts UUID references in
 original UUIDs to positions, then replaces each UUID in the scoring data with
 the corresponding position.  This is the inverse of what [[ensure_uuids_in_entry]]
 does on import.
+
+Only the types whose identifiers we dropped need this treatment, which is why
+the conversion is guarded by the interaction type.  Ordering and matching
+answer keys are already correct as they stand: they name identifiers that the
+cleaned [[interaction_data]] still carries.
 
 <<functions>>=
 def clean_scoring_data(scoring_data, original_interaction_data, interaction_type):
@@ -8081,6 +8292,88 @@ def clean_scoring_data(scoring_data, original_interaction_data, interaction_type
         return {'value': new_value}
 
   return scoring_data
+@
+
+\paragraph{The round trip}
+Export followed by import is the invariant the cleaning functions and
+[[ensure_uuids_in_entry]] have to satisfy together: a question that goes out
+through [[--importable]] and comes back in through [[items add]] must ask the
+students the same thing.  \enquote{The same thing} is deliberately not the same
+JSON---identifiers change, positions stand in for them---but everything a
+student sees must line up: each choice keeps its text, and each answer key still
+names the same choices, in the same order where order matters.
+
+Let's verify that on the module's own example questions, one per structure.  We
+begin with the two that lost the most: the ordering question, whose texts the
+old cleaning discarded outright, and the matching question, whose stems used to
+arrive with their identifiers stripped while [[scoring_data]] went on naming
+them.
+
+<<test functions>>=
+def matching_pairs(entry):
+  """Returns a matching entry's stem-to-answer pairs, keyed by stem text."""
+  value = entry['scoring_data']['value']
+  return {question['item_body']: value[question['id']]
+          for question in entry['interaction_data']['questions']}
+
+def test_ordering_survives_export_and_import():
+  item = example_new_quiz_item('Ordering Example')
+  expected_order = ordering_answer_key(item['entry'])
+
+  cleaned = quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+  imported = quizzes.ensure_uuids_in_entry(cleaned)
+
+  assert isinstance(cleaned['interaction_data']['choices'], dict)
+  assert ordering_answer_key(cleaned) == expected_order
+  assert ordering_answer_key(imported) == expected_order
+
+def test_matching_survives_export_and_import():
+  item = example_new_quiz_item('Matching Example')
+  expected_pairs = matching_pairs(item['entry'])
+  expected_answers = item['entry']['interaction_data']['answers']
+
+  cleaned = quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+  imported = quizzes.ensure_uuids_in_entry(cleaned)
+
+  assert matching_pairs(cleaned) == expected_pairs
+  assert matching_pairs(imported) == expected_pairs
+  assert imported['interaction_data']['answers'] == expected_answers
+@
+
+The types that \emph{do} travel by position must keep working, since the import
+side no longer branches on the interaction type to recognise them.  Here the
+cleaned export is readable in the way \cref{sec:importable-flag} promises---the
+answer key names the positions [[1]] and [[1, 2, 4]]---and the question that
+comes back still marks the same texts correct.
+
+<<test functions>>=
+def choice_answer_texts(entry):
+  """Returns the texts of the choices that an answer key names."""
+  value = entry['scoring_data']['value']
+  correct = value if isinstance(value, list) else [value]
+  return [choice['item_body']
+          for choice in entry['interaction_data']['choices']
+          if choice['id'] in correct]
+
+def test_choice_survives_export_and_import():
+  item = example_new_quiz_item('Multiple Choice Example')
+  expected_texts = choice_answer_texts(item['entry'])
+
+  cleaned = quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+  imported = quizzes.ensure_uuids_in_entry(cleaned)
+
+  assert cleaned['scoring_data']['value'] == 1
+  assert choice_answer_texts(imported) == expected_texts
+
+def test_multi_answer_survives_export_and_import():
+  item = example_new_quiz_item('Multiple Answer Example')
+  expected_texts = choice_answer_texts(item['entry'])
+
+  cleaned = quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+  imported = quizzes.ensure_uuids_in_entry(cleaned)
+
+  assert cleaned['scoring_data']['value'] == [1, 2, 4]
+  assert choice_answer_texts(imported) == expected_texts
 @
 
 \subsubsection{Cleaning Classic Quiz exports}
