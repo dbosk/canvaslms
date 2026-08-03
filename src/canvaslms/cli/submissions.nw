@@ -82,6 +82,7 @@ import pytest
 from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
+    convert_to_md,
     filter_view_submissions,
     format_rubric,
     format_submission,
@@ -1953,12 +1954,115 @@ def convert_to_md(attachment: canvasapi.file.File,
   Store a file version in `tmpdir`.
   """
   <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
-  content_type = getattr(attachment, "content-type")
+  <<let [[content_type]] be the attachment's content type>>
   <<if [[content_type]] is text, just use [[outfile]] contents>>
   <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>
   <<else convert [[outfile]] using [[pypandoc]]>>
+@
+
+\subsection{One unconvertible attachment must not hide the others}
+\label{AttachmentFailureIsolation}
+
+[[convert_to_md]] can fail in many ways: the download can time out, the cached
+copy can fail to decrypt, an external converter can be missing, a file can
+refuse to decode.
+The loop that calls it, however, sits inside a single
+[[try]]\ldots[[except AttributeError]] that exists for an entirely different
+reason---to skip submissions that carry no [[attachments]] at all.
+The scope of that guard, not its intent, is the problem: an exception raised
+while converting the third of five files unwinds past the rest of the loop, so
+files four and five are never converted.
+In JSON output the damage is larger still, because the [[update]] that
+introduces the [[attachments]] key runs after the loop: the key never appears,
+and the reader has no way to tell an aborted conversion from a submission
+without files.
+
+Narrowing the outer guard would not help---it is the loop body that needs to be
+recoverable, not the guard that needs to be stricter.
+[[extract_submission_text]] (\cref{TextExtractionForDiff}) already demonstrates
+the shape we want: it wraps each attachment on its own and substitutes a
+placeholder for the ones it cannot convert, so a failure costs exactly one file.
+We give this loop the same property.
+
+We catch [[Exception]] rather than any specific class because the loop's
+contract is about output, not about diagnosis: whatever goes wrong with one
+file, the remaining files must still be rendered.
+
+The placeholder here says more than the one used for diffs, and deliberately so.
+That one feeds a comparison between two submission versions, where a message
+varying with the error would surface as a spurious change; a fixed string keeps
+the diff honest.
+This text, by contrast, is read by a human who needs to know why a file is
+missing, so we name the error and also warn on standard error.
 <<let [[contents]] be the converted [[attachment]]>>=
-contents = convert_to_md(attachment, tmpdir)
+try:
+  contents = convert_to_md(attachment, tmpdir)
+except Exception as err:
+  canvaslms.cli.warn(
+    f"could not convert attachment {attachment.filename}: {err}")
+  contents = f"[Could not convert attachment: {err}]"
+@
+
+Let's verify that a failing attachment costs us only itself.
+The first attachment is unconvertible and the second is fine; both must appear
+in the output, and the JSON output must still carry its [[attachments]] key.
+<<test functions>>=
+class TestAttachmentConversionFailures:
+    """Test that one failing attachment does not hide the others."""
+
+    def make_submission(self):
+        """Build a submission with a broken and a working attachment."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.attachments = [Mock(filename="broken.bin"),
+                                  Mock(filename="essay.txt")]
+        submission.preview_url = (
+            "https://example.com/courses/1/assignments/2/submissions/3")
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def convert_all_but_the_first(self, monkeypatch):
+        """Make conversion fail for broken.bin and succeed otherwise."""
+        def convert_to_md(attachment, tmpdir):
+            if attachment.filename == "broken.bin":
+                raise AttributeError("content-type")
+            return "essay contents"
+
+        monkeypatch.setattr("canvaslms.cli.submissions.convert_to_md",
+                            convert_to_md)
+
+    def test_working_attachment_survives_broken_one(self, tmp_path,
+                                                    monkeypatch):
+        """The good file is converted even though the bad one failed."""
+        self.convert_all_but_the_first(monkeypatch)
+
+        output = format_submission(self.make_submission(), tmpdir=tmp_path)
+
+        assert "## broken.bin" in output
+        assert "Could not convert attachment" in output
+        assert "## essay.txt" in output
+        assert "essay contents" in output
+
+    def test_json_output_keeps_attachments_key(self, tmp_path, monkeypatch):
+        """A failed conversion must not drop the whole attachments key."""
+        self.convert_all_but_the_first(monkeypatch)
+
+        output = format_submission(self.make_submission(), json_format=True,
+                                   tmpdir=tmp_path)
+
+        assert set(output["attachments"]) == {"broken.bin", "essay.txt"}
+        assert output["attachments"]["essay.txt"] == "essay contents"
 @
 
 We check if the attachment is already cached before downloading.
@@ -1980,11 +2084,68 @@ if not attachment_cache.restore_cached_attachment(attachment.id, outfile):
   attachment_cache.cache_attachment(attachment.id, outfile, {
     'filename': attachment.filename,
     'size': getattr(attachment, 'size', 0),
-    'content_type': getattr(attachment, 'content-type', 'application/octet-stream')
+    'content_type': getattr(attachment, 'content-type',
+                            DEFAULT_CONTENT_TYPE)
   })
 @
 
-If the content type is text, we can just decode it and use it in a Markdown 
+\subsection{Attachments of unknown type}
+
+Canvas does not promise a [[content-type]] on every attachment, which is why
+the cache metadata above falls back to [[application/octet-stream]], the
+conventional \enquote{unknown binary} type.
+The read that drives the conversion has to make the same allowance, and it did
+not: an attachment lacking the attribute raised [[AttributeError]] from the
+middle of [[convert_to_md]], and that exception did not merely cost us the one
+file (\cref{AttachmentFailureIsolation}).
+
+Falling back to [[application/octet-stream]] is not a guess about the file, it
+is a statement that we know nothing about it.
+That is exactly the right input for the branches below: neither the text branch
+nor the PDF branch claims that type, so an attachment of unknown type falls
+through to Pandoc, which infers the format from the file's own contents rather
+than from Canvas' metadata.
+We name the default instead of repeating the literal, because the defect was
+precisely that two reads of the same attribute disagreed about it.
+<<constants>>=
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
+<<let [[content_type]] be the attachment's content type>>=
+content_type = getattr(attachment, "content-type", DEFAULT_CONTENT_TYPE)
+@
+
+Let's verify that an attachment without a content type reaches the converters
+instead of raising.
+
+<<test functions>>=
+class TestConvertToMdWithoutContentType:
+    """Test conversion of attachments that carry no content type."""
+
+    class Attachment:
+        """An attachment as Canvas returns it without a content type."""
+
+        def __init__(self, filename):
+            self.id = 1
+            self.filename = filename
+
+    def test_unknown_type_is_handed_to_pandoc(self, tmp_path, monkeypatch):
+        """Absent content type must not abort the conversion."""
+        def restore_cached_attachment(attachment_id, outfile):
+            outfile.write_text("some bytes")
+            return True
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.attachment_cache"
+            ".restore_cached_attachment",
+            restore_cached_attachment)
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.pypandoc.convert_file",
+            lambda outfile, fmt: "converted by pandoc")
+
+        assert convert_to_md(self.Attachment("mystery.dat"),
+                             tmp_path) == "converted by pandoc"
+@
+
+If the content type is text, we can just decode it and use it in a Markdown
 code block with a suitable (Markdown) content type.
 This means that we can set what type of data the code block contains.
 We compute this text from the content type of the attachment.
@@ -2502,7 +2663,7 @@ else:
                                   md_title_level=md_title_level+"#")
 @
 
-\subsection{Text extraction for diff comparison}
+\subsection{Text extraction for diff comparison}\label{TextExtractionForDiff}
 
 To generate meaningful diffs, we need to extract text content from submissions
 in a consistent format. This function handles different types of content including
