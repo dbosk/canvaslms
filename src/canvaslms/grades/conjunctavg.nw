@@ -24,6 +24,7 @@ Conjunctive average means:
 
 import datetime as dt
 from canvaslms.cli import results
+from canvaslms.grades.gradealiases import normalize_grade
 from canvasapi.exceptions import ResourceDoesNotExist
 
 <<helper functions>>
@@ -46,6 +47,8 @@ the grade handling they verify.
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from canvaslms.grades.conjunctavg import *
 
 <<test functions>>
@@ -64,39 +67,21 @@ We can then check for Fs among the P/F grades (as seen above), if we find an F
 the summarized grade will be an F.
 If we find no Fs, then we can compute the average over all A--E grades and use 
 that as the final grade.
-We translate completes to Ps and incompletes to Fs.
-Canvas also sometimes reports the failing label [[must fix]].
-For conjunctive grading that label carries no extra information beyond failure,
-so we normalize it to [[F]] before classifying the grade.
+Canvas spells those grades in more ways than we want to reason about here:
+completes and [[P+]] are passes, incompletes and the label [[must fix]] are
+failures, and a missing grade on a mandatory assignment is a failure too.
+That vocabulary is not specific to conjunctive averaging---[[disjunctmax]]
+needs exactly the same translation---so it lives in [[gradealiases]]
+(\cref{gradealiases}), and we import its [[normalize_grade]] rather than
+keeping a copy.
+This module's own contribution starts after the translation: averaging the
+A--E grades and requiring a pass everywhere else.
 
-A course-defined [[P+]] needs the same treatment for the opposite reason.
-It is a passing grade---see \cref{p-plus-grades} for how it reaches us---but
-the classification below knows only A--E, P, F and Canvas's
-complete/incomplete, so a [[P+]] fell through to the [[else]] branch and
-aborted the entire export with a [[ValueError]].
-Conjunctive averaging has nowhere to put the plus anyway: it averages the A--E
-grades and demands a pass from the rest, and [[P+]] is a pass.
-So we collapse it to [[P]] here.
-
-Normalizing in one place is what makes this a one-line fix rather than two.
-Both the classification and [[is_passing_grade]] run their input through
-[[normalize_grade]] first, so the same [[P+]] that crashed the summary---and
-that [[--missing]] reported as \enquote{not a passing grade (P+)}---is now a
-plain pass on both paths, and [[conjunctavgsurvey]] inherits the correction by
-importing this function.
-<<helper functions>>=
-def normalize_grade(grade):
-  """Normalize Canvas grade aliases to this module's grade tokens."""
-  if grade is None:
-    return "F"
-  if isinstance(grade, str):
-    alias = grade.casefold()
-    if alias == "must fix":
-      return "F"
-    if alias == "p+":
-      return "P"
-  return grade
-@
+The import is at module level rather than inside the functions, which makes
+[[conjunctavg.normalize_grade]] a re-export.
+That is deliberate: [[conjunctavgsurvey]] imports the name from here, and so
+may a teacher's own summary module, so the name has to keep working where it
+has always been.
 
 <<helper functions>>=
 def summarize(user, assignments_list):
@@ -151,8 +136,24 @@ if grade_date:
   dates.append(grade_date)
 @
 
-We extract the grade and then try to figure out which grading scale is used.
-Then we translate, if necessary, and add it to the proper list.
+We extract the grade and then figure out which grading scale it belongs to,
+so we can put it in the list that scale is averaged in.
+
+This classification used to carry two branches of its own, one appending [[P]]
+for \enquote{complete} and one appending [[F]] for \enquote{incomplete}.
+They cannot run any more: [[normalize_grade]] has already turned those
+spellings into [[P]] and [[F]], and the P/F branch appends the very same value
+to the very same list.
+Dropping them is thus behaviour-preserving for every grade Canvas reports, and
+it removes the last copy of the alias vocabulary from this module---which is
+the point of moving it to \cref{gradealiases}.
+
+One case does change, and for the better.
+The removed branches called [[casefold]] on the grade unguarded, so a
+non-string grade---a numeric survey score, say---used to raise an
+[[AttributeError]] from the middle of the classification.
+Such a grade now falls through to the [[else]] branch and raises this module's
+own [[ValueError]], which names the grade and the assignment it came from.
 <<add grade to the correct grades list>>=
 grade = normalize_grade(submission.grade)
 
@@ -160,10 +161,6 @@ if grade in ["A", "B", "C", "D", "E"]:
   a2e_grades.append(grade)
 elif grade in ["P", "F"]:
   pf_grades.append(grade)
-elif grade.casefold() == "complete":
-  pf_grades.append("P")
-elif grade.casefold() == "incomplete":
-  pf_grades.append("F")
 else:
   raise ValueError(f"Unknown grade {grade} for assignment {assignment}.")
 @
@@ -209,18 +206,18 @@ individual failing assignments as \enquote{missing} if the student already
 passed via another assignment.
 
 We define what counts as a passing grade for this module.
-A grade is passing if it's one of A--E, P, or \enquote{complete}.
+A grade is passing if it's one of A--E or P---which, after the shared
+translation, includes \enquote{complete} and [[P+]] as well.
+The explicit check for \enquote{complete} that used to follow the list is gone
+for the same reason as its twin in the classification above: the grade is
+already a [[P]] by the time we look at it.
 <<helper functions>>=
 def is_passing_grade(grade):
   """
   Returns True if grade is passing for conjunctive A-E grading.
   """
   grade = normalize_grade(grade)
-  if grade in ["A", "B", "C", "D", "E", "P"]:
-    return True
-  if isinstance(grade, str) and grade.casefold() == "complete":
-    return True
-  return False
+  return grade in ["A", "B", "C", "D", "E", "P"]
 @
 
 We reuse the shared [[missing_assignments]] implementation from
@@ -318,4 +315,62 @@ class TestPlusGrade:
     def test_p_plus_is_a_passing_grade(self):
         """--missing must not report a passed assignment as missing."""
         assert is_passing_grade("P+")
+@
+
+Moving the vocabulary out of this module removed the branches that handled
+\enquote{complete} and \enquote{incomplete} here, so we pin the behaviour those
+branches used to provide.
+The last test pins the one deliberate difference: a grade from a scale this
+module cannot read now raises the module's own error instead of an
+[[AttributeError]] from a [[casefold]] call.
+<<test functions>>=
+class TestCanvasPassFailGrades:
+    """Test the grades from Canvas's built-in pass/fail grading type."""
+
+    def graded(self, grade):
+        """Build an assignment whose submission carries the given grade."""
+        assignment = SimpleNamespace(name="Lab 1")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade=grade,
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+        return assignment
+
+    def test_complete_summarizes_as_p(self):
+        """A complete is a pass, whatever its capitalization."""
+        user = SimpleNamespace(id=1)
+
+        for grade in ["complete", "Complete"]:
+            summary, _, _ = summarize(user, [self.graded(grade)])
+            assert summary == "P"
+
+    def test_incomplete_summarizes_as_f(self):
+        """An incomplete fails the group, as it always did."""
+        user = SimpleNamespace(id=1)
+
+        summary, _, _ = summarize(user, [self.graded("incomplete")])
+
+        assert summary == "F"
+
+    def test_complete_is_passing_and_incomplete_is_not(self):
+        """The --missing check keeps the same verdicts."""
+        assert is_passing_grade("complete")
+        assert is_passing_grade("Complete")
+        assert not is_passing_grade("incomplete")
+        assert not is_passing_grade("must fix")
+        assert not is_passing_grade(None)
+
+    def test_unreadable_grade_names_grade_and_assignment(self):
+        """A scale we can't read is an error the teacher can act on."""
+        user = SimpleNamespace(id=1)
+
+        with pytest.raises(ValueError) as error:
+            summarize(user, [self.graded(17.0)])
+
+        assert "17.0" in str(error.value)
+        assert "Lab 1" in str(error.value)
 @
