@@ -36,6 +36,7 @@ import logging
 import os
 import pathlib
 import subprocess
+from pdfminer.high_level import extract_text
 import pypandoc
 import re
 import rich.console
@@ -1956,7 +1957,7 @@ def convert_to_md(attachment: canvasapi.file.File,
   <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
   content_type = getattr(attachment, "content-type")
   <<if [[content_type]] is text, just use [[outfile]] contents>>
-  <<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>
+  <<else if [[content_type]] is PDF, convert [[outfile]] using [[extract_text]]>>
   <<else convert [[outfile]] using [[pypandoc]]>>
 <<let [[contents]] be the converted [[attachment]]>>=
 contents = convert_to_md(attachment, tmpdir)
@@ -2033,34 +2034,65 @@ except ValueError:
 @
 
 Now we'll do the same for PDF files.
-We'll use [[pdf2txt]] to convert the PDF to text.
-However, here we'll use an if statement.
+Here we'll use an if statement rather than a [[try]] block.
 We'll check for the content type to end with [[pdf]], that will capture also
 [[x-pdf]].
 
-Unlike [[pypandoc]], [[pdf2txt]] is not something we depend on: it ships with
-pdfminer.six, which we never declare as a dependency, so the user may or may
-not have it.  That gives this step two distinct ways to come up empty.  If
-[[pdf2txt]] is installed but chokes on the file, Python raises
-[[subprocess.CalledProcessError]]; if it was never installed, the exec fails
-before the tool ever runs and Python raises [[FileNotFoundError]] instead.
-Both outcomes mean the same thing to us---this converter cannot produce text
-for this attachment---so both must fall through to the [[pypandoc]] attempt
-below.  That is exactly what the fallback chain exists for: a missing optional
-tool must degrade like a failing one.
+We extract the text with pdfminer.six, which we call through its
+[[extract_text]] function.  This deserves a word of explanation, because we
+used to do the same job by shelling out to [[pdf2txt]] instead---the
+command-line front end to that very same library.  Spawning a process was the
+worse choice for two reasons that reinforce each other.
 
-Catching only [[subprocess.CalledProcessError]] would instead make the absent
-tool fatal rather than merely unhelpful.  The [[FileNotFoundError]] escapes
-[[convert_to_md]], and the attachment loop that calls it guards only against
-[[AttributeError]], so a single PDF attachment would abort the whole
-[[submission]] command with a traceback---on precisely the machines where the
-graceful \enquote{Cannot convert this file} pointer was the right answer.
-<<else if [[content_type]] is PDF, convert [[outfile]] using [[pdf2txt]]>>=
+The first is that it made pdfminer.six an \emph{undeclared} dependency.
+Nothing in our packaging metadata mentioned it, so [[pip]] never installed it,
+and whether PDF conversion worked at all came down to what happened to be on
+the user's machine.  The maintainer asked for the obvious remedy---declare the
+dependency---so pdfminer.six now sits alongside [[pypandoc]] in
+[[pyproject.toml]] and is installed with us.
+
+The second reason is why declaring it is not enough on its own, and why we
+must import the library rather than keep calling the program.  A dependency
+buys us a guarantee about the \emph{package}, not about any executable it
+drops on [[PATH]]: upstream installs the front end as [[pdf2txt.py]], Debian
+and its derivatives rename it to [[pdf2txt]], and a user with several Python
+environments may have neither on [[PATH]] even with the library importable in
+ours.  Hard-coding one of those spellings is a guess we cannot win.  Importing
+[[extract_text]] makes the question disappear: the name we depend on is a
+Python symbol resolved through our own interpreter, which is exactly the thing
+the dependency declaration does guarantee.
+
+Extraction can still fail on a corrupt or encrypted PDF, and when it does we
+want the same outcome as before: fall through to the [[pypandoc]] attempt
+below, and failing that, the pointer to the file on disk.  So we catch
+[[Exception]] rather than pdfminer's own [[PDFException]] base class.
+
+The wider net is deliberate, and it is not merely defensive.  We hand
+[[extract_text]] a path, so it does the opening itself, which means a file
+that has gone missing or is unreadable surfaces as [[FileNotFoundError]] or
+[[PermissionError]]---plain [[OSError]] subclasses that lie entirely outside
+the [[PDFException]] hierarchy.  Those are reachable states for us, not
+hypothetical ones: [[outfile]] lives in a temporary directory that the caller
+supplies and that nothing stops an unlucky system from cleaning underneath us.
+Catching only [[PDFException]] would let them escape.
+
+That is the same shape of mistake this branch made before.  The old code
+caught only [[subprocess.CalledProcessError]], so a missing [[pdf2txt]] raised
+[[FileNotFoundError]] straight past it, out of [[convert_to_md]], and past the
+attachment loop, which guards only against [[AttributeError]]---aborting the
+entire [[submission]] command over one attachment.  In both cases the catch
+was narrower than the contract it was meant to implement, which is not
+\enquote{the PDF was malformed} but \enquote{this converter cannot produce
+text for this attachment}.  Matching the catch to the contract costs us
+nothing, because every path out of it still leads somewhere sensible: the next
+link in the chain is strictly more capable at guessing formats, and the last
+one always succeeds.  The [[pypandoc]] attempt just below already catches
+[[Exception]] for exactly this reason.
+<<else if [[content_type]] is PDF, convert [[outfile]] using [[extract_text]]>>=
 if content_type.endswith("pdf"):
   try:
-    return subprocess.check_output(["pdf2txt", str(outfile)],
-                                    text=True)
-  except (subprocess.CalledProcessError, FileNotFoundError):
+    return extract_text(outfile)
+  except Exception:
     pass
 @
 
@@ -2077,33 +2109,35 @@ except Exception as err:
          f"The file is located at\n\n  {outfile}\n\n"
 @
 
-Now that the whole chain is in place, let's verify that an uninstalled
-[[pdf2txt]] really does end up in that last-resort message rather than
+Now that the whole chain is in place, let's verify that a PDF which defeats
+[[extract_text]] really does end up in that last-resort message rather than
 escaping as an exception.  We pretend the attachment is already cached, so
-nothing is downloaded, and then make both converters fail the way they would
-on a machine with neither tool installed: the missing [[pdf2txt]] surfaces as
-[[FileNotFoundError]] from [[subprocess.check_output]], which is the failure
-mode that used to abort the command.
+nothing is downloaded, and then make both converters fail.  The exception we
+raise from [[extract_text]] is the [[FileNotFoundError]] it really does raise
+when the file has gone missing---deliberately \emph{not} one of pdfminer's own
+error types, so the test pins down the part of the catch that a narrower
+[[except PDFException]] would get wrong.
 
 <<test functions>>=
-class TestPDFConversionWithoutPdf2txt:
-    """Test that a missing pdf2txt degrades like a failing one"""
+class TestPDFConversionFallback:
+    """Test that a failing PDF converter degrades to the pointer message"""
 
-    def test_missing_pdf2txt_falls_through(self, tmp_path, monkeypatch):
+    def test_pdf_extraction_failure_falls_through(self, tmp_path,
+                                                  monkeypatch):
         """convert_to_md returns the pointer message instead of raising"""
-        def missing_tool(*args, **kwargs):
-            raise FileNotFoundError(2, "No such file or directory: 'pdf2txt'")
+        def cannot_convert(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory")
 
         monkeypatch.setattr(
             "canvaslms.cli.submissions.attachment_cache"
             ".restore_cached_attachment",
             lambda *args, **kwargs: True)
         monkeypatch.setattr(
-            "canvaslms.cli.submissions.subprocess.check_output",
-            missing_tool)
+            "canvaslms.cli.submissions.extract_text",
+            cannot_convert)
         monkeypatch.setattr(
             "canvaslms.cli.submissions.pypandoc.convert_file",
-            missing_tool)
+            cannot_convert)
 
         attachment = Mock()
         attachment.id = 1
