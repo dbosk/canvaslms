@@ -95,12 +95,13 @@ def calendar_list_command(config, canvas, args):
   <<get and output calendar events>>
 @
 
-We add an option to choose the CSV delimiter (default: tab).
-<<add calendar list arguments>>=
-calendar_list_parser.add_argument("--delimiter", "-D",
-  default="\t",
-  help="Delimiter for CSV output (default: tab)")
-@
+The CSV delimiter comes from [[args.delimiter]], which the global
+[[-d]]/[[--delimiter]] option supplies; this subcommand adds no delimiter
+option of its own.
+It used to add a [[--delimiter]]/[[-D]] with a tab default, and that
+duplicate was worse than redundant: it reset [[args.delimiter]] for every
+invocation, so [[canvaslms -d , calendar list]] kept emitting tabs
+(\cref{sec:global-options-are-global}).
 
 We add options to filter events.
 <<add calendar list arguments>>=
@@ -178,6 +179,7 @@ end_time = utils.format_canvas_time(end_time)
 
 
 \section{Processing course options for calendar events}
+\label{sec:calendar:course-default}
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
@@ -484,17 +486,66 @@ if not selected:
   canvaslms.cli.err(1, "No matching events found in the specified date range")
 
 if args.json:
-  print(repr(selected))
+  print(format_events_json(selected))
 else:
   # Print each event's details
   for idx, event in enumerate(selected):
     print_event_details(event)
     if idx != len(selected) - 1:
       print()
+@
+
+\subsection{Machine-readable output}
+
+The details we print by default are laid out for a human reader: labelled
+lines, a wrapped description, one line per booked participant.  A script
+that only wants, say, the URL of every matching event would have to parse
+those labels back out again---and any change to the layout would break it.
+So we also offer the events as JSON.
+
 <<add calendar view arguments>>=
 calendar_view_parser.add_argument("--json",
   action="store_true", default=False,
   help="Output matching events as JSON")
+@
+
+What should that JSON contain?  A canvasapi [[CalendarEvent]] is little
+more than the JSON object Canvas sent us: [[set_attributes]] turns each
+key of the API response into an instance attribute.  Serialising the
+object's attribute dictionary therefore hands the consumer back
+essentially the event as Canvas described it, ready for [[jq]] or
+[[json.loads]].  The alternative we used to take---printing
+[[repr(selected)]]---produced a Python list of object reprs, which no
+JSON parser accepts, so the [[--json]] flag promised something it never
+delivered.
+
+Two properties of that attribute dictionary need care.
+The attributes beginning with an underscore are canvasapi's own
+bookkeeping rather than data about the event; [[_requester]], which holds
+the HTTP session, is not even serialisable.  We drop them.
+Timestamps get a derived [[datetime]] twin ([[start_at_date]] alongside
+[[start_at]], and so on) that [[json.dumps]] likewise cannot handle on
+its own, so we render those with [[default=str]].
+Note that this is a weaker conversion than the one [[format_json]]
+applies to assignments, where every value is passed through [[str]]:
+calendar events carry nested structures---the [[child_events]] of an
+appointment group, for instance---and stringifying those would flatten
+whole booking lists into single Python reprs.  With [[default=str]] only
+the values JSON cannot express are converted, and the nesting survives.
+
+<<functions>>=
+def format_events_json(events):
+  """Returns a JSON representation of a list of calendar events"""
+  return json.dumps([
+    {key: value for key, value in event.__dict__.items()
+      if not key.startswith("_")}
+    for event in events
+  ], indent=2, default=str)
+@
+
+The human-readable form is the counterpart: one labelled line per piece
+of information, expanding an appointment group into the students who
+booked its slots.
 <<functions>>=
 def print_event_details(event):
   """Formats and prints details of a calendar event"""
@@ -637,7 +688,7 @@ def add_calendar_create_command(subp):
     help="Creates a new calendar event", 
     description="Creates a new calendar event or appointment group for bookable time slots")
   calendar_create_parser.set_defaults(func=calendar_create_command)
-  courses.add_course_option(calendar_create_parser)
+  courses.add_course_option(calendar_create_parser, default=None)
   <<add calendar create arguments>>
 
 def calendar_create_command(config, canvas, args):
@@ -645,7 +696,24 @@ def calendar_create_command(config, canvas, args):
   <<create calendar event>>
 @
 
-The create command requires title and start time and quite a few other options.
+The create command requires only a title and a start time; everything else is
+optional.
+In particular, Canvas happily stores an event that has no end time at all---an
+open-ended entry such as a deadline or a reminder, which the calendar renders
+as a point in time rather than as an interval.
+We therefore declare [[--end-time]] without [[required=True]], which makes
+\begin{quote}
+[[canvaslms calendar create "Assignment 3 due" --start-time "2026-08-15 17:00"]]
+\end{quote}
+a complete command line.
+
+Appointment groups are the exception: they subdivide an interval into bookable
+slots, so they need both bounds.
+Making [[--end-time]] mandatory for every event type would be the easy way to
+guarantee that, but it would also take open-ended events away from everyone to
+serve one event type.
+We instead let the appointment-group code demand an end time where it needs
+one, when it computes the slots below.
 <<add calendar create arguments>>=
 calendar_create_parser.add_argument("title",
   help="Title of the calendar event")
@@ -667,19 +735,12 @@ calendar_create_parser.add_argument("--max-appointments", type=int, default=1,
   help="Maximum appointments per time slot (only for appointment_group type, default: 1)")
 @
 
-We create the calendar event with the specified parameters.
-We interpret the start and end times ([[args.start_time]] and 
-[[args.end_time]]) as local time in the system timezone.
+Creating an event takes three steps: we turn the user's date and time strings
+into Canvas timestamps, we sanity-check them against each other, and only then
+do we call the API for the requested event type.
 <<create calendar event>>=
-try:
-  start_time = utils.format_canvas_time(arrow.get(args.start_time, tzinfo='local'))
-  end_time = utils.format_canvas_time(arrow.get(args.end_time, tzinfo='local'))
-except Exception as e:
-  canvaslms.cli.err(1, f"Invalid date/time format: {e} "
-                       f"(did you write 8:15 instead of 08:15?)")
-
-if end_time < start_time:
-  canvaslms.cli.err(1, "End time cannot be before start time.")
+<<parse start and end times>>
+<<reject events that end before they start>>
 
 try:
   if args.event_type == "appointment_group":
@@ -690,8 +751,101 @@ except canvasapi.exceptions.CanvasException as e:
   canvaslms.cli.err(1, f"Failed to create calendar event: {e}")
 @
 
+We interpret the start and end times ([[args.start_time]] and
+[[args.end_time]]) as local time in the system timezone.
+The start time is always there, since [[--start-time]] is required, but the end
+time is [[None]] whenever the user omitted [[--end-time]]---and [[arrow.get]]
+does not parse [[None]], it raises a [[TypeError]] instead.
+We must therefore ask whether we have an end time \emph{before} we try to parse
+one; the conditional expression lets a missing end time travel onwards as
+[[end_time = None]] rather than as an exception.
+
+Guarding the parse is what makes the absent end time visible at all.
+The [[except]] clause is deliberately broad, because [[arrow]] reports every
+malformed input differently, but that breadth means it cannot distinguish a
+typo from a missing value: parsing [[None]] unconditionally reported
+\enquote{no end time given} as the fatal and misleading
+\enquote{Invalid date/time format: Cannot parse argument of type None},
+which made open-ended events impossible to create at all.
+<<parse start and end times>>=
+try:
+  start_time = utils.format_canvas_time(
+    arrow.get(args.start_time, tzinfo='local'))
+  end_time = utils.format_canvas_time(
+    arrow.get(args.end_time, tzinfo='local')) if args.end_time else None
+except Exception as e:
+  canvaslms.cli.err(1, f"Invalid date/time format: {e} "
+                       f"(did you write 8:15 instead of 08:15?)")
+@
+
+Both timestamps come out of [[format_canvas_time]] in the same shape, a UTC ISO
+string ending in [[Z]], so comparing them as strings orders them
+chronologically---no reparsing needed.
+An event that never ends cannot end too early, so the ordering check applies
+only when the user actually gave us an end time.
+<<reject events that end before they start>>=
+if end_time and end_time < start_time:
+  canvaslms.cli.err(1, "End time cannot be before start time.")
+@
+
+\subsection{Distinguishing no course from all courses}
+
+Both event types must know which course contexts the new event belongs
+to, and both learn it from the [[-c]] option added by
+[[courses.add_course_option]].
+For the listing commands that option defaults to the match-all regex
+[[.*]] (\cref{sec:calendar:course-default}), and for them the default is
+harmless: reading every calendar and reading with no filter are the same
+request.
+
+Creating is not so forgiving.
+[[calendar create]] used to share that default and test [[args.course]]
+for truthiness only; since the default regex matches every course the
+user is enrolled in,
+\begin{verbatim}
+canvaslms calendar create "Meeting" --start-time "2026-08-01 10:00" \
+                                    --end-time "2026-08-01 11:00"
+\end{verbatim}
+looped over all of them and created one copy of \enquote{Meeting} in
+each---silently, with no confirmation, and with no bulk delete to undo
+it.
+Nor can the command recover by comparing [[args.course]] against the
+default regex: an explicit [[-c '.*']]---a user who really does want the
+event in every course---produces exactly the same [[args]] as no [[-c]]
+at all, so the comparison silently takes that ability away.
+
+The distinction the command needs can only live in the default itself.
+[[calendar create]] therefore registers its course option with
+[[default=None]]: a [[None]] means the user never mentioned courses, and
+any string---the match-all [[.*]] included---is an explicit request that
+we honour by creating the event in every matching course.
+Both branches below test [[args.course]] against [[None]] by truthiness,
+which is now sound because argparse never turns an absent [[-c]] into a
+non-empty string.
+
+\subsection{Regular calendar events}
+
 We first look at how we create a regular calendar event.
-We set the data required and create \emph{one} event for \emph{every} course.
+A Canvas calendar event lives in exactly one context, so an explicit
+[[-c]] regex matching several courses means several events: we set the
+shared data once and then create \emph{one} event for \emph{every}
+matched course.
+When no course was selected we still must name a context: Canvas
+refuses an event without one (\enquote{Dictionary with key
+'context_code' is required}), so there is no such thing as omitting the
+context and letting the server pick.
+The user's own calendar \emph{is} a context of its own, addressed as
+[[user_<id>]], so we look up the authenticated user and file the event
+there---the natural reading of a [[calendar create]] that never
+mentions a course.
+
+Only the title and the start time go into [[params]] unconditionally; each
+optional field is added only when the user supplied it.
+That is what carries an open-ended event through to Canvas: we say
+\enquote{this event has no end} by leaving [[end_at]] out of the request
+altogether, rather than by sending a key whose value is [[None]].
+The parse above and this assembly thus agree---when [[args.end_time]] is
+missing, [[end_time]] stays [[None]] and never reaches the request.
 <<create regular calendar event>>=
 params = {
   'calendar_event': {
@@ -707,20 +861,33 @@ if args.description:
 if args.location:
   params['calendar_event']['location_name'] = args.location
   
-# Set context if course is specified
-if hasattr(args, 'course') and args.course:
+if args.course:
   course_list = courses.process_course_option(canvas, args)
   for course in course_list:
     params['calendar_event']['context_code'] = f"course_{course.id}"
     event = canvas.create_calendar_event(**params)
 else:
+  user = canvas.get_current_user()
+  params['calendar_event']['context_code'] = f"user_{user.id}"
   event = canvas.create_calendar_event(**params)
 @
 
-Appointment groups (bookable timeslots) , on the other hand, are created 
+\subsection{Appointment groups}
+
+Appointment groups (bookable timeslots) , on the other hand, are created
 differently.
-Here we can create one appointment group for many course contexts---thus having 
+Here we can create one appointment group for many course contexts---thus having
 one appointment group joint for several courses.
+
+The user's own calendar is no fallback here.
+An appointment group exists so that participants can book its slots, and
+Canvas accordingly requires at least one context code: without a course
+there is no set of students who could book anything.
+That leaves us two ways to react to a missing [[-c]], guess or stop.
+Guessing means every course the user is enrolled in---exactly the
+accident we set out to prevent, only now the user has also published
+bookable office hours to strangers.
+So we stop, and we name the option the user has to supply.
 <<create appointment group>>=
 params = {
   'appointment_group': {
@@ -739,14 +906,16 @@ if args.location:
 
 <<compute time slots>>
   
-# Set context if course is specified
-if hasattr(args, 'course') and args.course:
-  course_list = courses.process_course_option(canvas, args)
-  for course in course_list:
-    try:
-      params['appointment_group']['context_codes'].append(f"course_{course.id}")
-    except KeyError:
-      params['appointment_group']['context_codes'] = [f"course_{course.id}"]
+if not args.course:
+  canvaslms.cli.err(1, "An appointment group must belong to at least one "
+                       "course; select the course(s) with -c/--course.")
+
+course_list = courses.process_course_option(canvas, args)
+for course in course_list:
+  try:
+    params['appointment_group']['context_codes'].append(f"course_{course.id}")
+  except KeyError:
+    params['appointment_group']['context_codes'] = [f"course_{course.id}"]
 
 appointment_group = canvas.create_appointment_group(**params)
 @
@@ -754,11 +923,26 @@ appointment_group = canvas.create_appointment_group(**params)
 We get the duration from the [[args.time_slot_duration]] option.
 Now we simply need to compute the time slots between the start and end times.
 
-The timeslots should be added to a \emph{dictionary} called 
+This is where an appointment group parts ways with a regular event.
+We fill the interval by stepping from the start until the next slot no longer
+fits, so the loop is bounded by the end time: without one there is no last
+slot, and the list of appointments we have to send would never terminate.
+An appointment group therefore cannot be open-ended the way a plain event can.
+
+The end time and the slot duration are therefore preconditions rather than
+options here, and we say so before computing anything.
+We could instead let the arithmetic fail on the missing values, but [[end_time]]
+is [[None]] here for exactly the reason the user cares about---they forgot a
+flag---and a [[TypeError]] from deep inside [[arrow]] does not say which flag.
+Naming the missing option is what turns a crash into an instruction.
+
+The timeslots should be added to a \emph{dictionary} called
 [[new_appointments]].
-Although numbered by index, as a list, the API requires a dictionary with 
+Although numbered by index, as a list, the API requires a dictionary with
 string keys.
 <<compute time slots>>=
+if not args.end_time:
+  canvaslms.cli.err(1, "--end-time is required for appointment groups")
 if not args.time_slot_duration:
   canvaslms.cli.err(1, "--time-slot-duration is required for appointment groups")
 
@@ -777,3 +961,161 @@ while current_start + slot_duration <= end:
   params["appointment_group"]["new_appointments"][str(slot_num)] = slot
   current_start += slot_duration
   slot_num += 1
+@
+
+
+\section{Verifying the course guard on \texttt{calendar create}}
+
+The broadcast failure is expensive precisely because it is silent:
+a successful run prints nothing that would reveal that the event was
+created seventeen times.
+Tests are thus the only cheap way to keep the guard honest, so we pin
+down the three cases that carry the decision---the default regex, an
+explicit regex, and an appointment group with no course at all.
+
+<<test [[calendar.py]]>>=
+"""Tests for creating calendar events"""
+import argparse
+import copy
+
+import pytest
+
+import canvaslms.cli.calendar as calendar
+
+<<test helper functions>>
+<<test functions>>
+@
+
+Recording the calls to [[create_calendar_event]] is not enough by
+itself.
+The command builds a single [[params]] dictionary and mutates its
+[[context_code]] between calls, so a mock would hand us the same
+dictionary several times and every recorded call would show the
+\emph{last} course.
+We therefore copy each call's arguments as they arrive.
+
+<<test helper functions>>=
+def record_created_events(canvas):
+    """Make canvas record copies of create_calendar_event arguments"""
+    created = []
+    canvas.create_calendar_event.side_effect = \
+        lambda **kwargs: created.append(copy.deepcopy(kwargs))
+    return created
+
+@
+
+The command reads its arguments straight off [[args]], so we build the
+namespace that [[argparse]] would have produced.
+The defaults spell out the interesting case---no [[-c]] on the command
+line, which argparse leaves as [[None]] now that the create parser
+registers the option with [[default=None]]---and each test overrides
+only what it varies.
+
+<<test helper functions>>=
+def create_args(**overrides):
+    """Build the args namespace that `calendar create` would receive"""
+    args = argparse.Namespace(
+        title="Meeting",
+        start_time="2026-08-01 10:00",
+        end_time="2026-08-01 11:00",
+        description=None,
+        location=None,
+        event_type="event",
+        course=None,
+        time_slot_duration=None,
+        max_appointments=1,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+The [[mock_courses]] fixture supplies three courses, all matching the
+regex [[CS]], which makes the difference between the two regexes
+visible: the default must yield one event, the explicit one three.
+
+<<test functions>>=
+class TestCalendarCreateCourseGuard:
+    """The default -c regex must not broadcast events to every course"""
+
+    <<course guard test methods>>
+@
+
+Without a course the event belongs to the user, so we expect exactly one
+call, addressed to the user's own [[user_<id>]] context---not to any
+course, and not without a context, which Canvas would refuse.
+
+<<course guard test methods>>=
+def test_default_regex_creates_one_user_event(self, mock_canvas,
+                                              mock_courses):
+    """Default -c should create a single event in the user context"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_current_user.return_value.id = 42
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas, create_args())
+
+    assert len(created) == 1
+    assert created[0]["calendar_event"]["context_code"] == "user_42"
+
+@
+
+An explicit regex, on the other hand, keeps the per-course behaviour:
+one event in each matched course, in the order the courses arrive.
+
+<<course guard test methods>>=
+def test_explicit_regex_creates_one_event_per_course(self, mock_canvas,
+                                                     mock_courses):
+    """An explicit -c should create one event per matching course"""
+    mock_canvas.get_courses.return_value = mock_courses
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas,
+                                     create_args(course="CS"))
+
+    assert [event["calendar_event"]["context_code"]
+            for event in created] == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+The match-all regex gets no special treatment: written out explicitly it
+is a course selection like any other, so the user who really wants the
+event everywhere can say so.
+This is the case the earlier compare-against-the-default guard got
+wrong---it read an explicit [[-c '.*']] as if no course had been given.
+
+<<course guard test methods>>=
+def test_explicit_match_all_broadcasts(self, mock_canvas, mock_courses):
+    """An explicit -c '.*' should create one event per course"""
+    mock_canvas.get_courses.return_value = mock_courses
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command({}, mock_canvas,
+                                     create_args(course=".*"))
+
+    assert len(created) == len(mock_courses)
+    assert all(event["calendar_event"]["context_code"].startswith("course_")
+               for event in created)
+
+@
+
+Appointment groups have no user-calendar fallback, so the same default
+must abort the command instead.
+[[canvaslms.cli.err]] exits, which surfaces as [[SystemExit]], and
+nothing may reach Canvas.
+
+<<course guard test methods>>=
+def test_appointment_group_requires_explicit_course(self, mock_canvas,
+                                                    mock_courses):
+    """An appointment group without -c should fail, not use all courses"""
+    mock_canvas.get_courses.return_value = mock_courses
+
+    with pytest.raises(SystemExit):
+        calendar.calendar_create_command(
+            {}, mock_canvas,
+            create_args(event_type="appointment_group",
+                        time_slot_duration=30))
+
+    mock_canvas.create_appointment_group.assert_not_called()

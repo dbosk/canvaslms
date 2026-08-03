@@ -83,12 +83,16 @@ from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
     filter_view_submissions,
+    format_rubric,
+    format_submission,
     format_submission_short,
+    generate_diff,
     get_course_user,
     is_null_submission,
     is_ungraded,
     list_submissions,
     list_ungraded_submissions,
+    match_renamed_files,
     speedgrader,
 )
 
@@ -276,16 +280,40 @@ list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
 @
 
+The guard on this resolution must ask whether a filter was \emph{given}, not
+whether its value looks non-empty.
+The two questions differ for exactly one input: the empty regular expression
+matches every string, so [[-u '']] is a legitimate way to spell \enquote{all
+users}, just like [[-u '.*']]---yet the empty string is falsy.
+A truthiness test therefore treats [[-u '']] as \enquote{no filter given} and
+leaves [[user_list]] as [[None]], skipping the filtering below.
+That is worse than a missed filter: [[filter_submissions]] is the only place
+that attaches a [[user]] attribute to a submission, so skipping it makes the
+printing step fail with an [[AttributeError]] on [[submission.user.name]].
+Comparing against [[None]] keeps the empty regex on the filtering path, where
+[[filter_users]] reads it as [[.*]] and matches everyone, which is what the
+user asked for.
+
 When no user or group options are set, both [[user_list]] and [[student_ids]]
 stay [[None]]: the listing helpers then treat the whole assignment as in scope,
 and we skip filtering entirely.
 <<resolve user filter and student ids>>=
 user_list = None
 student_ids = None
-if args.user or args.category or args.group:
+if args.user is not None or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
   student_ids = {user.id for user in user_list}
 @
+
+That [[None]] branch is unreachable for this command today: the [[users]]
+module registers [[--user]] with the default [[.*]], so [[args.user]] is a
+string on every invocation and the guard is always true---which is also why the
+truthiness tests on [[--group]] and [[--category]] can never decide the
+outcome, short-circuited as they are by the test on [[args.user]].
+We keep the branch nonetheless, because it documents the contract with the
+listing helpers---[[student_ids]] of [[None]] means \enquote{the whole
+assignment is in scope}---and keeps this chunk correct should the default ever
+be dropped.
 
 If a user or group filter was set, we now restrict the submissions to the users
 we resolved above.  We reuse [[user_list]] rather than querying Canvas again.
@@ -344,13 +372,78 @@ list_parser.add_argument("-l", "--login-id",
   default=False, action="store_true")
 @
 
+\subsection{Verifying that every listed submission has a user}
+
+Now that we have seen the command end to end, we can verify the property that
+ties its two halves together: whatever the user filter says, every submission
+that reaches the printing step must carry a [[user]] attribute.
+We stub out the three Canvas round-trips---the assignment lookup, the user
+lookup and the submission listing---so that the test exercises only the
+resolution and filtering logic in between.
+The stubbed submission deliberately has no [[user]] attribute, mirroring what
+the listing helpers return, so the test fails loudly if the filtering step is
+skipped.
+
+Contrasting the empty regex with the default [[.*]] shows that the two spell
+the same request:
+
+<<test functions>>=
+class TestListCommandUserResolution:
+    """Test user resolution in submissions_list_command()"""
+
+    def run_list_command(self, monkeypatch, user_regex):
+        """Run the list command with all Canvas access stubbed out"""
+        import argparse
+        import types
+        from unittest.mock import MagicMock
+
+        import canvaslms.cli.submissions as submissions_module
+
+        user = MagicMock()
+        user.id = 1
+        user.name = "Alice Anderson"
+
+        assignment = MagicMock()
+        assignment.course.course_code = "DD1234"
+        assignment.name = "Lab 1"
+
+        # As the listing helpers return it: no user attached yet
+        submission = types.SimpleNamespace(user_id=1, assignment=assignment,
+                                           grade="P", submitted_at=None,
+                                           graded_at=None)
+
+        monkeypatch.setattr(submissions_module.assignments,
+                            "process_assignment_option",
+                            lambda canvas, args: [assignment])
+        monkeypatch.setattr(submissions_module.users,
+                            "process_user_or_group_option",
+                            lambda canvas, args: [user])
+        monkeypatch.setattr(submissions_module, "list_submissions",
+                            lambda *args, **kwargs: [submission])
+
+        args = argparse.Namespace(user=user_regex, category=None, group=None,
+                                  history=False, ungraded=False,
+                                  login_id=False, delimiter="\t")
+        submissions_module.submissions_list_command(None, None, args)
+
+    def test_empty_user_regex_matches_everyone(self, monkeypatch, capsys):
+        """An explicit -u '' must filter, not skip filtering"""
+        self.run_list_command(monkeypatch, "")
+
+        assert "Alice Anderson" in capsys.readouterr().out
+
+    def test_default_user_regex_matches_everyone(self, monkeypatch, capsys):
+        """The default -u '.*' asks for the same thing"""
+        self.run_list_command(monkeypatch, ".*")
+
+        assert "Alice Anderson" in capsys.readouterr().out
+@
+
 
 \section{Computing the SpeedGrader URL}
 
 Sometimes we want to compute the URL for SpeedGrader for a submission.
 The [[Submission]] objects come with an attribute [[preview_url]].
-(However, previous submissions don't have this, so if it doesn't exist, we use 
-[[None]].)
 We want to turn that one into the SpeedGrader URL.
 The [[preview_url]] looks like this:
 \begin{minted}{text}
@@ -363,13 +456,19 @@ https://canvas.kth.se/courses/26930/gradebook/speed_grader?
   assignment_id=173825&student_id=108849
 \end{minted}
 We use Python's regex abilities to rewrite the URL.
+
+Not every submission has a preview URL, though, and then there is no SpeedGrader
+page to point at either.
+We return [[None]] for those, which is the contract the callers must respect;
+\cref{MissingPreviewURL} explains which submissions those are, and why detecting
+them is trickier than it looks.
 <<functions>>=
 def speedgrader(submission):
-  """Returns the SpeedGrader URL of the submission"""
-  try:
-    speedgrader_url = submission.preview_url
-  except AttributeError:
-    return None
+  """
+  Returns the SpeedGrader URL of the submission.
+  Returns None if the submission has no preview URL.
+  """
+  <<return [[None]] when there is no preview URL>>
 
   speedgrader_url = re.sub("assignments/",
     "gradebook/speed_grader?assignment_id=",
@@ -382,6 +481,51 @@ def speedgrader(submission):
   speedgrader_url = re.sub(r"\?preview.*$", "", speedgrader_url)
 
   return speedgrader_url
+@
+
+\subsection{Submissions without a preview URL}\label{MissingPreviewURL}
+
+Canvas attaches [[preview_url]] to the current version of a submission only.
+The historical versions in [[submission_history]] therefore arrive without one,
+and those are exactly the submissions that [[format_submission]] renders for
+[[canvaslms submission --history]] and [[--diff]].
+So the empty case is not an exotic corner: it is one whole command.
+
+Detecting it used to be a matter of catching the failed attribute access:
+\begin{minted}{python}
+try:
+  speedgrader_url = submission.preview_url
+except AttributeError:
+  return None
+\end{minted}
+That guard was correct as long as \enquote{Canvas did not send this field} meant
+\enquote{this Python object has no such attribute}.
+Normalizing Canvas objects at ingress broke that equivalence.
+[[ensure_submission_attrs]] lists [[preview_url]] among [[SUBMISSION_ATTRS]] and
+fills in every missing attribute with [[None]], and [[format_submission]]
+normalizes each submission before formatting it.
+By the time [[speedgrader]] is called, the attribute always exists.
+
+The guard thus became dead code without any change to [[speedgrader]] itself:
+[[AttributeError]] can no longer be raised, so [[None]] flows past the [[try]]
+block into [[re.sub]], which raises [[TypeError]] instead
+(\enquote{expected string or bytes-like object}).
+The failure mode moved from \enquote{handled} to \enquote{crash} while the
+handling code still looked right.
+
+The general lesson is worth stating, because it applies to every guard written
+against a Canvas attribute: once objects are normalized at ingress, absence is a
+\emph{value}, not a missing attribute, so guards must test the value.
+We test for a falsy URL, which covers both the normalized [[None]] and an empty
+string from Canvas.
+We still read the attribute with a [[getattr]] default, because [[speedgrader]]
+is a small public helper that callers may reach with an object that never passed
+through normalization; falling back to [[None]] keeps its documented contract in
+that case too.
+<<return [[None]] when there is no preview URL>>=
+speedgrader_url = getattr(submission, "preview_url", None)
+if not speedgrader_url:
+  return None
 @
 
 \subsection{Verifying [[speedgrader]] URL generation}
@@ -415,6 +559,24 @@ class TestSpeedgraderURL:
         result = speedgrader(submission)
         
         assert result is None
+@
+
+Absence has two shapes, and the second one is the one that used to crash: a
+normalized submission carries [[preview_url]] with an empty value rather than no
+attribute at all.
+Both shapes must yield [[None]], and neither may raise.
+
+<<test functions>>=
+class TestSpeedgraderWithoutPreviewURL:
+    """Test speedgrader() on submissions Canvas gave no preview URL."""
+
+    @pytest.mark.parametrize("preview_url", [None, ""])
+    def test_returns_none_for_empty_preview_url(self, preview_url):
+        """Normalized submissions carry an empty preview_url, not no attr."""
+        submission = Mock(spec=["preview_url"])
+        submission.preview_url = preview_url
+
+        assert speedgrader(submission) is None
 @
 
 
@@ -936,9 +1098,6 @@ def add_grading_options(parser):
     help="The grade to set for the submissions")
   grade_options.add_argument("-m", "--message",
     help="A comment to the student")
-  parser.add_argument("-v", "--verbose",
-    action="store_true", default=False,
-    help="Prints information about what is being graded")
 
 def add_view_options(parser):
   """Adds submission viewing options to argparse parser
@@ -1488,6 +1647,19 @@ def format_section(title, body, json_format=False, md_title_level="#"):
 
 To format the metadata section, we simply pass the right strings to the section 
 formatting function.
+
+One of those strings can be absent.
+[[speedgrader]] returns [[None]] for the history versions that carry no preview
+URL (\cref{MissingPreviewURL}), and this section is precisely where those
+versions are rendered, so the Markdown output would show a bare [[None]] as if
+that were the URL.
+We substitute the same [[N/A]] placeholder that [[format_local_time]] already
+produces for absent timestamps in this very dictionary, so that every absent
+field of the metadata section reads the same way.
+The trade-off is that the JSON output carries the string [[N/A]] here rather
+than [[null]]; we accept it because the timestamps in this dictionary already
+behave that way, and consistency within the section is worth more than a null
+for a field that only ever means \enquote{no page to link to}.
 <<add metadata to output>>=
 metadata = {
   "course": submission.assignment.course.course_code,
@@ -1500,7 +1672,7 @@ metadata = {
     submission.graded_at),
   "grade": submission.grade,
   "graded_by": str(resolve_grader(submission)),
-  "speedgrader": speedgrader(submission)
+  "speedgrader": speedgrader(submission) or "N/A"
 }
 
 if json_format:
@@ -1559,26 +1731,56 @@ return get_course_user(submission.assignment.course, submission.grader_id)
 @
 
 
-\subsection{Rubric data}
+\subsection{Rubric data}\label{RubricData}
 
+The rubric section is the only one whose body is structured data in its own
+right rather than a plain string, so the output format must be threaded through
+two calls: [[format_rubric]] builds the assessment, and [[format_section]]
+wraps it under a section title.
+Getting the parentheses wrong here is easy, and we did: the closing parenthesis
+used to sit one argument too early, so [[json_format=True]] was passed to
+[[dict.update]] instead of to [[format_section]].
+[[format_section]] would then have rendered the assessment as Markdown, and
+[[dict.update]] cannot build a dictionary out of the resulting string.
+
+That failure never occurred, because [[format_rubric]] raised an
+[[AttributeError]] before [[format_section]] was ever reached
+(\cref{FormattingRubrics}), and the [[except AttributeError]] that lets us skip
+submissions with no rubric data at all caught it.
+The visible symptom was therefore neither exception but silence:
+[[canvaslms submission --json]] dropped the whole rubric assessment from its
+output.
+The two defects have to be repaired in one go.
+Repairing only the parenthesis leaves the data loss untouched, and repairing
+only [[format_rubric]] promotes the data loss into a crash.
+
+Like every other section, the rubric assessment must inherit
+[[md_title_level]] from the caller.
+Otherwise a rubric nested inside a history version would open a top-level
+heading underneath that version's subsection heading, and [[rich]] would
+render it as a document title.
 <<add rubric assessment to output>>=
 try:
   if submission.rubric_assessment:
     if json_format:
       formatted_submission.update(format_section(
         "rubric_assessment",
-        format_rubric(submission, json_format=True)),
-        json_format=True)
+        format_rubric(submission, json_format=True),
+        json_format=True))
     else:
       formatted_submission += format_section(
         "Rubric assessment",
-        format_rubric(submission))
+        format_rubric(submission),
+        md_title_level=md_title_level)
 except AttributeError:
   pass
 @
 
 \subsection{General comments}
 
+The comments section inherits [[md_title_level]] for the same reason as the
+rubric section above: a version's comments belong under that version's
+heading, not at the top of the document.
 <<add comments to output>>=
 try:
   if submission.submission_comments:
@@ -1593,9 +1795,58 @@ try:
           comment['created_at'])
         body += f"{comment['author_name']} ({created_at}):\n\n"
         body += comment["comment"] + "\n\n"
-      formatted_submission += format_section("Comments", body)
+      formatted_submission += format_section("Comments", body,
+                                             md_title_level=md_title_level)
 except AttributeError:
   pass
+@
+
+\subsection{Verifying that nested sections stay nested}
+
+Both sections above are also emitted from the recursive history calls, where
+[[md_title_level]] is deeper than the default.
+Formatting a submission at [[###]] must therefore leave no top-level heading
+behind: [[rich]] renders one as a document title, which would break the very
+hierarchy that [[--history]] exists to provide.
+
+<<test functions>>=
+class TestFormatSubmissionTitleLevel:
+    """Test that sections honour the requested Markdown title level."""
+
+    def make_submission(self):
+        """Build a submission carrying a rubric assessment and a comment."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = (
+            "https://example.com/courses/1/assignments/2/submissions/3")
+        submission.rubric_assessment = {"crit": {"points": 1}}
+        submission.submission_comments = [
+            {"author_name": "Bob", "created_at": None, "comment": "Nice"}
+        ]
+        submission.assignment.name = "A1"
+        submission.assignment.rubric = [
+            {"id": "crit", "description": "Quality"}]
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_nested_sections_use_requested_level(self, tmp_path):
+        """Every section should sit at the level the caller asked for."""
+        output = format_submission(self.make_submission(),
+                                   md_title_level="###",
+                                   tmpdir=tmp_path)
+
+        assert "### Rubric assessment" in output
+        assert "### Comments" in output
+        assert "\n# " not in output
 @
 
 \subsection{Body}
@@ -2437,7 +2688,10 @@ add/delete operations.
 
 The matching algorithm works for any number of files:
 \begin{enumerate}
-\item Compute edit distance between all pairs of files with matching extensions
+\item\label{SetAsideUnchangedNames} Set aside every filename that occurs in
+  \emph{both} versions; such a file is already matched---to itself
+\item Compute edit distance between all remaining pairs of files with
+  matching extensions
 \item Sort pairs by edit distance (lowest first)
 \item Accept matches greedily, ensuring one-to-one mapping
 \item Only accept matches below a conservative threshold:
@@ -2475,6 +2729,46 @@ diff_threshold_percent=args.diff_threshold_percent
 The key insight is that by considering lowest-distance pairs first,
 we naturally find the correct matches even when students add or remove
 files with similar names.
+
+\subsubsection{Unchanged filenames are not rename candidates}
+\label{UnchangedNamesNotCandidates}
+
+The first step of the matching algorithm
+(\cref{SetAsideUnchangedNames})---setting aside filenames that occur in
+both versions---looks like a trivial optimisation that saves us a few
+distance computations.
+It is in fact the rule that keeps the last of the scenarios above, adding a
+file with a similar name, from going badly wrong.
+Consider a student who edits [[lab.py]] and adds a new test file:
+\begin{description}
+\item[Version 0] [[lab.py]]
+\item[Version 1] [[lab.py]], [[lab_test.py]]
+\end{description}
+
+Suppose we skipped only the \emph{identical} pair, that is, we refused to
+match [[lab.py]] against itself but still let it be paired with anything
+else.
+Then the sole surviving candidate is [[lab.py]] $\to$ [[lab_test.py]],
+at an edit distance of~5 between the base names [[lab]] and [[lab_test]].
+That is comfortably below the default fixed threshold of
+[[DEFAULT_DIFF_THRESHOLD_FIXED]], so the matcher happily reports
+[[lab_test.py]] as a rename of [[lab.py]].
+The resulting diff then announces that [[lab.py]] is brand new---it has no
+counterpart left in the previous version---and diffs the student's new
+test file against the old lab's contents.
+Both halves of the output are the opposite of what happened.
+
+Raising or lowering the thresholds cannot help here.
+They are deliberately generous, and at the default of
+[[DEFAULT_DIFF_THRESHOLD_FIXED]] essentially any two short filenames
+sharing an extension are within reach of each other.
+What disqualifies this pair is not its distance but its \emph{structure}:
+a name that appears in both versions has already been accounted for, and
+pairing it with a second file would assert that the student simultaneously
+kept the file and renamed it away.
+Since the greedy loop enforces a one-to-one mapping, a file matched to
+itself can be neither a rename source nor a rename target, and we can
+therefore exclude it before computing any distances at all.
 
 \subsubsection{Adjusting matching thresholds}
 
@@ -2533,14 +2827,50 @@ The function uses a conservative threshold to avoid incorrect pairings
 distance is too large).
 
 <<match single files with different names>>=
-# Find renamed files using edit distance matching
 filename_mapping = match_renamed_files(prev_attachments, curr_attachments,
-                                      diff_threshold_fixed,
-                                      diff_threshold_percent)
+                                       diff_threshold_fixed,
+                                       diff_threshold_percent)
 
-# Rename files in prev_attachments to match current names
-for curr_filename, prev_filename in filename_mapping.items():
-  prev_attachments[curr_filename] = prev_attachments.pop(prev_filename)
+<<rekey [[prev_attachments]] under the current names>>
+@
+
+Having found the renames, we re-key the previous version's attachments so
+that each old file sits under the name it carries in the current version.
+That way the comparison loop below can simply look both versions up by the
+same key, and the mapping is consulted only to label the diff header with
+the file's original name.
+
+The tempting way to do this is to move each entry as we walk the mapping,
+[[prev_attachments[curr] = prev_attachments.pop(prev)]].
+We build a fresh dictionary instead, because the in-place version reads
+from and writes to the same dictionary it is iterating over: whether it is
+correct depends on the order the mapping happens to enumerate its keys, and
+on the guarantee---established over in [[match_renamed_files]], not
+here---that no current name it writes is already a key of
+[[prev_attachments]].
+When that guarantee fails, a [[pop]] can carry away an entry a later
+iteration still needs, and the baseline for a file the student never
+renamed is silently destroyed.
+The discussion under \nameref{UnchangedNamesNotCandidates} above explains
+why the matcher used to produce exactly such mappings.
+Rebuilding the dictionary makes this step correct on its own terms, for any
+mapping whatsoever, so a future change to the matcher cannot resurrect the
+data loss.
+It also leaves the caller's [[prev_content]] untouched, which matters
+because [[format_submission]] hands the same content dictionary to
+[[generate_diff]] that [[extract_submission_text]] produced.
+
+We invert the mapping to get the new name for each old file, then copy
+every entry across under that name, defaulting to its existing name for
+files that were not renamed.
+
+<<rekey [[prev_attachments]] under the current names>>=
+rename_targets = {prev_filename: curr_filename
+                  for curr_filename, prev_filename
+                  in filename_mapping.items()}
+
+prev_attachments = {rename_targets.get(filename, filename): content
+                    for filename, content in prev_attachments.items()}
 @
 
 Each attachment file is compared individually.
@@ -2582,6 +2912,79 @@ if diff_lines:
       formatted_lines.append(line)
   return "```diff\n" + "".join(formatted_lines) + "```"
 return None
+@
+
+\subsubsection{Verifying attachment diffs across renames}
+
+With [[generate_diff]] complete, we can check the property that matters to
+the grader reading the output: every hunk must be labelled with the pair of
+files it actually came from.
+Getting a rename wrong is worse than not detecting it, because the diff then
+looks plausible while describing changes the student never made.
+
+We start from the two situations that used to be mislabelled.
+In the first, the student edits [[lab.py]] and adds [[lab_test.py]]; the
+diff must show an edit to [[lab.py]] and a wholly new [[lab_test.py]], and
+in particular must never diff the new test file against the old lab.
+
+<<test functions>>=
+class TestGenerateDiffAttachmentNames:
+    """Test that attachment diffs are attributed to the right files"""
+
+    <<attachment naming test methods>>
+@
+
+<<attachment naming test methods>>=
+def test_added_file_does_not_steal_an_edited_file(self):
+    """Editing lab.py and adding lab_test.py is not a rename"""
+    prev = {"attachments": {"lab.py": "old lab\n"}}
+    curr = {"attachments": {"lab.py": "new lab\n",
+                            "lab_test.py": "tests\n"}}
+
+    diff = generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert "--- Version 0/lab.py\n+++ Version 1/lab.py\n" in diff
+    assert "--- Version 0/lab_test.py\n" \
+           "+++ Version 1/lab_test.py\n" in diff
+    assert "--- Version 0/lab.py\n+++ Version 1/lab_test.py\n" not in diff
+    assert "-old lab\n" in diff
+    assert "+new lab\n" in diff
+@
+
+In the second, the student keeps [[a.py]], drops [[b.py]] and adds
+[[c.py]].
+The kept file must be diffed against its own baseline, and only the
+genuinely renamed pair may carry two different names in its header.
+
+<<attachment naming test methods>>=
+def test_kept_file_keeps_its_own_baseline(self):
+    """A rename elsewhere must not disturb an unrenamed file"""
+    prev = {"attachments": {"a.py": "A old\n", "b.py": "B old\n"}}
+    curr = {"attachments": {"a.py": "A new\n", "c.py": "C new\n"}}
+
+    diff = generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert "--- Version 0/a.py\n+++ Version 1/a.py\n" in diff
+    assert "-A old\n" in diff
+    assert "+A new\n" in diff
+    assert "--- Version 0/b.py\n+++ Version 1/c.py\n" in diff
+    assert "--- Version 0/b.py\n+++ Version 1/a.py\n" not in diff
+@
+
+Finally, since we rebuild the attachment dictionary rather than renaming
+its keys, the content dictionaries we were handed must come back
+untouched.
+
+<<attachment naming test methods>>=
+def test_does_not_mutate_its_arguments(self):
+    """generate_diff must leave the caller's content dictionaries alone"""
+    prev = {"attachments": {"lab.py": "code\n"}}
+    curr = {"attachments": {"lab_final.py": "new code\n"}}
+
+    generate_diff(prev, curr, "Version 0", "Version 1")
+
+    assert prev == {"attachments": {"lab.py": "code\n"}}
+    assert curr == {"attachments": {"lab_final.py": "new code\n"}}
 @
 
 \subsection{Limitations and edge cases}
@@ -2818,6 +3221,15 @@ First, we compute edit distances for all candidate pairs.
 We only consider pairs with matching file extensions, since students rarely
 change extensions when renaming (\eg [[.py]] to [[.txt]]).
 
+We also drop any pair involving a filename that occurs in both versions,
+for the reasons given under \nameref{UnchangedNamesNotCandidates}: such a
+file is matched to itself, so it can be neither the source nor the target
+of a rename.
+Note that testing both endpoints is what makes this work, and that a weaker
+test comparing the two names to \emph{each other} would not: it is precisely
+when the names differ---[[lab.py]] paired with the newly added
+[[lab_test.py]]---that an unchanged file gets dragged into a bogus rename.
+
 <<build candidate matches with distances>>=
 candidates = []
 
@@ -2831,8 +3243,9 @@ for curr_filename in curr_attachments:
     if prev_ext != curr_ext or not prev_ext:
       continue
 
-    # Skip if names are identical (will be matched automatically later)
-    if curr_filename == prev_filename:
+    # A name present in both versions is matched to itself
+    if curr_filename in prev_attachments \
+          or prev_filename in curr_attachments:
       continue
 
     prev_base = get_file_base(prev_filename)
@@ -2882,8 +3295,56 @@ for distance, curr_filename, prev_filename in candidates:
 return filename_mapping
 @
 
+\subsubsection{Verifying the matching rules}
 
-\section{Formatting rubrics}
+Let us now check that the matcher still detects genuine renames while
+leaving files that survived under their own name alone.
+The first test is the scenario from
+\nameref{UnchangedNamesNotCandidates}, which is the case the exclusion rule
+exists for; the remaining ones guard the behaviour it must not break.
+
+<<test functions>>=
+class TestMatchRenamedFiles:
+    """Test the rename detection heuristic"""
+
+    def test_unchanged_file_is_not_a_rename_source(self):
+        """A file kept under its own name must not be paired with another"""
+        prev = {"lab.py": "old lab\n"}
+        curr = {"lab.py": "new lab\n", "lab_test.py": "tests\n"}
+
+        assert match_renamed_files(prev, curr) == {}
+
+    def test_unchanged_file_is_not_a_rename_target(self):
+        """The symmetric case: a removed file must not claim a kept name"""
+        prev = {"lab.py": "old lab\n", "lab_old.py": "scratch\n"}
+        curr = {"lab.py": "new lab\n"}
+
+        assert match_renamed_files(prev, curr) == {}
+
+    def test_detects_genuine_rename(self):
+        """A file that disappears and reappears renamed is still matched"""
+        prev = {"lab.py": "code\n"}
+        curr = {"lab_final.py": "code\n"}
+
+        assert match_renamed_files(prev, curr) == {"lab_final.py": "lab.py"}
+
+    def test_rename_alongside_unchanged_file(self):
+        """Only the renamed file is matched when another name is kept"""
+        prev = {"lab.py": "code\n", "test.py": "tests\n"}
+        curr = {"lab_final.py": "code\n", "test.py": "tests\n"}
+
+        assert match_renamed_files(prev, curr) == {"lab_final.py": "lab.py"}
+
+    def test_ignores_pairs_with_different_extensions(self):
+        """Students rarely change the extension when renaming"""
+        prev = {"lab.py": "code\n"}
+        curr = {"lab.txt": "code\n"}
+
+        assert match_renamed_files(prev, curr) == {}
+@
+
+
+\section{Formatting rubrics}\label{FormattingRubrics}
 
 For assignments that use rubrics, we want to format those rubrics so that we 
 can read the results instead of just the cumulated grade.
@@ -2916,7 +3377,7 @@ def format_rubric(submission, json_format=False):
     if not json_format:
       result += "\n"
 
-  return result.strip()
+  <<return [[result]] in the requested format>>
 @
 
 Sometimes Canvas is missing some data.
@@ -2956,6 +3417,28 @@ else:
     result += textwrap.indent(textwrap.fill(f"- Comment: {comments}"),
                               "  ")
     result += "\n"
+@
+
+The two accumulators have different types, so they cannot share a return
+statement.
+Only the Markdown string carries formatting artefacts worth removing: we append
+a blank line after every criterion, so without trimming the output would end in
+stray newlines.
+A dictionary has no such artefacts---its keys and values are already exactly
+what the caller asked for---so we hand it back untouched.
+
+Returning [[result.strip()]] unconditionally, as this function used to, is
+worse than redundant in JSON mode: dictionaries have no [[strip]] method, so
+the JSON branch raised an [[AttributeError]] instead of returning the
+assessment it had just built.
+The caller swallows that exception, which is why the defect surfaced as missing
+rubric data rather than as a crash (\cref{RubricData}).
+
+<<return [[result]] in the requested format>>=
+if json_format:
+  return result
+
+return result.strip()
 @
 
 We can get the rating of a rubric from the rubric assessment.
@@ -3005,6 +3488,94 @@ def get_rating(rating_id, criterion):
   return None
 @
 
+\subsection{Verifying rubric output in both formats}
+
+Let's verify that a rubric-graded submission survives both output formats.
+The first test pins down [[format_rubric]] on its own; the second follows the
+same assessment through [[format_submission]] to confirm that it really reaches
+the JSON document, which is where it went missing before; the third checks that
+the Markdown rendering is unaffected.
+
+<<test functions>>=
+class TestRubricOutput:
+    """Test rubric rendering in JSON and Markdown output"""
+
+    RUBRIC = [{
+        "id": "_7957",
+        "points": 1.0,
+        "description": "Correctness",
+        "ratings": [
+            {"id": "_6397", "points": 1.0, "description": "OK"},
+            {"id": "_7836", "points": 0.0, "description": "Remark"},
+        ],
+    }]
+
+    ASSESSMENT = {
+        "_7957": {"rating_id": "_6397", "points": 1.0,
+                  "comments": "Well done"},
+    }
+
+    EXPECTED = {
+        "Correctness": {"rating": "OK", "points": 1.0,
+                        "comments": "Well done"},
+    }
+
+    def make_submission(self):
+        """Build a stub submission graded with a one-criterion rubric"""
+        student = Mock(spec=["id", "name", "login_id"])
+        student.id = 23
+        student.name = "Alice Anderson"
+        student.login_id = "alice"
+
+        course = Mock(spec=["course_code", "get_user"])
+        course.course_code = "DD1234"
+        course.get_user.return_value = student
+
+        assignment = Mock(spec=["course", "name", "rubric"])
+        assignment.course = course
+        assignment.name = "Lab 1"
+        assignment.rubric = self.RUBRIC
+
+        submission = Mock(spec=[
+            "assignment", "user_id", "id", "submitted_at", "graded_at",
+            "grade", "grader_id", "preview_url", "rubric_assessment",
+            "submission_comments", "body", "attachments"])
+        submission.assignment = assignment
+        submission.user_id = 23
+        submission.id = 4711
+        submission.submitted_at = "2023-12-15T10:30:00Z"
+        submission.graded_at = "2023-12-15T14:00:00Z"
+        submission.grade = "P"
+        submission.grader_id = -1
+        submission.preview_url = ("https://canvas.kth.se/courses/26930"
+                                  "/assignments/173825/submissions/108849"
+                                  "?preview=1")
+        submission.rubric_assessment = self.ASSESSMENT
+        submission.submission_comments = []
+        submission.body = None
+        submission.attachments = []
+        return submission
+
+    def test_json_rubric_is_a_dictionary(self):
+        """format_rubric should hand back the assessment dict unchanged"""
+        assert format_rubric(self.make_submission(),
+                             json_format=True) == self.EXPECTED
+
+    def test_json_submission_keeps_rubric_assessment(self):
+        """JSON output should contain the rubric assessment section"""
+        result = format_submission(self.make_submission(), json_format=True)
+
+        assert result["rubric_assessment"] == self.EXPECTED
+
+    def test_markdown_submission_still_renders_rubric(self):
+        """Markdown output should be unchanged by the JSON fix"""
+        result = format_submission(self.make_submission())
+
+        assert "# Rubric assessment" in result
+        assert "- Correctness: OK (1.0)" in result
+        assert "- Comment: Well done" in result
+@
+
 
 \section{The [[submissions grade]] subcommand}
 
@@ -3032,16 +3603,16 @@ We introduce two options:
 This can be almost anything: Canvas accepts points, percentages or letter 
 grades and will convert accordingly.
 \item [[-m]] or [[--message]], which sets a comment.
-\item [[-v]] or [[--verbose]], which will cause [[canvaslms]] to print what 
-grade is set for which assignment and which student.
 \end{itemize}
-Both [[-g]] and [[-m]] are optional.
+Both are optional.
 If neither is given, the SpeedGrader page of each submission is opened in the 
 web browser.
-In that case, [[-v]] make not much sense.
 The grading options are added via the [[add_grading_options]] function,
 which is shared between [[submissions grade]] and the standalone [[grade]]
 alias command.
+
+Progress reporting is deliberately \emph{not} among these options: it belongs
+to the global [[-v]]/[[--verbose]] flag, for the reason we return to below.
 
 When we process the options, we will set up a dictionary that will be passed to 
 the Canvas API.
@@ -3060,18 +3631,51 @@ or message options were given, or open the submission in SpeedGrader.
 <<grade the submissions>>=
 if not args.grade and not args.message:
   for submission in submission_list:
-    webbrowser.open(speedgrader(submission))
+    <<open [[submission]] in SpeedGrader>>
 else:
   for submission in submission_list:
     <<if verbose, print [[submission]] and [[results]] to stdout>>
     <<grade submission with error handling>>
 @
 
+Opening SpeedGrader means honouring [[speedgrader]]'s contract that there might
+be no URL to open (\cref{MissingPreviewURL}).
+Passing [[None]] to [[webbrowser.open]] does not fail politely: it raises
+[[TypeError]] from deep inside the standard library while substituting the URL
+into a browser command line.
+That would abort the whole loop, so one submission Canvas gave no preview URL
+for would keep every later submission from opening---the opposite of what a
+grader running this over a batch wants.
+We therefore skip such submissions with a warning, naming the submission so the
+grader can open it manually, and carry on with the rest.
+<<open [[submission]] in SpeedGrader>>=
+speedgrader_url = speedgrader(submission)
+if speedgrader_url:
+  webbrowser.open(speedgrader_url)
+else:
+  canvaslms.cli.warn(f"No SpeedGrader URL for "
+                     f"{submission.assignment.name} "
+                     f"for {submission.user}, skipping.")
+@
+
 \subsection{Verbose output when setting grades}
 
-We log grading operations at INFO level, which is visible with the [[-v]]
-flag. This provides detailed feedback about what's happening during grading
+We log grading operations at [[INFO]] level, which is visible with the global
+[[-v]] flag.
+This provides detailed feedback about what's happening during grading
 operations without cluttering normal output.
+
+It was a local flag once.
+Back when this code wrote to stdout directly, [[add_grading_options]] declared
+a [[-v]]/[[--verbose]] of its own and the printing was wrapped in
+[[if args.verbose]].
+Moving the output to [[logging]] handed that decision to the global flag, but
+the local one stayed behind---and with it the collision described in
+\cref{sec:global-options-are-global}.
+Its [[False]] default overwrote the count that [[-v]] had just produced, so
+the level never rose above [[WARNING]] and [[canvaslms -vv grade ...]] said
+nothing at all.
+Dropping the local flag is what lets these messages out.
 <<if verbose, print [[submission]] and [[results]] to stdout>>=
 logger.info(f"Grading {submission.assignment.course.course_code} "
              f"{submission.assignment.name} for {submission.user.name}")

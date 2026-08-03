@@ -77,12 +77,15 @@ the helpers they verify.
 
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
+import requests
 from unittest.mock import MagicMock, Mock, patch
 
-from canvasapi.assignment import Assignment
+from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.course import Course
+from canvasapi.util import combine_kwargs
 
 from canvaslms.cli.assignments import *
+from canvaslms.cli.utils import parse_date
 
 <<test functions>>
 @
@@ -476,6 +479,7 @@ The [[view]] subcommand provides detailed information about assignments in
 a human-readable format with rich formatting when displayed in a terminal.
 
 \subsection{The [[--html]] option}
+\label{sec:html-option}
 
 By default, [[view]] converts assignment descriptions from HTML to Markdown for
 easier reading and editing. However, some assignments contain elements that
@@ -491,6 +495,32 @@ When [[--html]] is specified:
 
 This enables a round-trip workflow where HTML assignments can be viewed, edited,
 and pushed back without losing any formatting.
+
+Two parsers must offer this option, not one: the [[assignment]] alias of
+\cref{sec:assignment-alias} dispatches to the very same command function, which
+reads [[args.html]] whichever parser produced [[args]].  Writing the
+[[add_argument]] call literally at both sites would let the two declarations
+drift apart, and \cref{sec:assignment-alias} shows that such drift crashes the
+command rather than merely giving it fewer options.  We therefore register the
+option through a helper, following the [[add_XXX_option]] convention already
+used for [[add_assignment_option]] and [[add_file_option]].  A helper function
+suits this better than a shared code chunk: the two parsers are built in
+different functions and their parser variables have different names, so no
+single chunk of [[add_argument]] text could serve both, whereas a function takes
+the parser as a parameter.
+<<functions>>=
+def add_html_option(parser):
+  """Adds the --html output option to argparse parser"""
+  parser.add_argument("--html",
+    action="store_true",
+    help="Output raw HTML instead of converting to Markdown")
+@
+
+Note that [[assignments edit]] also has a [[--html]] flag, but it is a different
+option that happens to share a name: there it describes the format of the
+\emph{incoming} content rather than the outgoing, so it keeps its own
+declaration with its own help text.
+
 <<add assignments view subcommand>>=
 # Add view subcommand (was the old "assignment" command)
 view_parser = assignments_subp.add_parser("view",
@@ -501,9 +531,7 @@ view_parser = assignments_subp.add_parser("view",
       "Use --html to preserve HTML instead of converting to Markdown.")
 view_parser.set_defaults(func=assignments_view_command)
 add_assignment_option(view_parser)
-view_parser.add_argument("--html",
-    action="store_true",
-    help="Output raw HTML instead of converting to Markdown")
+add_html_option(view_parser)
 @
 
 The [[set-dates]] subcommand allows modification of assignment timing with 
@@ -561,6 +589,7 @@ edit_parser.add_argument("--html",
 
 
 \section{The [[assignment]] command (convenience alias)}
+\label{sec:assignment-alias}
 
 We provide an [[assignment]] (singular) command that serves as a direct alias
 for [[assignments view]].
@@ -580,12 +609,72 @@ This serves two important purposes:
 The command reuses all the same options and functionality as [[assignments view]],
 simply providing a shorter, more natural command name when working with
 individual assignments.
+
+\subsection{An alias must declare every option its command function reads}
+
+Sharing the command function is what makes the alias faithful, but it is also
+what makes an incomplete option list fatal.  Argparse creates an attribute in
+the resulting [[Namespace]] only for the options that \emph{this} parser
+declares; [[assignments_view_command]], however, was written against the
+[[view]] parser and reads [[args.html]] unconditionally to choose between HTML
+and Markdown output.  An alias that registers the function without the option
+therefore does not simply offer fewer options---it raises [[AttributeError]] on
+every successful lookup.  Since [[main()]] only catches [[EmptyListError]] and
+[[MultipleMatchesError]], the user sees a raw traceback, and precisely the old
+scripts the alias exists to protect are the ones that break.
+
+Calling [[add_html_option]] from \cref{sec:html-option} here, rather than
+repeating its [[add_argument]] call, is what keeps the two parsers identical by
+construction: a future option added to [[assignments view]] becomes one more
+helper call to mirror, and the helper is the single place where its flag name,
+default and help text are decided.
 <<add assignment command to subp>>=
 assignment_parser = subp.add_parser("assignment",
   help="View assignment details (alias for 'assignments view')",
   description="Views detailed information about assignments")
 assignment_parser.set_defaults(func=assignments_view_command)
 add_assignment_option(assignment_parser)
+add_html_option(assignment_parser)
+@
+
+\subsection{Verifying that the alias accepts the same options}
+
+The regression is invisible to a parser-level smoke test that only checks that
+[[canvaslms assignment]] exists, so we assert the property that actually
+matters: parsing the same arguments through the alias and through
+[[assignments view]] must yield namespaces with the same attributes, apart from
+the [[assignments_subcommand]] field that only the nested form records.  That
+formulation catches any future option that is added to one parser and forgotten
+on the other, not just [[--html]].
+
+<<test functions>>=
+class TestAssignmentAlias:
+    """Test that 'assignment' is a faithful alias for 'assignments view'."""
+
+    def parse(self, argv):
+        """Parse argv with the real assignments parsers."""
+        parser = argparse.ArgumentParser()
+        subp = parser.add_subparsers()
+        add_command(subp)
+        return parser.parse_args(argv)
+
+    def test_alias_defines_html_option(self):
+        """The alias must provide the args.html the command function reads."""
+        assert self.parse(["assignment", "-a", "Lab 1"]).html is False
+        assert self.parse(["assignment", "--html", "-a", "Lab 1"]).html is True
+
+    def test_alias_dispatches_to_view_command(self):
+        """The alias must run the command function 'assignments view' runs."""
+        assert self.parse(["assignment"]).func is assignments_view_command
+
+    def test_alias_options_match_view_options(self):
+        """Both spellings must produce namespaces with the same attributes."""
+        alias_args = self.parse(["assignment", "-a", "Lab 1"])
+        view_args = self.parse(["assignments", "view", "-a", "Lab 1"])
+
+        assert vars(alias_args).keys() == (
+            vars(view_args).keys() - {"assignments_subcommand"}
+        )
 @
 
 Now, the [[assignments_list_command]] function implements the core logic for
@@ -670,21 +759,91 @@ groups, we return assignments from either group.
 But if we also specify [[-a "Lab"]], we only return Lab assignments from those
 groups.
 
-The key difference from [[filter_assignments_by_group]] is that this function
-takes a list of groups and builds a set of group IDs for efficient membership
-testing.
+The key difference from [[filter_assignments_by_group]] is that the singular
+version receives one group object, whereas this one receives a whole sequence
+of them---and that sequence must be traversed with care.
+The name says \emph{list}, but [[filter_assignment_groups]] is a generator
+function, so the caller above hands us a generator.
+A generator can only be traversed once: whichever loop reads it first consumes
+it, and every later loop sees an empty sequence.
+An implementation that first collected the group identifiers for the membership
+test and then rescanned the groups to find the matching object would therefore
+work when handed a list and fail silently when handed a generator---the
+membership test would be exhausted before the lookup ever ran, so
+[[assignment.assignment_group]] would never be attached.
+
+The failure is silent because the right assignments are still yielded; only the
+attached group object goes missing.
+The damage shows up one level up, in [[assignments_list_command]], whose
+[[hasattr]] check then falls through to an extra [[get_assignment_group]] API
+call per assignment---and prints the placeholder [[Group 12345]] instead of the
+group's name whenever that call fails.
+
+We avoid the trap by traversing the groups exactly once, into a dictionary
+keyed by group identifier.
+A single traversal is what makes the function correct for generators as well as
+lists, and the dictionary answers both questions we have about an assignment's
+group---is it among the filtered ones, and which object is it---in one constant
+time lookup, instead of the linear rescan per assignment that a plain set of
+identifiers would force.
 <<functions>>=
 def filter_assignments_by_group_list(assignment_groups, assignments):
   """Returns elements in assignments that belong to any of the assignment_groups"""
-  group_ids = {group.id for group in assignment_groups}
+  groups_by_id = {group.id: group for group in assignment_groups}
 
   for assignment in assignments:
-    if assignment.assignment_group_id in group_ids:
-      for group in assignment_groups:
-        if assignment.assignment_group_id == group.id:
-          assignment.assignment_group = group
-          break
+    group = groups_by_id.get(assignment.assignment_group_id)
+    if group is not None:
+      assignment.assignment_group = group
       yield assignment
+@
+
+\subsection{Verifying group attachment for generator input}
+
+The regression we must guard against is exactly the one described above, so the
+test feeds the function a generator rather than a list---a list would pass even
+with the exhausted-generator bug---and asserts that the matching group object
+was attached, not merely that the assignment survived the filter.
+
+<<test functions>>=
+class TestFilterAssignmentsByGroupList:
+    """Test filtering assignments by a sequence of assignment groups."""
+
+    def make_group(self, group_id, name):
+        """Create a real Canvas assignment group instance."""
+        return AssignmentGroup(MagicMock(), {"id": group_id, "name": name})
+
+    def make_assignment(self, assignment_id, name, group_id):
+        """Create a real Canvas assignment instance belonging to a group."""
+        return Assignment(MagicMock(), {
+            "id": assignment_id,
+            "name": name,
+            "assignment_group_id": group_id,
+        })
+
+    def test_attaches_group_when_given_a_generator(self):
+        """A one-shot generator of groups must still attach the group object."""
+        graded = self.make_group(1, "Graded")
+        homework = self.make_group(2, "Homework")
+        in_group = self.make_assignment(10, "Lab 1", 1)
+        out_of_group = self.make_assignment(11, "Lab 2", 3)
+
+        groups = (group for group in [graded, homework])
+        result = list(filter_assignments_by_group_list(
+            groups, [in_group, out_of_group]))
+
+        assert result == [in_group]
+        assert result[0].assignment_group is graded
+
+    def test_attaches_group_when_given_a_list(self):
+        """Lists behave like generators, so both call styles stay supported."""
+        homework = self.make_group(2, "Homework")
+        assignment = self.make_assignment(10, "Lab 1", 2)
+
+        result = list(filter_assignments_by_group_list(
+            [homework], [assignment]))
+
+        assert result[0].assignment_group is homework
 @
 
 
@@ -964,30 +1123,20 @@ the shared [[submissions.is_ungraded()]] predicate.
 We still attach [[assignment.course]] and [[assignment.assignment_group]]
 before filtering so cached assignment objects expose the same attributes
 regardless of which listing path fetched them.
+Exactly which of the two we can attach depends on the container at hand, so
+we defer that question, and its answer, to the two chunks that follow.
 <<functions>>=
 def list_assignments(assignments_containers, ungraded=False):
   """Lists all assignments in all assignments containers (courses or
   assignement groups)"""
   for container in assignments_containers:
-    if isinstance(container, canvasapi.course.Course):
-      course = container
-    elif isinstance(container, canvasapi.assignment.AssignmentGroup):
-      assignment_group = container
-      course = assignment_group.course
+    <<identify the [[container]]'s course and group>>
 
     assignments = container.get_assignments()
 
     for assignment in assignments:
       assignment = canvaslms.cli.utils.ensure_assignment_attrs(assignment)
-      try:
-        assignment.course = course
-      except NameError:
-        pass
-
-      try:
-        assignment.assignment_group = assignment_group
-      except NameError:
-        pass
+      <<attach container context to assignment>>
 
       if ungraded and not has_ungraded_submissions(assignment):
         continue
@@ -996,6 +1145,92 @@ def list_assignments(assignments_containers, ungraded=False):
 
 def list_ungraded_assignments(assignments_containers):
   return list_assignments(assignments_containers, ungraded=True)
+@
+
+\subsection{Attaching container context, one container at a time}
+
+The two containers carry different amounts of context.
+A course tells us only which course an assignment belongs to.
+An assignment group tells us both the group and, through the [[course]]
+attribute that [[filter_assignment_groups]] attaches to it, the course as
+well.
+So the context to attach is a property of the \emph{current} container, and
+the listing must attach whatever this container determines---and nothing
+else.
+
+The natural way to say \enquote{nothing else} in Python would seem to be to
+leave the name unassigned and catch the resulting error, and that is what an
+earlier version of this function did:
+\begin{minted}{python}
+try:
+  assignment.assignment_group = assignment_group
+except NameError:
+  pass
+\end{minted}
+This is the wrong tool, because [[NameError]] answers a different question
+than the one we are asking.
+It reports whether the name is bound anywhere in the function's scope, not
+whether \emph{this} iteration bound it---and a local variable outlives the
+loop iteration that created it.
+So the guard holds only until the first assignment group appears in
+[[assignments_containers]].
+From that container onward [[assignment_group]] stays bound, the
+[[except NameError]] branch becomes unreachable, and every subsequent plain
+course has its assignments stamped with the previous [[container]]'s group.
+
+We therefore make the per-iteration question explicit.
+Clearing both names at the top of each iteration turns \enquote{not
+determined by this container} into an ordinary value we can test, so a
+container that determines no group leaves [[assignment_group]] as [[None]]
+no matter what earlier containers did.
+<<identify the [[container]]'s course and group>>=
+course = assignment_group = None
+
+if isinstance(container, canvasapi.course.Course):
+  course = container
+elif isinstance(container, canvasapi.assignment.AssignmentGroup):
+  assignment_group = container
+  course = assignment_group.course
+@
+
+Attaching is then a pair of ordinary conditionals.
+Note that we skip the attribute rather than assigning [[None]] to it: the
+assignment objects are cached and shared, so an earlier listing path may
+already have attached a correct group, and overwriting it with [[None]]
+would lose information that no later path can recover.
+<<attach container context to assignment>>=
+if course is not None:
+  assignment.course = course
+
+if assignment_group is not None:
+  assignment.assignment_group = assignment_group
+@
+
+Let's verify that context no longer leaks across containers.
+The mixed list below is the smallest case that exercises the bug: the
+assignment group comes first and binds [[assignment_group]], and the plain
+course that follows must still yield assignments with no group attached.
+
+<<test functions>>=
+def test_container_context_does_not_leak_across_containers():
+    """Each container attaches only the context it determines itself."""
+    group_course = Course(MagicMock(), {"id": 11, "name": "Group course"})
+    group = AssignmentGroup(MagicMock(), {"id": 5, "name": "Graded"})
+    group.course = group_course
+    plain_course = Course(MagicMock(), {"id": 12, "name": "Plain course"})
+
+    grouped = Assignment(MagicMock(), {"id": 1, "name": "Lab 1"})
+    ungrouped = Assignment(MagicMock(), {"id": 2, "name": "Lab 2"})
+    group.get_assignments = Mock(return_value=[grouped])
+    plain_course.get_assignments = Mock(return_value=[ungrouped])
+
+    result = list(list_assignments([group, plain_course]))
+
+    assert result == [grouped, ungrouped]
+    assert grouped.assignment_group is group
+    assert grouped.course is group_course
+    assert ungrouped.course is plain_course
+    assert not hasattr(ungrouped, "assignment_group")
 @
 
 We determine whether an assignment is ungraded by looking at its submissions,
@@ -1154,9 +1389,6 @@ date_group.add_argument("--unlock-at",
 date_group.add_argument("--lock-at",
   help="Set the lock date (when assignment is no longer available). "
     "Use 'none' or 'clear' to remove the lock date.")
-set_dates_parser.add_argument("-v", "--verbose",
-  action="store_true", default=False,
-  help="Print information about what is being updated")
 @
 
 \subsection{Processing date arguments}
@@ -1184,12 +1416,17 @@ if not assignment_data:
 updates = {"assignment": assignment_data}
 @
 
-For each date argument, we check if it was provided, and if so, either parse it 
-as a date or set it to None if the user wants to clear it. We use the 
-[[parse_date]] function from the utils module for flexible date parsing.
+For each date argument we first check whether the user passed it at all; only
+then does the field enter [[assignment_data]]. That guard is what keeps an
+omitted option from disturbing a date nobody mentioned: the update we send
+contains exactly the fields named on the command line, and Canvas leaves every
+other field alone.
 
-The date parsing logic handles multiple common date formats and converts them 
-to Canvas-compatible UTC timestamps.
+Each named field is then converted by [[parse_date]], which accepts the
+many human-readable formats the rest of the tool accepts and, in addition,
+understands a request to clear the date. That second job turns out to be
+subtler than it looks, so it gets its own discussion in
+\cref{clearing-a-date}.
 <<parse due date argument>>=
 if args.due_at is not None:
   try:
@@ -1213,18 +1450,67 @@ if args.lock_at is not None:
     return
 @
 
+\subsection{Clearing a date}%
+\label{clearing-a-date}
+
+A user clears a date by passing [[none]] or [[clear]] as its value.
+[[parse_date]] translates that request into the empty string---the
+Canvas wire encoding of \enquote{no date}---rather than [[None]],
+precisely so that this command can hand the result to the API
+unchanged.
+The distinction matters because [[requests]] drops form fields whose
+value is [[None]] before the request is sent: a [[None]] date would
+make the field vanish from the [[PUT]] entirely, Canvas would receive
+nothing to change, and the command would report success while leaving
+the date untouched---which is exactly the silent failure this command
+used to exhibit.
+The empty string instead survives encoding as
+[[assignment%5Bdue_at%5D=]], which Canvas reads as an instruction to
+clear the date.
+The full reasoning lives with [[parse_date]] in the utilities chapter;
+here it is enough that whatever [[parse_date]] returns is safe to send.
+
+Let us verify that the translated value really does survive encoding
+into a request body.
+This is the test that would have caught the original bug: it drives the
+exact pipeline, [[combine_kwargs]] followed by the [[requests]]
+encoder, that used to swallow the field.
+<<test functions>>=
+class TestClearedDateEncoding:
+    """Test that a cleared date survives into the request body."""
+
+    def test_cleared_date_survives_form_encoding(self):
+        """A cleared field must still be present in the request body."""
+        updates = {"assignment": {"due_at": parse_date("none")}}
+        request = requests.Request(
+            "PUT", "https://example.com/api/v1/courses/1/assignments/2",
+            data=combine_kwargs(**updates))
+
+        assert "assignment%5Bdue_at%5D=" in request.prepare().body
+@
+
+
 \subsection{Updating assignment dates}
 
-Finally, we iterate through the selected assignments and update their dates 
-using the Canvas API.
+Finally, we iterate through the selected assignments and update their dates
+using the Canvas API.  When we report what we are about to do, we recognise a
+clearing request by the empty string that \cref{clearing-a-date} introduced;
+any other value is a timestamp we are setting.
+
+Each step is reported at [[INFO]] level, so the global [[-v]] flag turns the
+running commentary on.
+This subcommand once declared a [[-v]]/[[--verbose]] of its own alongside the
+date options above, which no code ever read; all it accomplished was to
+overwrite the global count with its own [[False]] default and thereby suppress
+the very messages it was named after (\cref{sec:global-options-are-global}).
 <<update assignment dates>>=
 for assignment in assignment_list:
   logger.info(f"Updating assignment '{assignment.name}' (ID: {assignment.id})")
   for field, value in assignment_data.items():
-    if value is None:
-      logger.info(f"  Clearing {field}")
-    else:
+    if value:
       logger.info(f"  Setting {field} to {value}")
+    else:
+      logger.info(f"  Clearing {field}")
 
   try:
     assignment.edit(**updates)
