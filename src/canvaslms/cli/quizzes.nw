@@ -2511,6 +2511,11 @@ For creating a quiz without questions (add questions later with
   "allowed_attempts": 2
 }
 \end{verbatim}
+The [[time_limit]] is in seconds here, the unit New Quizzes themselves use:
+[[3600]] is a one-hour quiz.  Reusing Canvas's unit is what lets a file
+written by [[quizzes export]] be fed back---to [[quizzes create]] or to
+[[quizzes edit -f]]---without anyone rescaling it
+(\cref{sec:quiz-file-formats}).
 
 \paragraph{Full format with questions.}
 For creating a complete quiz including questions (the format produced by
@@ -2819,10 +2824,25 @@ different field names and units:
 \begin{description}
 \item[Instructions] New Quizzes use [[instructions]], Classic Quizzes use
   [[description]].
-\item[Time limit] New Quizzes use seconds, Classic Quizzes use minutes.
-  We normalize to \emph{minutes} in the YAML (more human-friendly) and convert
-  when calling the API.
+\item[Time limit] New Quizzes count seconds, Classic Quizzes count minutes.
 \end{description}
+
+The time limit forces every representation we generate to pick a unit, and our
+two representations pick differently.  The front matter we hand to the editor
+is written for a human who thinks in minutes, so a New Quiz value is divided
+on the way in and multiplied back on the way out.  The JSON (and equivalent
+YAML) representation is the interchange format shared with [[quizzes export]]
+and [[quizzes create]]; there the value keeps Canvas's own unit, so that
+exporting a quiz and feeding the untouched file straight back is a no-op.
+
+Keeping the two conventions apart matters more than which one we picked.  A
+conversion attached to the API call rather than to the representation cannot
+tell the representations apart, so it multiplies values that were never
+divided: a 30-minute quiz exported as [[1800]] would come back as [[108000]]
+seconds---30 hours---and each further round trip would multiply again.  We
+therefore convert where the front matter is built and consumed
+(\cref{sec:front-matter-time-limit}) and let the shared API-parameter
+conversion pass the value through untouched.
 
 
 \subsection{Quiz schema for editing}
@@ -3091,6 +3111,13 @@ the file extension and verified against the content:
   instructions.  This is the default interactive editing format, focused on
   editing settings and instructions without touching questions.
 \end{description}
+
+The formats agree on field names but not on the unit of [[time_limit]] for a
+New Quiz: the front matter states it in minutes, JSON and YAML state it in
+seconds.  The split follows from what each format is for.  Front matter is
+typed by hand, so it uses the unit instructors think in; JSON and YAML are
+what [[quizzes export]] wrote, so they must repeat what Canvas reported or the
+export/edit round trip would not be idempotent.
 
 The format is detected by file extension and verified by checking the first
 characters of the file:
@@ -3523,14 +3550,26 @@ def test_quiz_body_from_settings_reads_either_key():
   assert quizzes.quiz_body_from_settings({'description': body}) == body
   assert quizzes.quiz_body_from_settings({'instructions': body}) == body
   assert quizzes.quiz_body_from_settings({'title': 'Exam'}) == ''
+@
+
+The formats also disagree about the unit of [[time_limit]], and the
+disagreement resolves per quiz rather than per file: a front-matter time limit
+needs converting only when the quiz it targets is a New Quiz.  We therefore
+convert inside the loop, where the quiz type is known, and leave the JSON and
+YAML settings alone because they already carry Canvas's units
+(\cref{sec:front-matter-time-limit}).
+
 <<apply settings from file>>=
 body = quiz_data.get('instructions') or ''
 
 for quiz in quiz_list:
   if quiz_data['format'] in ('json', 'yaml'):
     body = quiz_body_from_settings(settings)
+    api_settings = settings
+  else:
+    api_settings = convert_front_matter_units(settings, is_new_quiz(quiz))
 
-  success = apply_quiz_edit(quiz, settings, body, requester, args.html)
+  success = apply_quiz_edit(quiz, api_settings, body, requester, args.html)
   if success:
     print(f"Updated quiz: {quiz.title}")
     <<update quiz module membership from file>>
@@ -3588,6 +3627,12 @@ The interactive editing workflow mirrors [[assignments edit]]. We use
 that the instructions are extracted from attributes, converted to Markdown
 (unless HTML mode), and placed as the body after the YAML front matter.
 
+Whatever the user types comes back in front-matter units, so the attributes
+make one last stop at [[convert_front_matter_units]]
+(\cref{sec:front-matter-time-limit}) before we apply them.  We keep the
+unconverted [[final_attrs]] for the module update below, which is interested
+in [[modules]] rather than in time.
+
 <<functions>>=
 def edit_quiz_interactive(quiz, requester, html_mode=False):
   """Edit a single quiz interactively
@@ -3636,7 +3681,8 @@ def edit_quiz_interactive(quiz, requester, html_mode=False):
   final_attrs, final_body = result
 
   # Apply the changes
-  success = apply_quiz_edit(quiz, final_attrs, final_body, requester, html_mode)
+  api_attrs = convert_front_matter_units(final_attrs, is_new_quiz(quiz))
+  success = apply_quiz_edit(quiz, api_attrs, final_body, requester, html_mode)
   if success:
     <<update quiz module membership interactively>>
   return 'updated' if success else 'error'
@@ -4165,6 +4211,12 @@ body content, not a YAML attribute).
 For New Quizzes, we also extract [[quiz_settings]] which contains the
 important [[multiple_attempts]] and [[result_view_settings]] structures.
 
+This function is where the front-matter unit convention starts: a New Quiz
+time limit arrives from Canvas in seconds and leaves here in minutes.  A zero
+or missing limit becomes [[None]], because Canvas expresses \enquote{no time
+limit} both ways and the editor should show the absence rather than a
+misleading [[0]].
+
 <<functions>>=
 def extract_quiz_attributes(quiz, requester=None):
   """Extract editable attributes from a quiz object
@@ -4183,12 +4235,8 @@ def extract_quiz_attributes(quiz, requester=None):
     canvas_attr = spec.get('canvas_attr', key)
     value = getattr(quiz, canvas_attr, spec.get('default'))
 
-    # Normalize time_limit to minutes
-    if key == 'time_limit' and value is not None:
-      if is_new_quiz(quiz):
-        # New Quizzes store time in seconds
-        value = value // 60 if value else None
-      # Classic Quizzes already use minutes
+    if key == 'time_limit' and is_new_quiz(quiz):
+      value = value // SECONDS_PER_MINUTE if value else None
 
     if value is not None:
       attrs[key] = value
@@ -4205,6 +4253,8 @@ def extract_quiz_attributes(quiz, requester=None):
     attrs['instructions'] = getattr(quiz, 'description', '') or ''
 
   return attrs
+<<constants>>=
+SECONDS_PER_MINUTE = 60
 @
 
 \paragraph{Fetching New Quiz settings.}
@@ -4238,15 +4288,90 @@ def fetch_new_quiz_settings(quiz, requester):
 @
 
 
+\subsection{Restoring the time limit unit}
+\label{sec:front-matter-time-limit}
+
+Everything downstream of the editor---the confirm-and-edit loop,
+[[apply_quiz_edit]], the Canvas API---speaks seconds again, so the division
+[[extract_quiz_attributes]] performed has to be undone before the attributes
+leave the front-matter world.  The same undoing applies to a hand-written
+[[.md]] file, which uses that same representation.
+
+We undo it in a function of its own rather than inside [[apply_quiz_edit]]
+because [[apply_quiz_edit]] is shared with the JSON paths, whose attributes
+were never divided.  Provenance is the property that decides whether to
+multiply, and a sink that receives dictionaries from three callers cannot
+observe it; a function called once per front-matter ingress makes it visible
+in the caller list.
+
+The conversion is a no-op for Classic Quizzes, whose front matter and API
+agree on minutes, and for a missing or unlimited time limit.  In those cases
+we hand back the very dictionary we were given; otherwise we copy it, so that
+a caller which keeps using its own attributes---as the interactive path does
+for [[modules]]---never finds them silently rewritten.
+
+<<functions>>=
+def convert_front_matter_units(attributes, is_new):
+  """Return quiz attributes with time_limit in the units Canvas expects
+
+  The YAML front matter states a New Quiz time limit in minutes, whereas
+  the New Quizzes API states it in seconds.  Classic Quizzes use minutes
+  on both sides, so their attributes are returned unchanged.
+
+  Args:
+    attributes: Dictionary of attributes from YAML front matter
+    is_new: True if this is a New Quiz
+
+  Returns:
+    The original dictionary, or a copy with time_limit converted
+  """
+  if not is_new or not attributes.get('time_limit'):
+    return attributes
+
+  converted = dict(attributes)
+  converted['time_limit'] = attributes['time_limit'] * SECONDS_PER_MINUTE
+  return converted
+@
+
+Let's verify that a New Quiz limit is scaled, that a Classic one is not, and
+that the caller's dictionary survives the call untouched:
+
+<<test functions>>=
+def test_convert_front_matter_units_scales_new_quiz_minutes():
+  converted = quizzes.convert_front_matter_units({'time_limit': 30}, True)
+
+  assert converted['time_limit'] == 1800
+
+
+def test_convert_front_matter_units_keeps_classic_quiz_minutes():
+  attributes = {'time_limit': 30}
+
+  assert quizzes.convert_front_matter_units(attributes, False) is attributes
+
+
+def test_convert_front_matter_units_does_not_mutate_input():
+  attributes = {'time_limit': 30}
+
+  quizzes.convert_front_matter_units(attributes, True)
+
+  assert attributes['time_limit'] == 30
+@
+
+
 \subsection{Applying quiz edits}
 
 After editing, we need to translate the attributes back to API format and
 call the appropriate update function. The key challenges are:
 \begin{itemize}
-\item Converting [[time_limit]] from minutes to seconds for New Quizzes
 \item Using [[instructions]] vs [[description]] for the body
 \item Handling HTML conversion for Markdown input
 \end{itemize}
+
+Note what is \emph{not} on that list: unit conversion.  [[apply_quiz_edit]] is
+the common sink for all three edit paths---front matter, JSON/YAML files, and
+[[--full-json]]---and receives attributes in whichever units its caller
+produced.  Only the front-matter callers convert; here [[time_limit]] is
+already in Canvas's units and travels through unchanged.
 
 <<functions>>=
 def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
@@ -4305,6 +4430,10 @@ the Markdown body in the editor clears the description on Canvas.
 def quiz_attributes_to_api_params(attributes, is_new, html_body):
   """Convert schema attributes to Canvas API parameters
 
+  Values are passed through in the units they arrive in; time_limit must
+  already be in the units Canvas expects (seconds for New Quizzes, minutes
+  for Classic Quizzes).
+
   Args:
     attributes: Dictionary of attributes from YAML
     is_new: True if this is a New Quiz
@@ -4321,16 +4450,6 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
       continue
 
     if value is None:
-      continue
-
-    # Handle time_limit conversion
-    if key == 'time_limit':
-      if is_new:
-        # New Quizzes want seconds
-        params['time_limit'] = value * 60
-      else:
-        # Classic Quizzes want minutes
-        params['time_limit'] = value
       continue
 
     # Skip quiz_type for New Quizzes: New Quizzes are always graded assignments
@@ -4392,6 +4511,54 @@ def test_empty_body_clears_the_description():
     {'title': 'Exam', 'description': '<p>Old text.</p>'}, False, '')
 
   assert params['description'] == ''
+@
+
+The invariant worth pinning down is the one users rely on: exporting a quiz
+and feeding the file back unedited must change nothing.  We state it as the
+settings a New Quiz export produces---seconds, straight from Canvas---going
+through to the API with the same number.
+
+<<test functions>>=
+def test_exported_new_quiz_time_limit_survives_round_trip():
+  exported_settings = {'title': 'Midterm', 'time_limit': 1800}
+
+  params = quizzes.quiz_attributes_to_api_params(
+    exported_settings, True, '<p>Answer all questions.</p>')
+
+  assert params['time_limit'] == 1800
+@
+
+Classic Quizzes speak minutes on both sides of every representation, so their
+time limit is equally untouched:
+
+<<test functions>>=
+def test_classic_quiz_time_limit_stays_in_minutes():
+  params = quizzes.quiz_attributes_to_api_params({'time_limit': 30}, False, '')
+
+  assert params['time_limit'] == 30
+@
+
+The front-matter path must still reach Canvas in seconds, and it must reach it
+with the number Canvas started from.  This test walks the whole loop for a New
+Quiz: extraction into the editor buffer, conversion back, and the API
+parameters, showing the minutes the instructor sees in between:
+
+<<test functions>>=
+def test_front_matter_edit_returns_the_time_limit_canvas_gave_us():
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.title = 'Midterm'
+  quiz.time_limit = 1800
+
+  attributes = quizzes.extract_quiz_attributes(quiz)
+  assert attributes['time_limit'] == 30
+
+  params = quizzes.quiz_attributes_to_api_params(
+    quizzes.convert_front_matter_units(attributes, True), True, '')
+
+  assert params['time_limit'] == 1800
 @
 
 
