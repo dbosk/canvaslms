@@ -1,4 +1,5 @@
 \section{Disjunctive maximum, \texttt{disjunctmax}}%
+\label{disjunctmax}
 
 In this module we want to provide the disjunctive maximum way of computing 
 \emph{one grade} from \emph{several assignments}.
@@ -33,6 +34,7 @@ This gives the following outline of the module.
 
 import datetime as dt
 from canvaslms.cli import results
+from canvaslms.grades.gradealiases import normalize_grade
 from canvasapi.exceptions import ResourceDoesNotExist
 
 <<helper functions>>
@@ -53,6 +55,8 @@ the grade handling they verify.
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from canvaslms.grades.disjunctmax import *
 
 <<test functions>>
@@ -69,21 +73,31 @@ For the most recent date, we just add them to a list as we iterate through the
 submissions.
 We do the same for grades, as we iterate through we add any grade to a list.
 In the end we compute the maximums of both lists.
-Canvas can also use the label [[must fix]] for a failing attempt.
-Disjunctive grading only needs to know that the attempt has not yet passed, so
-we normalize that label to [[F]] before ranking the grades.
-A missing submission has the same effect, so the exception path also records
-[[F]].
-<<helper functions>>=
-def normalize_grade(grade):
-  """Normalize Canvas failing aliases before ranking grades."""
-  if grade is None:
-    return "F"
-  if isinstance(grade, str) and grade.casefold() == "must fix":
-    return "F"
-  return grade
-@
+The grades we rank are A--E, P and F, plus the borderline [[Fx]].
+A submission can arrive with other spellings of those same outcomes:
+\enquote{complete}, [[P+]], \enquote{incomplete}, the Canvas label
+[[must fix]], or no grade at all.
+Only the last two were ever translated here; the first three reached the
+ranking untouched and aborted the export with a bare [[KeyError]]
+(\cref{p-plus-grades}).
+Since that vocabulary is Canvas's and the courses', not this module's, we take
+it from [[gradealiases]] (\cref{gradealiases}) rather than keeping a private
+copy; a missing submission has the same effect as a failing one, so the
+exception path in [[summarize]] records [[F]] directly.
 
+The translation is a good fit here for a reason worth stating.
+A disjunctive maximum exists to pick the best of several attempts at the same
+examination, so all it needs to know about an attempt is where it ranks.
+Neither \enquote{complete} nor [[P+]] says anything more than \enquote{this
+attempt passed}, and [[P]] is how a passed attempt is spelled on the scale we
+rank---the plus has nowhere to go.
+Translating once, before any of the three consumers (the ranking, the summary
+and the missing-assignment report) sees the grade, is what keeps them from
+drifting apart.
+
+Importing the name at module level also keeps [[normalize_grade]] available as
+[[disjunctmax.normalize_grade]], where callers of this module have always
+found it.
 <<helper functions>>=
 def summarize(user, assignments_list):
   """Extracts user's submissions for assignments in assingments_list to 
@@ -145,18 +159,83 @@ def grade_max(grades):
 
   return None
 
-def grade_to_int(grade):
+def grade_to_int(grade, assignment=None):
+  """Takes a grade, returns its rank among A--E/P/F grades.
+
+  The optional assignment is only used to point at the offending
+  submission if the grade isn't one we can rank.
+  """
   grade = normalize_grade(grade)
   grade_map = {"F": -2, "Fx": -1,
                "P": 0,
                "E": 1, "D": 2, "C": 3, "B": 4, "A": 5}
-  return grade_map[grade]
+  try:
+    return grade_map[grade]
+  except KeyError:
+    <<complain about the unrankable grade>>
 
 def int_to_grade(int_grade):
   grade_map_inv = {-2: "F", -1: "Fx",
                    0: "P",
                    1: "E", 2: "D", 3: "C", 4: "B", 5: "A"}
   return grade_map_inv[int_grade]
+@
+
+The module doc promises that we fail if an assignment doesn't use an A--F or
+P/F grading scale, and this lookup is where that promise is kept---or was
+broken.
+A bare [[grade_map[grade]]] raises [[KeyError: 'P+']], which propagates out of
+[[summarize]], out of the summary module and out of [[canvaslms results]]:
+one unexpected grade on one submission aborts the whole export, and the
+traceback names neither the student nor the assignment that caused it.
+
+Now that [[normalize_grade]] handles the aliases we know about, whatever still
+reaches this branch is a genuine mismatch between the assignment's grading
+scale and this module---a numeric survey score, say.
+That deserves an error, but one the teacher can act on: it names the grade, the
+assignment it came from when the caller knows it, and the scale we expected.
+We suppress the [[KeyError]] context with [[from None]] because the dictionary
+lookup is an implementation detail, not information for the reader.
+
+Reporting the assignment is what the optional parameter buys us.
+[[missing_assignments]] keeps grades paired with their assignments and passes
+it; [[grade_max]] ranks a bare list of grades, so on that path the message
+names the grade alone.
+<<complain about the unrankable grade>>=
+where = f" for assignment {assignment}" if assignment is not None else ""
+raise ValueError(
+  f"Unknown grade {grade}{where}; disjunctive maximum can only rank "
+  f"{', '.join(grade_map)}.") from None
+@
+
+Let's verify that the aliases rank as their canonical grades, so that a
+[[P+]] attempt outranks a failed one, and that a grade we can't rank says so
+in terms the teacher can use.
+<<test functions>>=
+class TestRankingGrades:
+    """Test the ranking of grades, aliases included."""
+
+    def test_passing_aliases_rank_as_p(self):
+        """P+ and complete are passed attempts, i.e. Ps."""
+        for grade in ["P+", "complete", "Complete"]:
+            assert grade_to_int(grade) == grade_to_int("P")
+
+    def test_failing_aliases_rank_as_f(self):
+        """The failing aliases rank below every passing grade."""
+        for grade in [None, "incomplete", "must fix"]:
+            assert grade_to_int(grade) == grade_to_int("F")
+
+    def test_p_plus_outranks_a_failed_attempt(self):
+        """Disjunctive maximum should pick the P+ attempt."""
+        assert grade_max(["F", "P+"]) == "P"
+
+    def test_unrankable_grade_names_grade_and_assignment(self):
+        """An unusable grading scale should fail loudly, not silently."""
+        with pytest.raises(ValueError) as error:
+            grade_to_int("17.0", assignment="Lab 1")
+
+        assert "17.0" in str(error.value)
+        assert "Lab 1" in str(error.value)
 @
 
 
@@ -180,7 +259,6 @@ Disjunctive logic requires evaluating ALL assignments first, then deciding what
 to report.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
-                        passing_regex=None,
                         optional_assignments=None):
   """
   Returns missing assignments for disjunctive maximum grading.
@@ -209,7 +287,8 @@ def missing_assignments(assignments_list, users_list,
       grades_with_assignments.append((assignment, grade))
 
     # Check if student has at least one passing grade (P or better)
-    has_passing = any(grade_to_int(g) >= 0 for _, g in grades_with_assignments)
+    has_passing = any(grade_to_int(g, a) >= 0
+                      for a, g in grades_with_assignments)
 
     if not has_passing:
       # Report all assignments as options to complete
@@ -287,4 +366,60 @@ class TestMissingSubmission:
         assert grade == "F"
         assert grade_date is not None
         assert graders == []
+@
+
+The passing aliases have to survive the same two paths: a [[P+]] attempt is a
+passed attempt in the summary, and a student who has one is missing nothing at
+all.
+<<test functions>>=
+class TestPassingGradeAliases:
+    """Test the passing aliases P+ and complete."""
+
+    def graded(self, grade):
+        """Build an assignment whose submission carries the given grade."""
+        assignment = SimpleNamespace(name="Exam")
+        assignment.get_submission = Mock(
+            return_value=SimpleNamespace(
+                grade=grade,
+                submitted_at="2026-01-10T10:00:00Z",
+                graded_at=None,
+                submission_history=[],
+            )
+        )
+        return assignment
+
+    def test_summarize_treats_p_plus_as_p(self):
+        """A P+ attempt should summarize as a pass, not crash."""
+        user = SimpleNamespace(id=1)
+
+        grade, grade_date, graders = summarize(user, [self.graded("P+")])
+
+        assert grade == "P"
+        assert grade_date is not None
+
+    def test_summarize_treats_complete_as_p(self):
+        """Canvas pass/fail grading passes with 'complete'."""
+        user = SimpleNamespace(id=1)
+
+        grade, _, _ = summarize(user, [self.graded("complete")])
+
+        assert grade == "P"
+
+    def test_summarize_treats_incomplete_as_f(self):
+        """Canvas pass/fail grading fails with 'incomplete'."""
+        user = SimpleNamespace(id=1)
+
+        grade, _, _ = summarize(user, [self.graded("incomplete")])
+
+        assert grade == "F"
+
+    def test_p_plus_leaves_nothing_missing(self):
+        """One passing attempt is all disjunctive grading asks for."""
+        user = SimpleNamespace(id=1)
+
+        missing = list(
+            missing_assignments([self.graded("P+")], [user])
+        )
+
+        assert missing == []
 @
