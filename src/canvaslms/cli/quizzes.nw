@@ -928,8 +928,34 @@ def is_new_quiz(quiz):
 
 Both Classic Quizzes and New Quizzes return Progress objects when generating
 reports. This helper function polls a progress object until completion.
+
+The sleep and exponential backoff live \emph{between} attempts, inside this
+function.
+That placement is load-bearing: an outer retry loop that calls
+[[poll_progress]] with [[max_attempts=1]] would never reach the sleep guard
+([[attempt < max_attempts - 1]] is false when there is only one attempt), so
+all its retries would hit the API back-to-back with no pacing.
+Callers must therefore hand [[poll_progress]] their full attempt budget and
+let it drive the retries.
+
+That in turn means refreshing must also happen \emph{inside} the loop.
+Progress objects can refresh themselves---they carry a [[query]] method that
+re-fetches their state from Canvas.
+Classic Quiz report objects ([[QuizReport]]) cannot: they are static
+snapshots, so re-checking the same snapshot can never observe completion.
+For those, the caller supplies a [[refresh]] callable that returns a freshly
+fetched object; we invoke it before each check, mirroring the
+refresh-then-check pattern that [[query]] gives us for free.
+
+A refreshed [[QuizReport]] does not reliably expose a [[workflow_state]]
+either.
+What a finished report gains is its generated [[file]] attachment, so we also
+treat a non-empty [[file]] as completion.
+Returning the fresh snapshot here matters: it is the object the caller
+extracts the download URL from.
 <<functions>>=
-def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
+def poll_progress(progress_obj, max_attempts=30, sleep_interval=2,
+                  refresh=None):
   """
   Poll a progress object until it completes.
 
@@ -937,6 +963,8 @@ def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
     progress_obj: A Progress object or report object with progress attribute
     max_attempts: Maximum number of polling attempts
     sleep_interval: Seconds to wait between polls
+    refresh: Optional callable taking the current object and returning a
+      freshly fetched one, for objects that cannot refresh themselves
 
   Returns:
     The final progress/report object, or None if max attempts reached
@@ -944,6 +972,9 @@ def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
   import time
 
   for attempt in range(max_attempts):
+    if refresh is not None:
+      progress_obj = refresh(progress_obj)
+
     # Check different ways the progress might indicate completion
     is_completed = False
 
@@ -962,6 +993,9 @@ def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
     elif hasattr(progress_obj, 'workflow_state'):
       is_completed = progress_obj.workflow_state == 'completed'
 
+    if getattr(progress_obj, 'file', None):
+      is_completed = True
+
     if is_completed:
       return progress_obj
 
@@ -970,6 +1004,58 @@ def poll_progress(progress_obj, max_attempts=30, sleep_interval=2):
       sleep_interval *= 1.2 # Exponential backoff
 
   return None
+@
+
+Let's verify the pacing and refresh behaviour.
+The first test replays the Classic Quiz report scenario: a snapshot that
+completes on the third re-fetch.
+The poller must consult [[refresh]] once per attempt, sleep between
+attempts---with backoff, so consecutive sleeps grow---and return the
+completed snapshot rather than a stale one.
+
+<<test functions>>=
+def test_poll_progress_refreshes_and_sleeps_between_attempts(monkeypatch):
+  import time
+
+  sleeps = []
+  monkeypatch.setattr(time, 'sleep', lambda seconds: sleeps.append(seconds))
+
+  incomplete = MagicMock(spec=[])
+  completed = MagicMock(spec=['file'])
+  completed.file = {'url': 'https://example.com/report.csv'}
+
+  snapshots = [incomplete, incomplete, completed]
+  fetched = []
+
+  def refresh(current):
+    fetched.append(current)
+    return snapshots[len(fetched) - 1]
+
+  result = quizzes.poll_progress(MagicMock(spec=[]), max_attempts=30,
+                                 refresh=refresh)
+
+  assert result is completed
+  assert len(fetched) == 3
+  assert len(sleeps) == 2
+  assert sleeps[1] > sleeps[0]
+@
+
+The second test covers the already-finished report: a snapshot that carries
+its [[file]] attachment must be recognised as complete immediately, without
+burning any sleep time.
+
+<<test functions>>=
+def test_poll_progress_completes_on_file_without_sleeping(monkeypatch):
+  import time
+
+  sleeps = []
+  monkeypatch.setattr(time, 'sleep', lambda seconds: sleeps.append(seconds))
+
+  report = MagicMock(spec=['file'])
+  report.file = {'url': 'https://example.com/report.csv'}
+
+  assert quizzes.poll_progress(report) is report
+  assert sleeps == []
 @
 
 
@@ -2426,6 +2512,18 @@ For each quiz, we need to generate a report, poll until it's ready, download the
 CSV, and save it to a temporary file. The approach differs slightly between
 Classic Quizzes and New Quizzes, but both result in a CSV file URL that we
 download and add to our [[csv_files]] list.
+
+The two quiz types poll differently.
+New Quizzes give us a self-refreshing Progress object, so
+[[poll_progress(progress)]] suffices.
+Classic Quizzes' [[create_report]] returns a static [[QuizReport]] snapshot,
+so we pass [[poll_progress]] a [[refresh]] callback that re-fetches the
+report by id between attempts.
+In both cases we hand [[poll_progress]] the whole attempt budget in a single
+call: an earlier version looped here, calling [[poll_progress]] with
+[[max_attempts=1]] each time, which disabled the poller's pacing---the sleep
+sits between attempts inside [[poll_progress]], and a single-attempt call
+has no between---so all thirty requests fired back-to-back.
 <<download quiz report and add file to [[csv_files]]>>=
 import tempfile
 import requests
@@ -2454,13 +2552,11 @@ else:
     report = quiz.create_report(report_type='student_analysis',
                                includes_all_versions=True)
 
-    # Poll until ready
-    for attempt in range(30):
-      report = quiz.get_quiz_report(report.id)
-      final_report = poll_progress(report, max_attempts=1)
-      if final_report:
-        report = final_report
-        break
+    final_report = poll_progress(
+      report,
+      refresh=lambda current: quiz.get_quiz_report(current.id))
+    if final_report:
+      report = final_report
 
     # Extract file URL
     if hasattr(report, 'file'):
