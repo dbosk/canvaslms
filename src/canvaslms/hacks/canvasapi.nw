@@ -3782,8 +3782,10 @@ Key design decisions:
 We give the whole picture first, then fill in each method.  The wrapper holds
 the fetched submission together with everything needed to re-fetch it---the
 originating assignment, the [[include]] parameters, and the unwrapped
-[[get_submission]] method---plus the timestamp of the last refresh.  Around that
-state it layers three groups of behaviour: deciding \emph{when} a refresh is due
+[[get_submission]] method---plus the timestamp of the last refresh and a record
+of the attributes callers have attached to the submission (the
+\emph{annotations}, whose role becomes clear once we look at refreshing).
+Around that state it layers three groups of behaviour: deciding \emph{when} a refresh is due
 ([[_needs_refresh]], [[would_need_refresh]]); performing the refresh and
 filling in attributes locally ([[_refresh]], [[ensure_attrs]]); and intercepting
 attribute access so that reads and writes reach the right object
@@ -3832,6 +3834,7 @@ class LazySubmission:
     object.__setattr__(self, '_includes', includes)
     object.__setattr__(self, '_original_get_submission', original_get_submission)
     object.__setattr__(self, '_last_refresh', datetime.now())
+    object.__setattr__(self, '_annotations', {})
 
   <<LazySubmission methods>>
 
@@ -3997,13 +4000,36 @@ through the cache and double-wrap the result.  Rebinding [[_submission]] updates
 every holder of this wrapper at once, because they all share the one wrapper
 object---which is exactly why the cache need not be touched separately.
 
+Swapping the wrapped object has a side effect that is easy to miss.  The CLI
+decorates submissions with attributes Canvas never sent: [[filter_submissions]]
+attaches the matching [[User]] as [[submission.user]], and the listing helpers
+attach the parent [[Assignment]] as [[submission.assignment]].  As we will see
+under \enquote{Intercepting writes}, those annotations are stored on the
+\emph{wrapped} submission---so a refresh, which replaces that object with a
+freshly fetched one, silently drops them.  The symptom is an [[AttributeError]]
+on [[submission.user.login_id]] in [[submissions view]], which reads the
+mutable [[submitted_at]] (triggering the refresh) before it reads [[user]].
+We therefore carry the recorded annotations over to the fresh submission.
+
+The carry-over is deliberately one-sided: an annotation is re-applied only
+when the fresh payload lacks the name.  Annotations are decorations Canvas
+knows nothing about, so they can never conflict with the payload; but should
+a caller ever write a payload attribute such as [[grade]] through the wrapper,
+the value just fetched from Canvas is the truth and must win over the stale
+local write.
+
 <<LazySubmission methods>>=
 def _refresh(self):
-  """Refresh the wrapped submission from Canvas."""
+  """Refresh the wrapped submission from Canvas.
+
+  Caller annotations (attributes set through the wrapper, e.g. `user`)
+  are carried over to the fresh submission unless Canvas sent that name.
+  """
   assignment = object.__getattribute__(self, '_assignment')
   submission = object.__getattribute__(self, '_submission')
   includes = object.__getattribute__(self, '_includes')
   original_get_submission = object.__getattribute__(self, '_original_get_submission')
+  annotations = object.__getattribute__(self, '_annotations')
 
   # Call original method directly (bypasses decorator, no double-wrapping)
   fresh_submission = original_get_submission(
@@ -4012,9 +4038,74 @@ def _refresh(self):
     include=list(includes)
   )
 
+  for name, value in annotations.items():
+    if not hasattr(fresh_submission, name):
+      setattr(fresh_submission, name, value)
+
   # Update internal state (cache automatically updated via reference)
   object.__setattr__(self, '_submission', fresh_submission)
   object.__setattr__(self, '_last_refresh', datetime.now())
+@
+
+Let us verify the carry-over with the same set-up as the staleness tests: a
+stale wrapper whose next mutable read swaps in a fresh stand-in.  The [[user]]
+annotation must survive that swap; a name the fresh payload already carries
+must keep the fresh value; and the [[None]] fill-ins made by [[ensure_attrs]]
+(which bypasses the wrapper's [[__setattr__]], see below) must not be mistaken
+for annotations.
+
+<<test functions>>=
+class TestLazySubmissionAnnotationsSurviveRefresh:
+    """Attributes set through the wrapper persist across a refresh."""
+
+    class StandInSubmission:
+        """A submission as Canvas returns it: no caller annotations."""
+
+        def __init__(self, grade="F"):
+            self.grade = grade
+            self.user_id = 1
+            self.submission_history = ()
+
+    def stale_wrapper(self, fresh):
+        """A stale wrapper whose next mutable read fetches `fresh`."""
+        lazy = LazySubmission(
+            self.StandInSubmission(), MagicMock(),
+            {"submission_history"}, MagicMock(return_value=fresh))
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
+        return lazy
+
+    def test_user_annotation_survives_a_refresh(self):
+        """`.user` set by filter_submissions outlives the refresh."""
+        fresh = self.StandInSubmission()
+        lazy = self.stale_wrapper(fresh)
+        sentinel_user = object()
+        lazy.user = sentinel_user
+
+        lazy.submission_history
+
+        assert lazy.user is sentinel_user
+
+    def test_fresh_payload_wins_over_annotation(self):
+        """A name Canvas sent is not overwritten by a stale local write."""
+        fresh = self.StandInSubmission(grade="P")
+        lazy = self.stale_wrapper(fresh)
+        lazy.grade = "stale local write"
+
+        lazy.submission_history
+
+        assert lazy.grade == "P"
+
+    def test_ensure_attrs_fill_ins_are_not_annotations(self):
+        """`None` fill-ins from ensure_attrs are not carried over."""
+        fresh = self.StandInSubmission()
+        lazy = self.stale_wrapper(fresh)
+        lazy.ensure_attrs(["rubric_assessment"])
+
+        lazy.submission_history
+
+        assert not hasattr(fresh, "rubric_assessment")
 @
 
 \paragraph{Intercepting reads}
@@ -4106,8 +4197,12 @@ class TestLazySubmissionDelegation:
 
 Writes mirror reads: internal state---the underscore-private names---stays on
 the wrapper, while every other name is set on the wrapped submission so callers
-can annotate it.  The most important such annotation is [[assignment]], whose
-fate after a refresh we turn to next.
+can annotate it.  Setting the value on the wrapped submission alone is not
+enough, though: as explained under \enquote{Performing the refresh}, the
+wrapped object is replaced on refresh, so we also record every such write in
+[[_annotations]] for [[_refresh]] to re-apply.  Recording happens only on this
+path---[[ensure_attrs]] writes its [[None]] fill-ins directly to the wrapped
+submission and is thus, by design, not an annotation.
 
 <<LazySubmission methods>>=
 def __setattr__(self, name, value):
@@ -4115,29 +4210,28 @@ def __setattr__(self, name, value):
   Intercept attribute setting to handle both wrapper and submission attrs.
 
   Internal attributes (_*) are set on the wrapper.
-  All other attributes are set on the wrapped submission.
+  All other attributes are set on the wrapped submission and remembered
+  as annotations so that they survive a refresh.
   """
   if name.startswith('_'):
     object.__setattr__(self, name, value)
   else:
+    object.__getattribute__(self, '_annotations')[name] = value
     submission = object.__getattribute__(self, '_submission')
     setattr(submission, name, value)
 @
 
-\paragraph{Surviving a refresh: serving [[assignment]] from [[_assignment]]}
+\paragraph{Serving [[assignment]] from [[_assignment]] when nobody set it}
 
-A subtle interaction lurks between [[__setattr__]] and [[_refresh]].  As just
-noted, a caller-set [[assignment]] lands on the \emph{wrapped} submission, since
-[[assignment]] is not a private name.
+The annotation record above keeps a caller-set [[assignment]] alive across
+refreshes, just like [[user]].  But [[assignment]] is special in one more way:
+not every code path annotates it, yet downstream code reads
+[[submission.assignment.course]] regardless.  Historically this was the first
+attribute lost on refresh, and the fix predates the annotation record: the
+fallback below.  We keep it, because it also covers the wrapper that was never
+annotated at all.
 
-Now suppose a later read touches a mutable attribute such as
-[[submission_history]].  That access triggers [[_refresh]], which fetches a
-\emph{new} submission from Canvas and rebinds [[_submission]] to it.  The
-freshly fetched object never had [[assignment]] assigned, so the caller's
-attribute silently vanishes---and the next read of [[submission.assignment]]
-raises [[AttributeError]].
-
-We cannot recover the lost value from [[assignment_id]] alone: downstream code
+We cannot recover the value from [[assignment_id]] alone: downstream code
 needs the assignment's [[course]] object, and re-fetching by id would neither
 restore [[course]] nor have a [[Canvas]] handle to query.  Fortunately the
 wrapper already retains exactly what we need.  [[_assignment]] is the
@@ -4170,11 +4264,10 @@ def __getattr__(self, name):
   return getattr(submission, name)
 @
 
-Now let's verify the [[assignment]] fallback.  A caller-set [[assignment]] lives
-on the wrapped submission, so a refresh---which rebinds [[_submission]] to a
-freshly fetched object---would otherwise discard it.  We check both that the
-wrapper serves [[assignment]] from [[_assignment]] when the wrapped submission
-lacks it, and that the attribute therefore survives an actual refresh.
+Now let's verify the [[assignment]] fallback.  We check that the wrapper
+serves [[assignment]] from [[_assignment]] when the wrapped submission lacks
+it, and---belt and braces with the annotation record---that a caller-set
+[[assignment]] survives an actual refresh.
 
 <<test functions>>=
 class TestLazySubmissionAssignmentSurvivesRefresh:
@@ -4218,7 +4311,6 @@ class TestLazySubmissionAssignmentSurvivesRefresh:
         lazy.submission_history
 
         original_get_submission.assert_called_once()
-        assert not hasattr(fresh, "assignment")
         assert lazy.assignment is sentinel_assignment
 @
 
@@ -4271,8 +4363,13 @@ pickling:
 \item \textbf{Before pickling} ([[__getstate__]]): Exclude the
   unpicklable [[_original_get_submission]] from the state dictionary.
   Save only the submission, assignment reference, includes list, and last
-  refresh timestamp.
-\item \textbf{After unpickling} ([[__setstate__]]): Reconstruct
+  refresh timestamp.  The annotation record is left out too, but for a
+  different reason: annotations are per-run decorations that the CLI
+  re-applies on every invocation (for instance [[filter_submissions]] sets
+  [[user]] anew each run), so persisting them would only freeze one run's
+  view of the data.
+\item \textbf{After unpickling} ([[__setstate__]]): Start with an empty
+  annotation record and reconstruct
   [[_original_get_submission]] by searching the decorator's closure.
   The decorated method stores the original in its [[__closure__]]
   attribute, which we can access via
@@ -4358,6 +4455,7 @@ def __setstate__(self, state):
   """
   for key, value in state.items():
     object.__setattr__(self, key, value)
+  object.__setattr__(self, '_annotations', {})
 
   # Restore the original method from the assignment's decorated method
   # The decorated method has the original in its closure
