@@ -856,40 +856,50 @@ def test_validate_returns_no_errors_for_valid_specs():
 \subsection{Updating module membership based on patterns}
 
 The [[update_item_modules]] function synchronizes an item's module membership
-with a list of regex patterns.
+with a list of module specs (\cref{sec:module-positions}).
 The semantics are:
 \begin{description}
 \item[Empty list] Remove the item from all modules
 \item[Non-empty list] The item should be in exactly those modules matching
-  at least one regex pattern---add to matching modules, remove from non-matching
+  at least one pattern---add to matching modules, remove from non-matching
+\item[Spec with a position] Additionally, the item should sit at that
+  position in each module the spec matches---created there if new, moved
+  there if present elsewhere
 \end{description}
 
 This provides a declarative interface: the user specifies the desired state,
-and we compute the necessary additions and removals.
+and we compute the necessary additions, removals and moves.
+Position is deliberately the only thing about ordering the user states: Canvas
+renumbers the other items itself when one is inserted or moved, so
+\enquote{be item~3} is a complete instruction, whereas anything relative to
+siblings would need us to know and manage the whole module.
 
 <<functions>>=
-def update_item_modules(course, item_type, item_id, module_regexes):
-  """Update module membership for an item based on regex patterns.
+def update_item_modules(course, item_type, item_id, module_specs):
+  """Update module membership for an item based on module specs.
 
   Args:
       course: Canvas course object
       item_type: 'Assignment' or 'Page'
       item_id: For Assignment: assignment.id (int),
                For Page: page.url (string slug)
-      module_regexes: List of regex patterns to match module names.
-                      Empty list, or None, means remove from all
-                      modules.
+      module_specs: List of regex patterns or {module, position} mappings,
+                    see normalize_module_specs. Empty list, or None,
+                    means remove from all modules.
 
   Returns:
-      Tuple of (added_modules, removed_modules) as lists of module names
+      Tuple of (added, removed, moved) as lists of module names
+
+  Raises:
+      ValueError: if module_specs is malformed.
   """
-  <<treat a missing pattern list as empty>>
+  <<normalize module specs>>
   <<find modules matching regex patterns>>
   <<compute and apply module membership changes>>
-  return added, removed
+  return added, removed, moved
 @
 
-Our callers hand us [[module_regexes]] straight out of YAML front matter, and
+Our callers hand us [[module_specs]] straight out of YAML front matter, and
 YAML draws its distinctions in a different place than we do.  A bare
 [[modules:]] line with nothing after it parses to [[None]], not to the empty
 list---yet to a human writing front matter the two say the same thing.  The
@@ -900,21 +910,26 @@ module membership to be set to whatever they wrote; writing nothing means
 \enquote{no modules}, which is precisely the empty-list case above.
 
 We normalise here rather than in each caller so that every call site---page,
-assignment, and quiz editing alike---reads a bare key the same way.  Without
-this, the loop in [[<<find modules matching regex patterns>>]] iterates over
-[[None]] and raises a [[TypeError]].  The page commands catch that exception
-and report it as an error updating the page---but they do so \emph{after} the
-new content has already been written, so the user is told the edit failed
-when in fact only the module assignment did.
+assignment, and quiz editing alike---reads a bare key the same way, and so
+that the two spellings of a spec (\cref{sec:module-positions}) arrive as the
+same [[(pattern, position)]] pairs.  Without this, the loop in
+[[<<find modules matching regex patterns>>]] would iterate over [[None]] and
+raise a [[TypeError]].  Malformed specs still raise here, as a
+[[ValueError]]; the callers are expected to have run
+[[validate_module_specs]] before writing any content, so that this raise is
+a safety net rather than the user's first notice.
 
-<<treat a missing pattern list as empty>>=
-if module_regexes is None:
-  module_regexes = []
+<<normalize module specs>>=
+module_specs = normalize_module_specs(module_specs)
 @
 
 First, we compile all regex patterns and find which modules match.
 We match against both module name and Canvas ID, consistent with
 [[filter_modules]].
+Alongside the set of matching modules we record, per module, the position
+the user asked for; a later spec overwrites an earlier one, which gives the
+\enquote{last position wins} rule, and a spec without a position leaves no
+entry, which is how \enquote{no position means don't move} falls out.
 <<find modules matching regex patterns>>=
 all_modules = [
     canvaslms.cli.utils.ensure_module_attrs(module)
@@ -922,23 +937,29 @@ all_modules = [
 ]
 
 matching_module_ids = set()
-for pattern in module_regexes:
+desired_positions = {}
+for pattern, position in module_specs:
   regex = re.compile(pattern)
   for module in all_modules:
     if regex.search(module.name) or regex.search(str(module.id)):
       matching_module_ids.add(module.id)
+      if position is not None:
+        desired_positions[module.id] = position
 @
 
-For each module, we determine the current state (is the item present?)
-and the desired state (does the module match a regex?).
-Then we add or remove as needed.
+For each module, we determine the current state (is the item present, and
+where?) and the desired state (does the module match a spec, and with which
+position?).
+Then we add, remove or move as needed.
 <<compute and apply module membership changes>>=
 added = []
 removed = []
+moved = []
 
 for module in all_modules:
   <<find current module item if present>>
   should_be_in = module.id in matching_module_ids
+  desired_position = desired_positions.get(module.id)
   <<add or remove item from module as needed>>
 @
 
@@ -1029,24 +1050,42 @@ def invalidate_module_items(module):
     module.module_item_all_fetched = None
 @
 
-Finally, we add or remove based on comparing current vs desired state.
-When adding, we use [[create_module_item]] with the appropriate type and ID.
+Moving an item is a [[PUT]] on the module item with the new position; Canvas
+shifts the siblings to make room.
+The [[canvasapi]] method [[ModuleItem.edit]] returns a fresh object and
+leaves the one we called it on untouched, so after the call our
+[[item.position]] is stale---one more reason to invalidate the module's
+cached items rather than patch the object by hand.
+We keep the move in a function of its own because the [[modules move]]
+subcommand (\cref{sec:modules-move}) needs exactly the same two steps.
+<<functions>>=
+def move_module_item(module, item, position):
+  """Move `item` to 1-based `position` within `module`."""
+  item.edit(module_item={'position': position})
+  invalidate_module_items(module)
+@
+
+Finally, we add, remove or move based on comparing current vs desired state.
+When adding, we use [[create_module_item]] with the appropriate type and ID,
+and with the position when the user gave one: Canvas accepts [[position]] on
+creation and inserts the item there, which saves a second request and avoids
+the item briefly appearing at the end.
 When removing, we call [[delete()]] on the module item object.
-Either way we invalidate the module's cached items afterwards.
+When the item is already present and a position was asked for, we move it
+only if it is not there already, so that pushing an unchanged file is a
+no-op in Canvas as well as in our output.
+Every mutation invalidates the module's cached items afterwards.
 <<add or remove item from module as needed>>=
 if should_be_in and current_item is None:
   # Add to module
   try:
     if item_type == 'Assignment':
-      module.create_module_item({
-        'type': 'Assignment',
-        'content_id': item_id
-      })
+      new_item = {'type': 'Assignment', 'content_id': item_id}
     else:  # Page
-      module.create_module_item({
-        'type': 'Page',
-        'page_url': item_id
-      })
+      new_item = {'type': 'Page', 'page_url': item_id}
+    if desired_position is not None:
+      new_item['position'] = desired_position
+    module.create_module_item(new_item)
     invalidate_module_items(module)
     added.append(module.name)
   except Exception:
@@ -1059,6 +1098,83 @@ elif not should_be_in and current_item is not None:
     removed.append(module.name)
   except Exception:
     pass  # Silently skip if we can't remove
+elif should_be_in and desired_position is not None:
+  <<move item to desired position>>
+@
+
+<<move item to desired position>>=
+if current_item.position != desired_position:
+  try:
+    move_module_item(module, current_item, desired_position)
+    moved.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't move
+@
+
+Let's verify the position handling: a new item is created at the requested
+position (and without one when none was given), a present item is moved
+only when its position differs, the last spec with a position wins, and a
+move invalidates the cache just like the other mutations.
+<<test functions>>=
+def one_module_course(items, name="Week 1"):
+  """Create a course mock with one cached module holding `items`."""
+  module = make_cached_module(name, 11, items)
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  return course, module
+
+def test_create_passes_requested_position():
+  course, module = one_module_course([])
+  added, removed, moved = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42, 'position': 2})
+  assert (added, removed, moved) == (["Week 1"], [], [])
+
+def test_create_without_position_omits_it():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Page', 'intro', ["^Week 1$"])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Page', 'page_url': 'intro'})
+
+def test_present_item_is_moved_when_position_differs():
+  item = make_assignment_item(42, position=5)
+  course, module = one_module_course([item])
+  added, removed, moved = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  item.edit.assert_called_once_with(module_item={'position': 2})
+  assert (added, removed, moved) == ([], [], ["Week 1"])
+  assert module.module_item_all_fetched is None
+
+def test_present_item_at_position_is_left_alone():
+  item = make_assignment_item(42, position=2)
+  course, module = one_module_course([item])
+  added, removed, moved = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  item.edit.assert_not_called()
+  assert (added, removed, moved) == ([], [], [])
+  assert module.module_item_all_fetched is not None
+
+def test_present_item_without_position_is_not_moved():
+  item = make_assignment_item(42, position=5)
+  course, module = one_module_course([item])
+  update_item_modules(course, 'Assignment', 42, ["^Week 1$"])
+  item.edit.assert_not_called()
+
+def test_last_spec_with_position_wins():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week", "position": 1},
+      {"module": "^Week 1$", "position": 4},
+      "^Week 1$"])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42, 'position': 4})
+
+def test_update_rejects_malformed_specs():
+  course, module = one_module_course([])
+  with pytest.raises(ValueError):
+    update_item_modules(course, 'Assignment', 42, [{"position": 1}])
+  module.create_module_item.assert_not_called()
 @
 
 Let's verify that both an addition and a removal leave the module in the
