@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 <<yaml front matter functions>>
 <<schema functions>>
+<<html conversion functions>>
 <<rendering functions>>
 <<file input functions>>
 <<matching functions>>
@@ -107,6 +108,7 @@ import canvaslms.cli.content as content
 
 <<test yaml functions>>
 <<test schema functions>>
+<<test html conversion functions>>
 <<test rendering functions>>
 <<test file input functions>>
 <<test matching functions>>
@@ -698,6 +700,122 @@ class TestSchemaFunctions:
 @
 
 
+\section{Converting Canvas HTML to Markdown}
+\label{sec:html-to-markdown}
+
+Every export in the Canvas-to-file direction---pages, assignments,
+announcements, the syllabus, quiz instructions, the editor templates---turns
+the HTML body Canvas stores into Markdown with [[pypandoc]].
+The obvious call, [[pypandoc.convert_text(html, 'md', format='html')]],
+has a trap that is invisible until a page with an embedded video is pushed
+back: pandoc's HTML reader does not keep [[<iframe>]] elements.
+Unless the reader's [[raw_html]] extension is on, it tries to \emph{fetch}
+the iframe's [[src]] and splice the fetched document in; a Kaltura or
+YouTube embed then either becomes the junk of a \enquote{JavaScript
+required} page or, when the fetch fails, disappears with a warning.
+Either way the exported Markdown no longer contains the embed, and the
+round trip [[pages view]] $\rightarrow$ edit $\rightarrow$ [[pages edit -f]]
+silently deletes the video from Canvas.
+
+With [[raw_html]] enabled the reader keeps elements it has no native
+representation for---[[iframe]], [[embed]], [[object]], [[video]],
+[[audio]]---as raw HTML, but it writes them in pandoc's own Markdown
+spelling: inline [[`<iframe ...>`{=html}]] runs inside paragraphs and
+[[```{=html}]] fences for block-level ones.
+That round-trips through pandoc, but nobody editing the file by hand would
+write it that way, and an embed split into two fenced blocks (opening and
+closing tag) is easy to mangle.
+So we unwrap the raw spans and fences back into plain HTML tags and rejoin
+an opening tag with its closing tag.
+Plain inline HTML and block-level HTML tags are exactly what pandoc's
+Markdown reader accepts as raw HTML on the way back---the same form a
+user pastes in by hand---so the unwrapped output is both readable and
+faithful when pushed.
+
+We contrast this with the [[--html]] export modes, which never convert and
+therefore never had the problem; the fix belongs to the Markdown path only.
+Every caller goes through this one function so that the exports of all
+content types agree on how embeds look.
+<<content constants>>=
+RAW_HTML_FENCE = re.compile(r"```\{=html\}\n(.*?)\n```", re.S)
+RAW_HTML_SPAN = re.compile(r"`([^`]*)`\{=html\}")
+EMBED_TAGS = "iframe|embed|object|video|audio"
+SPLIT_EMBED = re.compile(rf"(<({EMBED_TAGS})\b[^>]*>)\n+(</\2>)")
+BLOCK_EMBED_END = re.compile(rf"(</(?:{EMBED_TAGS})>)\n(?!\n)")
+<<html conversion functions>>=
+def html_to_markdown(html):
+    """Convert Canvas HTML to Markdown, keeping embeds as raw HTML.
+
+    Elements pandoc cannot represent (iframe, embed, object, video, audio)
+    come out as plain HTML tags in the Markdown, which pandoc's Markdown
+    reader passes through unchanged when the content is converted back.
+    Raises whatever pypandoc raises if pandoc is missing or fails.
+    """
+    markdown = pypandoc.convert_text(html, 'md', format='html+raw_html')
+    markdown = RAW_HTML_FENCE.sub(lambda m: m.group(1), markdown)
+    markdown = RAW_HTML_SPAN.sub(lambda m: m.group(1), markdown)
+    markdown = SPLIT_EMBED.sub(r"\1\3", markdown)
+    markdown = BLOCK_EMBED_END.sub(r"\1\n\n", markdown)
+    return markdown
+@
+
+Let's verify the property that matters: an embed survives HTML
+$\rightarrow$ Markdown $\rightarrow$ HTML, as a plain tag in between, both
+when it is a block of its own and when it sits inside a paragraph---and
+that ordinary content is unaffected.
+These tests need pandoc on the machine; without it they are skipped rather
+than failed, like the other pandoc-dependent behaviour in this project.
+<<test html conversion functions>>=
+def pandoc_available():
+    try:
+        import pypandoc
+        pypandoc.get_pandoc_version()
+        return True
+    except Exception:
+        return False
+
+needs_pandoc = pytest.mark.skipif(not pandoc_available(),
+                                  reason="pandoc not installed")
+
+IFRAME = ('<iframe id="kmsembed-1" src="https://play.kth.se/embed/secure/'
+          'iframe/entryId/0_abc/uiConfId/1" width="650" height="366" '
+          'allowfullscreen title="Kaltura Player"></iframe>')
+
+
+@needs_pandoc
+class TestHtmlToMarkdown:
+    def test_block_iframe_is_kept_as_plain_tag(self):
+        import pypandoc
+        md = content.html_to_markdown(f"<p>Before.</p>{IFRAME}<p>After.</p>")
+        assert "{=html}" not in md
+        assert 'src="https://play.kth.se/embed/secure/iframe/entryId/0_abc' in md
+        assert "Before." in md and "After." in md
+        html = pypandoc.convert_text(md, 'html', format='md')
+        assert html.count("<iframe") == 1 and "</iframe>" in html
+
+    def test_iframe_inside_paragraph_survives_round_trip(self):
+        import pypandoc
+        md = content.html_to_markdown(f"<p>Watch this: {IFRAME}</p>")
+        html = pypandoc.convert_text(md, 'html', format='md')
+        assert html.count("<iframe") == 1
+        assert "Watch this:" in html
+
+    def test_video_and_embed_are_kept(self):
+        md = content.html_to_markdown(
+            '<p><video src="a.mp4" controls></video><embed src="e.swf"></p>')
+        assert '<video src="a.mp4" controls>' in md
+        assert '<embed src="e.swf">' in md
+        assert "{=html}" not in md
+
+    def test_plain_content_is_converted_normally(self):
+        md = content.html_to_markdown(
+            "<h2>Title</h2><p>Some <strong>bold</strong> text.</p>")
+        assert "## Title" in md
+        assert "**bold**" in md
+        assert "<" not in md
+@
+
+
 \section{Rendering Canvas objects to Markdown}
 
 The [[render_to_markdown]] function implements the Canvas-to-file direction.
@@ -733,7 +851,7 @@ def render_to_markdown(obj, schema, content_attr='message', extra_attributes=Non
     html_content = getattr(obj, content_attr, '') or ''
     if html_content:
         try:
-            markdown_content = pypandoc.convert_text(html_content, 'md', format='html')
+            markdown_content = html_to_markdown(html_content)
         except Exception as e:
             logger.warning(f"Failed to convert HTML to Markdown: {e}")
             markdown_content = html_content
@@ -1253,7 +1371,7 @@ def get_content_from_editor(schema, initial_attributes=None, content_attr=None,
                 body_content = raw_content
             else:
                 try:
-                    body_content = pypandoc.convert_text(raw_content, 'md', format='html')
+                    body_content = html_to_markdown(raw_content)
                 except Exception:
                     body_content = raw_content
 
