@@ -64,10 +64,29 @@ def add_command(subp):
   view_parser = modules_subp.add_parser("view",
     help="Shows modules and their contents",
     description="Shows modules and their contents. Output: course, "
-                "module name, item type, item name, [item id], "
-                "completion requirement")
+                "module name, [position], item type, item name, "
+                "[item id], completion requirement")
   view_parser.set_defaults(func=modules_view_command)
   <<add view arguments>>
+@
+
+Tests for this chapter are distributed through it, each placed after the
+code it verifies. They drive the commands with [[MagicMock]] courses and
+modules, so no Canvas server is needed.
+<<test [[modules.py]]>>=
+"""Tests for the modules command and its module membership helpers."""
+import argparse
+import csv
+import io
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import canvaslms.cli.modules as modules
+from canvaslms.cli.modules import *
+
+<<test functions>>
 @
 
 The subcommand is [[required]] because [[modules]] is a container command:
@@ -94,9 +113,11 @@ commands without defaults: [[pages]], [[discussions]], [[calendar]],
 Both subcommands accept a regular expression for filtering modules by name
 or Canvas ID.
 This allows users to work with specific modules or groups of related modules.
-Additionally, the [[view]] subcommand supports an optional [[--show-id]] flag
-to include Canvas item IDs in the output.
-These IDs are useful for automation and scripting, but omitted by default for
+Additionally, the [[view]] subcommand supports two optional flags that add
+columns: [[--show-id]] includes Canvas item IDs and [[--show-position]]
+includes each item's position within its module.
+Both are useful for automation and scripting---IDs for constructing URLs,
+positions for deciding where to place new items---but omitted by default for
 cleaner, more readable output.
 
 <<add list arguments>>=
@@ -112,6 +133,8 @@ view_parser.add_argument("regex",
 courses.add_course_option(view_parser, required=True)
 view_parser.add_argument("--show-id", action="store_true",
   help="Include Canvas IDs in output")
+view_parser.add_argument("--show-position", action="store_true",
+  help="Include each item's position within its module in output")
 @
 
 
@@ -178,22 +201,33 @@ responses), and we want robust output rather than a failed command.
 try:
   items = list_module_items(module)
   if not items:
-    # Show module even if it has no items
-    row = [course.course_code, module.name, "No items", ""]
-    if args.show_id:
-      row.append("")
-    row.append("")
-    output.writerow(row)
+    message = "No items"
+    <<write placeholder row for module>>
   else:
     for item in items:
       <<write module item information to output>>
 except:
-  # If we can't get items, show the module with error
-  row = [course.course_code, module.name, "Error loading items", ""]
-  if args.show_id:
-    row.append("")
+  message = "Error loading items"
+  <<write placeholder row for module>>
+@
+
+Both placeholder rows must have exactly as many columns as an item row, or
+the output stops being a table: a consumer doing [[cut -f]] would read the
+message as a title in one row and as a type in the next.
+The item row has two optional columns, so the placeholder has to pad for
+each flag that is on.
+Producing both placeholders from one chunk keeps the padding in one place;
+the message sits in the item-type column, where a reader scanning the
+table expects to learn what kind of row this is.
+<<write placeholder row for module>>=
+row = [course.course_code, module.name]
+if args.show_position:
   row.append("")
-  output.writerow(row)
+row += [message, ""]
+if args.show_id:
+  row.append("")
+row.append("")
+output.writerow(row)
 @
 
 \subsection{Module metadata output format}
@@ -245,9 +279,9 @@ progress_mode = "sequential" if sequential else "any-order"
 
 For the [[modules view]] command, we output information about each item within
 matching modules.
-The output includes: course code, module name, item type, item title,
-optionally the Canvas ID (when [[--show-id]] is specified), and any
-completion requirements.
+The output includes: course code, module name, optionally the item's position
+(when [[--show-position]] is specified), item type, item title, optionally the
+Canvas ID (when [[--show-id]] is specified), and any completion requirements.
 
 Completion requirements specify what students must do to mark an item complete:
 they might need to view the item, submit an assignment, or achieve a minimum
@@ -259,6 +293,15 @@ Canvas item IDs are useful for automation (e.g., constructing URLs or making
 API calls) but add visual clutter for humans reading the output.
 Therefore, we make ID output optional via the [[--show-id]] flag, defaulting to
 cleaner output without IDs.
+
+The position is Canvas's own 1-based ordinal of the item within its module,
+the number one writes in front matter to place an item (\cref{sec:module-membership}).
+Canvas already returns items in position order, so for reading the output
+the number is redundant; it earns its column only when the reader is about
+to reorder.
+We therefore gate it behind [[--show-position]], and for the same reason as
+for IDs: every column added by default shifts the fields that existing
+[[cut -f]] scripts rely on.
 
 <<write module item information to output>>=
 <<extract completion requirement>>
@@ -277,15 +320,20 @@ if item.completion_requirement:
 
 We build the output row incrementally.
 The base row always includes course, module, item type, and item title.
-If the user requested IDs via [[--show-id]], we insert the Canvas ID
-before the completion requirement.
+If the user requested positions via [[--show-position]], we insert the
+position right after the module name, where it reads as \enquote{item
+number $n$ of this module}; if the user requested IDs via [[--show-id]], we
+insert the Canvas ID before the completion requirement.
 This approach maintains consistent column ordering while allowing optional
 fields.
 
 <<build item output row conditionally>>=
-row = [
-  course.course_code,
-  module.name,
+row = [course.course_code, module.name]
+
+if args.show_position:
+  row.append(item.position if item.position is not None else "")
+
+row += [
   item.type or "Unknown",
   item.title or "No title"
 ]
@@ -300,6 +348,68 @@ if args.show_id:
 
 row.append(completion_req)
 output.writerow(row)
+@
+
+Let's verify the column layout.
+The property we care about is that every row of one invocation has the same
+number of columns, whatever combination of flags is given, and that the
+position lands right after the module name.
+We build a course with one module and let the test choose the module's items
+(or make item retrieval fail), then parse the TSV that the command prints.
+<<test functions>>=
+def run_modules_view(items, capsys, show_id=False, show_position=False):
+  """Run modules view on one module and return the parsed TSV rows."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  module = MagicMock()
+  module.name = "Week 1"
+  module.id = 11
+  if isinstance(items, Exception):
+    module.get_module_items.side_effect = items
+  else:
+    module.get_module_items.return_value = items
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex=".*", delimiter="\t",
+                            show_id=show_id, show_position=show_position)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_view_command({}, MagicMock(), args)
+  return list(csv.reader(io.StringIO(capsys.readouterr().out),
+                         delimiter="\t"))
+
+def make_module_item(position, title="Item", item_type="Page"):
+  """Create a module item mock with the attributes the CLI reads."""
+  item = MagicMock()
+  item.type = item_type
+  item.title = title
+  item.position = position
+  item.content_id = None
+  item.id = 5
+  item.completion_requirement = None
+  return item
+
+def test_view_position_column_after_module_name(capsys):
+  rows = run_modules_view([make_module_item(2)], capsys, show_position=True)
+  assert rows == [["CODE", "Week 1", "2", "Page", "Item", ""]]
+
+def test_view_without_position_flag_keeps_old_layout(capsys):
+  rows = run_modules_view([make_module_item(2)], capsys)
+  assert rows == [["CODE", "Week 1", "Page", "Item", ""]]
+
+@pytest.mark.parametrize("show_id", [False, True])
+@pytest.mark.parametrize("show_position", [False, True])
+def test_view_placeholder_rows_match_item_width(capsys, show_id, show_position):
+  item_rows = run_modules_view([make_module_item(1)], capsys,
+                               show_id=show_id, show_position=show_position)
+  empty_rows = run_modules_view([], capsys,
+                                show_id=show_id, show_position=show_position)
+  error_rows = run_modules_view(RuntimeError("boom"), capsys,
+                                show_id=show_id, show_position=show_position)
+  width = len(item_rows[0])
+  assert [len(r) for r in empty_rows] == [width]
+  assert [len(r) for r in error_rows] == [width]
+  assert "No items" in empty_rows[0]
+  assert "Error loading items" in error_rows[0]
 @
 
 
@@ -477,6 +587,7 @@ def filter_pages_by_module_list(modules, pages):
 
 
 \section{Querying and updating module membership}
+\label{sec:module-membership}
 
 When editing pages or assignments, users may want to control which modules
 contain the item.
