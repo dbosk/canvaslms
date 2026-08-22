@@ -974,9 +974,40 @@ except Exception:
   pass  # Page doesn't exist or can't be fetched
 @
 
+\subsubsection{Keeping the module item cache honest}
+
+Module items are cached, and the cache outlives the process: the
+[[Module]] objects returned by the cached [[course.get_modules()]] carry
+their item list in [[module_item_cache]] and [[module_item_all_fetched]]
+(\cref{sec:caching-module-items}), and that is written to disk between
+runs with a refresh interval of days.
+Nothing about the caching layer knows that [[create_module_item]] or
+[[delete()]] changed the list.
+Left alone, the next command---[[modules view]], or the membership check
+for the next page in a loop---would read the stale list and, worse, stale
+positions: Canvas renumbers all the siblings when an item is inserted,
+removed or moved, so after any of these operations \emph{every} cached
+position in the module is suspect.
+
+The fix is local: after a successful mutation we drop the module's cached
+items and reset its \enquote{all fetched} timestamp, which is exactly the
+state of a module whose items have never been fetched, so the next access
+refetches them.
+The two [[hasattr]] guards let the helper run on plain [[Module]] objects
+(and mocks) that never went through the caching decorator.
+<<functions>>=
+def invalidate_module_items(module):
+  """Forget the cached items of `module` so the next access refetches."""
+  if hasattr(module, 'module_item_cache'):
+    module.module_item_cache.clear()
+  if hasattr(module, 'module_item_all_fetched'):
+    module.module_item_all_fetched = None
+@
+
 Finally, we add or remove based on comparing current vs desired state.
 When adding, we use [[create_module_item]] with the appropriate type and ID.
 When removing, we call [[delete()]] on the module item object.
+Either way we invalidate the module's cached items afterwards.
 <<add or remove item from module as needed>>=
 if should_be_in and current_item is None:
   # Add to module
@@ -991,6 +1022,7 @@ if should_be_in and current_item is None:
         'type': 'Page',
         'page_url': item_id
       })
+    invalidate_module_items(module)
     added.append(module.name)
   except Exception:
     pass  # Silently skip if we can't add
@@ -998,7 +1030,51 @@ elif not should_be_in and current_item is not None:
   # Remove from module
   try:
     current_item.delete()
+    invalidate_module_items(module)
     removed.append(module.name)
   except Exception:
     pass  # Silently skip if we can't remove
+@
+
+Let's verify that both an addition and a removal leave the module in the
+\enquote{never fetched} state.
+We give the mock module a real dictionary and timestamp, because those are
+what the caching decorator stores and what [[invalidate_module_items]] must
+reset.
+<<test functions>>=
+def make_cached_module(name, module_id, items):
+  """Create a module mock carrying cache state and the given items."""
+  module = MagicMock()
+  module.name = name
+  module.id = module_id
+  module.get_module_items.return_value = items
+  module.module_item_cache = {item.id: (item, {}) for item in items}
+  module.module_item_all_fetched = datetime.now()
+  return module
+
+def make_assignment_item(content_id, position=None):
+  """Create an Assignment module item mock."""
+  item = make_module_item(position, item_type="Assignment")
+  item.content_id = content_id
+  item.id = 100 + content_id
+  return item
+
+def test_adding_item_invalidates_module_cache():
+  module = make_cached_module("Week 1", 11, [])
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  update_item_modules(course, 'Assignment', 42, ["^Week 1$"])
+  module.create_module_item.assert_called_once()
+  assert module.module_item_cache == {}
+  assert module.module_item_all_fetched is None
+
+def test_removing_item_invalidates_module_cache():
+  item = make_assignment_item(42)
+  module = make_cached_module("Week 1", 11, [item])
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  update_item_modules(course, 'Assignment', 42, [])
+  item.delete.assert_called_once()
+  assert module.module_item_cache == {}
+  assert module.module_item_all_fetched is None
 @
