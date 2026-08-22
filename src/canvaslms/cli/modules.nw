@@ -20,12 +20,13 @@ properly configured before a course begins.
 \section*{Chapter overview}
 
 This chapter serves two purposes:
-First, it provides the [[modules]] subcommand with two sub-commands:
+First, it provides the [[modules]] subcommand with three sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
 \item [[modules view]] --- displays module contents including all items and
   their completion requirements
+\item [[modules move]] --- moves an item to a given position within a module
 \end{itemize}
 
 Second, it provides utility functions ([[add_module_option]],
@@ -39,6 +40,7 @@ We outline the module structure:
 <<[[modules.py]]>>=
 import argparse
 import canvasapi
+import canvaslms.cli
 import canvaslms.cli.utils
 import canvaslms.cli.courses as courses
 import csv
@@ -71,6 +73,14 @@ def add_command(subp):
                 "[item id], completion requirement")
   view_parser.set_defaults(func=modules_view_command)
   <<add view arguments>>
+
+  # Add 'move' subcommand
+  move_parser = modules_subp.add_parser("move",
+    help="Moves an item to a position within a module",
+    description="Moves one item to a 1-based position within each matching "
+                "module; Canvas renumbers the other items.")
+  move_parser.set_defaults(func=modules_move_command)
+  <<add move arguments>>
 @
 
 Tests for this chapter are distributed through it, each placed after the
@@ -93,10 +103,10 @@ from canvaslms.cli.modules import *
 @
 
 The subcommand is [[required]] because [[modules]] is a container command:
-all its work happens in [[list]] or [[view]], and a bare [[canvaslms modules]]
-has no meaningful interpretation.
+all its work happens in [[list]], [[view]] or [[move]], and a bare
+[[canvaslms modules]] has no meaningful interpretation.
 Requiring it lets argparse answer such a command line with the usage message
-listing the two alternatives, which is both the most informative answer and
+listing the alternatives, which is both the most informative answer and
 the earliest one.
 Without it, argparse happily accepts the incomplete command line and returns
 arguments where [[func]] was never set, leaving the main program to notice
@@ -113,8 +123,8 @@ We don't pay it here, which leaves requiring the subcommand as the only way
 commands without defaults: [[pages]], [[discussions]], [[calendar]],
 [[syllabus]] and [[cache]].
 
-Both subcommands accept a regular expression for filtering modules by name
-or Canvas ID.
+All subcommands accept a regular expression for filtering modules by name
+or Canvas ID; [[move]] requires it (\cref{sec:modules-move}).
 This allows users to work with specific modules or groups of related modules.
 Additionally, the [[view]] subcommand supports two optional flags that add
 columns: [[--show-id]] includes Canvas item IDs and [[--show-position]]
@@ -138,6 +148,19 @@ view_parser.add_argument("--show-id", action="store_true",
   help="Include Canvas IDs in output")
 view_parser.add_argument("--show-position", action="store_true",
   help="Include each item's position within its module in output")
+@
+
+The arguments of [[move]] are explained with the command
+(\cref{sec:modules-move}).
+<<add move arguments>>=
+move_parser.add_argument("regex",
+  help="Regex for selecting modules (required: the move applies to each "
+       "matching module)")
+courses.add_course_option(move_parser, required=True)
+move_parser.add_argument("-i", "--item", required=True,
+  help="Regex matching the title or Canvas ID of the item to move")
+move_parser.add_argument("-p", "--position", required=True, type=int,
+  help="New 1-based position of the item within the module")
 @
 
 
@@ -413,6 +436,121 @@ def test_view_placeholder_rows_match_item_width(capsys, show_id, show_position):
   assert [len(r) for r in error_rows] == [width]
   assert "No items" in empty_rows[0]
   assert "Error loading items" in error_rows[0]
+@
+
+
+\section{Moving an item within a module, [[modules_move_command]]}
+\label{sec:modules-move}
+
+The [[pages]], [[assignments]] and [[quizzes]] commands can place the items
+they manage at a position in a module through the [[modules]] front matter
+(\cref{sec:module-positions}), but that is the item's own view of the
+world: it requires exporting the item, editing a file and pushing it back,
+and it only reaches the kinds of item those commands manage.
+A module also holds sub-headers, files, external URLs and tools, and an
+instructor reordering a module wants to say \enquote{put that one third}
+without round-tripping content.
+[[modules move]] is that module-centric view:
+\begin{minted}{bash}
+canvaslms modules move -c prgi25 "^Week 1$" -i "^Lab 1" -p 3
+\end{minted}
+
+The module regex is required rather than defaulting to [[.*]] as it does for
+[[list]] and [[view]]: listing every module is a harmless default, moving an
+item in every module is not.
+The item is matched by title or Canvas ID, like modules are, and the match
+must be unique within each module, because a position is a single slot and
+moving several items \enquote{to position~3} would only mean something
+arbitrary.
+A module with no matching item is reported and skipped rather than being an
+error, so that a pattern can be applied across several modules of which only
+some contain the item.
+<<functions>>=
+def modules_move_command(config, canvas, args):
+  """Move an item to a 1-based position within each matching module."""
+  if args.position < 1:
+    canvaslms.cli.err(1, "Position must be 1 or greater")
+  item_regex = re.compile(args.item)
+  course_list = courses.process_course_option(canvas, args)
+  moved = []
+  for course in course_list:
+    for module in filter_modules(course, args.regex):
+      <<move the matching item in [[module]]>>
+  print_module_changes([], [], moved)
+@
+
+An item already at the requested position is left alone, so that repeating
+a command is harmless; the move itself is [[move_module_item]]
+(\cref{sec:module-membership}), the same function the front-matter path
+uses, so both invalidate the module's cached items the same way.
+<<move the matching item in [[module]]>>=
+matches = [item for item in list_module_items(module)
+           if item_regex.search(item.title or "")
+           or item_regex.search(str(item.id))]
+if not matches:
+  canvaslms.cli.warn(
+      f"No item matching '{args.item}' in module {module.name}")
+  continue
+if len(matches) > 1:
+  titles = ", ".join(repr(item.title) for item in matches)
+  canvaslms.cli.err(1, f"Several items match '{args.item}' in module "
+                       f"{module.name}: {titles}")
+item = matches[0]
+if item.position == args.position:
+  continue
+try:
+  move_module_item(module, item, args.position)
+  moved.append(module.name)
+except Exception as e:
+  canvaslms.cli.warn(f"Could not move '{item.title}' in {module.name}: {e}")
+@
+
+Let's verify the three outcomes per module---moved, already there, not
+found---and that an ambiguous pattern stops the command.
+<<test functions>>=
+def run_modules_move(items, item_regex, position):
+  """Run modules move on one module and return (module, captured stderr)."""
+  module = make_cached_module("Week 1", 11, items)
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", item=item_regex,
+                            position=position)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_move_command({}, MagicMock(), args)
+  return module
+
+def test_move_edits_unique_match(capsys):
+  lab = make_module_item(5, title="Lab 1")
+  module = run_modules_move([make_module_item(1, title="Intro"), lab],
+                            "^Lab", 2)
+  lab.edit.assert_called_once_with(module_item={'position': 2})
+  assert module.module_item_all_fetched is None
+  assert "Moved within modules: Week 1" in capsys.readouterr().err
+
+def test_move_leaves_item_already_in_place(capsys):
+  lab = make_module_item(2, title="Lab 1")
+  run_modules_move([lab], "^Lab", 2)
+  lab.edit.assert_not_called()
+  assert "Moved" not in capsys.readouterr().err
+
+def test_move_skips_module_without_match():
+  intro = make_module_item(1, title="Intro")
+  run_modules_move([intro], "^Lab", 2)
+  intro.edit.assert_not_called()
+
+def test_move_refuses_ambiguous_match():
+  items = [make_module_item(1, title="Lab 1"),
+           make_module_item(2, title="Lab 2")]
+  with pytest.raises(SystemExit):
+    run_modules_move(items, "^Lab", 3)
+  for item in items:
+    item.edit.assert_not_called()
+
+def test_move_rejects_position_below_one():
+  with pytest.raises(SystemExit):
+    run_modules_move([make_module_item(1, title="Lab 1")], "^Lab", 0)
 @
 
 
