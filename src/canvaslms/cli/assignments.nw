@@ -909,12 +909,21 @@ converted to Markdown. This format can be saved to a file, edited, and
 pushed back to Canvas using [[assignments edit -f]].
 
 The front matter includes a [[modules]] field listing which modules currently
-contain this assignment. When editing:
+contain this assignment, each as a mapping with an anchored regex and the
+assignment's position in that module (\cref{sec:export-module-specs}):
+\begin{verbatim}
+modules:
+- module: ^Week 1$
+  position: 3
+\end{verbatim}
+When editing:
 \begin{description}
 \item[Leave unset] Module membership is not changed
 \item[Set to empty list] Assignment is removed from all modules
-\item[Set to list of regexes] Assignment is placed in exactly those modules
-  matching the patterns---added to matching modules, removed from non-matching
+\item[Set to list of specs] Assignment is placed in exactly those modules
+  matching the patterns---added to matching modules, removed from
+  non-matching---at the given position where one is given; a plain regex
+  string is also a valid spec and leaves the position alone
 \end{description}
 <<output assignment in editable format>>=
 <<get current modules for assignment>>
@@ -938,11 +947,11 @@ if hasattr(assignment, 'rubric') and assignment.rubric:
   assignment_rubric = assignment.rubric
 @
 
-We fetch the current module membership using [[get_item_modules]] from the
-modules module. Assignments are identified by their numeric ID ([[content_id]]
-in the Canvas API).
+We fetch the current module membership, with positions, using
+[[export_module_specs]] from the modules module. Assignments are identified
+by their numeric ID ([[content_id]] in the Canvas API).
 <<get current modules for assignment>>=
-assignment_modules = modules.get_item_modules(
+assignment_modules = modules.export_module_specs(
     assignment.course, 'Assignment', assignment.id)
 @
 
@@ -1572,6 +1581,12 @@ This mode is script-friendly and does not require user interaction.
 We read the file using the content module's infrastructure, then validate the
 attributes against the assignment schema. The body content may be Markdown
 (default) or HTML (when [[--html]] is specified).
+
+The [[modules]] list is not part of the schema, so we validate it separately
+with [[validate_module_specs]] (\cref{sec:module-positions}) and fold its
+messages into the same error list, for the reason given for pages: the
+module update runs after the description has been written, so a malformed
+spec must be caught before anything is sent to Canvas.
 <<read and validate assignment content from file>>=
 try:
   # body_content is Markdown or HTML depending on args.html
@@ -1583,6 +1598,8 @@ except Exception as e:
 
 errors = canvaslms.cli.content.validate_attributes(
     attributes, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
+if 'modules' in attributes:
+  errors += modules.validate_module_specs(attributes['modules'])
 if errors:
   for error in errors:
     logger.error(f"Validation error: {error}")
@@ -1720,11 +1737,10 @@ except Exception as e:
 For newly created assignments, we also process module membership if specified.
 <<update new assignment module membership>>=
 if 'modules' in attributes:
-  module_regexes = attributes['modules']
-  added, removed = modules.update_item_modules(
-      new_assignment.course, 'Assignment', new_assignment.id, module_regexes)
-  if added:
-    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+  module_specs = attributes['modules']
+  added, removed, moved = modules.update_item_modules(
+      new_assignment.course, 'Assignment', new_assignment.id, module_specs)
+  modules.print_module_changes(added, removed, moved)
 @
 
 \subsubsection{Filter-based assignment matching}
@@ -1821,34 +1837,31 @@ the assignment:
 \begin{description}
 \item[Absent] Module membership is not modified
 \item[Empty list] Assignment is removed from all modules
-\item[List of regexes] Assignment is placed in exactly those modules matching
-  the patterns---added to matching modules, removed from non-matching ones
+\item[List of specs] Assignment is placed in exactly those modules matching
+  the patterns---added to matching modules, removed from non-matching
+  ones---and moved to the position a spec gives; a spec without a position
+  (in particular a plain regex string) leaves the assignment where it is
+  (\cref{sec:module-positions})
 \end{description}
 
 We use the [[update_item_modules]] utility from the modules module. Assignments
 use their numeric ID as the item identifier.
 <<update assignment module membership>>=
 if 'modules' in attributes:
-  module_regexes = attributes['modules']
-  added, removed = modules.update_item_modules(
-      assignment.course, 'Assignment', assignment.id, module_regexes)
-  if added:
-    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
-  if removed:
-    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+  module_specs = attributes['modules']
+  added, removed, moved = modules.update_item_modules(
+      assignment.course, 'Assignment', assignment.id, module_specs)
+  modules.print_module_changes(added, removed, moved)
 @
 
 In the interactive editing context, the attributes are stored in [[final_attrs]]
 rather than [[attributes]], so we provide a separate chunk for that scope.
 <<update assignment module membership interactively>>=
 if 'modules' in final_attrs:
-  module_regexes = final_attrs['modules']
-  added, removed = modules.update_item_modules(
-      assignment.course, 'Assignment', assignment.id, module_regexes)
-  if added:
-    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
-  if removed:
-    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+  module_specs = final_attrs['modules']
+  added, removed, moved = modules.update_item_modules(
+      assignment.course, 'Assignment', assignment.id, module_specs)
+  modules.print_module_changes(added, removed, moved)
 @
 
 \subsection{Interactive editing}
@@ -1931,8 +1944,7 @@ current_attrs = canvaslms.cli.content.extract_attributes_from_object(
     assignment, canvaslms.cli.content.ASSIGNMENT_SCHEMA)
 current_attrs['description'] = getattr(
     assignment, 'description', '') or ''
-assignment_modules = modules.get_item_modules(
-    assignment.course, 'Assignment', assignment.id)
+<<get current modules for assignment>>
 assignment_rubric = None
 if hasattr(assignment, 'rubric') and assignment.rubric:
   assignment_rubric = assignment.rubric
@@ -1984,7 +1996,10 @@ final_attrs, final_content = result
 When the user accepts, we convert the Markdown to HTML and update the assignment.
 If the user is working in HTML mode, we skip the conversion since the content
 is already HTML.
+As in the file-based path, a malformed [[modules]] list is reported and the
+assignment skipped before anything is written.
 <<update single assignment from interactive edit>>=
+<<reject invalid module specs before editing assignment>>
 if args.html:
   html_content = final_content
 else:
@@ -2026,6 +2041,17 @@ except Exception as e:
   logger.error(f"Error updating assignment '{assignment.name}': {e}")
   print(f"Error updating assignment '{assignment.name}': {e}", file=sys.stderr)
   skipped_count += 1
+@
+
+<<reject invalid module specs before editing assignment>>=
+if 'modules' in final_attrs:
+  spec_errors = modules.validate_module_specs(final_attrs['modules'])
+  if spec_errors:
+    for error in spec_errors:
+      print(f"Invalid modules for assignment '{assignment.name}': {error}",
+            file=sys.stderr)
+    skipped_count += 1
+    continue
 @
 
 Finally, we report a summary of what was done.

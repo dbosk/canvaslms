@@ -2701,6 +2701,11 @@ SETTINGS FOR CLASSIC QUIZZES (time_limit in minutes):
   points_possible, published, due_at, unlock_at, lock_at,
   show_correct_answers, one_question_at_a_time, cant_go_back, access_code
 
+MODULES (both quiz types, in settings.modules):
+  A list of module specs: each entry is a regex matching a module name, or
+  a mapping {"module": <regex>, "position": <1-based int>} to also place
+  the quiz at that position in the module. This is what quizzes export writes.
+
 QUESTION GROUPS (Classic Quizzes only):
   A questions entry may be a group entry wrapping a pool of questions:
     {"group": {"name": ..., "pick_count": N, "question_points": P},
@@ -2806,6 +2811,17 @@ The command supports two JSON formats:
 If the JSON contains [[items]] (New Quizzes) or [[questions]] (Classic Quizzes),
 those are added after the quiz is created.
 
+The settings written by [[quizzes export]] also carry keys that are ours,
+not Canvas's (the [[CANVASLMS_SETTINGS_KEYS]]): [[id]] and [[regex]]
+identify the source quiz, and a [[modules]] list
+(\cref{sec:module-positions}) is an instruction to us.
+They must be taken out of the settings before these are turned into API
+parameters---[[build_new_quiz_api_params]] and [[create_classic_quiz]] pass
+every key through, and Canvas would receive a [[quiz[id]]] of another course's
+quiz and a meaningless [[quiz[modules]]].
+We validate the module specs before creating the quiz, for the same reason
+as in [[quizzes edit]], and apply them once the quiz exists and has an ID.
+
 <<functions>>=
 def create_command(config, canvas, args):
   """Creates a new quiz in a course"""
@@ -2854,6 +2870,8 @@ def create_command(config, canvas, args):
   if args.title:
     quiz_params['title'] = args.title
 
+  <<take canvaslms-only keys out of the quiz settings>>
+
   if quiz_type == "new":
     <<warn about ignored New Quiz settings>>
 
@@ -2872,6 +2890,8 @@ def create_command(config, canvas, args):
 
   quiz_id = quiz.get('id', 'unknown')
   print(f"Created quiz: {quiz_params.get('title')} (ID: {quiz_id})")
+
+  <<place new quiz in requested modules>>
 
   # Add questions if present in JSON
   items = quiz_data.get('items', [])
@@ -2892,6 +2912,61 @@ def create_command(config, canvas, args):
       canvaslms.cli.warn(f"Failed to add questions: {e}")
 @
 
+
+The keys are popped, not merely read, so that the remaining
+[[quiz_params]] are pure quiz settings; the module specs are the one value
+we keep.
+<<take canvaslms-only keys out of the quiz settings>>=
+module_specs = strip_canvaslms_settings(quiz_params)
+if module_specs is not None:
+  spec_errors = modules.validate_module_specs(module_specs)
+  if spec_errors:
+    canvaslms.cli.err(1, "Invalid modules in file: " + "; ".join(spec_errors))
+@
+
+<<functions>>=
+def strip_canvaslms_settings(quiz_params):
+  """Remove canvaslms-only keys from `quiz_params` in place.
+
+  Returns the `modules` value (None when absent); `id` and `regex` are
+  dropped.
+  """
+  module_specs = quiz_params.pop('modules', None)
+  for key in CANVASLMS_SETTINGS_KEYS:
+    quiz_params.pop(key, None)
+  return module_specs
+@
+
+Let's verify that an exported settings mapping is reduced to Canvas settings
+and that the module specs survive the stripping.
+<<test functions>>=
+def test_strip_canvaslms_settings_keeps_only_canvas_keys():
+  params = {'id': 7, 'regex': '^Quiz$', 'title': 'Quiz',
+            'modules': ['^Week 1$'], 'time_limit': 60}
+  specs = quizzes.strip_canvaslms_settings(params)
+  assert specs == ['^Week 1$']
+  assert params == {'title': 'Quiz', 'time_limit': 60}
+
+def test_strip_canvaslms_settings_without_modules():
+  params = {'id': 7, 'title': 'Quiz'}
+  assert quizzes.strip_canvaslms_settings(params) is None
+  assert params == {'title': 'Quiz'}
+@
+
+A New Quiz appears in modules as the [[Assignment]] item whose ID Canvas
+just returned; a Classic Quiz as a [[Quiz]] item with the quiz ID.
+Should Canvas have answered without an ID we cannot place the quiz, and say
+so, rather than fail after the quiz has been created.
+<<place new quiz in requested modules>>=
+if module_specs is not None:
+  try:
+    item_id = int(quiz_id)
+  except (TypeError, ValueError):
+    canvaslms.cli.warn("Created quiz has no usable ID; not placed in modules")
+  else:
+    item_type = 'Assignment' if quiz_type == "new" else 'Quiz'
+    apply_quiz_module_specs(course, item_type, item_id, module_specs)
+@
 
 \subsection{Creating a New Quiz via API}
 
@@ -3329,16 +3404,24 @@ field. We interpret this the same way as [[assignments edit]]:
 \begin{description}
 \item[Absent] Leave module membership unchanged.
 \item[Empty list] Remove the quiz from all modules.
-\item[List of regexes] Ensure the quiz appears in every matching module and is
-  removed from non-matching modules.
+\item[List of specs] Ensure the quiz appears in every matching module and is
+  removed from non-matching modules; a spec with a position also moves the
+  quiz there, a plain regex leaves its position alone
+  (\cref{sec:module-positions}).
 \end{description}
 
 New Quizzes are implemented as assignments, and the module item type Canvas uses
-is [[Assignment]]. We therefore update membership using the quiz's assignment ID.
-Classic quizzes also appear as module items and can be targeted the same way.
+is [[Assignment]], with the assignment ID. Classic Quizzes are listed in
+modules as items of type [[Quiz]], with the quiz ID. The two therefore need
+different item types when talking to the modules helpers; [[quiz_module_item]]
+makes that choice in one place.
 
-We centralize this logic in a helper function so both file-based and interactive
-edit paths behave identically.
+We centralize this logic in a helper function so the file-based and
+interactive edit paths, and [[quizzes create]], behave identically.
+The lower-level [[apply_quiz_module_specs]] takes the course and the item ID
+rather than a quiz object, because [[quizzes create]] only has the ID Canvas
+returned when the quiz was made; [[update_quiz_module_membership]] computes
+the ID from a quiz object for the edit paths.
 
 The [[quizzes edit]] command supports three file formats, auto-detected from
 the file extension and verified against the content:
@@ -3369,15 +3452,46 @@ characters of the file:
 \end{itemize}
 
 <<functions>>=
-def update_quiz_module_membership(quiz, module_regexes):
-  """Update module membership for a quiz based on module regex list"""
-  item_id = int(quiz.id) if is_new_quiz(quiz) else quiz.id
-  added, removed = modules.update_item_modules(
-      quiz.course, 'Assignment', item_id, module_regexes)
-  if added:
-    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
-  if removed:
-    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+def quiz_module_item(quiz):
+  """Return (item_type, item_id) identifying `quiz` as a module item."""
+  if is_new_quiz(quiz):
+    return 'Assignment', int(quiz.id)
+  return 'Quiz', quiz.id
+
+def apply_quiz_module_specs(course, item_type, item_id, module_specs):
+  """Place the quiz appearing as module item (item_type, item_id)."""
+  added, removed, moved = modules.update_item_modules(
+      course, item_type, item_id, module_specs)
+  modules.print_module_changes(added, removed, moved)
+
+def update_quiz_module_membership(quiz, module_specs):
+  """Update module membership for a quiz based on module specs"""
+  item_type, item_id = quiz_module_item(quiz)
+  apply_quiz_module_specs(quiz.course, item_type, item_id, module_specs)
+@
+
+Let's verify that the helpers reach [[update_item_modules]] with the item
+type each kind of quiz appears as in modules.
+<<test functions>>=
+def test_apply_quiz_module_specs_delegates_to_modules(monkeypatch):
+  calls = []
+  def fake_update(course, item_type, item_id, specs):
+    calls.append((course, item_type, item_id, specs))
+    return ([], [], [])
+  monkeypatch.setattr(quizzes.modules, "update_item_modules", fake_update)
+  course = MagicMock()
+  specs = [{"module": "^Week 1$", "position": 2}]
+  quizzes.apply_quiz_module_specs(course, 'Quiz', 42, specs)
+  assert calls == [(course, 'Quiz', 42, specs)]
+
+def test_quiz_module_item_distinguishes_quiz_kinds(monkeypatch):
+  quiz = MagicMock()
+  quiz.id = "42"
+  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
+  assert quizzes.quiz_module_item(quiz) == ('Assignment', 42)
+  quiz.id = 7
+  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: False)
+  assert quizzes.quiz_module_item(quiz) == ('Quiz', 7)
 
 
 <<functions>>=
@@ -3657,8 +3771,17 @@ We can identify the target quiz in two ways:
   the user's selection expression so scripted edits stay stable.
 \end{description}
 
+Before we look for the quiz we check the [[modules]] list, if there is one,
+with [[validate_module_specs]] (\cref{sec:module-positions}).
+The module update is the last step of the edit, after settings and
+questions have been written, so a malformed spec caught only there would
+leave a half-applied edit behind.
 <<identify target quiz from file data>>=
 settings = quiz_data.get('settings') or {}
+if 'modules' in settings:
+  spec_errors = modules.validate_module_specs(settings['modules'])
+  if spec_errors:
+    canvaslms.cli.err(1, "Invalid modules in file: " + "; ".join(spec_errors))
 course_list = courses.process_course_option(canvas, args)
 
 if getattr(args, 'assignment', None):
@@ -3732,7 +3855,8 @@ field the same way as in [[assignments edit]]:
 \begin{description}
 \item[Absent] Module membership is not modified
 \item[Empty list] Quiz is removed from all modules
-\item[List of regexes] Quiz is placed in all modules matching the patterns
+\item[List of specs] Quiz is placed in all modules matching the patterns, at
+  the position a spec gives (\cref{sec:module-positions})
 \end{description}
 
 <<handle item replacement if requested>>=
@@ -3937,12 +4061,26 @@ def edit_quiz_interactive(quiz, requester, html_mode=False):
 
   final_attrs, final_body = result
 
+  <<reject invalid module specs before editing quiz>>
+
   # Apply the changes
   api_attrs = convert_front_matter_units(final_attrs, is_new_quiz(quiz))
   success = apply_quiz_edit(quiz, api_attrs, final_body, requester, html_mode)
   if success:
     <<update quiz module membership interactively>>
   return 'updated' if success else 'error'
+@
+
+The editor validates the schema attributes but knows nothing about module
+specs, so, as in the file-based path, we check the [[modules]] list before
+applying anything, and report an error without touching the quiz.
+<<reject invalid module specs before editing quiz>>=
+if 'modules' in final_attrs:
+  spec_errors = modules.validate_module_specs(final_attrs['modules'])
+  if spec_errors:
+    for error in spec_errors:
+      print(f"Invalid modules: {error}", file=sys.stderr)
+    return 'error'
 @
 
 
@@ -4683,6 +4821,16 @@ body becomes the caller's job---which is what
 We still send an empty body rather than omitting the key, so that clearing
 the Markdown body in the editor clears the description on Canvas.
 
+Three keys in a settings mapping are ours rather than Canvas's: [[id]] and
+[[regex]] identify the quiz for round trips (\cref{sec:quizzes-create} and
+the file-based edit path), and [[modules]] is an instruction to the modules
+helpers.
+Both the edit path here and [[quizzes create]] must drop them before building
+API parameters, so the list is named once.
+<<constants>>=
+CANVASLMS_SETTINGS_KEYS = ('id', 'regex', 'modules')
+@
+
 <<functions>>=
 def quiz_attributes_to_api_params(attributes, is_new, html_body):
   """Convert schema attributes to Canvas API parameters
@@ -4702,8 +4850,7 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
   params = {}
 
   for key, value in attributes.items():
-    if key in ('id', 'regex', 'modules'):
-      # Don't send ID as an update parameter
+    if key in CANVASLMS_SETTINGS_KEYS:
       continue
 
     if value is None:
@@ -5073,10 +5220,11 @@ The export command finds the quiz, extracts its settings, and exports all
 questions.  We reuse the existing [[export_new_quiz_items]] and
 [[export_classic_questions]] functions for question export.
 
-If the quiz appears in modules, we also export a [[modules]] list. The
-[[quizzes edit]] command interprets this list as regex patterns, so we export
-module names as anchored, regex-escaped patterns (e.g., [[^FBF$]]) to mean
-\enquote{match this module name exactly}.
+If the quiz appears in modules, we also export a [[modules]] list of module
+specs: anchored, regex-escaped module names (e.g., [[^FBF$]]) paired with the
+quiz's position in each module, as produced by
+[[modules.export_module_specs]]. The [[quizzes edit]] and [[quizzes create]]
+commands read the same form back.
 
 <<functions>>=
 def export_command(config, canvas, args):
@@ -5134,11 +5282,8 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
   """
   # Extract basic settings
   settings = {
-    'modules': [
-      "^" + re.escape(name) + "$"
-      for name in modules.get_item_modules(
-          quiz.course, 'Assignment', int(quiz.id))
-    ],
+    'modules': modules.export_module_specs(
+        quiz.course, *quiz_module_item(quiz)),
     'title': quiz.title or '',
     'instructions': quiz.instructions or '',
     'time_limit': getattr(quiz, 'time_limit', None),
@@ -5188,11 +5333,8 @@ def export_full_classic_quiz(quiz, importable=False):
   """
   # Extract settings
   settings = {
-    'modules': [
-      "^" + re.escape(name) + "$"
-      for name in modules.get_item_modules(
-          quiz.course, 'Assignment', quiz.id)
-    ],
+    'modules': modules.export_module_specs(
+        quiz.course, *quiz_module_item(quiz)),
     'title': quiz.title or '',
     'description': quiz.description or '',
     'quiz_type': quiz.quiz_type or 'assignment',
