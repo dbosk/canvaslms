@@ -674,6 +674,160 @@ elif item_type == 'Page':
       pass
 @
 
+\subsection{Module specifications: patterns with optional positions}
+\label{sec:module-positions}
+
+A [[modules]] list of plain regex strings can say \emph{which} modules an
+item belongs in, but nothing about \emph{where} in each module it goes.
+Canvas keeps every module's items in order and exposes that order as a
+1-based [[position]]; adding an item without one appends it.
+That is fine for a first import, but a course whose pages live in files
+(one file per page, pushed one at a time) needs each file to carry the
+page's place in the module, or the module order would depend on the order
+in which files happen to be pushed.
+
+So a [[modules]] entry may also be a mapping that pairs a pattern with a
+position:
+\begin{verbatim}
+modules:
+- ^Week 1$
+- module: ^Week 2$
+  position: 3
+\end{verbatim}
+The first entry is the familiar string form: the item must be in the
+modules matching it, wherever it already is or at the end if new.
+The second says the item must be the third item of every module matching
+[[^Week 2$]].
+We chose a mapping over some inline syntax such as [[^Week 2$@3]] because
+YAML parses it for us, the position stays an integer rather than a string
+to be dissected, and the form has room to grow (a later
+[[after: <pattern>]] would not change the string form).
+The key is named [[module]] to mirror the [[-M]]/[[--module]] option, whose
+value is the same kind of pattern.
+
+The semantics of a missing position are the important design decision here:
+a spec without a position leaves the item where it is, it never moves it to
+the end.
+This is what makes round trips safe---a file exported from Canvas and
+pushed back unchanged must not reorder anything---and it is why the mapping
+form with no [[position]] is allowed at all: it means the same as the
+string, so exporters can always write mappings.
+When several specs match the same module, the last one that carries a
+position decides; when one pattern matches several modules, the item gets
+that position in each of them.
+
+We normalize the two forms into one shape, a list of
+[[(pattern, position)]] pairs, so the rest of the code never has to ask
+which spelling the user chose.
+Anything else is a [[ValueError]] naming the offending entry, because the
+alternative---silently skipping an entry---would leave the item in the
+wrong module with no hint why.
+<<functions>>=
+def normalize_module_specs(specs):
+  """Return module specs as a list of (pattern, position) pairs.
+
+  Each entry of `specs` is either a regex string or a mapping with the key
+  `module` (a regex) and an optional `position` (an integer >= 1). A missing
+  position is returned as None; `specs` itself may be None, meaning no
+  modules. Raises ValueError for anything else.
+  """
+  if specs is None:
+    return []
+  if isinstance(specs, str) or not isinstance(specs, (list, tuple)):
+    raise ValueError(f"modules must be a list of patterns, got {specs!r}")
+  normalized = []
+  for spec in specs:
+    <<normalize one module spec>>
+  return normalized
+@
+
+A string is a pattern; a mapping must have a string [[module]] and nothing
+but [[module]] and [[position]].
+Rejecting unknown keys matters because a typo such as [[postion: 3]] would
+otherwise be accepted as \enquote{no position} and the item would quietly
+stay put.
+<<normalize one module spec>>=
+if isinstance(spec, str):
+  normalized.append((spec, None))
+  continue
+if not isinstance(spec, dict):
+  raise ValueError(
+      f"module spec must be a pattern or a mapping, got {spec!r}")
+unknown = set(spec) - {"module", "position"}
+if unknown:
+  raise ValueError(f"module spec {spec!r} has unknown keys: "
+                   f"{', '.join(sorted(unknown))}")
+if not isinstance(spec.get("module"), str):
+  raise ValueError(f"module spec {spec!r} needs a 'module' pattern")
+position = spec.get("position")
+if position is not None:
+  <<check that [[position]] is a positive integer>>
+normalized.append((spec["module"], position))
+@
+
+Canvas positions start at 1, so zero and negatives are errors rather than
+\enquote{first}.
+We must also rule out booleans explicitly: [[bool]] is a subclass of [[int]]
+in Python, and YAML reads [[position: yes]] as [[True]], which would
+otherwise pass as position~1.
+<<check that [[position]] is a positive integer>>=
+if (isinstance(position, bool) or not isinstance(position, int)
+    or position < 1):
+  raise ValueError(
+      f"module spec {spec!r}: position must be an integer >= 1")
+@
+
+The commands that read front matter validate it before they write anything
+to Canvas, collecting error messages with [[content.validate_attributes]].
+[[modules]] is not part of those schemas, so we offer the same shape of
+interface for it: a function returning a list of messages, empty when the
+specs are fine, that callers can append to their own list.
+Validating up front matters because the module update runs \emph{after} the
+content has been written; an error raised only then would tell the user the
+edit failed when in fact only the placement did.
+<<functions>>=
+def validate_module_specs(specs):
+  """Return error messages for module `specs`; empty when they are valid."""
+  try:
+    normalize_module_specs(specs)
+  except ValueError as e:
+    return [str(e)]
+  return []
+@
+
+Let's verify both spellings normalize to the same shape and that each
+malformed form is rejected with a message that names it.
+<<test functions>>=
+def test_normalize_accepts_strings_and_mappings():
+  specs = ["^Week 1$", {"module": "^Week 2$", "position": 3},
+           {"module": "^Week 3$"}]
+  assert normalize_module_specs(specs) == [
+      ("^Week 1$", None), ("^Week 2$", 3), ("^Week 3$", None)]
+
+def test_normalize_treats_none_as_no_modules():
+  assert normalize_module_specs(None) == []
+  assert normalize_module_specs([]) == []
+
+@pytest.mark.parametrize("bad", [
+    "^Week 1$",                                   # not a list
+    [3],                                          # neither str nor mapping
+    [{"position": 2}],                            # missing module
+    [{"module": 7}],                              # module not a pattern
+    [{"module": "x", "postion": 2}],              # typo'd key
+    [{"module": "x", "position": "2"}],           # position not an int
+    [{"module": "x", "position": True}],          # YAML yes
+    [{"module": "x", "position": 0}],             # Canvas starts at 1
+])
+def test_normalize_rejects_malformed_specs(bad):
+  with pytest.raises(ValueError):
+    normalize_module_specs(bad)
+  errors = validate_module_specs(bad)
+  assert len(errors) == 1
+
+def test_validate_returns_no_errors_for_valid_specs():
+  assert validate_module_specs(["a", {"module": "b", "position": 1}]) == []
+@
+
 \subsection{Updating module membership based on patterns}
 
 The [[update_item_modules]] function synchronizes an item's module membership
