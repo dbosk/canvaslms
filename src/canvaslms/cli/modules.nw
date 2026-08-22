@@ -639,9 +639,13 @@ The function handles two item types differently:
 \item[Page] Identified by [[page_url]] matching the page's URL slug
 \end{description}
 
+Since we visit the matching module item anyway, we return its position along
+with the module name; the exporters need both
+(\cref{sec:export-module-specs}), and a second scan of every module just for
+the positions would double the API traffic of every export.
 <<functions>>=
-def get_item_modules(course, item_type, item_id):
-  """Get list of modules containing an item.
+def get_item_module_positions(course, item_type, item_id):
+  """Get the modules containing an item and the item's position in each.
 
   Args:
       course: Canvas course object
@@ -650,7 +654,7 @@ def get_item_modules(course, item_type, item_id):
                For Page: page.url (string slug)
 
   Returns:
-      List of module names containing this item
+      List of (module name, position) pairs; position may be None.
   """
   target_url = None
   if item_type == 'Page':
@@ -682,21 +686,93 @@ redirect old URLs to new ones, so we need to resolve the URL before comparing
 <<check if item matches and add module to list>>=
 if item_type == 'Assignment':
   if item.content_id == item_id:
-    modules.append(module.name)
+    modules.append((module.name, item.position))
     break
 elif item_type == 'Page':
   if item.page_url:
     if item.page_url == item_id:
-      modules.append(module.name)
+      modules.append((module.name, item.position))
       break
     # Compare canonical URLs to avoid duplicates when Canvas redirects old slugs.
     try:
       resolved_page = course.get_page(item.page_url)
       if resolved_page.url == target_url:
-        modules.append(module.name)
+        modules.append((module.name, item.position))
         break
     except Exception:
       pass
+@
+
+Most readers of membership only want the names, so we keep the simpler
+function as a view of the richer one.
+<<functions>>=
+def get_item_modules(course, item_type, item_id):
+  """Get list of names of the modules containing an item.
+
+  Arguments are as for get_item_module_positions.
+  """
+  return [name for name, _ in
+          get_item_module_positions(course, item_type, item_id)]
+@
+
+\subsubsection{Exporting membership as module specs}
+\label{sec:export-module-specs}
+
+The [[pages view]], [[assignments view]] and [[quizzes export]] commands write
+the item's current membership into the exported front matter, so that the
+file can be edited and pushed back.
+What they write must therefore be something [[update_item_modules]] reads:
+a list of module specs (\cref{sec:module-positions}).
+
+We write the mapping form, with the position, rather than bare module names
+for two reasons.
+First, the names are regexes on the way back in, so a bare name such as
+[[Week 1]] would also match [[Week 10]]; anchoring and escaping the name
+([[^Week 1$]]) makes the round trip exact.
+Second, including the position makes the export a complete description of
+the item's place in the course: a file pulled from Canvas, edited and pushed
+back puts the item exactly where it was, and a set of such files can be
+pushed in any order and still reproduce the module order---which is what a
+course kept in version control needs.
+An item Canvas reports without a position (it should not happen, but the
+attribute is normalized to [[None]] if it does) gets a spec without one,
+which by the rules of \cref{sec:module-positions} means \enquote{leave it}.
+<<functions>>=
+def export_module_specs(course, item_type, item_id):
+  """Return the item's module membership as a list of module specs.
+
+  Each spec is a mapping with an anchored, escaped regex under `module`
+  and, when known, the item's 1-based `position` in that module. The list
+  is suitable for the `modules` front matter key.
+  """
+  specs = []
+  for name, position in get_item_module_positions(course, item_type,
+                                                   item_id):
+    spec = {'module': "^" + re.escape(name) + "$"}
+    if position is not None:
+      spec['position'] = position
+    specs.append(spec)
+  return specs
+@
+
+Let's verify that the export is anchored, escaped and carries the position,
+and that it reads back as it was written.
+<<test functions>>=
+def test_export_module_specs_round_trips_through_normalize():
+  item = make_assignment_item(42, position=3)
+  course, module = one_module_course([item], name="Week 1 (a+b)")
+  specs = export_module_specs(course, 'Assignment', 42)
+  assert specs == [{'module': r"^Week\ 1\ \(a\+b\)$", 'position': 3}]
+  assert normalize_module_specs(specs) == [(r"^Week\ 1\ \(a\+b\)$", 3)]
+  assert re.search(specs[0]['module'], "Week 1 (a+b)")
+  assert not re.search(specs[0]['module'], "Week 1 (a+b) extra")
+
+def test_export_module_specs_omits_unknown_position():
+  item = make_assignment_item(42, position=None)
+  course, module = one_module_course([item])
+  assert export_module_specs(course, 'Assignment', 42) == [
+      {'module': "^Week\\ 1$"}]
+  assert get_item_modules(course, 'Assignment', 42) == ["Week 1"]
 @
 
 \subsection{Module specifications: patterns with optional positions}
