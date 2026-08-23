@@ -20,13 +20,15 @@ properly configured before a course begins.
 \section*{Chapter overview}
 
 This chapter serves two purposes:
-First, it provides the [[modules]] subcommand with three sub-commands:
+First, it provides the [[modules]] subcommand with five sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
 \item [[modules view]] --- displays module contents including all items and
   their completion requirements
 \item [[modules move]] --- moves an item to a given position within a module
+\item [[modules create]] --- creates a module
+\item [[modules delete]] --- deletes modules, after confirmation
 \end{itemize}
 
 Second, it provides utility functions ([[filter_modules]] and the
@@ -81,6 +83,24 @@ def add_command(subp):
                 "module; Canvas renumbers the other items.")
   move_parser.set_defaults(func=modules_move_command)
   <<add move arguments>>
+
+  # Add 'create' subcommand
+  create_parser = modules_subp.add_parser("create",
+    help="Creates a module",
+    description="Creates a module in each selected course and prints it "
+                "as a 'modules list' row.")
+  create_parser.set_defaults(func=modules_create_command)
+  <<add create arguments>>
+
+  # Add 'delete' subcommand
+  delete_parser = modules_subp.add_parser("delete",
+    help="Deletes modules",
+    description="Deletes the modules matching the regex after listing them "
+                "and asking for confirmation (skip with --force). The "
+                "items are removed from the module; the pages, assignments "
+                "and files they point to stay in the course.")
+  delete_parser.set_defaults(func=modules_delete_command)
+  <<add delete arguments>>
 @
 
 Tests for this chapter are distributed through it, each placed after the
@@ -103,8 +123,9 @@ from canvaslms.cli.modules import *
 @
 
 The subcommand is [[required]] because [[modules]] is a container command:
-all its work happens in [[list]], [[view]] or [[move]], and a bare
-[[canvaslms modules]] has no meaningful interpretation.
+all its work happens in [[list]], [[view]], [[move]], [[create]] or
+[[delete]], and a bare [[canvaslms modules]] has no meaningful
+interpretation.
 Requiring it lets argparse answer such a command line with the usage message
 listing the alternatives, which is both the most informative answer and
 the earliest one.
@@ -123,8 +144,10 @@ We don't pay it here, which leaves requiring the subcommand as the only way
 commands without defaults: [[pages]], [[discussions]], [[calendar]],
 [[syllabus]] and [[cache]].
 
-All subcommands accept a regular expression for filtering modules by name
-or Canvas ID; [[move]] requires it (\cref{sec:modules-move}).
+[[list]], [[view]], [[move]] and [[delete]] accept a regular expression for
+selecting modules by name or Canvas ID; [[move]] and [[delete]] require it
+(\cref{sec:modules-move,sec:modules-delete}), [[create]] takes a module
+name instead (\cref{sec:modules-create}).
 This allows users to work with specific modules or groups of related modules.
 Additionally, the [[view]] subcommand supports two optional flags that add
 columns: [[--show-id]] includes Canvas item IDs and [[--show-position]]
@@ -150,8 +173,8 @@ view_parser.add_argument("--show-position", action="store_true",
   help="Include each item's position within its module in output")
 @
 
-The arguments of [[move]] are explained with the command
-(\cref{sec:modules-move}).
+The arguments of [[move]], [[create]] and [[delete]] are explained with
+their commands (\cref{sec:modules-move,sec:modules-create,sec:modules-delete}).
 <<add move arguments>>=
 move_parser.add_argument("regex",
   help="Regex for selecting modules (required: the move applies to each "
@@ -551,6 +574,250 @@ def test_move_refuses_ambiguous_match():
 def test_move_rejects_position_below_one():
   with pytest.raises(SystemExit):
     run_modules_move([make_module_item(1, title="Lab 1")], "^Lab", 0)
+@
+
+
+\section{Creating modules, [[modules_create_command]]}
+\label{sec:modules-create}
+
+Placing items in modules presupposes that the modules exist, and a course
+set up from files (\cref{sec:module-positions}) wants that step scripted
+too.
+[[modules create]] creates one module per selected course:
+\begin{minted}{bash}
+canvaslms modules create -c prgi25 "Week 1" --position 1 --unlock-at 2026-08-24 --publish
+\end{minted}
+Canvas is happy to create several modules with the same name, which in a
+script is almost always a re-run rather than an intention, so we refuse a
+name that already exists in the course unless [[--allow-duplicate]] says
+otherwise.
+The new module is printed as a [[modules list]] row, so that a script can
+read back what it created in the format it already parses.
+
+The course's module list is cached across runs (\cref{sec:caching-module-items}
+describes the mechanism for items; modules are cached the same way on the
+[[Course]] object), so after creating or deleting a module we forget the
+course's cached modules, exactly as [[invalidate_module_items]] does for a
+module's items.
+<<functions>>=
+def invalidate_course_modules(course):
+  """Forget the cached modules of `course` so the next access refetches."""
+  if hasattr(course, 'module_cache'):
+    course.module_cache.clear()
+  if hasattr(course, 'module_all_fetched'):
+    course.module_all_fetched = None
+
+def modules_create_command(config, canvas, args):
+  """Create a module in each selected course and print it as a list row."""
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  course_list = courses.process_course_option(canvas, args)
+  for course in course_list:
+    <<refuse to duplicate an existing module name>>
+    <<build the module attributes from the options>>
+    module = canvaslms.cli.utils.ensure_module_attrs(
+        course.create_module(module_attrs))
+    invalidate_course_modules(course)
+    <<publish the new module if requested>>
+    <<write module information to output>>
+@
+
+<<refuse to duplicate an existing module name>>=
+existing = [m for m in course.get_modules()
+            if canvaslms.cli.utils.ensure_module_attrs(m).name == args.name]
+if existing and not args.allow_duplicate:
+  canvaslms.cli.err(1, f"Module '{args.name}' already exists in "
+                       f"{course.course_code}; use --allow-duplicate to add "
+                       "another")
+@
+
+Only the options the user gave are sent, so Canvas applies its own
+defaults for the rest (appended last, locked never, any order).
+The unlock date goes through [[parse_date]] like the assignment dates do, so
+the same human-readable forms work here.
+<<build the module attributes from the options>>=
+module_attrs = {'name': args.name}
+if args.position is not None:
+  module_attrs['position'] = args.position
+if args.unlock_at:
+  module_attrs['unlock_at'] = canvaslms.cli.utils.parse_date(args.unlock_at)
+if args.sequential:
+  module_attrs['require_sequential_progress'] = True
+@
+
+Canvas creates modules unpublished and accepts [[published]] only on
+update, hence the second request.
+<<publish the new module if requested>>=
+if args.publish:
+  module.edit(module={'published': True})
+@
+
+<<add create arguments>>=
+create_parser.add_argument("name",
+  help="Name of the new module")
+courses.add_course_option(create_parser, required=True)
+create_parser.add_argument("-p", "--position", type=int,
+  help="1-based position among the course's modules (default: last)")
+create_parser.add_argument("--unlock-at",
+  help="When the module unlocks for students, e.g. '2026-08-24 08:00'")
+create_parser.add_argument("--sequential", action="store_true",
+  help="Require students to complete the items in order")
+create_parser.add_argument("--publish", action="store_true",
+  help="Publish the module right away (default: unpublished)")
+create_parser.add_argument("--allow-duplicate", action="store_true",
+  help="Create the module even if one with the same name exists")
+@
+
+Let's verify that the module is created from the options, that the cached
+module list is forgotten, and that a duplicate name is refused.
+<<test functions>>=
+def run_modules_create(existing_names, capsys, **options):
+  """Run modules create on one course; return (course, created module)."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  mods = []
+  for name in existing_names:
+    m = MagicMock(); m.name = name; mods.append(m)
+  course.get_modules.return_value = mods
+  course.module_cache = {1: (MagicMock(), {})}
+  course.module_all_fetched = datetime.now()
+  created = MagicMock()
+  created.name = options.get("name", "New")
+  created.unlock_at = None
+  created.require_sequential_progress = False
+  created.get_module_items.return_value = []
+  course.create_module.return_value = created
+  args = argparse.Namespace(delimiter="\t", position=None, unlock_at=None,
+                            sequential=False, publish=False,
+                            allow_duplicate=False, name="New")
+  for k, v in options.items():
+    setattr(args, k, v)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_create_command({}, MagicMock(), args)
+  return course, created
+
+def test_create_sends_only_given_options(capsys):
+  course, created = run_modules_create([], capsys, name="Week 1",
+                                       position=2, sequential=True)
+  course.create_module.assert_called_once_with(
+      {'name': "Week 1", 'position': 2, 'require_sequential_progress': True})
+  created.edit.assert_not_called()
+  assert course.module_cache == {}
+  assert course.module_all_fetched is None
+  row = capsys.readouterr().out.strip().split("\t")
+  assert row[:2] == ["CODE", "Week 1"] and row[-1] == "0"
+
+def test_create_publishes_on_request(capsys):
+  course, created = run_modules_create([], capsys, name="Week 1", publish=True)
+  created.edit.assert_called_once_with(module={'published': True})
+
+def test_create_refuses_duplicate_name_unless_allowed(capsys):
+  with pytest.raises(SystemExit):
+    run_modules_create(["Week 1"], capsys, name="Week 1")
+  course, created = run_modules_create(["Week 1"], capsys, name="Week 1",
+                                       allow_duplicate=True)
+  course.create_module.assert_called_once()
+@
+
+
+\section{Deleting modules, [[modules_delete_command]]}
+\label{sec:modules-delete}
+
+Deleting a module removes the module and its items from the course
+structure; the pages, assignments and files the items pointed to stay in
+the course.
+That makes it less destructive than it sounds, but a regex can match more
+than the user had in mind, so we follow [[quizzes delete]]: show what will
+be deleted, ask, and let [[--force]] skip the question for scripts.
+Unlike [[quizzes delete]] we do accept several matches---tearing down a
+whole set of [[Week .*]] modules is the common case---which is why the
+listing and the question come before any deletion.
+<<functions>>=
+def modules_delete_command(config, canvas, args):
+  """Delete the modules matching a regex, after confirmation."""
+  course_list = courses.process_course_option(canvas, args)
+  targets = [(course, module)
+             for course in course_list
+             for module in filter_modules(course, args.regex)]
+  if not targets:
+    raise canvaslms.cli.EmptyListError(f"No modules match '{args.regex}'")
+  <<list the modules about to be deleted>>
+  <<ask for confirmation unless forced>>
+  for course, module in targets:
+    module.delete()
+    invalidate_course_modules(course)
+    print(f"Deleted module '{module.name}' in {course.course_code}",
+          file=sys.stderr)
+@
+
+The item count is the most useful thing to show: an empty module is
+harmless to delete, one with thirty items deserves a second look.
+<<list the modules about to be deleted>>=
+for course, module in targets:
+  try:
+    item_count = len(list_module_items(module))
+  except Exception:
+    item_count = "?"
+  print(f"{course.course_code}\t{module.name}\t{item_count} item(s)",
+        file=sys.stderr)
+@
+
+<<ask for confirmation unless forced>>=
+if not args.force:
+  answer = input(f"Delete {len(targets)} module(s)? Items are removed from "
+                 "the module, their content stays in the course. [y/N] ")
+  if answer.strip().lower() not in ('y', 'yes'):
+    print("Aborted.", file=sys.stderr)
+    return
+@
+
+<<add delete arguments>>=
+delete_parser.add_argument("regex",
+  help="Regex for selecting the modules to delete (name or Canvas ID)")
+courses.add_course_option(delete_parser, required=True)
+delete_parser.add_argument("--force", "-F", action="store_true",
+  help="Skip the confirmation prompt")
+@
+
+Let's verify that deletion only happens after a yes (or [[--force]]), that
+all matches go, and that the cached module list is forgotten.
+<<test functions>>=
+def run_modules_delete(names, regex, force, answer=None):
+  """Run modules delete on a course with modules `names`; return them."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  mods = []
+  for i, name in enumerate(names):
+    m = MagicMock(); m.name = name; m.id = 100 + i
+    m.get_module_items.return_value = []
+    mods.append(m)
+  course.get_modules.return_value = mods
+  course.module_cache = {m.id: (m, {}) for m in mods}
+  course.module_all_fetched = datetime.now()
+  args = argparse.Namespace(regex=regex, force=force)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]), \
+       patch("builtins.input", return_value=answer or ""):
+    modules_delete_command({}, MagicMock(), args)
+  return course, mods
+
+def test_delete_force_deletes_all_matches():
+  course, mods = run_modules_delete(["Week 1", "Week 2", "Exam"], "^Week",
+                                    force=True)
+  assert [m.delete.called for m in mods] == [True, True, False]
+  assert course.module_cache == {} and course.module_all_fetched is None
+
+def test_delete_asks_and_respects_no():
+  course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
+                                    answer="n")
+  mods[0].delete.assert_not_called()
+  course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
+                                    answer="y")
+  mods[0].delete.assert_called_once()
+
+def test_delete_without_match_raises_empty_list_error():
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    run_modules_delete(["Week 1"], "^Nothing", force=True)
 @
 
 
