@@ -993,7 +993,7 @@ reserved for data (exported content, TSV listings), and a line is printed
 only when there is something to say, so an unchanged item produces no
 noise.
 <<functions>>=
-def print_module_changes(added, removed, moved=()):
+def print_module_changes(added, removed, moved=(), required=()):
   """Report module membership changes on standard error.
 
   Each argument is a list of module names; empty lists print nothing.
@@ -1004,6 +1004,9 @@ def print_module_changes(added, removed, moved=()):
     print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
   if moved:
     print(f"  Moved within modules: {', '.join(moved)}", file=sys.stderr)
+  if required:
+    print(f"  Requirement set in modules: {', '.join(required)}",
+          file=sys.stderr)
 @
 
 \subsection{Getting current module membership}
@@ -1041,7 +1044,8 @@ def get_item_module_positions(course, item_type, item_id):
                For Page: page.url (string slug)
 
   Returns:
-      List of (module name, position) pairs; position may be None.
+      List of (module name, position, completion requirement) triples;
+      position and requirement may be None.
   """
   target_url = None
   if item_type == 'Page':
@@ -1073,18 +1077,18 @@ redirect old URLs to new ones, so we need to resolve the URL before comparing
 <<check if item matches and add module to list>>=
 if item_type in CONTENT_ID_ITEM_TYPES:
   if item.content_id == item_id:
-    modules.append((module.name, item.position))
+    modules.append((module.name, item.position, item.completion_requirement))
     break
 elif item_type == 'Page':
   if item.page_url:
     if item.page_url == item_id:
-      modules.append((module.name, item.position))
+      modules.append((module.name, item.position, item.completion_requirement))
       break
     # Compare canonical URLs to avoid duplicates when Canvas redirects old slugs.
     try:
       resolved_page = course.get_page(item.page_url)
       if resolved_page.url == target_url:
-        modules.append((module.name, item.position))
+        modules.append((module.name, item.position, item.completion_requirement))
         break
     except Exception:
       pass
@@ -1098,7 +1102,7 @@ def get_item_modules(course, item_type, item_id):
 
   Arguments are as for get_item_module_positions.
   """
-  return [name for name, _ in
+  return [name for name, _, _ in
           get_item_module_positions(course, item_type, item_id)]
 @
 
@@ -1124,22 +1128,35 @@ course kept in version control needs.
 An item Canvas reports without a position (it should not happen, but the
 attribute is normalized to [[None]] if it does) gets a spec without one,
 which by the rules of \cref{sec:module-positions} means \enquote{leave it}.
+The completion requirement (\cref{sec:completion-requirements}) is exported
+the same way, in its short string form unless it is a [[min_score]]
+requirement, whose score needs the mapping form; Canvas's per-user
+[[completed]] flag is not part of the requirement and is dropped.
 <<functions>>=
 def export_module_specs(course, item_type, item_id):
   """Return the item's module membership as a list of module specs.
 
   Each spec is a mapping with an anchored, escaped regex under `module`
-  and, when known, the item's 1-based `position` in that module. The list
-  is suitable for the `modules` front matter key.
+  and, when known, the item's 1-based `position` in that module and its
+  `completion_requirement`. The list is suitable for the `modules` front
+  matter key.
   """
   specs = []
-  for name, position in get_item_module_positions(course, item_type,
-                                                   item_id):
+  for name, position, requirement in get_item_module_positions(
+      course, item_type, item_id):
     spec = {'module': "^" + re.escape(name) + "$"}
     if position is not None:
       spec['position'] = position
+    if requirement and requirement.get('type'):
+      spec['completion_requirement'] = export_requirement(requirement)
     specs.append(spec)
   return specs
+
+def export_requirement(requirement):
+  """Return a Canvas completion requirement in spec form."""
+  if requirement['type'] == 'min_score':
+    return {'type': 'min_score', 'min_score': requirement.get('min_score')}
+  return requirement['type']
 @
 
 Let's verify that the export is anchored, escaped and carries the position,
@@ -1147,10 +1164,13 @@ and that it reads back as it was written.
 <<test functions>>=
 def test_export_module_specs_round_trips_through_normalize():
   item = make_assignment_item(42, position=3)
+  item.completion_requirement = {'type': 'must_submit', 'completed': False}
   course, module = one_module_course([item], name="Week 1 (a+b)")
   specs = export_module_specs(course, 'Assignment', 42)
-  assert specs == [{'module': r"^Week\ 1\ \(a\+b\)$", 'position': 3}]
-  assert normalize_module_specs(specs) == [(r"^Week\ 1\ \(a\+b\)$", 3)]
+  assert specs == [{'module': r"^Week\ 1\ \(a\+b\)$", 'position': 3,
+                    'completion_requirement': 'must_submit'}]
+  assert normalize_module_specs(specs) == [
+      (r"^Week\ 1\ \(a\+b\)$", 3, {'type': 'must_submit'})]
   assert re.search(specs[0]['module'], "Week 1 (a+b)")
   assert not re.search(specs[0]['module'], "Week 1 (a+b) extra")
 
@@ -1160,6 +1180,15 @@ def test_export_module_specs_omits_unknown_position():
   assert export_module_specs(course, 'Assignment', 42) == [
       {'module': "^Week\\ 1$"}]
   assert get_item_modules(course, 'Assignment', 42) == ["Week 1"]
+
+def test_export_module_specs_writes_min_score_as_mapping():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'min_score', 'min_score': 7.0,
+                                 'completed': True}
+  course, module = one_module_course([item])
+  spec = export_module_specs(course, 'Assignment', 42)[0]
+  assert spec['completion_requirement'] == {'type': 'min_score',
+                                            'min_score': 7.0}
 @
 
 \subsection{Module specifications: patterns with optional positions}
@@ -1204,19 +1233,25 @@ When several specs match the same module, the last one that carries a
 position decides; when one pattern matches several modules, the item gets
 that position in each of them.
 
-We normalize the two forms into one shape, a list of
-[[(pattern, position)]] pairs, so the rest of the code never has to ask
-which spelling the user chose.
+A spec may also carry a completion requirement for the item
+(\cref{sec:completion-requirements}); like the position it is optional and
+absent means unchanged.
+
+We normalize the forms into one shape, a list of
+[[(pattern, position, requirement)]] triples, so the rest of the code never
+has to ask which spelling the user chose.
 Anything else is a [[ValueError]] naming the offending entry, because the
 alternative---silently skipping an entry---would leave the item in the
 wrong module with no hint why.
 <<functions>>=
 def normalize_module_specs(specs):
-  """Return module specs as a list of (pattern, position) pairs.
+  """Return module specs as a list of (pattern, position, requirement).
 
   Each entry of `specs` is either a regex string or a mapping with the key
-  `module` (a regex) and an optional `position` (an integer >= 1). A missing
-  position is returned as None; `specs` itself may be None, meaning no
+  `module` (a regex), an optional `position` (an integer >= 1) and an
+  optional `completion_requirement` (a type name such as 'must_submit',
+  'none' to remove, or a {type, min_score} mapping). Missing position and
+  requirement are returned as None; `specs` itself may be None, meaning no
   modules. Raises ValueError for anything else.
   """
   if specs is None:
@@ -1230,18 +1265,18 @@ def normalize_module_specs(specs):
 @
 
 A string is a pattern; a mapping must have a string [[module]] and nothing
-but [[module]] and [[position]].
+but [[module]], [[position]] and [[completion_requirement]].
 Rejecting unknown keys matters because a typo such as [[postion: 3]] would
 otherwise be accepted as \enquote{no position} and the item would quietly
 stay put.
 <<normalize one module spec>>=
 if isinstance(spec, str):
-  normalized.append((spec, None))
+  normalized.append((spec, None, None))
   continue
 if not isinstance(spec, dict):
   raise ValueError(
       f"module spec must be a pattern or a mapping, got {spec!r}")
-unknown = set(spec) - {"module", "position"}
+unknown = set(spec) - {"module", "position", "completion_requirement"}
 if unknown:
   raise ValueError(f"module spec {spec!r} has unknown keys: "
                    f"{', '.join(sorted(unknown))}")
@@ -1250,7 +1285,10 @@ if not isinstance(spec.get("module"), str):
 position = spec.get("position")
 if position is not None:
   <<check that [[position]] is a positive integer>>
-normalized.append((spec["module"], position))
+requirement = spec.get("completion_requirement")
+if requirement is not None:
+  requirement = normalize_completion_requirement(requirement, spec)
+normalized.append((spec["module"], position, requirement))
 @
 
 Canvas positions start at 1, so zero and negatives are errors rather than
@@ -1263,6 +1301,75 @@ if (isinstance(position, bool) or not isinstance(position, int)
     or position < 1):
   raise ValueError(
       f"module spec {spec!r}: position must be an integer >= 1")
+@
+
+\subsubsection{Completion requirements in module specs}
+\label{sec:completion-requirements}
+
+A module item may carry a \emph{completion requirement}: what a student
+must do with it before the module counts it as done (and, with sequential
+progress or prerequisites, before the next item or module unlocks).
+Canvas knows [[must_view]], [[must_submit]], [[must_mark_done]],
+[[must_contribute]] and [[min_score]] (with a score).
+A course locked behind a pre-test needs this on the test's module item, so
+the spec mapping takes a third optional key:
+\begin{verbatim}
+modules:
+- module: ^Terminal pre-test$
+  position: 1
+  completion_requirement: must_submit
+- module: ^Week 2$
+  completion_requirement:
+    type: min_score
+    min_score: 5
+\end{verbatim}
+The plain string forms name the requirement type; the mapping form is
+needed only for [[min_score]], which has a parameter.
+The special value [[none]] removes a requirement.
+As with [[position]], an absent key leaves the item's requirement alone, so
+a plain regex string spec still means what it always did.
+
+We normalize a requirement to a mapping with a [[type]] key (and
+[[min_score]] when the type is [[min_score]]), which is what Canvas expects
+in the request; [[none]] becomes [[{'type': 'none'}]] so that one shape
+covers all three intents and the apply step can tell \enquote{remove} from
+\enquote{leave}.
+<<constants>>=
+COMPLETION_REQUIREMENT_TYPES = ('must_view', 'must_submit', 'must_mark_done',
+                                'must_contribute', 'min_score', 'none')
+<<functions>>=
+def normalize_completion_requirement(value, spec):
+  """Return `value` (a type string or a {type, min_score} mapping) as a
+  mapping, or raise ValueError naming `spec`."""
+  if isinstance(value, str):
+    value = {'type': value}
+  if not isinstance(value, dict) or not isinstance(value.get('type'), str):
+    raise ValueError(f"module spec {spec!r}: completion_requirement must be "
+                     "a type name or a mapping with 'type'")
+  unknown = set(value) - {'type', 'min_score'}
+  if unknown:
+    raise ValueError(f"module spec {spec!r}: completion_requirement has "
+                     f"unknown keys: {', '.join(sorted(unknown))}")
+  if value['type'] not in COMPLETION_REQUIREMENT_TYPES:
+    raise ValueError(f"module spec {spec!r}: unknown completion_requirement "
+                     f"type {value['type']!r}; one of "
+                     f"{', '.join(COMPLETION_REQUIREMENT_TYPES)}")
+  <<check that a [[min_score]] requirement has a score>>
+  return value
+@
+
+Only [[min_score]] takes a score, and it must have one; the same
+bool-is-an-int care as for positions applies.
+<<check that a [[min_score]] requirement has a score>>=
+if value['type'] == 'min_score':
+  score = value.get('min_score')
+  if (isinstance(score, bool) or not isinstance(score, (int, float))
+      or score < 0):
+    raise ValueError(f"module spec {spec!r}: min_score requires a "
+                     "non-negative number under 'min_score'")
+elif 'min_score' in value:
+  raise ValueError(f"module spec {spec!r}: min_score only makes sense "
+                   "with type min_score")
 @
 
 The commands that read front matter validate it before they write anything
@@ -1290,7 +1397,18 @@ def test_normalize_accepts_strings_and_mappings():
   specs = ["^Week 1$", {"module": "^Week 2$", "position": 3},
            {"module": "^Week 3$"}]
   assert normalize_module_specs(specs) == [
-      ("^Week 1$", None), ("^Week 2$", 3), ("^Week 3$", None)]
+      ("^Week 1$", None, None), ("^Week 2$", 3, None),
+      ("^Week 3$", None, None)]
+
+def test_normalize_accepts_completion_requirements():
+  specs = [{"module": "^A$", "completion_requirement": "must_submit"},
+           {"module": "^B$", "completion_requirement":
+            {"type": "min_score", "min_score": 5}},
+           {"module": "^C$", "completion_requirement": "none"}]
+  assert normalize_module_specs(specs) == [
+      ("^A$", None, {"type": "must_submit"}),
+      ("^B$", None, {"type": "min_score", "min_score": 5}),
+      ("^C$", None, {"type": "none"})]
 
 def test_normalize_treats_none_as_no_modules():
   assert normalize_module_specs(None) == []
@@ -1305,6 +1423,11 @@ def test_normalize_treats_none_as_no_modules():
     [{"module": "x", "position": "2"}],           # position not an int
     [{"module": "x", "position": True}],          # YAML yes
     [{"module": "x", "position": 0}],             # Canvas starts at 1
+    [{"module": "x", "completion_requirement": "must_dance"}],
+    [{"module": "x", "completion_requirement": {"type": "min_score"}}],
+    [{"module": "x", "completion_requirement":
+      {"type": "must_view", "min_score": 3}}],
+    [{"module": "x", "completion_requirement": {"min_score": 3}}],
 ])
 def test_normalize_rejects_malformed_specs(bad):
   with pytest.raises(ValueError):
@@ -1346,12 +1469,15 @@ def update_item_modules(course, item_type, item_id, module_specs):
       item_type: 'Assignment', 'Quiz' or 'Page'
       item_id: For Assignment and Quiz: the numeric ID,
                For Page: page.url (string slug)
-      module_specs: List of regex patterns or {module, position} mappings,
-                    see normalize_module_specs. Empty list, or None,
-                    means remove from all modules.
+      module_specs: List of regex patterns or {module, position,
+                    completion_requirement} mappings, see
+                    normalize_module_specs. Empty list, or None, means
+                    remove from all modules.
 
   Returns:
-      Tuple of (added, removed, moved) as lists of module names
+      Tuple of (added, removed, moved, required) as lists of module names;
+      `required` lists the modules where the item's completion requirement
+      was set or removed.
 
   Raises:
       ValueError: if module_specs is malformed.
@@ -1359,7 +1485,7 @@ def update_item_modules(course, item_type, item_id, module_specs):
   <<normalize module specs>>
   <<find modules matching regex patterns>>
   <<compute and apply module membership changes>>
-  return added, removed, moved
+  return added, removed, moved, required
 @
 
 Our callers hand us [[module_specs]] straight out of YAML front matter, and
@@ -1390,9 +1516,10 @@ First, we compile all regex patterns and find which modules match.
 We match against both module name and Canvas ID, consistent with
 [[filter_modules]].
 Alongside the set of matching modules we record, per module, the position
-the user asked for; a later spec overwrites an earlier one, which gives the
-\enquote{last position wins} rule, and a spec without a position leaves no
-entry, which is how \enquote{no position means don't move} falls out.
+and the completion requirement the user asked for; a later spec overwrites
+an earlier one, which gives the \enquote{last one wins} rule, and a spec
+without a position (or requirement) leaves no entry, which is how
+\enquote{absent means don't touch} falls out.
 <<find modules matching regex patterns>>=
 all_modules = [
     canvaslms.cli.utils.ensure_module_attrs(module)
@@ -1401,28 +1528,33 @@ all_modules = [
 
 matching_module_ids = set()
 desired_positions = {}
-for pattern, position in module_specs:
+desired_requirements = {}
+for pattern, position, requirement in module_specs:
   regex = re.compile(pattern)
   for module in all_modules:
     if regex.search(module.name) or regex.search(str(module.id)):
       matching_module_ids.add(module.id)
       if position is not None:
         desired_positions[module.id] = position
+      if requirement is not None:
+        desired_requirements[module.id] = requirement
 @
 
 For each module, we determine the current state (is the item present, and
-where?) and the desired state (does the module match a spec, and with which
-position?).
-Then we add, remove or move as needed.
+where, with which requirement?) and the desired state (does the module match
+a spec, and with which position and requirement?).
+Then we add, remove, move or re-require as needed.
 <<compute and apply module membership changes>>=
 added = []
 removed = []
 moved = []
+required = []
 
 for module in all_modules:
   <<find current module item if present>>
   should_be_in = module.id in matching_module_ids
   desired_position = desired_positions.get(module.id)
+  desired_requirement = desired_requirements.get(module.id)
   <<add or remove item from module as needed>>
 @
 
@@ -1528,15 +1660,45 @@ def move_module_item(module, item, position):
   invalidate_module_items(module)
 @
 
-Finally, we add, remove or move based on comparing current vs desired state.
+Setting a requirement is another [[PUT]] on the module item.
+Canvas reports the current requirement as a mapping with [[type]],
+[[min_score]] (as a float) and a per-user [[completed]] flag, so
+comparing it with what the user asked for means comparing type and score
+only---we do not want to re-send an unchanged requirement every push.
+Removing a requirement is the one request that is not a mapping: Canvas
+accepts an empty [[completion_requirement]] to clear it (a mapping with an
+empty or missing type is rejected), which the [[none]] spelling maps to.
+<<functions>>=
+def requirement_matches(current, desired):
+  """Is the item's `current` requirement already what `desired` asks for?"""
+  if desired['type'] == 'none':
+    return not current or not current.get('type')
+  if not current or current.get('type') != desired['type']:
+    return False
+  if desired['type'] == 'min_score':
+    try:
+      return float(current.get('min_score')) == float(desired['min_score'])
+    except (TypeError, ValueError):
+      return False
+  return True
+
+def set_item_requirement(module, item, requirement):
+  """Set (or with type 'none' remove) `item`'s completion requirement."""
+  payload = '' if requirement['type'] == 'none' else requirement
+  item.edit(module_item={'completion_requirement': payload})
+  invalidate_module_items(module)
+@
+
+Finally, we add, remove, move or re-require based on comparing current vs
+desired state.
 When adding, we use [[create_module_item]] with the appropriate type and ID,
-and with the position when the user gave one: Canvas accepts [[position]] on
-creation and inserts the item there, which saves a second request and avoids
-the item briefly appearing at the end.
+and with the position and the completion requirement when the user gave
+them: Canvas accepts both on creation, which saves extra requests and avoids
+the item briefly appearing at the end or without its requirement.
 When removing, we call [[delete()]] on the module item object.
-When the item is already present and a position was asked for, we move it
-only if it is not there already, so that pushing an unchanged file is a
-no-op in Canvas as well as in our output.
+When the item is already present we move it only if it is not at the asked
+position, and set the requirement only if it differs, so that pushing an
+unchanged file is a no-op in Canvas as well as in our output.
 Every mutation invalidates the module's cached items afterwards.
 <<add or remove item from module as needed>>=
 if should_be_in and current_item is None:
@@ -1548,6 +1710,8 @@ if should_be_in and current_item is None:
       new_item = {'type': 'Page', 'page_url': item_id}
     if desired_position is not None:
       new_item['position'] = desired_position
+    if desired_requirement is not None and desired_requirement['type'] != 'none':
+      new_item['completion_requirement'] = desired_requirement
     module.create_module_item(new_item)
     invalidate_module_items(module)
     added.append(module.name)
@@ -1561,17 +1725,29 @@ elif not should_be_in and current_item is not None:
     removed.append(module.name)
   except Exception:
     pass  # Silently skip if we can't remove
-elif should_be_in and desired_position is not None:
+elif should_be_in:
   <<move item to desired position>>
+  <<set completion requirement if asked>>
 @
 
 <<move item to desired position>>=
-if current_item.position != desired_position:
+if desired_position is not None and current_item.position != desired_position:
   try:
     move_module_item(module, current_item, desired_position)
     moved.append(module.name)
   except Exception:
     pass  # Silently skip if we can't move
+@
+
+<<set completion requirement if asked>>=
+if (desired_requirement is not None
+    and not requirement_matches(current_item.completion_requirement,
+                                desired_requirement)):
+  try:
+    set_item_requirement(module, current_item, desired_requirement)
+    required.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't set the requirement
 @
 
 Let's verify the position handling: a new item is created at the requested
@@ -1588,11 +1764,11 @@ def one_module_course(items, name="Week 1"):
 
 def test_create_passes_requested_position():
   course, module = one_module_course([])
-  added, removed, moved = update_item_modules(
+  added, removed, moved, required = update_item_modules(
       course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
   module.create_module_item.assert_called_once_with(
       {'type': 'Assignment', 'content_id': 42, 'position': 2})
-  assert (added, removed, moved) == (["Week 1"], [], [])
+  assert (added, removed, moved, required) == (["Week 1"], [], [], [])
 
 def test_create_without_position_omits_it():
   course, module = one_module_course([])
@@ -1603,19 +1779,19 @@ def test_create_without_position_omits_it():
 def test_present_item_is_moved_when_position_differs():
   item = make_assignment_item(42, position=5)
   course, module = one_module_course([item])
-  added, removed, moved = update_item_modules(
+  added, removed, moved, required = update_item_modules(
       course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
   item.edit.assert_called_once_with(module_item={'position': 2})
-  assert (added, removed, moved) == ([], [], ["Week 1"])
+  assert (added, removed, moved, required) == ([], [], ["Week 1"], [])
   assert module.module_item_all_fetched is None
 
 def test_present_item_at_position_is_left_alone():
   item = make_assignment_item(42, position=2)
   course, module = one_module_course([item])
-  added, removed, moved = update_item_modules(
+  added, removed, moved, required = update_item_modules(
       course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
   item.edit.assert_not_called()
-  assert (added, removed, moved) == ([], [], [])
+  assert (added, removed, moved, required) == ([], [], [], [])
   assert module.module_item_all_fetched is not None
 
 def test_present_item_without_position_is_not_moved():
@@ -1640,6 +1816,47 @@ def test_update_rejects_malformed_specs():
   module.create_module_item.assert_not_called()
 @
 
+And the requirements: created with the item, set on a present item only
+when it differs (type and score compared, Canvas's float and
+[[completed]] flag ignored), removed with an empty payload for [[none]].
+<<test functions>>=
+def test_create_passes_completion_requirement():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "must_submit"}])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42,
+       'completion_requirement': {'type': 'must_submit'}})
+
+def test_requirement_set_only_when_different():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'min_score', 'min_score': 5.0,
+                                 'completed': False}
+  course, module = one_module_course([item])
+  same = [{"module": "^Week 1$", "completion_requirement":
+           {"type": "min_score", "min_score": 5}}]
+  assert update_item_modules(course, 'Assignment', 42, same)[3] == []
+  item.edit.assert_not_called()
+  other = [{"module": "^Week 1$", "completion_requirement": "must_view"}]
+  assert update_item_modules(course, 'Assignment', 42, other)[3] == ["Week 1"]
+  item.edit.assert_called_once_with(
+      module_item={'completion_requirement': {'type': 'must_view'}})
+  assert module.module_item_all_fetched is None
+
+def test_requirement_none_clears_with_empty_payload():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'must_view'}
+  course, module = one_module_course([item])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "none"}])
+  item.edit.assert_called_once_with(module_item={'completion_requirement': ''})
+  item.edit.reset_mock()
+  item.completion_requirement = None
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "none"}])
+  item.edit.assert_not_called()
+@
+
 A Classic Quiz is matched and created as a [[Quiz]] item, and is not confused
 with an assignment that happens to have the same numeric ID.
 <<test functions>>=
@@ -1648,8 +1865,9 @@ def test_quiz_items_are_matched_by_type_and_content_id():
   quiz = make_module_item(2, title="Quiz", item_type="Quiz")
   quiz.content_id = 42
   course, module = one_module_course([assignment, quiz])
-  assert get_item_module_positions(course, 'Quiz', 42) == [("Week 1", 2)]
-  added, removed, moved = update_item_modules(
+  assert get_item_module_positions(course, 'Quiz', 42) == [
+      ("Week 1", 2, None)]
+  added, removed, moved, required = update_item_modules(
       course, 'Quiz', 42, [{"module": "^Week 1$", "position": 3}])
   quiz.edit.assert_called_once_with(module_item={'position': 3})
   assignment.edit.assert_not_called()
