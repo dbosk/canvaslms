@@ -736,8 +736,9 @@ calendar_create_parser.add_argument("--max-appointments", type=int, default=1,
 @
 
 Creating an event takes three steps: we turn the user's date and time strings
-into Canvas timestamps, we sanity-check them against each other, and only then
-do we call the API for the requested event type.
+into instants, we sanity-check them against each other, and only then do we
+call the API for the requested event type, which is where the instants are
+finally written out as Canvas timestamps.
 <<create calendar event>>=
 <<parse start and end times>>
 <<reject events that end before they start>>
@@ -767,20 +768,45 @@ typo from a missing value: parsing [[None]] unconditionally reported
 \enquote{no end time given} as the fatal and misleading
 \enquote{Invalid date/time format: Cannot parse argument of type None},
 which made open-ended events impossible to create at all.
+
+What we keep is the parsed instant, not its printed form.
+Everything the command does with these values before it calls Canvas asks a
+question about \emph{time}---is the end after the start, how many slots fit
+between them---and only the request we finally hand to [[canvasapi]] asks for
+text.
+Formatting here would satisfy the last of those steps and leave the earlier
+ones to either reparse the string or reason about how it was spelled; keeping
+[[arrow]] objects until the API boundary lets them compare and add instants
+instead.
 <<parse start and end times>>=
 try:
-  start_time = utils.format_canvas_time(
-    arrow.get(args.start_time, tzinfo='local'))
-  end_time = utils.format_canvas_time(
-    arrow.get(args.end_time, tzinfo='local')) if args.end_time else None
+  start_time = arrow.get(args.start_time, tzinfo='local')
+  end_time = arrow.get(args.end_time,
+                       tzinfo='local') if args.end_time else None
 except Exception as e:
   canvaslms.cli.err(1, f"Invalid date/time format: {e} "
                        f"(did you write 8:15 instead of 08:15?)")
 @
 
-Both timestamps come out of [[format_canvas_time]] in the same shape, a UTC ISO
-string ending in [[Z]], so comparing them as strings orders them
-chronologically---no reparsing needed.
+The check is a comparison, and it matters a great deal \emph{what} we compare.
+Formatted timestamps invite a shortcut: both come out of
+[[format_canvas_time]] as UTC ISO text ending in [[Z]], and for two strings of
+the same shape the alphabetical order and the chronological one agree.
+That coincidence is the trap.
+It holds only while every timestamp is spelled identically, and [[isoformat]]
+does not spell them identically---it prints fractional seconds only when there
+are any.
+An event starting at [[10:00:00]] and ending half a second later thus yields
+[[...T10:00:00Z]] and [[...T10:00:00.500000Z]], where the [[.]] sorts before
+the [[Z]]: alphabetically the end precedes the start, and the command rejects
+an event that is perfectly well formed.
+Swap the two times and the same rule accepts an event that really does end
+before it starts.
+
+Comparing the [[arrow]] instants removes the question rather than answering it.
+[[arrow]] orders by the moment a value denotes, not by how it is written, so
+the check stops depending on how many digits [[isoformat]] chose to print---or
+on both bounds having been printed by the same function at all.
 An event that never ends cannot end too early, so the ordering check applies
 only when the user actually gave us an end time.
 <<reject events that end before they start>>=
@@ -846,16 +872,22 @@ That is what carries an open-ended event through to Canvas: we say
 altogether, rather than by sending a key whose value is [[None]].
 The parse above and this assembly thus agree---when [[args.end_time]] is
 missing, [[end_time]] stays [[None]] and never reaches the request.
+
+This is also where the instants become text.
+[[params]] is what leaves for Canvas, so the entries we put into it are the
+last values we can still reason about as times, and applying
+[[format_canvas_time]] as they enter is what keeps the conversion at that
+boundary instead of ahead of it.
 <<create regular calendar event>>=
 params = {
   'calendar_event': {
     'title': args.title,
-    'start_at': start_time,
+    'start_at': utils.format_canvas_time(start_time),
   }
 }
 
 if args.end_time:
-  params['calendar_event']['end_at'] = end_time
+  params['calendar_event']['end_at'] = utils.format_canvas_time(end_time)
 if args.description:
   params['calendar_event']['description'] = args.description  
 if args.location:
@@ -940,6 +972,12 @@ The timeslots should be added to a \emph{dictionary} called
 [[new_appointments]].
 Although numbered by index, as a list, the API requires a dictionary with
 string keys.
+
+The bounds arrive here as instants, which is exactly what stepping through the
+interval needs: the loop walks [[current_start]] forward by whole slot
+durations and stops when the next slot would overshoot [[end]].
+Each slot is formatted as it is emitted, because the pair of strings is what
+Canvas stores---the arithmetic that produced them never sees text at all.
 <<compute time slots>>=
 if not args.end_time:
   canvaslms.cli.err(1, "--end-time is required for appointment groups")
@@ -949,8 +987,8 @@ if not args.time_slot_duration:
 params["appointment_group"]["new_appointments"] = {}
 
 slot_duration = datetime.timedelta(minutes=args.time_slot_duration)
-current_start = arrow.get(start_time)
-end = arrow.get(end_time)
+current_start = start_time
+end = end_time
 
 slot_num = 0
 while current_start + slot_duration <= end:
