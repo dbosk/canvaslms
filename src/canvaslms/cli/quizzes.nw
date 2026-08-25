@@ -3562,6 +3562,18 @@ def detect_quiz_file_format(filepath):
 The [[read_quiz_from_file]] function reads quiz data from any supported format
 and returns a unified structure that can be used for updating the quiz.
 
+Unified here means more than a common dictionary shape.  The three formats also
+disagree about where the quiz body is written---front matter puts it in the
+Markdown below the delimiters, a New Quiz export under [[instructions]], a
+Classic export under [[description]]---and we settle that question while
+reading, so that the returned [[instructions]] key carries the body whatever
+the file called it.  A caller that went back to the raw settings for the body
+would be answering the same question a second time, and two answers free to
+drift apart are exactly what erased Classic descriptions once already.  The
+reader for the full formats is therefore the shared
+[[quiz_body_from_settings]] of \cref{sec:quiz-edit-processing}, which is also
+where that story is told.
+
 <<functions>>=
 def read_quiz_from_file(filepath):
     """Read quiz data from JSON, YAML, or front matter file
@@ -3573,7 +3585,7 @@ def read_quiz_from_file(filepath):
         Dictionary with:
             'format': 'json'|'yaml'|'frontmatter'
             'settings': dict of quiz settings
-            'instructions': str or None (body for frontmatter format)
+            'instructions': str, the quiz body (empty if the file has none)
             'items': list or None (questions, for json/yaml)
             'quiz_type': 'new'|'classic' or None
 
@@ -3602,7 +3614,7 @@ def read_quiz_from_file(filepath):
         return {
             'format': 'frontmatter',
             'settings': attributes,
-            'instructions': body.strip() if body else None,
+            'instructions': body.strip() if body else '',
             'items': None,
             'quiz_type': None
         }
@@ -3629,16 +3641,55 @@ def _parse_quiz_full_format(data, format_type):
         settings = {k: v for k, v in data.items()
                     if k not in ('quiz_type', 'items', 'questions')}
 
-    # Extract instructions from settings if present
-    instructions = settings.get('instructions')
-
     return {
         'format': format_type,
         'settings': settings,
-        'instructions': instructions,
+        'instructions': quiz_body_from_settings(settings),
         'items': data.get('items') or data.get('questions'),
         'quiz_type': data.get('quiz_type')
     }
+@
+
+Let's prove that the body survives the parse whichever of the three ways the
+file spells it.  The Classic case is the one that used to fail, so we vary the
+spelling and hold everything else fixed: the same body, asked for under the
+same [[instructions]] key of the result.
+
+<<test functions>>=
+def test_read_quiz_from_file_keeps_classic_description(tmp_path):
+  body = '<p>Read carefully.</p>'
+  path = tmp_path / 'classic.json'
+  path.write_text(
+    '{"quiz_type": "classic", "settings": '
+    '{"title": "Exam", "description": "' + body + '"}}',
+    encoding='utf-8')
+
+  quiz_data = quizzes.read_quiz_from_file(str(path))
+
+  assert quiz_data['instructions'] == body
+
+def test_read_quiz_from_file_keeps_new_quiz_instructions(tmp_path):
+  body = '<p>Answer all questions.</p>'
+  path = tmp_path / 'new.yaml'
+  path.write_text(
+    'quiz_type: new\n'
+    'settings:\n'
+    '  title: Exam\n'
+    f'  instructions: {body}\n',
+    encoding='utf-8')
+
+  quiz_data = quizzes.read_quiz_from_file(str(path))
+
+  assert quiz_data['instructions'] == body
+
+def test_read_quiz_from_file_keeps_front_matter_body(tmp_path):
+  body = 'Read carefully.'
+  path = tmp_path / 'quiz.md'
+  path.write_text(f'---\ntitle: Exam\n---\n\n{body}\n', encoding='utf-8')
+
+  quiz_data = quizzes.read_quiz_from_file(str(path))
+
+  assert quiz_data['instructions'] == body
 @
 
 
@@ -3724,6 +3775,7 @@ edit_parser.add_argument("--replace-items",
 
 
 \subsection{Processing the edit command}
+\label{sec:quiz-edit-processing}
 
 The edit command has two modes: interactive (default) and file-based.
 In interactive mode, we open the editor for each matching quiz.
@@ -3874,14 +3926,15 @@ elif items:
         file=sys.stderr)
 @
 
-The settings are applied using [[apply_quiz_edit]].  For frontmatter format,
-the body is the Markdown following the front matter; for JSON and YAML it is
-one of the settings---and we must know which one.
+The settings are applied using [[apply_quiz_edit]], to which we hand the body
+[[read_quiz_from_file]] has already derived.  What that function had to be
+taught---which key of a settings dictionary carries the body---is worth
+stating carefully, because getting it wrong loses text silently.
 
 \paragraph{The export--edit round-trip invariant.}
-The file read here is normally one that [[quizzes export]] wrote, so the two
-commands have to agree about where the body lives.  We state that agreement
-as an invariant:
+The file is normally one that [[quizzes export]] wrote, so the two commands
+have to agree about where the body lives.  We state that agreement as an
+invariant:
 \begin{quote}
   A no-op round trip is a no-op on Canvas: [[quizzes export -a Q > q.json]]
   followed by [[quizzes edit -f q.json]], with nothing edited in between,
@@ -3927,6 +3980,13 @@ the front matter.
 So the machine format stays faithful to each API, and the reconciliation
 happens exactly once, here, in code.
 
+Exactly two sites hold a settings dictionary and need its body, and both ask
+this function: [[_parse_quiz_full_format]] (\cref{sec:quiz-file-formats}),
+which answers while reading the file so that the loop below can take the body
+as given, and [[apply_quiz_from_dict]], which gets its dictionary straight from
+the interactive JSON editor and never sees a file at all.  The loop is thus
+free of the question, and a third answer to it cannot quietly appear.
+
 Let's verify that both spellings are found:
 
 <<test functions>>=
@@ -3946,11 +4006,10 @@ YAML settings alone because they already carry Canvas's units
 (\cref{sec:front-matter-time-limit}).
 
 <<apply settings from file>>=
-body = quiz_data.get('instructions') or ''
+body = quiz_data['instructions']
 
 for quiz in quiz_list:
   if quiz_data['format'] in ('json', 'yaml'):
-    body = quiz_body_from_settings(settings)
     api_settings = settings
   else:
     api_settings = convert_front_matter_units(settings, is_new_quiz(quiz))
