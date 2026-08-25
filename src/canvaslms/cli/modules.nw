@@ -20,28 +20,38 @@ properly configured before a course begins.
 \section*{Chapter overview}
 
 This chapter serves two purposes:
-First, it provides the [[modules]] subcommand with two sub-commands:
+First, it provides the [[modules]] subcommand with seven sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
 \item [[modules view]] --- displays module contents including all items and
   their completion requirements
+\item [[modules move]] --- moves an item to a given position within a module
+\item [[modules require]] --- sets what students must do with an item
+\item [[modules create]] --- creates a module
+\item [[modules edit]] --- changes a module's name, position, unlock date,
+  progress mode, published state or prerequisites
+\item [[modules delete]] --- deletes modules, after confirmation
 \end{itemize}
 
-Second, it provides utility functions ([[add_module_option]],
-[[process_module_option]], [[filter_modules]]) that other subcommands can use
-to filter operations by module membership.
+Second, it provides utility functions ([[filter_modules]] and the
+[[filter_*_by_module_list]] family) that other subcommands use to filter
+their operations by module membership, and the membership helpers
+([[get_item_modules]], [[update_item_modules]], [[print_module_changes]])
+that the [[pages]], [[assignments]] and [[quizzes]] commands use to place
+items in modules.
 
 We outline the module structure:
 <<[[modules.py]]>>=
-import argparse
 import canvasapi
+import canvaslms.cli
 import canvaslms.cli.utils
 import canvaslms.cli.courses as courses
 import csv
 import re
 import sys
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -64,17 +74,79 @@ def add_command(subp):
   view_parser = modules_subp.add_parser("view",
     help="Shows modules and their contents",
     description="Shows modules and their contents. Output: course, "
-                "module name, item type, item name, [item id], "
-                "completion requirement")
+                "module name, [position], item type, item name, "
+                "[item id], completion requirement")
   view_parser.set_defaults(func=modules_view_command)
   <<add view arguments>>
+
+  # Add 'move' subcommand
+  move_parser = modules_subp.add_parser("move",
+    help="Moves an item to a position within a module",
+    description="Moves one item to a 1-based position within each matching "
+                "module; Canvas renumbers the other items.")
+  move_parser.set_defaults(func=modules_move_command)
+  <<add move arguments>>
+
+  # Add 'create' subcommand
+  create_parser = modules_subp.add_parser("create",
+    help="Creates a module",
+    description="Creates a module in each selected course and prints it "
+                "as a 'modules list' row.")
+  create_parser.set_defaults(func=modules_create_command)
+  <<add create arguments>>
+
+  # Add 'edit' subcommand
+  edit_parser = modules_subp.add_parser("edit",
+    help="Edits modules",
+    description="Changes name, position, unlock date, progress mode, "
+                "published state and/or prerequisites of the matching "
+                "modules and prints them as 'modules list' rows.")
+  edit_parser.set_defaults(func=modules_edit_command)
+  <<add edit arguments>>
+
+  # Add 'require' subcommand
+  require_parser = modules_subp.add_parser("require",
+    help="Sets an item's completion requirement",
+    description="Sets (or with --none removes) what students must do with "
+                "one item in each matching module.")
+  require_parser.set_defaults(func=modules_require_command)
+  <<add require arguments>>
+
+  # Add 'delete' subcommand
+  delete_parser = modules_subp.add_parser("delete",
+    help="Deletes modules",
+    description="Deletes the modules matching the regex after listing them "
+                "and asking for confirmation (skip with --force). The "
+                "items are removed from the module; the pages, assignments "
+                "and files they point to stay in the course.")
+  delete_parser.set_defaults(func=modules_delete_command)
+  <<add delete arguments>>
+@
+
+Tests for this chapter are distributed through it, each placed after the
+code it verifies. They drive the commands with [[MagicMock]] courses and
+modules, so no Canvas server is needed.
+<<test [[modules.py]]>>=
+"""Tests for the modules command and its module membership helpers."""
+import argparse
+import csv
+import io
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import canvaslms.cli.modules as modules
+from canvaslms.cli.modules import *
+
+<<test functions>>
 @
 
 The subcommand is [[required]] because [[modules]] is a container command:
-all its work happens in [[list]] or [[view]], and a bare [[canvaslms modules]]
-has no meaningful interpretation.
+all its work happens in one of the sub-commands, and a bare
+[[canvaslms modules]] has no meaningful interpretation.
 Requiring it lets argparse answer such a command line with the usage message
-listing the two alternatives, which is both the most informative answer and
+listing the alternatives, which is both the most informative answer and
 the earliest one.
 Without it, argparse happily accepts the incomplete command line and returns
 arguments where [[func]] was never set, leaving the main program to notice
@@ -91,12 +163,16 @@ We don't pay it here, which leaves requiring the subcommand as the only way
 commands without defaults: [[pages]], [[discussions]], [[calendar]],
 [[syllabus]] and [[cache]].
 
-Both subcommands accept a regular expression for filtering modules by name
-or Canvas ID.
+All sub-commands but [[create]] accept a regular expression for selecting
+modules by name or Canvas ID; the ones that change something ([[move]],
+[[require]], [[edit]], [[delete]]) require it, [[create]] takes a module
+name instead (\cref{sec:modules-create}).
 This allows users to work with specific modules or groups of related modules.
-Additionally, the [[view]] subcommand supports an optional [[--show-id]] flag
-to include Canvas item IDs in the output.
-These IDs are useful for automation and scripting, but omitted by default for
+Additionally, the [[view]] subcommand supports two optional flags that add
+columns: [[--show-id]] includes Canvas item IDs and [[--show-position]]
+includes each item's position within its module.
+Both are useful for automation and scripting---IDs for constructing URLs,
+positions for deciding where to place new items---but omitted by default for
 cleaner, more readable output.
 
 <<add list arguments>>=
@@ -112,6 +188,21 @@ view_parser.add_argument("regex",
 courses.add_course_option(view_parser, required=True)
 view_parser.add_argument("--show-id", action="store_true",
   help="Include Canvas IDs in output")
+view_parser.add_argument("--show-position", action="store_true",
+  help="Include each item's position within its module in output")
+@
+
+The arguments of the other sub-commands are explained with their commands
+(\cref{sec:modules-move,sec:modules-require,sec:modules-create,sec:modules-edit,sec:modules-delete}).
+<<add move arguments>>=
+move_parser.add_argument("regex",
+  help="Regex for selecting modules (required: the move applies to each "
+       "matching module)")
+courses.add_course_option(move_parser, required=True)
+move_parser.add_argument("-i", "--item", required=True,
+  help="Regex matching the title or Canvas ID of the item to move")
+move_parser.add_argument("-p", "--position", required=True, type=int,
+  help="New 1-based position of the item within the module")
 @
 
 
@@ -178,22 +269,33 @@ responses), and we want robust output rather than a failed command.
 try:
   items = list_module_items(module)
   if not items:
-    # Show module even if it has no items
-    row = [course.course_code, module.name, "No items", ""]
-    if args.show_id:
-      row.append("")
-    row.append("")
-    output.writerow(row)
+    message = "No items"
+    <<write placeholder row for module>>
   else:
     for item in items:
       <<write module item information to output>>
 except:
-  # If we can't get items, show the module with error
-  row = [course.course_code, module.name, "Error loading items", ""]
-  if args.show_id:
-    row.append("")
+  message = "Error loading items"
+  <<write placeholder row for module>>
+@
+
+Both placeholder rows must have exactly as many columns as an item row, or
+the output stops being a table: a consumer doing [[cut -f]] would read the
+message as a title in one row and as a type in the next.
+The item row has two optional columns, so the placeholder has to pad for
+each flag that is on.
+Producing both placeholders from one chunk keeps the padding in one place;
+the message sits in the item-type column, where a reader scanning the
+table expects to learn what kind of row this is.
+<<write placeholder row for module>>=
+row = [course.course_code, module.name]
+if args.show_position:
   row.append("")
-  output.writerow(row)
+row += [message, ""]
+if args.show_id:
+  row.append("")
+row.append("")
+output.writerow(row)
 @
 
 \subsection{Module metadata output format}
@@ -245,9 +347,9 @@ progress_mode = "sequential" if sequential else "any-order"
 
 For the [[modules view]] command, we output information about each item within
 matching modules.
-The output includes: course code, module name, item type, item title,
-optionally the Canvas ID (when [[--show-id]] is specified), and any
-completion requirements.
+The output includes: course code, module name, optionally the item's position
+(when [[--show-position]] is specified), item type, item title, optionally the
+Canvas ID (when [[--show-id]] is specified), and any completion requirements.
 
 Completion requirements specify what students must do to mark an item complete:
 they might need to view the item, submit an assignment, or achieve a minimum
@@ -259,6 +361,15 @@ Canvas item IDs are useful for automation (e.g., constructing URLs or making
 API calls) but add visual clutter for humans reading the output.
 Therefore, we make ID output optional via the [[--show-id]] flag, defaulting to
 cleaner output without IDs.
+
+The position is Canvas's own 1-based ordinal of the item within its module,
+the number one writes in front matter to place an item (\cref{sec:module-membership}).
+Canvas already returns items in position order, so for reading the output
+the number is redundant; it earns its column only when the reader is about
+to reorder.
+We therefore gate it behind [[--show-position]], and for the same reason as
+for IDs: every column added by default shifts the fields that existing
+[[cut -f]] scripts rely on.
 
 <<write module item information to output>>=
 <<extract completion requirement>>
@@ -277,15 +388,20 @@ if item.completion_requirement:
 
 We build the output row incrementally.
 The base row always includes course, module, item type, and item title.
-If the user requested IDs via [[--show-id]], we insert the Canvas ID
-before the completion requirement.
+If the user requested positions via [[--show-position]], we insert the
+position right after the module name, where it reads as \enquote{item
+number $n$ of this module}; if the user requested IDs via [[--show-id]], we
+insert the Canvas ID before the completion requirement.
 This approach maintains consistent column ordering while allowing optional
 fields.
 
 <<build item output row conditionally>>=
-row = [
-  course.course_code,
-  module.name,
+row = [course.course_code, module.name]
+
+if args.show_position:
+  row.append(item.position if item.position is not None else "")
+
+row += [
   item.type or "Unknown",
   item.title or "No title"
 ]
@@ -302,29 +418,806 @@ row.append(completion_req)
 output.writerow(row)
 @
 
+Let's verify the column layout.
+The property we care about is that every row of one invocation has the same
+number of columns, whatever combination of flags is given, and that the
+position lands right after the module name.
+We build a course with one module and let the test choose the module's items
+(or make item retrieval fail), then parse the TSV that the command prints.
+<<test functions>>=
+def run_modules_view(items, capsys, show_id=False, show_position=False):
+  """Run modules view on one module and return the parsed TSV rows."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  module = MagicMock()
+  module.name = "Week 1"
+  module.id = 11
+  if isinstance(items, Exception):
+    module.get_module_items.side_effect = items
+  else:
+    module.get_module_items.return_value = items
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex=".*", delimiter="\t",
+                            show_id=show_id, show_position=show_position)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_view_command({}, MagicMock(), args)
+  return list(csv.reader(io.StringIO(capsys.readouterr().out),
+                         delimiter="\t"))
 
-\section{Module selection options for other commands}
+def make_module_item(position, title="Item", item_type="Page"):
+  """Create a module item mock with the attributes the CLI reads."""
+  item = MagicMock()
+  item.type = item_type
+  item.title = title
+  item.position = position
+  item.content_id = None
+  item.id = 5
+  item.completion_requirement = None
+  return item
+
+def test_view_position_column_after_module_name(capsys):
+  rows = run_modules_view([make_module_item(2)], capsys, show_position=True)
+  assert rows == [["CODE", "Week 1", "2", "Page", "Item", ""]]
+
+def test_view_without_position_flag_keeps_old_layout(capsys):
+  rows = run_modules_view([make_module_item(2)], capsys)
+  assert rows == [["CODE", "Week 1", "Page", "Item", ""]]
+
+@pytest.mark.parametrize("show_id", [False, True])
+@pytest.mark.parametrize("show_position", [False, True])
+def test_view_placeholder_rows_match_item_width(capsys, show_id, show_position):
+  item_rows = run_modules_view([make_module_item(1)], capsys,
+                               show_id=show_id, show_position=show_position)
+  empty_rows = run_modules_view([], capsys,
+                                show_id=show_id, show_position=show_position)
+  error_rows = run_modules_view(RuntimeError("boom"), capsys,
+                                show_id=show_id, show_position=show_position)
+  width = len(item_rows[0])
+  assert [len(r) for r in empty_rows] == [width]
+  assert [len(r) for r in error_rows] == [width]
+  assert "No items" in empty_rows[0]
+  assert "Error loading items" in error_rows[0]
+@
+
+
+\section{Moving an item within a module, [[modules_move_command]]}
+\label{sec:modules-move}
+
+The [[pages]], [[assignments]] and [[quizzes]] commands can place the items
+they manage at a position in a module through the [[modules]] front matter
+(\cref{sec:module-positions}), but that is the item's own view of the
+world: it requires exporting the item, editing a file and pushing it back,
+and it only reaches the kinds of item those commands manage.
+A module also holds sub-headers, files, external URLs and tools, and an
+instructor reordering a module wants to say \enquote{put that one third}
+without round-tripping content.
+[[modules move]] is that module-centric view:
+\begin{minted}{bash}
+canvaslms modules move -c prgi25 "^Week 1$" -i "^Lab 1" -p 3
+\end{minted}
+
+The module regex is required rather than defaulting to [[.*]] as it does for
+[[list]] and [[view]]: listing every module is a harmless default, moving an
+item in every module is not.
+The item is matched by title or Canvas ID, like modules are, and the match
+must be unique within each module, because a position is a single slot and
+moving several items \enquote{to position~3} would only mean something
+arbitrary.
+A module with no matching item is reported and skipped rather than being an
+error, so that a pattern can be applied across several modules of which only
+some contain the item.
+<<functions>>=
+def modules_move_command(config, canvas, args):
+  """Move an item to a 1-based position within each matching module."""
+  if args.position < 1:
+    canvaslms.cli.err(1, "Position must be 1 or greater")
+  item_regex = re.compile(args.item)
+  course_list = courses.process_course_option(canvas, args)
+  moved = []
+  for course in course_list:
+    for module in filter_modules(course, args.regex):
+      <<move the matching item in [[module]]>>
+  print_module_changes([], [], moved)
+@
+
+An item already at the requested position is left alone, so that repeating
+a command is harmless; the move itself is [[move_module_item]]
+(\cref{sec:module-membership}), the same function the front-matter path
+uses, so both invalidate the module's cached items the same way.
+The item is located by [[find_unique_item]], shared with [[modules require]]
+(\cref{sec:modules-require}).
+<<move the matching item in [[module]]>>=
+item = find_unique_item(module, item_regex, args.item)
+if item is None or item.position == args.position:
+  continue
+try:
+  move_module_item(module, item, args.position)
+  moved.append(module.name)
+except Exception as e:
+  canvaslms.cli.warn(f"Could not move '{item.title}' in {module.name}: {e}")
+@
+
+Let's verify the three outcomes per module---moved, already there, not
+found---and that an ambiguous pattern stops the command.
+<<test functions>>=
+def run_modules_move(items, item_regex, position):
+  """Run modules move on one module and return (module, captured stderr)."""
+  module = make_cached_module("Week 1", 11, items)
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", item=item_regex,
+                            position=position)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_move_command({}, MagicMock(), args)
+  return module
+
+def test_move_edits_unique_match(capsys):
+  lab = make_module_item(5, title="Lab 1")
+  module = run_modules_move([make_module_item(1, title="Intro"), lab],
+                            "^Lab", 2)
+  lab.edit.assert_called_once_with(module_item={'position': 2})
+  assert module.module_item_all_fetched is None
+  assert "Moved within modules: Week 1" in capsys.readouterr().err
+
+def test_move_leaves_item_already_in_place(capsys):
+  lab = make_module_item(2, title="Lab 1")
+  run_modules_move([lab], "^Lab", 2)
+  lab.edit.assert_not_called()
+  assert "Moved" not in capsys.readouterr().err
+
+def test_move_skips_module_without_match():
+  intro = make_module_item(1, title="Intro")
+  run_modules_move([intro], "^Lab", 2)
+  intro.edit.assert_not_called()
+
+def test_move_refuses_ambiguous_match():
+  items = [make_module_item(1, title="Lab 1"),
+           make_module_item(2, title="Lab 2")]
+  with pytest.raises(SystemExit):
+    run_modules_move(items, "^Lab", 3)
+  for item in items:
+    item.edit.assert_not_called()
+
+def test_move_rejects_position_below_one():
+  with pytest.raises(SystemExit):
+    run_modules_move([make_module_item(1, title="Lab 1")], "^Lab", 0)
+@
+
+
+\section{Creating modules, [[modules_create_command]]}
+\label{sec:modules-create}
+
+Placing items in modules presupposes that the modules exist, and a course
+set up from files (\cref{sec:module-positions}) wants that step scripted
+too.
+[[modules create]] creates one module per selected course:
+\begin{minted}{bash}
+canvaslms modules create -c prgi25 "Week 1" --position 1 --unlock-at 2026-08-24 --publish
+\end{minted}
+Canvas is happy to create several modules with the same name, which in a
+script is almost always a re-run rather than an intention, so we refuse a
+name that already exists in the course unless [[--allow-duplicate]] says
+otherwise.
+The new module is printed as a [[modules list]] row, so that a script can
+read back what it created in the format it already parses.
+
+The course's module list is cached across runs (\cref{sec:caching-module-items}
+describes the mechanism for items; modules are cached the same way on the
+[[Course]] object), so after creating or deleting a module we forget the
+course's cached modules, exactly as [[invalidate_module_items]] does for a
+module's items.
+<<functions>>=
+def invalidate_course_modules(course):
+  """Forget the cached modules of `course` so the next access refetches."""
+  if hasattr(course, 'module_cache'):
+    course.module_cache.clear()
+  if hasattr(course, 'module_all_fetched'):
+    course.module_all_fetched = None
+
+def modules_create_command(config, canvas, args):
+  """Create a module in each selected course and print it as a list row."""
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  course_list = courses.process_course_option(canvas, args)
+  for course in course_list:
+    <<refuse to duplicate an existing module name>>
+    <<build the module attributes from the options>>
+    module = canvaslms.cli.utils.ensure_module_attrs(
+        course.create_module(module_attrs))
+    invalidate_course_modules(course)
+    <<publish the new module if requested>>
+    <<write module information to output>>
+@
+
+<<refuse to duplicate an existing module name>>=
+existing = [m for m in course.get_modules()
+            if canvaslms.cli.utils.ensure_module_attrs(m).name == args.name]
+if existing and not args.allow_duplicate:
+  canvaslms.cli.err(1, f"Module '{args.name}' already exists in "
+                       f"{course.course_code}; use --allow-duplicate to add "
+                       "another")
+@
+
+Only the options the user gave are sent, so Canvas applies its own
+defaults for the rest (appended last, locked never, any order).
+The unlock date goes through [[parse_date]] like the assignment dates do, so
+the same human-readable forms work here.
+Prerequisites are resolved and position-checked by [[resolve_prerequisites]]
+(\cref{sec:modules-edit}); a module created without [[--position]] is
+appended, so every existing module is before it.
+<<build the module attributes from the options>>=
+module_attrs = {'name': args.name}
+if args.position is not None:
+  module_attrs['position'] = args.position
+if args.unlock_at:
+  module_attrs['unlock_at'] = canvaslms.cli.utils.parse_date(args.unlock_at)
+if args.sequential:
+  module_attrs['require_sequential_progress'] = True
+if args.prerequisite:
+  module_attrs['prerequisite_module_ids'] = resolve_prerequisites(
+      course, args.prerequisite, args.position)
+@
+
+Canvas creates modules unpublished and accepts [[published]] only on
+update, hence the second request.
+<<publish the new module if requested>>=
+if args.publish:
+  module.edit(module={'published': True})
+@
+
+<<add create arguments>>=
+create_parser.add_argument("name",
+  help="Name of the new module")
+courses.add_course_option(create_parser, required=True)
+create_parser.add_argument("-p", "--position", type=int,
+  help="1-based position among the course's modules (default: last)")
+create_parser.add_argument("--unlock-at",
+  help="When the module unlocks for students, e.g. '2026-08-24 08:00'")
+create_parser.add_argument("--sequential", action="store_true",
+  help="Require students to complete the items in order")
+create_parser.add_argument("--publish", action="store_true",
+  help="Publish the module right away (default: unpublished)")
+create_parser.add_argument("--allow-duplicate", action="store_true",
+  help="Create the module even if one with the same name exists")
+create_parser.add_argument("--prerequisite", action="append", default=[],
+  metavar="REGEX",
+  help="Module(s) that must be completed before this one; repeatable")
+@
+
+Let's verify that the module is created from the options, that the cached
+module list is forgotten, and that a duplicate name is refused.
+<<test functions>>=
+def run_modules_create(existing_names, capsys, **options):
+  """Run modules create on one course; return (course, created module)."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  mods = []
+  for name in existing_names:
+    m = MagicMock(); m.name = name; mods.append(m)
+  course.get_modules.return_value = mods
+  course.module_cache = {1: (MagicMock(), {})}
+  course.module_all_fetched = datetime.now()
+  created = MagicMock()
+  created.name = options.get("name", "New")
+  created.unlock_at = None
+  created.require_sequential_progress = False
+  created.get_module_items.return_value = []
+  course.create_module.return_value = created
+  args = argparse.Namespace(delimiter="\t", position=None, unlock_at=None,
+                            sequential=False, publish=False,
+                            allow_duplicate=False, name="New",
+                            prerequisite=[])
+  for k, v in options.items():
+    setattr(args, k, v)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_create_command({}, MagicMock(), args)
+  return course, created
+
+def test_create_sends_only_given_options(capsys):
+  course, created = run_modules_create([], capsys, name="Week 1",
+                                       position=2, sequential=True)
+  course.create_module.assert_called_once_with(
+      {'name': "Week 1", 'position': 2, 'require_sequential_progress': True})
+  created.edit.assert_not_called()
+  assert course.module_cache == {}
+  assert course.module_all_fetched is None
+  row = capsys.readouterr().out.strip().split("\t")
+  assert row[:2] == ["CODE", "Week 1"] and row[-1] == "0"
+
+def test_create_publishes_on_request(capsys):
+  course, created = run_modules_create([], capsys, name="Week 1", publish=True)
+  created.edit.assert_called_once_with(module={'published': True})
+
+def test_create_resolves_prerequisites(capsys):
+  course, created = run_modules_create(["Pre-test"], capsys, name="Week 1",
+                                       prerequisite=["^Pre-test$"])
+  pre_id = course.get_modules.return_value[0].id
+  course.create_module.assert_called_once_with(
+      {'name': "Week 1", 'prerequisite_module_ids': [pre_id]})
+
+def test_create_refuses_duplicate_name_unless_allowed(capsys):
+  with pytest.raises(SystemExit):
+    run_modules_create(["Week 1"], capsys, name="Week 1")
+  course, created = run_modules_create(["Week 1"], capsys, name="Week 1",
+                                       allow_duplicate=True)
+  course.create_module.assert_called_once()
+@
+
+
+\section{Deleting modules, [[modules_delete_command]]}
+\label{sec:modules-delete}
+
+Deleting a module removes the module and its items from the course
+structure; the pages, assignments and files the items pointed to stay in
+the course.
+That makes it less destructive than it sounds, but a regex can match more
+than the user had in mind, so we follow [[quizzes delete]]: show what will
+be deleted, ask, and let [[--force]] skip the question for scripts.
+Unlike [[quizzes delete]] we do accept several matches---tearing down a
+whole set of [[Week .*]] modules is the common case---which is why the
+listing and the question come before any deletion.
+<<functions>>=
+def modules_delete_command(config, canvas, args):
+  """Delete the modules matching a regex, after confirmation."""
+  course_list = courses.process_course_option(canvas, args)
+  targets = [(course, module)
+             for course in course_list
+             for module in filter_modules(course, args.regex)]
+  if not targets:
+    raise canvaslms.cli.EmptyListError(f"No modules match '{args.regex}'")
+  <<list the modules about to be deleted>>
+  <<ask for confirmation unless forced>>
+  for course, module in targets:
+    module.delete()
+    invalidate_course_modules(course)
+    print(f"Deleted module '{module.name}' in {course.course_code}",
+          file=sys.stderr)
+@
+
+The item count is the most useful thing to show: an empty module is
+harmless to delete, one with thirty items deserves a second look.
+<<list the modules about to be deleted>>=
+for course, module in targets:
+  try:
+    item_count = len(list_module_items(module))
+  except Exception:
+    item_count = "?"
+  print(f"{course.course_code}\t{module.name}\t{item_count} item(s)",
+        file=sys.stderr)
+@
+
+<<ask for confirmation unless forced>>=
+if not args.force:
+  answer = input(f"Delete {len(targets)} module(s)? Items are removed from "
+                 "the module, their content stays in the course. [y/N] ")
+  if answer.strip().lower() not in ('y', 'yes'):
+    print("Aborted.", file=sys.stderr)
+    return
+@
+
+<<add delete arguments>>=
+delete_parser.add_argument("regex",
+  help="Regex for selecting the modules to delete (name or Canvas ID)")
+courses.add_course_option(delete_parser, required=True)
+delete_parser.add_argument("--force", "-F", action="store_true",
+  help="Skip the confirmation prompt")
+@
+
+Let's verify that deletion only happens after a yes (or [[--force]]), that
+all matches go, and that the cached module list is forgotten.
+<<test functions>>=
+def run_modules_delete(names, regex, force, answer=None):
+  """Run modules delete on a course with modules `names`; return them."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  mods = []
+  for i, name in enumerate(names):
+    m = MagicMock(); m.name = name; m.id = 100 + i
+    m.get_module_items.return_value = []
+    mods.append(m)
+  course.get_modules.return_value = mods
+  course.module_cache = {m.id: (m, {}) for m in mods}
+  course.module_all_fetched = datetime.now()
+  args = argparse.Namespace(regex=regex, force=force)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]), \
+       patch("builtins.input", return_value=answer or ""):
+    modules_delete_command({}, MagicMock(), args)
+  return course, mods
+
+def test_delete_force_deletes_all_matches():
+  course, mods = run_modules_delete(["Week 1", "Week 2", "Exam"], "^Week",
+                                    force=True)
+  assert [m.delete.called for m in mods] == [True, True, False]
+  assert course.module_cache == {} and course.module_all_fetched is None
+
+def test_delete_asks_and_respects_no():
+  course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
+                                    answer="n")
+  mods[0].delete.assert_not_called()
+  course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
+                                    answer="y")
+  mods[0].delete.assert_called_once()
+
+def test_delete_without_match_raises_empty_list_error():
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    run_modules_delete(["Week 1"], "^Nothing", force=True)
+@
+
+
+\section{Editing modules, [[modules_edit_command]]}
+\label{sec:modules-edit}
+
+Once modules exist, the things one wants to change are their name,
+position, unlock date, progress mode, published state and---the reason this
+command exists---their \emph{prerequisites}: the modules a student must
+complete before this one unlocks.
+A course that locks its material behind a pre-test is exactly this:
+\begin{minted}{bash}
+canvaslms modules edit -c datintro26 --prerequisite "^Terminal pre-test$" "^The terminal$"
+canvaslms modules edit -c datintro26 --publish --sequential "^Week 1$"
+\end{minted}
+The regex may match several modules (publish every [[Week]] module in one
+go); only [[--name]] insists on a single match, since giving several
+modules the same name is never what was meant.
+
+Canvas has one rule about prerequisites that it enforces by silently
+dropping offenders: a prerequisite must be positioned \emph{before} the
+module that requires it.
+A command that accepts the request and reports success while Canvas
+quietly ignores it would be worse than no command, so we resolve every
+[[--prerequisite]] regex ourselves, check the positions against the
+module's (new) position, and refuse with a message that says what to move.
+Clearing prerequisites ([[--no-prerequisites]]) sends an empty string: an
+empty list never reaches Canvas at all, as [[canvasapi]] drops empty
+parameters, and Canvas then complains about a missing module parameter.
+<<functions>>=
+def resolve_prerequisites(course, regexes, position):
+  """Return the IDs of the modules matching `regexes` in `course`.
+
+  Exits with an error if a regex matches nothing or if a matched module is
+  not positioned before `position` (None skips the position check).
+  """
+  ids = []
+  for regex in regexes:
+    matches = [canvaslms.cli.utils.ensure_module_attrs(m)
+               for m in filter_modules(course, regex)]
+    if not matches:
+      canvaslms.cli.err(1, f"No module matches prerequisite '{regex}' in "
+                           f"{course.course_code}")
+    for m in matches:
+      <<refuse a prerequisite positioned after the module>>
+      if m.id not in ids:
+        ids.append(m.id)
+  return ids
+@
+
+<<refuse a prerequisite positioned after the module>>=
+if (position is not None and m.position is not None
+    and m.position >= position):
+  canvaslms.cli.err(1, f"Prerequisite '{m.name}' is at position "
+                       f"{m.position}, not before position {position}; "
+                       "Canvas ignores such prerequisites, move the "
+                       "modules first (modules edit --position)")
+@
+
+<<functions>>=
+def modules_edit_command(config, canvas, args):
+  """Edit the modules matching a regex and print them as list rows."""
+  <<require at least one edit option>>
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  course_list = courses.process_course_option(canvas, args)
+  for course in course_list:
+    matches = [canvaslms.cli.utils.ensure_module_attrs(m)
+               for m in filter_modules(course, args.regex)]
+    if not matches:
+      canvaslms.cli.warn(f"No module matches '{args.regex}' in "
+                         f"{course.course_code}")
+      continue
+    if args.name is not None and len(matches) > 1:
+      canvaslms.cli.err(1, f"--name needs exactly one matching module, but "
+                           f"'{args.regex}' matches {len(matches)} in "
+                           f"{course.course_code}")
+    for module in matches:
+      <<build the module changes from the options>>
+      module = canvaslms.cli.utils.ensure_module_attrs(
+          module.edit(module=changes))
+      invalidate_course_modules(course)
+      <<write module information to output>>
+@
+
+A call with no option would be a no-op that still lists modules, which is
+what [[modules list]] is for; we say so instead.
+<<require at least one edit option>>=
+if all(v in (None, False, []) for v in (
+    args.name, args.position, args.unlock_at, args.sequential,
+    args.published, args.prerequisite, args.no_prerequisites)):
+  canvaslms.cli.err(1, "Nothing to change: give at least one of --name, "
+                       "--position, --unlock-at, --sequential/--any-order, "
+                       "--publish/--unpublish, --prerequisite, "
+                       "--no-prerequisites")
+@
+
+Only what the user gave is sent, so everything else keeps its value.
+The prerequisite check uses the position the module will have after this
+edit, which is [[--position]] if given and its current position otherwise.
+[[--unlock-at none]] clears the date: [[parse_date]] turns [[none]] into the
+empty string, which is how Canvas expects a cleared date.
+<<build the module changes from the options>>=
+changes = {}
+if args.name is not None:
+  changes['name'] = args.name
+if args.position is not None:
+  changes['position'] = args.position
+if args.unlock_at is not None:
+  changes['unlock_at'] = canvaslms.cli.utils.parse_date(args.unlock_at)
+if args.sequential is not None:
+  changes['require_sequential_progress'] = args.sequential
+if args.published is not None:
+  changes['published'] = args.published
+if args.no_prerequisites:
+  changes['prerequisite_module_ids'] = ''
+elif args.prerequisite:
+  target = args.position if args.position is not None else module.position
+  changes['prerequisite_module_ids'] = resolve_prerequisites(
+      course, args.prerequisite, target)
+@
+
+The paired flags ([[--sequential]]/[[--any-order]],
+[[--publish]]/[[--unpublish]]) share a destination with a three-valued
+default so that \enquote{not mentioned} is distinguishable from either
+choice.
+<<add edit arguments>>=
+edit_parser.add_argument("regex",
+  help="Regex for selecting the modules to edit (name or Canvas ID)")
+courses.add_course_option(edit_parser, required=True)
+edit_parser.add_argument("--name",
+  help="New name (the regex must then match exactly one module)")
+edit_parser.add_argument("-p", "--position", type=int,
+  help="New 1-based position among the course's modules")
+edit_parser.add_argument("--unlock-at",
+  help="When the module unlocks, e.g. '2026-08-24 08:00'; 'none' clears it")
+progress = edit_parser.add_mutually_exclusive_group()
+progress.add_argument("--sequential", dest="sequential",
+  action="store_const", const=True, default=None,
+  help="Require students to complete the items in order")
+progress.add_argument("--any-order", dest="sequential",
+  action="store_const", const=False,
+  help="Let students complete the items in any order")
+publish = edit_parser.add_mutually_exclusive_group()
+publish.add_argument("--publish", dest="published",
+  action="store_const", const=True, default=None,
+  help="Publish the module")
+publish.add_argument("--unpublish", dest="published",
+  action="store_const", const=False,
+  help="Unpublish the module")
+prereqs = edit_parser.add_mutually_exclusive_group()
+prereqs.add_argument("--prerequisite", action="append", default=[],
+  metavar="REGEX",
+  help="Module(s) that must be completed first; repeatable, replaces the "
+       "current list, each must be positioned before this module")
+prereqs.add_argument("--no-prerequisites", action="store_true",
+  help="Remove all prerequisites")
+@
+
+Let's verify that only the given options are sent, that prerequisites are
+resolved and position-checked, that clearing sends the empty string, and
+that an empty edit is refused.
+<<test functions>>=
+def make_plain_module(name, module_id, position):
+  """Create a module mock with the attributes the edit command reads."""
+  m = MagicMock()
+  m.name = name; m.id = module_id; m.position = position
+  m.unlock_at = None; m.require_sequential_progress = False
+  m.get_module_items.return_value = []
+  m.edit.return_value = m
+  return m
+
+def run_modules_edit(mods, regex, capsys, **options):
+  """Run modules edit on a course holding `mods`; return the course."""
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = mods
+  course.module_cache = {m.id: (m, {}) for m in mods}
+  course.module_all_fetched = datetime.now()
+  args = argparse.Namespace(regex=regex, delimiter="\t", name=None,
+                            position=None, unlock_at=None, sequential=None,
+                            published=None, prerequisite=[],
+                            no_prerequisites=False)
+  for k, v in options.items():
+    setattr(args, k, v)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_edit_command({}, MagicMock(), args)
+  return course
+
+def test_edit_sends_only_given_options(capsys):
+  pre, week = make_plain_module("Pre-test", 1, 1), make_plain_module("Week 1", 2, 2)
+  course = run_modules_edit([pre, week], "^Week 1$", capsys,
+                            published=True, sequential=False,
+                            prerequisite=["^Pre-test$"])
+  week.edit.assert_called_once_with(module={
+      'require_sequential_progress': False, 'published': True,
+      'prerequisite_module_ids': [1]})
+  pre.edit.assert_not_called()
+  assert course.module_all_fetched is None
+  assert capsys.readouterr().out.startswith("CODE\tWeek 1\t")
+
+def test_edit_refuses_prerequisite_positioned_after(capsys):
+  pre, week = make_plain_module("Pre-test", 1, 3), make_plain_module("Week 1", 2, 2)
+  with pytest.raises(SystemExit):
+    run_modules_edit([pre, week], "^Week 1$", capsys, prerequisite=["^Pre-test$"])
+  week.edit.assert_not_called()
+  # ... but the new position given with --position is what counts
+  run_modules_edit([pre, week], "^Week 1$", capsys, position=4,
+                   prerequisite=["^Pre-test$"])
+  week.edit.assert_called_once_with(module={'position': 4,
+                                            'prerequisite_module_ids': [1]})
+
+def test_edit_clears_prerequisites_with_empty_string(capsys):
+  week = make_plain_module("Week 1", 2, 2)
+  run_modules_edit([week], "^Week 1$", capsys, no_prerequisites=True)
+  week.edit.assert_called_once_with(module={'prerequisite_module_ids': ''})
+
+def test_edit_requires_an_option_and_unique_match_for_name(capsys):
+  a, b = make_plain_module("Week 1", 1, 1), make_plain_module("Week 2", 2, 2)
+  with pytest.raises(SystemExit):
+    run_modules_edit([a, b], "^Week", capsys)
+  with pytest.raises(SystemExit):
+    run_modules_edit([a, b], "^Week", capsys, name="Renamed")
+  run_modules_edit([a, b], "^Week 2$", capsys, name="Renamed")
+  b.edit.assert_called_once_with(module={'name': "Renamed"})
+@
+
+
+\section{Requiring completion of an item, [[modules_require_command]]}
+\label{sec:modules-require}
+
+The front-matter route (\cref{sec:completion-requirements}) sets an item's
+completion requirement when the item's own file is pushed.
+For an item that has no file---or to fix one requirement without a round
+trip---[[modules require]] does the same from the module's side, the way
+[[modules move]] does for positions:
+\begin{minted}{bash}
+canvaslms modules require -c datintro26 "^Terminal pre-test$" -i "pre-test" --must-submit
+canvaslms modules require -c datintro26 "^Week 1$" -i "^Lab 1" --min-score 5
+canvaslms modules require -c datintro26 "^Week 1$" -i "^Reading" --none
+\end{minted}
+The item is found exactly as for [[modules move]] (unique match on title or
+ID per module, ambiguity is an error, no match is a warning), so the two
+commands share that search.
+<<functions>>=
+def find_unique_item(module, item_regex, pattern):
+  """Return the one item of `module` matching `item_regex`, or None.
+
+  `pattern` is the regex as the user wrote it, for messages. No match
+  warns and returns None; several matches exit with an error.
+  """
+  matches = [item for item in list_module_items(module)
+             if item_regex.search(item.title or "")
+             or item_regex.search(str(item.id))]
+  if not matches:
+    canvaslms.cli.warn(f"No item matching '{pattern}' in module {module.name}")
+    return None
+  if len(matches) > 1:
+    titles = ", ".join(repr(item.title) for item in matches)
+    canvaslms.cli.err(1, f"Several items match '{pattern}' in module "
+                         f"{module.name}: {titles}")
+  return matches[0]
+
+def modules_require_command(config, canvas, args):
+  """Set (or remove) the completion requirement of an item in each module."""
+  requirement = <<the requirement chosen by the flags>>
+  item_regex = re.compile(args.item)
+  course_list = courses.process_course_option(canvas, args)
+  required = []
+  for course in course_list:
+    for module in filter_modules(course, args.regex):
+      item = find_unique_item(module, item_regex, args.item)
+      if item is None or requirement_matches(item.completion_requirement,
+                                             requirement):
+        continue
+      try:
+        set_item_requirement(module, item, requirement)
+        required.append(module.name)
+      except Exception as e:
+        canvaslms.cli.warn(f"Could not set requirement on '{item.title}' "
+                           f"in {module.name}: {e}")
+  print_module_changes([], [], [], required)
+@
+
+The flags map onto the same normalized mapping the specs use, so one
+[[set_item_requirement]] serves both routes; [[--min-score]] carries its
+value, the others are plain types, and exactly one must be given.
+<<the requirement chosen by the flags>>=
+({'type': 'min_score', 'min_score': args.min_score}
+ if args.min_score is not None else {'type': args.requirement})
+@
+
+<<add require arguments>>=
+require_parser.add_argument("regex",
+  help="Regex for selecting modules (name or Canvas ID)")
+courses.add_course_option(require_parser, required=True)
+require_parser.add_argument("-i", "--item", required=True,
+  help="Regex matching the title or Canvas ID of the item")
+kinds = require_parser.add_mutually_exclusive_group(required=True)
+for flag, kind, text in (
+    ("--must-view", "must_view", "students must view the item"),
+    ("--must-submit", "must_submit", "students must submit the item"),
+    ("--must-mark-done", "must_mark_done", "students must mark it done"),
+    ("--must-contribute", "must_contribute",
+     "students must contribute (post) to the item"),
+    ("--none", "none", "remove the requirement")):
+  kinds.add_argument(flag, dest="requirement", action="store_const",
+                     const=kind, help=text)
+kinds.add_argument("--min-score", dest="min_score", type=float,
+  metavar="N", help="students must score at least N on the item")
+@
+
+Let's verify the flag mapping, the no-op when the requirement already
+holds, and removal.
+<<test functions>>=
+def run_modules_require(items, item_regex, requirement=None, min_score=None):
+  """Run modules require on one module; return the module."""
+  module = make_cached_module("Week 1", 11, items)
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", item=item_regex,
+                            requirement=requirement, min_score=min_score)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_require_command({}, MagicMock(), args)
+  return module
+
+def test_require_sets_type_and_min_score():
+  lab = make_module_item(1, title="Lab 1")
+  run_modules_require([lab], "^Lab", requirement="must_submit")
+  lab.edit.assert_called_once_with(
+      module_item={'completion_requirement': {'type': 'must_submit'}})
+  lab.edit.reset_mock()
+  run_modules_require([lab], "^Lab", min_score=5.0)
+  lab.edit.assert_called_once_with(module_item={'completion_requirement':
+      {'type': 'min_score', 'min_score': 5.0}})
+
+def test_require_is_a_no_op_when_already_set_and_none_clears():
+  lab = make_module_item(1, title="Lab 1")
+  lab.completion_requirement = {'type': 'must_view', 'completed': False}
+  run_modules_require([lab], "^Lab", requirement="must_view")
+  lab.edit.assert_not_called()
+  run_modules_require([lab], "^Lab", requirement="none")
+  lab.edit.assert_called_once_with(module_item={'completion_requirement': ''})
+@
+
+
+\section{Module filtering for other commands}
 
 Many Canvas operations can be filtered by module membership.
-For example, when grading assignments, an instructor might want to grade only
-assignments from a specific module, or when listing submissions, they might
-want to filter by module.
+For example, when listing or grading assignments, an instructor might want
+only the assignments from a specific module, or only the pages of one week.
 
-To support these use cases, we provide two utility functions that other
-subcommands can use:
-[[add_module_option]] adds a [[-M, --module]] option to an argument parser,
-and [[process_module_option]] processes this option to return a filtered list
-of modules.
+One might expect a shared [[add_module_option]]/[[process_module_option]]
+pair here, mirroring [[courses.add_course_option]] and
+[[courses.process_course_option]].
+We do not provide one, and the reason is how [[-M]] is used: it is never a
+selector on its own but one filter among several that are ANDed---[[-a]],
+[[-A]] and [[-M]] for assignments, [[-p]] and [[-M]] for pages---so each
+command defines [[-M]] next to its siblings, with help text that names the
+siblings it combines with and a default that fits its own validation
+(\enquote{at least one of [[-a]], [[-A]], [[-M]]}).
+What the commands share is the work behind the option, and that is what this
+chapter offers: [[filter_modules]] turns the regex into modules, and
+[[filter_assignments_by_module_list]] and [[filter_pages_by_module_list]]
+turn modules into items.
+Filtering is per course, because a module belongs to a course and the
+commands already iterate over the selected courses.
 
-These functions follow the same pattern as [[courses.add_course_option]] and
-[[courses.process_course_option]], providing a consistent interface across
-subcommands.
-
-When selecting modules, we must first select a course (since modules belong to
-courses).
-The [[add_module_option]] function attempts to add the course option, but
-catches [[ArgumentError]] if the course option was already added by other code.
-If the [[required]] parameter is [[True]], we make the module option required.
+All of these read module items through [[list_module_items]], the single
+ingress that normalizes the attributes the CLI relies on
+(\cref{sec:caching-module-items} for where the items come from).
 <<functions>>=
 def list_module_items(module):
   """Return module items with the CLI's expected attributes ensured."""
@@ -332,34 +1225,6 @@ def list_module_items(module):
       canvaslms.cli.utils.ensure_module_item_attrs(item)
       for item in module.get_module_items()
   ]
-
-def add_module_option(parser, required=False):
-  """Adds module selection option to parser"""
-  try:
-    courses.add_course_option(parser, required=required)
-  except argparse.ArgumentError:
-    pass
-
-  parser.add_argument("-M", "--module",
-    required=required, default="" if not required else None,
-    help="Regex matching module title or Canvas identifier.")
-
-def process_module_option(canvas, args):
-  """Processes module selection from command line args"""
-  course_list = courses.process_course_option(canvas, args)
-  modules_list = []
-  
-  for course in course_list:
-    try:
-      module_regex = args.module
-    except AttributeError:
-      module_regex = ".*"
-    
-    if module_regex:
-      modules = filter_modules(course, module_regex)
-      modules_list.extend(modules)
-  
-  return modules_list
 @
 
 
@@ -477,18 +1342,44 @@ def filter_pages_by_module_list(modules, pages):
 
 
 \section{Querying and updating module membership}
+\label{sec:module-membership}
 
 When editing pages or assignments, users may want to control which modules
 contain the item.
 The front matter can include a [[modules]] field with a list of regex patterns
 specifying which modules should contain the item.
-To support this, we need two utility functions:
+To support this, we need two utility functions and a reporting helper:
 \begin{description}
 \item[ [[get_item_modules]] ] Returns the names of modules currently containing 
 an item
 \item[ [[update_item_modules]] ] Adds or removes an item from modules based on 
 regex patterns
+\item[ [[print_module_changes]] ] Tells the user what [[update_item_modules]]
+did
 \end{description}
+
+Every command that updates membership reports the outcome the same way, so
+the report lives here rather than being repeated at each call site.
+The lines go to standard error because the commands' standard output is
+reserved for data (exported content, TSV listings), and a line is printed
+only when there is something to say, so an unchanged item produces no
+noise.
+<<functions>>=
+def print_module_changes(added, removed, moved=(), required=()):
+  """Report module membership changes on standard error.
+
+  Each argument is a list of module names; empty lists print nothing.
+  """
+  if added:
+    print(f"  Added to modules: {', '.join(added)}", file=sys.stderr)
+  if removed:
+    print(f"  Removed from modules: {', '.join(removed)}", file=sys.stderr)
+  if moved:
+    print(f"  Moved within modules: {', '.join(moved)}", file=sys.stderr)
+  if required:
+    print(f"  Requirement set in modules: {', '.join(required)}",
+          file=sys.stderr)
+@
 
 \subsection{Getting current module membership}
 
@@ -497,24 +1388,36 @@ in the course and check each module's items.
 This is necessary because Canvas does not provide a direct API to query
 \enquote{which modules contain this assignment?}---we must search.
 
-The function handles two item types differently:
+The function handles three item types, in two ways:
 \begin{description}
 \item[Assignment] Identified by [[content_id]] matching the assignment's numeric ID
+\item[Quiz] Identified by [[content_id]] matching the quiz's numeric ID; this
+  is how Canvas lists a Classic Quiz in a module (a New Quiz is an
+  assignment and appears as one)
 \item[Page] Identified by [[page_url]] matching the page's URL slug
 \end{description}
+The numeric types share their matching logic, so we name the set once.
+<<constants>>=
+CONTENT_ID_ITEM_TYPES = ('Assignment', 'Quiz')
+@
 
+Since we visit the matching module item anyway, we return its position along
+with the module name; the exporters need both
+(\cref{sec:export-module-specs}), and a second scan of every module just for
+the positions would double the API traffic of every export.
 <<functions>>=
-def get_item_modules(course, item_type, item_id):
-  """Get list of modules containing an item.
+def get_item_module_positions(course, item_type, item_id):
+  """Get the modules containing an item and the item's position in each.
 
   Args:
       course: Canvas course object
-      item_type: 'Assignment' or 'Page'
-      item_id: For Assignment: assignment.id (int),
+      item_type: 'Assignment', 'Quiz' or 'Page'
+      item_id: For Assignment and Quiz: the numeric ID,
                For Page: page.url (string slug)
 
   Returns:
-      List of module names containing this item
+      List of (module name, position, completion requirement) triples;
+      position and requirement may be None.
   """
   target_url = None
   if item_type == 'Page':
@@ -539,67 +1442,425 @@ def get_item_modules(course, item_type, item_id):
 @
 
 The matching logic differs by item type.
-For assignments, Canvas stores the assignment ID in [[content_id]].
+For assignments and quizzes, Canvas stores the numeric ID in [[content_id]].
 For pages, Canvas stores the URL slug in [[page_url]]. However, Canvas may
 redirect old URLs to new ones, so we need to resolve the URL before comparing
 (see [[<<check if page item matches by resolving url>>]]).
 <<check if item matches and add module to list>>=
-if item_type == 'Assignment':
+if item_type in CONTENT_ID_ITEM_TYPES:
   if item.content_id == item_id:
-    modules.append(module.name)
+    modules.append((module.name, item.position, item.completion_requirement))
     break
 elif item_type == 'Page':
   if item.page_url:
     if item.page_url == item_id:
-      modules.append(module.name)
+      modules.append((module.name, item.position, item.completion_requirement))
       break
     # Compare canonical URLs to avoid duplicates when Canvas redirects old slugs.
     try:
       resolved_page = course.get_page(item.page_url)
       if resolved_page.url == target_url:
-        modules.append(module.name)
+        modules.append((module.name, item.position, item.completion_requirement))
         break
     except Exception:
       pass
 @
 
+Most readers of membership only want the names, so we keep the simpler
+function as a view of the richer one.
+<<functions>>=
+def get_item_modules(course, item_type, item_id):
+  """Get list of names of the modules containing an item.
+
+  Arguments are as for get_item_module_positions.
+  """
+  return [name for name, _, _ in
+          get_item_module_positions(course, item_type, item_id)]
+@
+
+\subsubsection{Exporting membership as module specs}
+\label{sec:export-module-specs}
+
+The [[pages view]], [[assignments view]] and [[quizzes export]] commands write
+the item's current membership into the exported front matter, so that the
+file can be edited and pushed back.
+What they write must therefore be something [[update_item_modules]] reads:
+a list of module specs (\cref{sec:module-positions}).
+
+We write the mapping form, with the position, rather than bare module names
+for two reasons.
+First, the names are regexes on the way back in, so a bare name such as
+[[Week 1]] would also match [[Week 10]]; anchoring and escaping the name
+([[^Week 1$]]) makes the round trip exact.
+Second, including the position makes the export a complete description of
+the item's place in the course: a file pulled from Canvas, edited and pushed
+back puts the item exactly where it was, and a set of such files can be
+pushed in any order and still reproduce the module order---which is what a
+course kept in version control needs.
+An item Canvas reports without a position (it should not happen, but the
+attribute is normalized to [[None]] if it does) gets a spec without one,
+which by the rules of \cref{sec:module-positions} means \enquote{leave it}.
+The completion requirement (\cref{sec:completion-requirements}) is exported
+the same way, in its short string form unless it is a [[min_score]]
+requirement, whose score needs the mapping form; Canvas's per-user
+[[completed]] flag is not part of the requirement and is dropped.
+<<functions>>=
+def export_module_specs(course, item_type, item_id):
+  """Return the item's module membership as a list of module specs.
+
+  Each spec is a mapping with an anchored, escaped regex under `module`
+  and, when known, the item's 1-based `position` in that module and its
+  `completion_requirement`. The list is suitable for the `modules` front
+  matter key.
+  """
+  specs = []
+  for name, position, requirement in get_item_module_positions(
+      course, item_type, item_id):
+    spec = {'module': "^" + re.escape(name) + "$"}
+    if position is not None:
+      spec['position'] = position
+    if requirement and requirement.get('type'):
+      spec['completion_requirement'] = export_requirement(requirement)
+    specs.append(spec)
+  return specs
+
+def export_requirement(requirement):
+  """Return a Canvas completion requirement in spec form."""
+  if requirement['type'] == 'min_score':
+    return {'type': 'min_score', 'min_score': requirement.get('min_score')}
+  return requirement['type']
+@
+
+Let's verify that the export is anchored, escaped and carries the position,
+and that it reads back as it was written.
+<<test functions>>=
+def test_export_module_specs_round_trips_through_normalize():
+  item = make_assignment_item(42, position=3)
+  item.completion_requirement = {'type': 'must_submit', 'completed': False}
+  course, module = one_module_course([item], name="Week 1 (a+b)")
+  specs = export_module_specs(course, 'Assignment', 42)
+  assert specs == [{'module': r"^Week\ 1\ \(a\+b\)$", 'position': 3,
+                    'completion_requirement': 'must_submit'}]
+  assert normalize_module_specs(specs) == [
+      (r"^Week\ 1\ \(a\+b\)$", 3, {'type': 'must_submit'})]
+  assert re.search(specs[0]['module'], "Week 1 (a+b)")
+  assert not re.search(specs[0]['module'], "Week 1 (a+b) extra")
+
+def test_export_module_specs_omits_unknown_position():
+  item = make_assignment_item(42, position=None)
+  course, module = one_module_course([item])
+  assert export_module_specs(course, 'Assignment', 42) == [
+      {'module': "^Week\\ 1$"}]
+  assert get_item_modules(course, 'Assignment', 42) == ["Week 1"]
+
+def test_export_module_specs_writes_min_score_as_mapping():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'min_score', 'min_score': 7.0,
+                                 'completed': True}
+  course, module = one_module_course([item])
+  spec = export_module_specs(course, 'Assignment', 42)[0]
+  assert spec['completion_requirement'] == {'type': 'min_score',
+                                            'min_score': 7.0}
+@
+
+\subsection{Module specifications: patterns with optional positions}
+\label{sec:module-positions}
+
+A [[modules]] list of plain regex strings can say \emph{which} modules an
+item belongs in, but nothing about \emph{where} in each module it goes.
+Canvas keeps every module's items in order and exposes that order as a
+1-based [[position]]; adding an item without one appends it.
+That is fine for a first import, but a course whose pages live in files
+(one file per page, pushed one at a time) needs each file to carry the
+page's place in the module, or the module order would depend on the order
+in which files happen to be pushed.
+
+So a [[modules]] entry may also be a mapping that pairs a pattern with a
+position:
+\begin{verbatim}
+modules:
+- ^Week 1$
+- module: ^Week 2$
+  position: 3
+\end{verbatim}
+The first entry is the familiar string form: the item must be in the
+modules matching it, wherever it already is or at the end if new.
+The second says the item must be the third item of every module matching
+[[^Week 2$]].
+We chose a mapping over some inline syntax such as [[^Week 2$@3]] because
+YAML parses it for us, the position stays an integer rather than a string
+to be dissected, and the form has room to grow (a later
+[[after: <pattern>]] would not change the string form).
+The key is named [[module]] to mirror the [[-M]]/[[--module]] option, whose
+value is the same kind of pattern.
+
+The semantics of a missing position are the important design decision here:
+a spec without a position leaves the item where it is, it never moves it to
+the end.
+This is what makes round trips safe---a file exported from Canvas and
+pushed back unchanged must not reorder anything---and it is why the mapping
+form with no [[position]] is allowed at all: it means the same as the
+string, so exporters can always write mappings.
+When several specs match the same module, the last one that carries a
+position decides; when one pattern matches several modules, the item gets
+that position in each of them.
+
+A spec may also carry a completion requirement for the item
+(\cref{sec:completion-requirements}); like the position it is optional and
+absent means unchanged.
+
+We normalize the forms into one shape, a list of
+[[(pattern, position, requirement)]] triples, so the rest of the code never
+has to ask which spelling the user chose.
+Anything else is a [[ValueError]] naming the offending entry, because the
+alternative---silently skipping an entry---would leave the item in the
+wrong module with no hint why.
+<<functions>>=
+def normalize_module_specs(specs):
+  """Return module specs as a list of (pattern, position, requirement).
+
+  Each entry of `specs` is either a regex string or a mapping with the key
+  `module` (a regex), an optional `position` (an integer >= 1) and an
+  optional `completion_requirement` (a type name such as 'must_submit',
+  'none' to remove, or a {type, min_score} mapping). Missing position and
+  requirement are returned as None; `specs` itself may be None, meaning no
+  modules. Raises ValueError for anything else.
+  """
+  if specs is None:
+    return []
+  if isinstance(specs, str) or not isinstance(specs, (list, tuple)):
+    raise ValueError(f"modules must be a list of patterns, got {specs!r}")
+  normalized = []
+  for spec in specs:
+    <<normalize one module spec>>
+  return normalized
+@
+
+A string is a pattern; a mapping must have a string [[module]] and nothing
+but [[module]], [[position]] and [[completion_requirement]].
+Rejecting unknown keys matters because a typo such as [[postion: 3]] would
+otherwise be accepted as \enquote{no position} and the item would quietly
+stay put.
+<<normalize one module spec>>=
+if isinstance(spec, str):
+  normalized.append((spec, None, None))
+  continue
+if not isinstance(spec, dict):
+  raise ValueError(
+      f"module spec must be a pattern or a mapping, got {spec!r}")
+unknown = set(spec) - {"module", "position", "completion_requirement"}
+if unknown:
+  raise ValueError(f"module spec {spec!r} has unknown keys: "
+                   f"{', '.join(sorted(unknown))}")
+if not isinstance(spec.get("module"), str):
+  raise ValueError(f"module spec {spec!r} needs a 'module' pattern")
+position = spec.get("position")
+if position is not None:
+  <<check that [[position]] is a positive integer>>
+requirement = spec.get("completion_requirement")
+if requirement is not None:
+  requirement = normalize_completion_requirement(requirement, spec)
+normalized.append((spec["module"], position, requirement))
+@
+
+Canvas positions start at 1, so zero and negatives are errors rather than
+\enquote{first}.
+We must also rule out booleans explicitly: [[bool]] is a subclass of [[int]]
+in Python, and YAML reads [[position: yes]] as [[True]], which would
+otherwise pass as position~1.
+<<check that [[position]] is a positive integer>>=
+if (isinstance(position, bool) or not isinstance(position, int)
+    or position < 1):
+  raise ValueError(
+      f"module spec {spec!r}: position must be an integer >= 1")
+@
+
+\subsubsection{Completion requirements in module specs}
+\label{sec:completion-requirements}
+
+A module item may carry a \emph{completion requirement}: what a student
+must do with it before the module counts it as done (and, with sequential
+progress or prerequisites, before the next item or module unlocks).
+Canvas knows [[must_view]], [[must_submit]], [[must_mark_done]],
+[[must_contribute]] and [[min_score]] (with a score).
+A course locked behind a pre-test needs this on the test's module item, so
+the spec mapping takes a third optional key:
+\begin{verbatim}
+modules:
+- module: ^Terminal pre-test$
+  position: 1
+  completion_requirement: must_submit
+- module: ^Week 2$
+  completion_requirement:
+    type: min_score
+    min_score: 5
+\end{verbatim}
+The plain string forms name the requirement type; the mapping form is
+needed only for [[min_score]], which has a parameter.
+The special value [[none]] removes a requirement.
+As with [[position]], an absent key leaves the item's requirement alone, so
+a plain regex string spec still means what it always did.
+
+We normalize a requirement to a mapping with a [[type]] key (and
+[[min_score]] when the type is [[min_score]]), which is what Canvas expects
+in the request; [[none]] becomes [[{'type': 'none'}]] so that one shape
+covers all three intents and the apply step can tell \enquote{remove} from
+\enquote{leave}.
+<<constants>>=
+COMPLETION_REQUIREMENT_TYPES = ('must_view', 'must_submit', 'must_mark_done',
+                                'must_contribute', 'min_score', 'none')
+<<functions>>=
+def normalize_completion_requirement(value, spec):
+  """Return `value` (a type string or a {type, min_score} mapping) as a
+  mapping, or raise ValueError naming `spec`."""
+  if isinstance(value, str):
+    value = {'type': value}
+  if not isinstance(value, dict) or not isinstance(value.get('type'), str):
+    raise ValueError(f"module spec {spec!r}: completion_requirement must be "
+                     "a type name or a mapping with 'type'")
+  unknown = set(value) - {'type', 'min_score'}
+  if unknown:
+    raise ValueError(f"module spec {spec!r}: completion_requirement has "
+                     f"unknown keys: {', '.join(sorted(unknown))}")
+  if value['type'] not in COMPLETION_REQUIREMENT_TYPES:
+    raise ValueError(f"module spec {spec!r}: unknown completion_requirement "
+                     f"type {value['type']!r}; one of "
+                     f"{', '.join(COMPLETION_REQUIREMENT_TYPES)}")
+  <<check that a [[min_score]] requirement has a score>>
+  return value
+@
+
+Only [[min_score]] takes a score, and it must have one; the same
+bool-is-an-int care as for positions applies.
+<<check that a [[min_score]] requirement has a score>>=
+if value['type'] == 'min_score':
+  score = value.get('min_score')
+  if (isinstance(score, bool) or not isinstance(score, (int, float))
+      or score < 0):
+    raise ValueError(f"module spec {spec!r}: min_score requires a "
+                     "non-negative number under 'min_score'")
+elif 'min_score' in value:
+  raise ValueError(f"module spec {spec!r}: min_score only makes sense "
+                   "with type min_score")
+@
+
+The commands that read front matter validate it before they write anything
+to Canvas, collecting error messages with [[content.validate_attributes]].
+[[modules]] is not part of those schemas, so we offer the same shape of
+interface for it: a function returning a list of messages, empty when the
+specs are fine, that callers can append to their own list.
+Validating up front matters because the module update runs \emph{after} the
+content has been written; an error raised only then would tell the user the
+edit failed when in fact only the placement did.
+<<functions>>=
+def validate_module_specs(specs):
+  """Return error messages for module `specs`; empty when they are valid."""
+  try:
+    normalize_module_specs(specs)
+  except ValueError as e:
+    return [str(e)]
+  return []
+@
+
+Let's verify both spellings normalize to the same shape and that each
+malformed form is rejected with a message that names it.
+<<test functions>>=
+def test_normalize_accepts_strings_and_mappings():
+  specs = ["^Week 1$", {"module": "^Week 2$", "position": 3},
+           {"module": "^Week 3$"}]
+  assert normalize_module_specs(specs) == [
+      ("^Week 1$", None, None), ("^Week 2$", 3, None),
+      ("^Week 3$", None, None)]
+
+def test_normalize_accepts_completion_requirements():
+  specs = [{"module": "^A$", "completion_requirement": "must_submit"},
+           {"module": "^B$", "completion_requirement":
+            {"type": "min_score", "min_score": 5}},
+           {"module": "^C$", "completion_requirement": "none"}]
+  assert normalize_module_specs(specs) == [
+      ("^A$", None, {"type": "must_submit"}),
+      ("^B$", None, {"type": "min_score", "min_score": 5}),
+      ("^C$", None, {"type": "none"})]
+
+def test_normalize_treats_none_as_no_modules():
+  assert normalize_module_specs(None) == []
+  assert normalize_module_specs([]) == []
+
+@pytest.mark.parametrize("bad", [
+    "^Week 1$",                                   # not a list
+    [3],                                          # neither str nor mapping
+    [{"position": 2}],                            # missing module
+    [{"module": 7}],                              # module not a pattern
+    [{"module": "x", "postion": 2}],              # typo'd key
+    [{"module": "x", "position": "2"}],           # position not an int
+    [{"module": "x", "position": True}],          # YAML yes
+    [{"module": "x", "position": 0}],             # Canvas starts at 1
+    [{"module": "x", "completion_requirement": "must_dance"}],
+    [{"module": "x", "completion_requirement": {"type": "min_score"}}],
+    [{"module": "x", "completion_requirement":
+      {"type": "must_view", "min_score": 3}}],
+    [{"module": "x", "completion_requirement": {"min_score": 3}}],
+])
+def test_normalize_rejects_malformed_specs(bad):
+  with pytest.raises(ValueError):
+    normalize_module_specs(bad)
+  errors = validate_module_specs(bad)
+  assert len(errors) == 1
+
+def test_validate_returns_no_errors_for_valid_specs():
+  assert validate_module_specs(["a", {"module": "b", "position": 1}]) == []
+@
+
 \subsection{Updating module membership based on patterns}
 
 The [[update_item_modules]] function synchronizes an item's module membership
-with a list of regex patterns.
+with a list of module specs (\cref{sec:module-positions}).
 The semantics are:
 \begin{description}
 \item[Empty list] Remove the item from all modules
 \item[Non-empty list] The item should be in exactly those modules matching
-  at least one regex pattern---add to matching modules, remove from non-matching
+  at least one pattern---add to matching modules, remove from non-matching
+\item[Spec with a position] Additionally, the item should sit at that
+  position in each module the spec matches---created there if new, moved
+  there if present elsewhere
 \end{description}
 
 This provides a declarative interface: the user specifies the desired state,
-and we compute the necessary additions and removals.
+and we compute the necessary additions, removals and moves.
+Position is deliberately the only thing about ordering the user states: Canvas
+renumbers the other items itself when one is inserted or moved, so
+\enquote{be item~3} is a complete instruction, whereas anything relative to
+siblings would need us to know and manage the whole module.
 
 <<functions>>=
-def update_item_modules(course, item_type, item_id, module_regexes):
-  """Update module membership for an item based on regex patterns.
+def update_item_modules(course, item_type, item_id, module_specs):
+  """Update module membership for an item based on module specs.
 
   Args:
       course: Canvas course object
-      item_type: 'Assignment' or 'Page'
-      item_id: For Assignment: assignment.id (int),
+      item_type: 'Assignment', 'Quiz' or 'Page'
+      item_id: For Assignment and Quiz: the numeric ID,
                For Page: page.url (string slug)
-      module_regexes: List of regex patterns to match module names.
-                      Empty list, or None, means remove from all
-                      modules.
+      module_specs: List of regex patterns or {module, position,
+                    completion_requirement} mappings, see
+                    normalize_module_specs. Empty list, or None, means
+                    remove from all modules.
 
   Returns:
-      Tuple of (added_modules, removed_modules) as lists of module names
+      Tuple of (added, removed, moved, required) as lists of module names;
+      `required` lists the modules where the item's completion requirement
+      was set or removed.
+
+  Raises:
+      ValueError: if module_specs is malformed.
   """
-  <<treat a missing pattern list as empty>>
+  <<normalize module specs>>
   <<find modules matching regex patterns>>
   <<compute and apply module membership changes>>
-  return added, removed
+  return added, removed, moved, required
 @
 
-Our callers hand us [[module_regexes]] straight out of YAML front matter, and
+Our callers hand us [[module_specs]] straight out of YAML front matter, and
 YAML draws its distinctions in a different place than we do.  A bare
 [[modules:]] line with nothing after it parses to [[None]], not to the empty
 list---yet to a human writing front matter the two say the same thing.  The
@@ -610,21 +1871,27 @@ module membership to be set to whatever they wrote; writing nothing means
 \enquote{no modules}, which is precisely the empty-list case above.
 
 We normalise here rather than in each caller so that every call site---page,
-assignment, and quiz editing alike---reads a bare key the same way.  Without
-this, the loop in [[<<find modules matching regex patterns>>]] iterates over
-[[None]] and raises a [[TypeError]].  The page commands catch that exception
-and report it as an error updating the page---but they do so \emph{after} the
-new content has already been written, so the user is told the edit failed
-when in fact only the module assignment did.
+assignment, and quiz editing alike---reads a bare key the same way, and so
+that the two spellings of a spec (\cref{sec:module-positions}) arrive as the
+same [[(pattern, position)]] pairs.  Without this, the loop in
+[[<<find modules matching regex patterns>>]] would iterate over [[None]] and
+raise a [[TypeError]].  Malformed specs still raise here, as a
+[[ValueError]]; the callers are expected to have run
+[[validate_module_specs]] before writing any content, so that this raise is
+a safety net rather than the user's first notice.
 
-<<treat a missing pattern list as empty>>=
-if module_regexes is None:
-  module_regexes = []
+<<normalize module specs>>=
+module_specs = normalize_module_specs(module_specs)
 @
 
 First, we compile all regex patterns and find which modules match.
 We match against both module name and Canvas ID, consistent with
 [[filter_modules]].
+Alongside the set of matching modules we record, per module, the position
+and the completion requirement the user asked for; a later spec overwrites
+an earlier one, which gives the \enquote{last one wins} rule, and a spec
+without a position (or requirement) leaves no entry, which is how
+\enquote{absent means don't touch} falls out.
 <<find modules matching regex patterns>>=
 all_modules = [
     canvaslms.cli.utils.ensure_module_attrs(module)
@@ -632,23 +1899,34 @@ all_modules = [
 ]
 
 matching_module_ids = set()
-for pattern in module_regexes:
+desired_positions = {}
+desired_requirements = {}
+for pattern, position, requirement in module_specs:
   regex = re.compile(pattern)
   for module in all_modules:
     if regex.search(module.name) or regex.search(str(module.id)):
       matching_module_ids.add(module.id)
+      if position is not None:
+        desired_positions[module.id] = position
+      if requirement is not None:
+        desired_requirements[module.id] = requirement
 @
 
-For each module, we determine the current state (is the item present?)
-and the desired state (does the module match a regex?).
-Then we add or remove as needed.
+For each module, we determine the current state (is the item present, and
+where, with which requirement?) and the desired state (does the module match
+a spec, and with which position and requirement?).
+Then we add, remove, move or re-require as needed.
 <<compute and apply module membership changes>>=
 added = []
 removed = []
+moved = []
+required = []
 
 for module in all_modules:
   <<find current module item if present>>
   should_be_in = module.id in matching_module_ids
+  desired_position = desired_positions.get(module.id)
+  desired_requirement = desired_requirements.get(module.id)
   <<add or remove item from module as needed>>
 @
 
@@ -681,7 +1959,7 @@ try:
   for item in list_module_items(module):
     if item.type != item_type:
       continue
-    if item_type == 'Assignment':
+    if item_type in CONTENT_ID_ITEM_TYPES:
       if item.content_id == item_id:
         current_item = item
         break
@@ -709,23 +1987,105 @@ except Exception:
   pass  # Page doesn't exist or can't be fetched
 @
 
-Finally, we add or remove based on comparing current vs desired state.
-When adding, we use [[create_module_item]] with the appropriate type and ID.
+\subsubsection{Keeping the module item cache honest}
+
+Module items are cached, and the cache outlives the process: the
+[[Module]] objects returned by the cached [[course.get_modules()]] carry
+their item list in [[module_item_cache]] and [[module_item_all_fetched]]
+(\cref{sec:caching-module-items}), and that is written to disk between
+runs with a refresh interval of days.
+Nothing about the caching layer knows that [[create_module_item]] or
+[[delete()]] changed the list.
+Left alone, the next command---[[modules view]], or the membership check
+for the next page in a loop---would read the stale list and, worse, stale
+positions: Canvas renumbers all the siblings when an item is inserted,
+removed or moved, so after any of these operations \emph{every} cached
+position in the module is suspect.
+
+The fix is local: after a successful mutation we drop the module's cached
+items and reset its \enquote{all fetched} timestamp, which is exactly the
+state of a module whose items have never been fetched, so the next access
+refetches them.
+The two [[hasattr]] guards let the helper run on plain [[Module]] objects
+(and mocks) that never went through the caching decorator.
+<<functions>>=
+def invalidate_module_items(module):
+  """Forget the cached items of `module` so the next access refetches."""
+  if hasattr(module, 'module_item_cache'):
+    module.module_item_cache.clear()
+  if hasattr(module, 'module_item_all_fetched'):
+    module.module_item_all_fetched = None
+@
+
+Moving an item is a [[PUT]] on the module item with the new position; Canvas
+shifts the siblings to make room.
+The [[canvasapi]] method [[ModuleItem.edit]] returns a fresh object and
+leaves the one we called it on untouched, so after the call our
+[[item.position]] is stale---one more reason to invalidate the module's
+cached items rather than patch the object by hand.
+We keep the move in a function of its own because the [[modules move]]
+subcommand (\cref{sec:modules-move}) needs exactly the same two steps.
+<<functions>>=
+def move_module_item(module, item, position):
+  """Move `item` to 1-based `position` within `module`."""
+  item.edit(module_item={'position': position})
+  invalidate_module_items(module)
+@
+
+Setting a requirement is another [[PUT]] on the module item.
+Canvas reports the current requirement as a mapping with [[type]],
+[[min_score]] (as a float) and a per-user [[completed]] flag, so
+comparing it with what the user asked for means comparing type and score
+only---we do not want to re-send an unchanged requirement every push.
+Removing a requirement is the one request that is not a mapping: Canvas
+accepts an empty [[completion_requirement]] to clear it (a mapping with an
+empty or missing type is rejected), which the [[none]] spelling maps to.
+<<functions>>=
+def requirement_matches(current, desired):
+  """Is the item's `current` requirement already what `desired` asks for?"""
+  if desired['type'] == 'none':
+    return not current or not current.get('type')
+  if not current or current.get('type') != desired['type']:
+    return False
+  if desired['type'] == 'min_score':
+    try:
+      return float(current.get('min_score')) == float(desired['min_score'])
+    except (TypeError, ValueError):
+      return False
+  return True
+
+def set_item_requirement(module, item, requirement):
+  """Set (or with type 'none' remove) `item`'s completion requirement."""
+  payload = '' if requirement['type'] == 'none' else requirement
+  item.edit(module_item={'completion_requirement': payload})
+  invalidate_module_items(module)
+@
+
+Finally, we add, remove, move or re-require based on comparing current vs
+desired state.
+When adding, we use [[create_module_item]] with the appropriate type and ID,
+and with the position and the completion requirement when the user gave
+them: Canvas accepts both on creation, which saves extra requests and avoids
+the item briefly appearing at the end or without its requirement.
 When removing, we call [[delete()]] on the module item object.
+When the item is already present we move it only if it is not at the asked
+position, and set the requirement only if it differs, so that pushing an
+unchanged file is a no-op in Canvas as well as in our output.
+Every mutation invalidates the module's cached items afterwards.
 <<add or remove item from module as needed>>=
 if should_be_in and current_item is None:
   # Add to module
   try:
-    if item_type == 'Assignment':
-      module.create_module_item({
-        'type': 'Assignment',
-        'content_id': item_id
-      })
+    if item_type in CONTENT_ID_ITEM_TYPES:
+      new_item = {'type': item_type, 'content_id': item_id}
     else:  # Page
-      module.create_module_item({
-        'type': 'Page',
-        'page_url': item_id
-      })
+      new_item = {'type': 'Page', 'page_url': item_id}
+    if desired_position is not None:
+      new_item['position'] = desired_position
+    if desired_requirement is not None and desired_requirement['type'] != 'none':
+      new_item['completion_requirement'] = desired_requirement
+    module.create_module_item(new_item)
+    invalidate_module_items(module)
     added.append(module.name)
   except Exception:
     pass  # Silently skip if we can't add
@@ -733,7 +2093,203 @@ elif not should_be_in and current_item is not None:
   # Remove from module
   try:
     current_item.delete()
+    invalidate_module_items(module)
     removed.append(module.name)
   except Exception:
     pass  # Silently skip if we can't remove
+elif should_be_in:
+  <<move item to desired position>>
+  <<set completion requirement if asked>>
+@
+
+<<move item to desired position>>=
+if desired_position is not None and current_item.position != desired_position:
+  try:
+    move_module_item(module, current_item, desired_position)
+    moved.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't move
+@
+
+<<set completion requirement if asked>>=
+if (desired_requirement is not None
+    and not requirement_matches(current_item.completion_requirement,
+                                desired_requirement)):
+  try:
+    set_item_requirement(module, current_item, desired_requirement)
+    required.append(module.name)
+  except Exception:
+    pass  # Silently skip if we can't set the requirement
+@
+
+Let's verify the position handling: a new item is created at the requested
+position (and without one when none was given), a present item is moved
+only when its position differs, the last spec with a position wins, and a
+move invalidates the cache just like the other mutations.
+<<test functions>>=
+def one_module_course(items, name="Week 1"):
+  """Create a course mock with one cached module holding `items`."""
+  module = make_cached_module(name, 11, items)
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  return course, module
+
+def test_create_passes_requested_position():
+  course, module = one_module_course([])
+  added, removed, moved, required = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42, 'position': 2})
+  assert (added, removed, moved, required) == (["Week 1"], [], [], [])
+
+def test_create_without_position_omits_it():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Page', 'intro', ["^Week 1$"])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Page', 'page_url': 'intro'})
+
+def test_present_item_is_moved_when_position_differs():
+  item = make_assignment_item(42, position=5)
+  course, module = one_module_course([item])
+  added, removed, moved, required = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  item.edit.assert_called_once_with(module_item={'position': 2})
+  assert (added, removed, moved, required) == ([], [], ["Week 1"], [])
+  assert module.module_item_all_fetched is None
+
+def test_present_item_at_position_is_left_alone():
+  item = make_assignment_item(42, position=2)
+  course, module = one_module_course([item])
+  added, removed, moved, required = update_item_modules(
+      course, 'Assignment', 42, [{"module": "^Week 1$", "position": 2}])
+  item.edit.assert_not_called()
+  assert (added, removed, moved, required) == ([], [], [], [])
+  assert module.module_item_all_fetched is not None
+
+def test_present_item_without_position_is_not_moved():
+  item = make_assignment_item(42, position=5)
+  course, module = one_module_course([item])
+  update_item_modules(course, 'Assignment', 42, ["^Week 1$"])
+  item.edit.assert_not_called()
+
+def test_last_spec_with_position_wins():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week", "position": 1},
+      {"module": "^Week 1$", "position": 4},
+      "^Week 1$"])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42, 'position': 4})
+
+def test_update_rejects_malformed_specs():
+  course, module = one_module_course([])
+  with pytest.raises(ValueError):
+    update_item_modules(course, 'Assignment', 42, [{"position": 1}])
+  module.create_module_item.assert_not_called()
+@
+
+And the requirements: created with the item, set on a present item only
+when it differs (type and score compared, Canvas's float and
+[[completed]] flag ignored), removed with an empty payload for [[none]].
+<<test functions>>=
+def test_create_passes_completion_requirement():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "must_submit"}])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42,
+       'completion_requirement': {'type': 'must_submit'}})
+
+def test_requirement_set_only_when_different():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'min_score', 'min_score': 5.0,
+                                 'completed': False}
+  course, module = one_module_course([item])
+  same = [{"module": "^Week 1$", "completion_requirement":
+           {"type": "min_score", "min_score": 5}}]
+  assert update_item_modules(course, 'Assignment', 42, same)[3] == []
+  item.edit.assert_not_called()
+  other = [{"module": "^Week 1$", "completion_requirement": "must_view"}]
+  assert update_item_modules(course, 'Assignment', 42, other)[3] == ["Week 1"]
+  item.edit.assert_called_once_with(
+      module_item={'completion_requirement': {'type': 'must_view'}})
+  assert module.module_item_all_fetched is None
+
+def test_requirement_none_clears_with_empty_payload():
+  item = make_assignment_item(42, position=1)
+  item.completion_requirement = {'type': 'must_view'}
+  course, module = one_module_course([item])
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "none"}])
+  item.edit.assert_called_once_with(module_item={'completion_requirement': ''})
+  item.edit.reset_mock()
+  item.completion_requirement = None
+  update_item_modules(course, 'Assignment', 42, [
+      {"module": "^Week 1$", "completion_requirement": "none"}])
+  item.edit.assert_not_called()
+@
+
+A Classic Quiz is matched and created as a [[Quiz]] item, and is not confused
+with an assignment that happens to have the same numeric ID.
+<<test functions>>=
+def test_quiz_items_are_matched_by_type_and_content_id():
+  assignment = make_assignment_item(42, position=1)
+  quiz = make_module_item(2, title="Quiz", item_type="Quiz")
+  quiz.content_id = 42
+  course, module = one_module_course([assignment, quiz])
+  assert get_item_module_positions(course, 'Quiz', 42) == [
+      ("Week 1", 2, None)]
+  added, removed, moved, required = update_item_modules(
+      course, 'Quiz', 42, [{"module": "^Week 1$", "position": 3}])
+  quiz.edit.assert_called_once_with(module_item={'position': 3})
+  assignment.edit.assert_not_called()
+
+def test_quiz_items_are_created_as_quiz_type():
+  course, module = one_module_course([])
+  update_item_modules(course, 'Quiz', 42, ["^Week 1$"])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Quiz', 'content_id': 42})
+@
+
+Let's verify that both an addition and a removal leave the module in the
+\enquote{never fetched} state.
+We give the mock module a real dictionary and timestamp, because those are
+what the caching decorator stores and what [[invalidate_module_items]] must
+reset.
+<<test functions>>=
+def make_cached_module(name, module_id, items):
+  """Create a module mock carrying cache state and the given items."""
+  module = MagicMock()
+  module.name = name
+  module.id = module_id
+  module.get_module_items.return_value = items
+  module.module_item_cache = {item.id: (item, {}) for item in items}
+  module.module_item_all_fetched = datetime.now()
+  return module
+
+def make_assignment_item(content_id, position=None):
+  """Create an Assignment module item mock."""
+  item = make_module_item(position, item_type="Assignment")
+  item.content_id = content_id
+  item.id = 100 + content_id
+  return item
+
+def test_adding_item_invalidates_module_cache():
+  module = make_cached_module("Week 1", 11, [])
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  update_item_modules(course, 'Assignment', 42, ["^Week 1$"])
+  module.create_module_item.assert_called_once()
+  assert module.module_item_cache == {}
+  assert module.module_item_all_fetched is None
+
+def test_removing_item_invalidates_module_cache():
+  item = make_assignment_item(42)
+  module = make_cached_module("Week 1", 11, [item])
+  course = MagicMock()
+  course.get_modules.return_value = [module]
+  update_item_modules(course, 'Assignment', 42, [])
+  item.delete.assert_called_once()
+  assert module.module_item_cache == {}
+  assert module.module_item_all_fetched is None
 @
