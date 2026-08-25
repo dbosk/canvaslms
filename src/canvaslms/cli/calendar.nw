@@ -439,7 +439,9 @@ calendar_view_parser.add_argument("--count", "-n", type=int, default=1,
        "set to 0 to show all matches")
 @
 
-We fetch events in the requested date window, filter them by regex (if provided), sort by start time, and print up to the requested count.
+We fetch events in the requested date window, filter them by regex (if
+provided), sort by start time, print up to the requested count---and then say
+how many matches that count left out.
 <<get and display calendar event details>>=
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
@@ -474,13 +476,7 @@ def start_key(ev):
 
 filtered.sort(key=start_key)
 
-# Take the top N
-if args.count == 0:
-  count = len(filtered)  # Show all matches
-else:
-  count = max(1, args.count)
-
-selected = filtered[:count]
+<<let [[selected]] be the first [[count]] events>>
 
 if not selected:
   canvaslms.cli.err(1, "No matching events found in the specified date range")
@@ -493,6 +489,71 @@ else:
     print_event_details(event)
     if idx != len(selected) - 1:
       print()
+
+<<warn about matches hidden by [[--count]]>>
+@
+
+\subsection{Selecting the events to show}
+
+The count is a slice length, so its two out-of-band values need translating
+before we can slice with it.
+Zero is the documented \enquote{show everything} spelling, which we turn
+into the length of the match list.
+A negative count is nonsense we cannot honour, and handing it to the slice
+would be worse than clamping it: Python counts a negative bound from the
+end, so $-1$ would show every match \emph{but} the last, and anything below
+minus the number of matches would slice to nothing---which the empty check
+below would then report as \enquote{no matching events}, blaming the
+calendar for what was a bad argument.
+Clamping to a single match keeps the outcome legible.
+
+<<let [[selected]] be the first [[count]] events>>=
+if args.count == 0:
+  count = len(filtered)
+else:
+  count = max(1, args.count)
+
+selected = filtered[:count]
+@
+
+\subsection{Saying what the count hid}
+
+The count defaults to one because [[calendar view]] is meant for reading a
+single event in detail; listing many is what [[calendar list]] is for.
+Truncation is therefore the \emph{normal} case rather than an exceptional
+one---and that is precisely why it must be announced.
+A range query such as
+\begin{center}
+  [[canvaslms calendar view --start-time 2026-03-09 --end-time 2026-03-14]]
+\end{center}
+looks like a query for a week's events, but prints the first match and
+nothing else.
+Without a word about the other matches, a single event is indistinguishable
+from a week that really did hold one event, and the reader concludes the
+fetch is broken rather than the count too small.
+
+The notice goes to standard error, never to standard output.
+Standard output carries either the labelled lines or the JSON array, and a
+consumer piping [[--json]] into [[jq]] would choke on a human sentence
+mixed into the stream; diagnostics are exactly what standard error is for.
+We say it with [[canvaslms.cli.warn]] rather than a bare
+[[print(..., file=sys.stderr)]], because [[warn]] routes through the
+logging setup that [[cli.nw]] configures: the message lands on standard
+error, and the [[-q]] flag already means \enquote{spare me the warnings},
+so a script that wants pure output has a way to ask for it.
+
+Truncation is a property of the selection, not of the output format---both
+branches above lose the same events---so a single notice after them covers
+both and cannot drift apart the way two copies would.
+Putting it after the events, rather than before, also leaves it as the last
+line on the terminal, where a reader who has just scrolled past a screenful
+of output will still see it.
+
+<<warn about matches hidden by [[--count]]>>=
+if len(selected) < len(filtered):
+  canvaslms.cli.warn(
+    f"showing {len(selected)} of {len(filtered)} matching events; "
+    f"use --count 0 to show all")
 @
 
 \subsection{Machine-readable output}
@@ -669,6 +730,135 @@ We want to format the times in local timezone for better readability.
 print(f"Start:    {canvaslms.cli.utils.format_local_time(getattr(event, 'start_at', None))}")
 print(f"End:      {canvaslms.cli.utils.format_local_time(getattr(event, 'end_at', None))}")
 @
+
+\section{Verifying the truncation notice}
+
+Both halves of the notice are easy to lose in a later edit: someone tuning
+the wording could route it to standard output, and someone reworking the
+selection could stop emitting it altogether.
+Neither mistake announces itself---a truncated run looks exactly like an
+honest one---so we pin the notice down with tests instead.
+The test file itself, with its imports and the fixtures it draws on, is
+introduced further down in this chapter; the chunks below add to it.
+
+The command reads its arguments straight off [[args]], so, as for
+[[calendar create]], we build the namespace that [[argparse]] would have
+produced and let each test override only what it varies.
+
+<<test helper functions>>=
+def view_args(**overrides):
+    """Build the args namespace that `calendar view` would receive"""
+    args = argparse.Namespace(
+        on=None,
+        start_time="2026-03-09",
+        end_time="2026-03-14",
+        course=None,
+        match=None,
+        title=None,
+        description=None,
+        ignore_case=False,
+        count=1,
+        json=False,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+The events themselves are plain attribute bags rather than mocks.
+A [[MagicMock]] answers every attribute lookup, so
+[[get_appointment_booking_data]] would see booking metadata on every event
+and the printer would try to walk a mock's [[child_events]]; a namespace
+answers only what we put in it, which is what [[getattr(event, ..., None)]]
+expects of a real event that is not an appointment group.
+Serialising to JSON needs nothing more either, since
+[[format_events_json]] works from [[__dict__]].
+We give the events distinct start times so the sort is deterministic and
+the first match is predictable.
+
+<<test helper functions>>=
+import json
+import types
+
+
+def calendar_events(count):
+    """Build `count` events, an hour apart, as Canvas would return them"""
+    return [
+        types.SimpleNamespace(
+            title=f"Event {number}",
+            description=f"Description {number}",
+            start_at=f"2026-03-09T{9 + number:02d}:00:00Z",
+            end_at=f"2026-03-09T{10 + number:02d}:00:00Z",
+            location_name="Room",
+            html_url=f"https://canvas.example.com/events/{number}",
+        )
+        for number in range(count)
+    ]
+
+@
+
+<<test functions>>=
+class TestCalendarViewCount:
+    """`calendar view` must say when --count hides matching events"""
+
+    <<count notice test methods>>
+@
+
+The default count of one on a week-long range is the case from the bug
+report.
+The notice must name both numbers---one shown, three matched---since
+knowing only that something was hidden leaves the reader no way to ask for
+the rest.
+Standard output must stay free of it: there, the events are the output.
+
+<<count notice test methods>>=
+def test_truncation_is_announced(self, mock_canvas, capsys, caplog):
+    """A count smaller than the number of matches must be reported"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(count=1))
+
+    assert "1 of 3" in caplog.text
+    assert "of 3" not in capsys.readouterr().out
+
+@
+
+Showing everything is the case that must stay quiet: a notice there would
+be noise on every unrestricted run, and users learn to ignore warnings that
+fire when nothing is wrong.
+
+<<count notice test methods>>=
+def test_showing_all_matches_is_silent(self, mock_canvas, caplog):
+    """With --count 0 nothing is hidden, so nothing is reported"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(count=0))
+
+    assert "matching events" not in caplog.text
+
+@
+
+The JSON path is where a notice on the wrong stream does the most damage,
+since the consumer is a parser rather than a person.
+We therefore check both properties at once: the array on standard output
+still parses and holds exactly the selected event, and the count is still
+reported beside it.
+
+<<count notice test methods>>=
+def test_json_output_stays_parsable(self, mock_canvas, capsys, caplog):
+    """The notice must not leak into the JSON on standard output"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(count=1, json=True))
+
+    events = json.loads(capsys.readouterr().out)
+    assert len(events) == 1
+    assert "1 of 3" in caplog.text
+
+@
+
 
 \section{The \texttt{calendar create} subcommand}
 
