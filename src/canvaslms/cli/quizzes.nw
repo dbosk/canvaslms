@@ -5659,6 +5659,8 @@ def format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_d
   """
   if interaction_type in ('choice', 'multi-answer'):
     format_new_quiz_choice_answers(lines, interaction_data, scoring_data)
+  elif interaction_type == 'ordering':
+    format_new_quiz_ordering(lines, interaction_data, scoring_data)
   elif interaction_type == 'true-false':
     format_new_quiz_true_false(lines, scoring_data)
   elif interaction_type == 'matching':
@@ -5673,26 +5675,199 @@ def format_new_quiz_answers(lines, interaction_type, interaction_data, scoring_d
     lines.append(f"*(Question type: {interaction_type})*")
 @
 
+\paragraph{Two structures behind one [[choices]] field.}
+Three of the types above---[[choice]], [[multi-answer]] and [[ordering]]---keep
+their alternatives in the [[choices]] field of [[interaction_data]], but not in
+the same structure.  A choice or multi-answer question sends a \emph{list} of
+choice objects, an ordering question a \emph{mapping} whose keys are the choice
+identifiers:
+\begin{minted}{json}
+{"choices": [{"id": "uuid-1", "item_body": "<p>5</p>"}]}
+{"choices": {"ord-1": {"id": "ord-1", "item_body": "<p>5</p>"}}}
+\end{minted}
+The export and import sides meet the same split and must branch on it
+(\cref{sec:cleaning-export}), for the reason that bites here as well:
+iterating a mapping yields its \emph{keys}, so code written for the list walks
+over the strings [["ord-1"]], [["ord-2"]],~\dots\ and asks each of them for a
+field that a string has no way to answer.
+
+We would rather not have that structural test scattered over one renderer per
+question type, so we normalize once---to the pairs that both structures
+describe underneath, an identifier and the choice it names.  Delivery order is
+what a list carries and all a mapping can offer, so we keep it in both cases;
+the renderer that needs another order has an answer key to build it from.
+
+<<functions>>=
+def new_quiz_choice_pairs(choices):
+  """Returns (choice id, choice) pairs for either choice structure
+
+  Accepts the list of choice objects that a choice or multi-answer
+  question carries as well as the id-keyed mapping of an ordering
+  question, preserving in both cases the order Canvas delivered.
+  """
+  if isinstance(choices, dict):
+    return list(choices.items())
+  return [(choice.get('id') if isinstance(choice, dict) else choice, choice)
+          for choice in choices or []]
+@
+
+Reading a choice's text needs a function of its own for a duller reason: the
+field arrives under two spellings, [[item_body]] from the New Quizzes API and
+[[itemBody]] from questions that reached it through the classic conversion.
+A choice may also be a bare identifier string rather than an object, which is
+what an export written before the ordering mapping was handled correctly
+leaves behind (\cref{sec:cleaning-export}); its text is gone for good, and
+showing the identifier at least keeps the question's items countable instead
+of rendering a run of empty lines.
+
+<<functions>>=
+def new_quiz_choice_text(choice):
+  """Returns the display text of one New Quiz choice, as markdown"""
+  if not isinstance(choice, dict):
+    return html_to_markdown(str(choice))
+  return html_to_markdown(choice.get('itemBody')
+                          or choice.get('item_body', ''))
+@
+
 \paragraph{Multiple choice and multi-answer questions.}
 These are the most common question types.
 Choices are listed with markers indicating correct answers.
+Normalizing first costs nothing for the list this function normally receives,
+and means a mapping arriving here by mistake renders the wrong \emph{kind} of
+answer instead of aborting the whole view with an [[AttributeError]].
 
 <<functions>>=
 def format_new_quiz_choice_answers(lines, interaction_data, scoring_data):
   """Format multiple choice or multi-answer question choices"""
-  choices = interaction_data.get('choices', [])
   correct_ids = scoring_data.get('value', [])
   if isinstance(correct_ids, str):
     correct_ids = [correct_ids]
 
-  for choice in choices:
-    choice_id = choice.get('id', '')
-    # Handle both 'itemBody' (classic) and 'item_body' (new) formats
-    choice_text = choice.get('itemBody') or choice.get('item_body', '')
-    choice_text = html_to_markdown(choice_text)
-    is_correct = choice_id in correct_ids
-    marker = "✓" if is_correct else "○"
-    lines.append(f"- {marker} {choice_text}")
+  for choice_id, choice in new_quiz_choice_pairs(
+      interaction_data.get('choices', [])):
+    marker = "✓" if choice_id in correct_ids else "○"
+    lines.append(f"- {marker} {new_quiz_choice_text(choice)}")
+@
+
+\paragraph{Ordering questions.}
+An ordering question asks the student to arrange the alternatives, so its
+answer key is not a selection among the choices but a permutation of them:
+[[scoring_data.value]] lists the mapping's keys in the sequence the student is
+supposed to produce.
+
+This is why ordering must not be routed to
+[[format_new_quiz_choice_answers]], even though the normalization above would
+now let it through.  The crash was the smaller of the two objections, and the
+one already dealt with; the larger is that a per-line correct/incorrect marker
+has nothing to say about this question.  Every choice occurs in the answer key,
+so every line
+would be marked correct, and the sequence---which is the whole of what the
+question asks and the whole of what its answer says---would not appear
+anywhere in the output.  Ordering therefore gets a renderer whose output
+\emph{is} that sequence: a numbered list, the items in the order the answer
+key names.
+
+Two things can go missing without costing the reader the question.  An answer
+key naming an identifier the mapping does not carry contributes nothing rather
+than raising, and any choice the key never names is listed after the ones it
+does, since a question with an item silently omitted is worse than one with an
+item out of place.  When no usable answer key survives at all, the items are
+still worth showing, under a heading that promises no order rather than one we
+cannot substantiate.
+
+<<functions>>=
+def format_new_quiz_ordering(lines, interaction_data, scoring_data):
+  """Format an ordering question as a numbered list in correct order"""
+  pairs = new_quiz_choice_pairs(interaction_data.get('choices', {}))
+  choices = dict(pairs)
+  answer_key = scoring_data.get('value', [])
+  if not isinstance(answer_key, list):
+    answer_key = []
+
+  ordered_ids = [choice_id for choice_id in answer_key
+                 if choice_id in choices]
+  ordered_ids += [choice_id for choice_id, _ in pairs
+                  if choice_id not in ordered_ids]
+
+  lines.append("**Correct order:**" if answer_key and ordered_ids
+               else "**Items to order:**")
+  lines.append("")
+  for number, choice_id in enumerate(ordered_ids, 1):
+    lines.append(f"{number}. {new_quiz_choice_text(choices[choice_id])}")
+@
+
+Let's verify this on an ordering question shaped the way Canvas delivers
+one---the choices in a mapping, the answer key naming its keys in an order
+that is not the delivery order, so that a renderer ignoring the key would give
+itself away.  This is the same question as the [[Ordering Example]] item of
+[[EXAMPLE_NEW_QUIZ_JSON]], with the choice texts wrapped in the markup a live
+quiz carries.
+
+<<test functions>>=
+def ordering_question_data():
+  """Returns interaction and scoring data of an ordering question."""
+  interaction_data = {
+    'choices': {
+      'ord-1': {'id': 'ord-1', 'item_body': '<p>5</p>'},
+      'ord-2': {'id': 'ord-2', 'item_body': '<p>2</p>'},
+      'ord-3': {'id': 'ord-3', 'item_body': '<p>8</p>'},
+      'ord-4': {'id': 'ord-4', 'item_body': '<p>1</p>'},
+    },
+  }
+  scoring_data = {'value': ['ord-4', 'ord-2', 'ord-1', 'ord-3']}
+  return interaction_data, scoring_data
+
+def test_format_new_quiz_ordering_numbers_the_correct_order():
+  interaction_data, scoring_data = ordering_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_ordering(lines, interaction_data, scoring_data)
+
+  assert lines == ['**Correct order:**', '',
+                   '1. 1', '2. 2', '3. 5', '4. 8']
+@
+
+The dispatch is what the [[view]] command actually reaches, and it is where
+the question used to be lost: with no [[ordering]] arm it fell through to the
+generic stub, which names the type and shows nothing of the question.
+
+<<test functions>>=
+def test_format_new_quiz_answers_dispatches_ordering():
+  interaction_data, scoring_data = ordering_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_answers(
+    lines, 'ordering', interaction_data, scoring_data)
+
+  assert '1. 1' in lines
+  assert not any('Question type' in line for line in lines)
+@
+
+The two degradations argued for above are worth pinning down as well, since
+each of them used to be a crash.  A question that arrives without an answer key
+still shows its items, in delivery order and under the heading that claims no
+more than that; and the mapping handed to the choice renderer---the shortcut
+this section argues against---renders a line per choice rather than raising in
+the middle of a quiz.
+
+<<test functions>>=
+def test_format_new_quiz_ordering_without_answer_key():
+  interaction_data, _ = ordering_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_ordering(lines, interaction_data, {})
+
+  assert lines == ['**Items to order:**', '',
+                   '1. 5', '2. 2', '3. 8', '4. 1']
+
+def test_format_new_quiz_choice_answers_survives_choice_mapping():
+  interaction_data, scoring_data = ordering_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_choice_answers(
+    lines, interaction_data, scoring_data)
+
+  assert lines == ['- ✓ 5', '- ✓ 2', '- ✓ 8', '- ✓ 1']
 @
 
 \paragraph{True/false questions.}
