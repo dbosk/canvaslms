@@ -945,13 +945,29 @@ preserve their timezone.
 We use conditional timezone interpretation:
 \begin{enumerate}
 \item Check if the string contains explicit timezone markers
-\item For naive strings, apply [[tzinfo='local']] to interpret as local time
+\item For naive strings, apply [[tzinfo=local_timezone()]] to interpret as
+      local time
 \item For explicit timezone strings, use default parsing to preserve the timezone
-\item For format-specific parsing, always apply [[tzinfo='local']] since those
-      formats never include timezone information
+\item For format-specific parsing, always apply [[tzinfo=local_timezone()]]
+      since those formats never include timezone information
 \item For natural-language input, hand the naive [[datetime]] we get back to
       [[format_canvas_time]], which applies the very same local-time rule
 \end{enumerate}
+
+The local zone arrives here as [[local_timezone()]] rather than as arrow's
+[[tzinfo='local']] shorthand, and for the reason given in
+\cref{sec:utils:local-zone}: the shorthand resolves to whatever offset is in
+force when the call is made, so it dated every parse by the calendar of the
+machine rather than by the date being parsed. That was the more visible half
+of the defect, because [[parse_date]] is what reads the user's command line:
+in July, [[parse_date("2023-12-15")]] answered [[2023-12-14T22:00:00Z]], an
+hour before the midnight it was asked for.
+
+The two halves also have to agree with each other. Natural-language input
+takes the [[dateutil]] route and is localized inside [[format_canvas_time]],
+while [[2023-12-15]] is localized here---and once one side resolves the
+offset at the target date and the other samples it at \enquote{now}, the same
+day spelled two ways names two different instants.
 
 Besides dates, the function accepts a request to have \emph{no} date:
 the words [[none]] and [[clear]], or an empty value.
@@ -997,16 +1013,14 @@ def parse_date(date_str):
   for fmt in formats:
     try:
       if fmt is None:
-        # Check if string has explicit timezone info
         if _has_explicit_timezone(date_str):
-          # Preserve explicit timezone
           return format_canvas_time(arrow.get(date_str))
         else:
-          # Interpret naive string as local time
-          return format_canvas_time(arrow.get(date_str, tzinfo='local'))
+          return format_canvas_time(arrow.get(date_str,
+                                              tzinfo=local_timezone()))
       else:
-        # Format-specific strings never include timezone, always use local
-        return format_canvas_time(arrow.get(date_str, fmt, tzinfo='local'))
+        return format_canvas_time(arrow.get(date_str, fmt,
+                                            tzinfo=local_timezone()))
     except (arrow.parser.ParserError, ValueError):
       continue
 
@@ -1035,7 +1049,7 @@ which code path gets to interpret it---and the two candidates disagree:
   [[December 15 2023]] becomes [[2023-12-15T00:00:00Z]]: midnight in
   Greenwich, not midnight where the user is.
 \item[Through [[format_canvas_time()]] ] Its [[datetime]] branch attaches the
-  local offset first and converts afterwards. In CET the same input becomes
+  local zone first and converts afterwards. In CET the same input becomes
   [[2023-12-14T23:00:00Z]]---the very instant that the plain [[2023-12-15]]
   yields through the format list.
 \end{description}
@@ -1149,3 +1163,50 @@ These tests verify that [[parse_date()]] provides a flexible interface, handling
 \item \textbf{Edge cases}: None values, empty strings, special keywords
 \item \textbf{Canvas compatibility}: All outputs end with 'Z' (UTC indicator)
 \end{enumerate}
+
+\subsection{Verifying that parsing does not depend on today}
+
+Those tests all freeze \enquote{now} on the date they parse, so they cannot
+separate an offset resolved at the parsed date from one sampled at
+\enquote{now}. The tests below therefore run on the real clock, pairing a
+summer expectation with a winter one exactly as in
+\cref{sec:utils:local-zone}: no single offset satisfies both, so one of them
+fails whenever the offset is sampled.
+
+The last test is the one that matters most for maintenance. Both spellings of
+the same December day must name the same instant, but they reach that answer
+along different routes---[[2023-12-15]] is localized inside [[parse_date]],
+[[December 15 2023]] inside [[format_canvas_time]] via the [[dateutil]]
+fallback. If either route is changed back to a sampled offset while the other
+is not, the two answers part company for half the year, and this assertion
+says so without needing to know which route was broken.
+
+<<test functions>>=
+class TestParseDateAcrossDST:
+    """Parsing must not date its answer by the calendar of the machine"""
+
+    def test_iso_date_uses_the_offset_of_its_own_date(self):
+        """
+        Midnight on 15 July is 22:00 UTC; midnight on 15 December is 23:00.
+
+        With the offset sampled at 'now', both answers become whichever of
+        the two the current season dictates.
+        """
+        assert parse_date("2023-07-15") == "2023-07-14T22:00:00Z"
+        assert parse_date("2023-12-15") == "2023-12-14T23:00:00Z"
+
+    def test_time_of_day_uses_the_offset_of_its_own_date(self):
+        """14:30 local is 12:30 UTC in July but 13:30 UTC in December"""
+        assert parse_date("2023-07-15 14:30") == "2023-07-15T12:30:00Z"
+        assert parse_date("2023-12-15 14:30") == "2023-12-15T13:30:00Z"
+
+    def test_both_localizing_routes_stay_in_step(self):
+        """
+        The format list and the dateutil fallback must localize alike.
+
+        'December 15 2023' matches no format, so it is localized inside
+        format_canvas_time, while '2023-12-15' is localized in parse_date.
+        """
+        assert parse_date("December 15 2023") == parse_date("2023-12-15")
+        assert parse_date("July 15 2023") == parse_date("2023-07-15")
+@
