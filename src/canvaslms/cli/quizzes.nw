@@ -2694,6 +2694,8 @@ SETTINGS FOR NEW QUIZZES (time_limit in seconds):
 ADVANCED SETTINGS FOR NEW QUIZZES (in settings.quiz_settings):
   multiple_attempts: attempt_limit, score_to_keep, cooling_period_seconds
   result_view_settings: display_item_correct_answer, display_item_feedback, etc.
+  has_time_limit, session_time_limit_in_seconds: the time limit as Canvas
+    stores it; a top-level time_limit, when present, overrides both
 
 SETTINGS FOR CLASSIC QUIZZES (time_limit in minutes):
   title, description, quiz_type (assignment/practice_quiz/graded_survey/survey),
@@ -3054,6 +3056,95 @@ The [[build_new_quiz_api_params]] function handles the conversion of our
 nested dictionary structure into the flat parameter format required by the
 Canvas API.  It recursively processes [[quiz_settings]] and its sub-structures.
 
+Keys the function does not recognise become top-level quiz parameters.  That
+default is right for [[title]] and [[due_at]], and wrong for exactly one key.
+
+\subsubsection{The time limit is not a top-level field}
+\label{sec:new-quiz-time-limit-params}
+
+A New Quiz has no writable top-level [[time_limit]].  Sending
+\begin{verbatim}
+quiz[time_limit]=1800
+\end{verbatim}
+is accepted, answered with a success status, and changes nothing: the quiz
+still reports [[has_time_limit: false]] afterwards (sandbox test, August
+2026).  What governs the timer is a pair of settings one level down:
+\begin{verbatim}
+quiz[quiz_settings][has_time_limit]=true
+quiz[quiz_settings][session_time_limit_in_seconds]=1800
+\end{verbatim}
+
+A silent no-op is the worst failure mode available here---the quiz opens
+untimed and nothing in our output says so---so we translate [[time_limit]]
+into that pair instead of letting the generic rule map it into a field
+nobody reads.  Writing the pair by hand always worked; what did not work was
+the [[time_limit]] our own help text advertises.
+
+The two settings have to be written as a pair, because [[has_time_limit]] is
+the switch and [[session_time_limit_in_seconds]] is only consulted when the
+switch is on.  A [[time_limit]] of [[null]] or [[0]]---the two ways our file
+formats spell \enquote{no time limit}---therefore turns the switch off and
+sends no duration at all.
+
+<<functions>>=
+def new_quiz_time_limit_params(seconds):
+  """Return the New Quizzes API parameters for a time limit
+
+  `seconds` is the limit in seconds, the unit New Quizzes count in; a
+  falsy value (null or 0) means the quiz has no time limit.
+  """
+  if not seconds:
+    return {HAS_TIME_LIMIT_PARAM: False}
+
+  return {HAS_TIME_LIMIT_PARAM: True, SESSION_TIME_LIMIT_PARAM: seconds}
+<<constants>>=
+HAS_TIME_LIMIT_PARAM = 'quiz[quiz_settings][has_time_limit]'
+SESSION_TIME_LIMIT_PARAM = \
+    'quiz[quiz_settings][session_time_limit_in_seconds]'
+@
+
+\subsubsection{Which statement wins when a file makes two}
+
+A file written by [[quizzes export]] states the limit twice: once as the
+friendly [[time_limit]], and once inside the [[quiz_settings]] Canvas
+returned, as the pair itself.  Editing either and feeding the file back is a
+reasonable thing to do, so the two statements can disagree, and something has
+to choose between them.
+
+We let [[time_limit]] win.  It is the key our documentation advertises, the
+one an instructor is most likely to have edited, and the only one a
+hand-written file usually carries; the pair is what an export happened to
+bring along.  Choosing the other way would reinstate this very bug---an
+edited [[time_limit]] with no effect---for everyone whose file came from
+[[quizzes export]], which is the population most likely to hit it.  A file
+that states only the pair is unaffected: with no [[time_limit]] key there is
+nothing to override, so the hand-written workaround keeps working.
+
+Neither statement is discarded quietly.  When a file makes both and they
+disagree, we say which one we used; agreement, which is what an untouched
+round trip produces, passes without a word.
+
+<<functions>>=
+def quiz_settings_time_limit(quiz_settings):
+  """Return the time limit in seconds stated by a quiz_settings mapping
+
+  Returns None when the mapping is absent, states no time limit, or
+  states a zero-length one.
+  """
+  if not quiz_settings or not quiz_settings.get('has_time_limit'):
+    return None
+
+  return quiz_settings.get('session_time_limit_in_seconds') or None
+@
+
+Comparing the two statements means reading a duration back out of a
+[[quiz_settings]] mapping, which is also how [[quizzes export]] and the
+editor learn a New Quiz's time limit
+(\cref{sec:reading-new-quiz-time-limit}).  The switch decides there too: a
+mapping whose [[has_time_limit]] is false states \enquote{no limit} however
+many seconds sit beside it, and Canvas does leave a stale [[0]] beside a
+switched-off timer.
+
 <<functions>>=
 def build_new_quiz_api_params(quiz_params):
   """Converts quiz parameters to Canvas API format
@@ -3061,6 +3152,10 @@ def build_new_quiz_api_params(quiz_params):
   Handles nested structures like quiz_settings.multiple_attempts by
   flattening them into the format:
     quiz[quiz_settings][multiple_attempts][key]=value
+
+  A top-level time_limit is translated into the quiz_settings pair the
+  New Quizzes API reads, and overrides a time limit stated in an
+  explicit quiz_settings.
 
   Args:
     quiz_params: Dictionary with quiz parameters, may include nested dicts
@@ -3071,6 +3166,9 @@ def build_new_quiz_api_params(quiz_params):
   params = {}
 
   for key, value in quiz_params.items():
+    if key == 'time_limit':
+      continue
+
     if value is None:
       continue
 
@@ -3094,7 +3192,88 @@ def build_new_quiz_api_params(quiz_params):
       # Top-level quiz parameter
       params[f'quiz[{key}]'] = value
 
+  <<translate the time limit into quiz settings parameters>>
+
   return params
+@
+
+The translation happens after the loop, not inside it, so that the outcome
+does not depend on which key a dictionary happened to yield first.  The
+duration is dropped before the pair is written rather than overwritten with
+it, because clearing a limit writes no duration at all and would otherwise
+leave the exported one standing beside a switched-off timer.
+
+<<translate the time limit into quiz settings parameters>>=
+if 'time_limit' in quiz_params:
+  seconds = quiz_params['time_limit']
+  <<warn when the two time limit statements disagree>>
+  params.pop(SESSION_TIME_LIMIT_PARAM, None)
+  params.update(new_quiz_time_limit_params(seconds))
+@
+
+<<warn when the two time limit statements disagree>>=
+stated = quiz_settings_time_limit(quiz_params.get('quiz_settings'))
+if stated is not None and stated != seconds:
+  canvaslms.cli.warn(
+    f"New Quiz time limit: quiz_settings says {stated} seconds, "
+    f"time_limit says {seconds}; using time_limit")
+@
+
+Let's verify that a time limit reaches Canvas where Canvas reads it, that it
+never reaches the top-level field that ignored it, and that the two ways of
+spelling \enquote{no time limit} both switch the timer off:
+
+<<test functions>>=
+def test_new_quiz_time_limit_becomes_a_quiz_settings_pair():
+  params = quizzes.build_new_quiz_api_params(
+    {'title': 'Midterm', 'time_limit': 1800})
+
+  assert params['quiz[quiz_settings][has_time_limit]'] is True
+  assert params['quiz[quiz_settings][session_time_limit_in_seconds]'] == 1800
+  assert 'quiz[time_limit]' not in params
+  assert params['quiz[title]'] == 'Midterm'
+
+
+def test_null_time_limit_switches_the_timer_off():
+  params = quizzes.build_new_quiz_api_params(
+    {'title': 'Midterm', 'time_limit': None,
+     'quiz_settings': {'has_time_limit': True,
+                       'session_time_limit_in_seconds': 1800}})
+
+  assert params['quiz[quiz_settings][has_time_limit]'] is False
+  assert 'quiz[quiz_settings][session_time_limit_in_seconds]' not in params
+
+
+def test_zero_time_limit_switches_the_timer_off():
+  params = quizzes.build_new_quiz_api_params({'time_limit': 0})
+
+  assert params['quiz[quiz_settings][has_time_limit]'] is False
+  assert 'quiz[quiz_settings][session_time_limit_in_seconds]' not in params
+@
+
+The precedence rule needs both directions pinned down: a [[time_limit]]
+overrides the pair an export carried along, and a file that states only the
+pair still says what it said.
+
+<<test functions>>=
+def test_time_limit_overrides_an_exported_quiz_settings_pair():
+  params = quizzes.build_new_quiz_api_params(
+    {'time_limit': 3600,
+     'quiz_settings': {'has_time_limit': True,
+                       'session_time_limit_in_seconds': 1800}})
+
+  assert params['quiz[quiz_settings][session_time_limit_in_seconds]'] == 3600
+  assert params['quiz[quiz_settings][has_time_limit]'] is True
+
+
+def test_hand_written_quiz_settings_time_limit_is_left_alone():
+  params = quizzes.build_new_quiz_api_params(
+    {'title': 'Midterm',
+     'quiz_settings': {'has_time_limit': True,
+                       'session_time_limit_in_seconds': 900}})
+
+  assert params['quiz[quiz_settings][session_time_limit_in_seconds]'] == 900
+  assert params['quiz[quiz_settings][has_time_limit]'] is True
 @
 
 
@@ -3162,6 +3341,12 @@ seconds---30 hours---and each further round trip would multiply again.  We
 therefore convert where the front matter is built and consumed
 (\cref{sec:front-matter-time-limit}) and let the shared API-parameter
 conversion pass the value through untouched.
+
+Untouched means unrescaled, not unmoved.  A New Quiz has no top-level time
+limit for those seconds to land in, so the shared conversion re-addresses
+them as the [[quiz_settings]] pair Canvas actually reads
+(\cref{sec:new-quiz-time-limit-params}).  The unit is what must survive the
+journey; the address is ours to get right.
 
 
 \subsection{Quiz schema for editing}
@@ -4676,6 +4861,36 @@ or missing limit becomes [[None]], because Canvas expresses \enquote{no time
 limit} both ways and the editor should show the absence rather than a
 misleading [[0]].
 
+\paragraph{Where a New Quiz keeps its time limit.}
+\label{sec:reading-new-quiz-time-limit}
+Those seconds do not arrive in the attribute named after them.  A New Quiz
+object reports [[time_limit]] as [[null]] even when its timer is running---the
+mirror image of the field being ignored on the way in
+(\cref{sec:new-quiz-time-limit-params})---and the value lives in
+[[quiz_settings]] in both directions.  We still read the attribute first, so
+that an object which does carry a limit is believed, and fall back to the
+settings when it does not.
+
+<<functions>>=
+def new_quiz_time_limit(quiz, quiz_settings):
+  """Return a New Quiz's time limit in seconds, or None
+
+  Canvas reports the limit in `quiz_settings`; the quiz object's own
+  time_limit attribute is null for New Quizzes, and is consulted first
+  only so that an object which does carry one is believed.
+  """
+  return (getattr(quiz, 'time_limit', None)
+          or quiz_settings_time_limit(quiz_settings))
+@
+
+The fallback is what moves the settings fetch ahead of the attribute loop.
+Fetching needs a requester, and callers without one---the front-matter tests,
+any caller holding only a quiz object---simply get no settings and fall back
+to nothing, exactly as the [[if requester]] guard at the old call site did.
+Making a missing requester the fetching function's own business
+(\cref{sec:fetching-new-quiz-settings}) keeps its three callers from
+repeating that condition.
+
 <<functions>>=
 def extract_quiz_attributes(quiz, requester=None):
   """Extract editable attributes from a quiz object
@@ -4689,25 +4904,25 @@ def extract_quiz_attributes(quiz, requester=None):
     and 'quiz_settings' (for New Quizzes)
   """
   attrs = {}
+  is_new = is_new_quiz(quiz)
+  quiz_settings = fetch_new_quiz_settings(quiz, requester) if is_new else None
 
   for key, spec in QUIZ_SCHEMA.items():
     canvas_attr = spec.get('canvas_attr', key)
     value = getattr(quiz, canvas_attr, spec.get('default'))
 
-    if key == 'time_limit' and is_new_quiz(quiz):
-      value = value // SECONDS_PER_MINUTE if value else None
+    if key == 'time_limit' and is_new:
+      seconds = new_quiz_time_limit(quiz, quiz_settings)
+      value = seconds // SECONDS_PER_MINUTE if seconds else None
 
     if value is not None:
       attrs[key] = value
 
   # Add instructions (not in schema, but needed for content_attr)
-  if is_new_quiz(quiz):
+  if is_new:
     attrs['instructions'] = getattr(quiz, 'instructions', '') or ''
-    # Fetch quiz_settings for New Quizzes
-    if requester:
-      quiz_settings = fetch_new_quiz_settings(quiz, requester)
-      if quiz_settings:
-        attrs['quiz_settings'] = quiz_settings
+    if quiz_settings:
+      attrs['quiz_settings'] = quiz_settings
   else:
     attrs['instructions'] = getattr(quiz, 'description', '') or ''
 
@@ -4716,10 +4931,40 @@ def extract_quiz_attributes(quiz, requester=None):
 SECONDS_PER_MINUTE = 60
 @
 
+Let's verify that the editor is shown the limit Canvas actually keeps---a
+quiz whose own attribute says nothing, and settings that say half an hour:
+
+<<test functions>>=
+def test_front_matter_shows_the_time_limit_from_quiz_settings():
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.time_limit = None
+  quiz.course = MagicMock(id=1)
+
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {
+    'quiz_settings': {'has_time_limit': True,
+                      'session_time_limit_in_seconds': 1800}}
+
+  attributes = quizzes.extract_quiz_attributes(quiz, requester)
+
+  assert attributes['time_limit'] == 30
+@
+
 \paragraph{Fetching New Quiz settings.}
+\label{sec:fetching-new-quiz-settings}
 The New Quizzes API returns [[quiz_settings]] as part of the quiz object,
 but the [[canvasapi]] library may not expose all fields.  We make a direct
 API call to get the complete settings.
+
+A caller without a requester has no way to ask, which is a normal state
+rather than a failure: the settings are simply unavailable.  Answering
+[[None]] up front keeps that case from reaching the request and being
+reported as a fetch failure the user can do nothing about.
 
 <<functions>>=
 def fetch_new_quiz_settings(quiz, requester):
@@ -4727,11 +4972,14 @@ def fetch_new_quiz_settings(quiz, requester):
 
   Args:
     quiz: Quiz object (must have .id and .course attributes)
-    requester: Canvas API requester
+    requester: Canvas API requester, or None when unavailable
 
   Returns:
     Dictionary with quiz_settings, or None if unavailable
   """
+  if requester is None:
+    return None
+
   try:
     endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}"
     response = requester.request(
@@ -5331,6 +5579,16 @@ contains the important [[multiple_attempts]] and [[result_view_settings]]
 structures.  The [[--importable]] flag triggers cleaning of Canvas-specific
 metadata.
 
+That fetch has a second job, which is why it happens before the settings
+dictionary is built rather than after: it is where the time limit is
+(\cref{sec:reading-new-quiz-time-limit}).  An export that took [[time_limit]]
+from the quiz object wrote [[null]] for every timed quiz, so the exported
+copy of a half-hour exam was an untimed exam---and the file looked
+authoritative while saying nothing.  The exported value stays in seconds, as
+Canvas states it, because this file is read back by [[quizzes create]] and
+[[quizzes edit -f]], where rescaling it would break the round trip
+(\cref{sec:quiz-file-formats}).
+
 <<functions>>=
 def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
   """Exports a complete New Quiz with settings and items
@@ -5344,21 +5602,22 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
   Returns:
     Dictionary with quiz_type, settings (including quiz_settings), and items
   """
+  # Fetch quiz_settings from the API (contains multiple_attempts, result_view_settings, etc.)
+  quiz_settings = fetch_new_quiz_settings(quiz, requester)
+
   # Extract basic settings
   settings = {
     'modules': modules.export_module_specs(
         quiz.course, *quiz_module_item(quiz)),
     'title': quiz.title or '',
     'instructions': quiz.instructions or '',
-    'time_limit': getattr(quiz, 'time_limit', None),
+    'time_limit': new_quiz_time_limit(quiz, quiz_settings),
     'points_possible': getattr(quiz, 'points_possible', None),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
   }
 
-  # Fetch quiz_settings from the API (contains multiple_attempts, result_view_settings, etc.)
-  quiz_settings = fetch_new_quiz_settings(quiz, requester)
   if quiz_settings:
     settings['quiz_settings'] = quiz_settings
 
@@ -5376,6 +5635,46 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'settings': settings,
     'items': items
   }
+@
+
+Let's verify the reading rule the export depends on: the settings are
+consulted when the quiz object says nothing, and a switched-off timer is no
+time limit however many seconds Canvas left lying beside it.
+
+<<test functions>>=
+def test_new_quiz_time_limit_comes_from_the_quiz_settings():
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.time_limit = None
+
+  assert quizzes.new_quiz_time_limit(
+    quiz, {'has_time_limit': True,
+           'session_time_limit_in_seconds': 1800}) == 1800
+
+  assert quizzes.new_quiz_time_limit(
+    quiz, {'has_time_limit': False,
+           'session_time_limit_in_seconds': 1800}) is None
+
+  assert quizzes.new_quiz_time_limit(quiz, None) is None
+@
+
+An exported New Quiz is therefore fed straight back into [[quizzes create]]
+with its limit intact---the seconds Canvas stated, translated into the pair
+Canvas reads:
+
+<<test functions>>=
+def test_exported_new_quiz_time_limit_reaches_canvas():
+  exported_settings = {'title': 'Midterm', 'time_limit': 1800,
+                       'quiz_settings': {
+                         'has_time_limit': True,
+                         'session_time_limit_in_seconds': 1800}}
+
+  params = quizzes.build_new_quiz_api_params(exported_settings)
+
+  assert params['quiz[quiz_settings][session_time_limit_in_seconds]'] == 1800
+  assert params['quiz[quiz_settings][has_time_limit]'] is True
 @
 
 
@@ -5587,9 +5886,10 @@ def format_new_quiz_as_markdown(quiz, course, requester):
   if points:
     lines.append(f"**Points:** {points}")
 
-  time_limit = getattr(quiz, 'time_limit', None)
+  quiz_settings = fetch_new_quiz_settings(quiz, requester)
+  time_limit = new_quiz_time_limit(quiz, quiz_settings)
   if time_limit:
-    lines.append(f"**Time limit:** {time_limit} minutes")
+    lines.append(f"**Time limit:** {format_time_limit(time_limit)}")
 
   if points or time_limit:
     lines.append("")
@@ -5622,6 +5922,88 @@ def format_new_quiz_as_markdown(quiz, course, requester):
     lines.append(f"*Could not fetch questions: {e}*")
 
   return "\n".join(lines)
+@
+
+
+\subsection{Reporting the time limit in a unit that is true}
+
+The Classic formatter below prints a quiz's time limit followed by the word
+[[minutes]], and it is right to: a Classic Quiz counts minutes.  Copying that
+line into this formatter---which is how it got here---produced a sentence
+that was wrong twice over.  New Quizzes count seconds, so a half-hour quiz
+was announced as \enquote{1800 minutes}; and the seconds are not in the
+attribute the line read (\cref{sec:reading-new-quiz-time-limit}), so in
+practice the line never appeared at all.  A viewer that shows nothing and a
+viewer that shows thirty hours are both worse than one that says thirty
+minutes.
+
+Reading the limit is the same problem the export and the editor have, and it
+gets the same answer: the [[quiz_settings]] Canvas keeps it in.  That costs
+one more request per quiz viewed, beside the request the formatter already
+makes for the items---a cheap price for a metadata line that is otherwise
+guaranteed to be either absent or false.
+
+Rendering it is a choice this formatter has to make on its own.  We report
+minutes, the unit the Classic line uses and the unit an instructor sets a
+quiz in, so that two quizzes viewed side by side can be compared at all.  A
+limit that is not a whole number of minutes is reported in seconds instead:
+[[90]] seconds rendered as \enquote{1 minutes} would be the original bug in
+smaller print, and in a viewer a number nobody can act on beats a number that
+misleads.
+
+<<functions>>=
+def format_time_limit(seconds):
+  """Return a time limit of `seconds` seconds as a human-readable string
+
+  Whole minutes are reported in minutes, the unit quizzes are set in;
+  anything else is reported in seconds rather than rounded.
+  """
+  minutes, remainder = divmod(seconds, SECONDS_PER_MINUTE)
+
+  if minutes and not remainder:
+    return f"{minutes} minutes"
+
+  return f"{seconds} seconds"
+@
+
+Let's verify that a half-hour quiz is announced as half an hour, and that a
+limit falling between minutes keeps its own unit:
+
+<<test functions>>=
+def test_format_time_limit_reports_whole_minutes_in_minutes():
+  assert quizzes.format_time_limit(1800) == '30 minutes'
+
+
+def test_format_time_limit_reports_a_partial_minute_in_seconds():
+  assert quizzes.format_time_limit(90) == '90 seconds'
+  assert quizzes.format_time_limit(45) == '45 seconds'
+@
+
+We can walk the whole path too, from Canvas's settings to the line a reader
+sees: a quiz whose own [[time_limit]] is null, and settings that say
+[[1800]], must be viewed as a half-hour quiz rather than as nothing or as
+thirty hours.
+
+<<test functions>>=
+def test_view_reports_a_new_quiz_time_limit_in_minutes():
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.time_limit = None
+  quiz.course = MagicMock(id=1)
+
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {
+    'quiz_settings': {'has_time_limit': True,
+                      'session_time_limit_in_seconds': 1800}}
+
+  markdown = quizzes.format_new_quiz_as_markdown(quiz, quiz.course, requester)
+
+  assert '**Time limit:** 30 minutes' in markdown
+  assert '1800' not in markdown
 @
 
 
@@ -7679,6 +8061,9 @@ The [[quiz_settings]] object within [[settings]] controls advanced quiz behavior
 \item[[[has_time_limit]]] Whether the quiz has a time limit
 \item[[[session_time_limit_in_seconds]]] Time limit in seconds
 \end{description}
+This pair is where a New Quiz's time limit really lives; the friendly
+top-level [[time_limit]] is translated into it, and overrides it when a file
+states both (\cref{sec:new-quiz-time-limit-params}).
 
 Some fields may be present in exports but ignored when creating a quiz via the
 API.
@@ -7969,6 +8354,7 @@ def print_full_quiz_example_json():
   print("  Time limit:")
   print("    has_time_limit: true/false")
   print("    session_time_limit_in_seconds: number")
+  print("    (a top-level time_limit, when present, overrides both)")
   print()
   print("  Question display:")
   print("    one_at_a_time_type: 'none' or 'question'")
