@@ -123,6 +123,7 @@ token = keyring.get_password("canvaslms", "token")
 
 
 \subsection{Falling back to the config file without a keyring}
+\label{sec:keyring-write-fallback}
 
 Not every machine has a working keyring: a headless server, a minimal
 container, or a desktop session without a running secret-service daemon all
@@ -246,8 +247,7 @@ def load_credentials(config):
     <<load [[hostname]] and [[token]] from keyring>>
     if hostname and token:
       return hostname, token
-  except:
-    pass
+  <<move on when the keyring cannot be read>>
 
   try:
     hostname = os.environ["CANVAS_SERVER"]
@@ -262,5 +262,80 @@ def load_credentials(config):
     pass
 
   return None, None
+@
+
+
+\subsection{Moving on when the keyring cannot be read}
+
+Of the three sources, only the keyring can fail in a way that is not simply
+\enquote{the credentials aren't here}.
+A machine without a secret-service daemon, a locked collection, a backend
+that refuses to answer: each of these makes [[keyring.get_password]] raise,
+and none of them says anything about the environment variables or the
+configuration file.
+The other two sources therefore still deserve their turn, which is why this
+handler swallows the exception and lets the function continue rather than
+propagating it.
+
+The exceptions worth swallowing are exactly the ones the keyring raises
+about itself, and those are all subclasses of [[keyring.errors.KeyringError]]
+(the no-backend case being [[keyring.errors.NoKeyringError]]).
+This mirrors the write path in \cref{sec:keyring-write-fallback}: the same
+family of failures, the same base class, the same reason to keep the handler
+narrow.
+
+The bare [[except:]] this code used to have caught [[BaseException]] instead,
+and thereby two exceptions that report no failure at all:
+[[KeyboardInterrupt]] and [[SystemExit]].
+Here that mattered more than on the write path, because [[load_credentials]]
+runs on \emph{every} invocation of [[canvaslms]], not just on
+[[canvaslms login]].
+When the keyring is locked, [[keyring.get_password]] blocks while the
+secret-service daemon asks the user to unlock it; pressing Ctrl-C at that
+prompt means \enquote{abort this command}.
+The bare handler read it as \enquote{the keyring has nothing}, and the
+command continued with whatever the environment or the configuration file
+happened to hold---or with [[None, None]], which surfaces much later as
+\enquote{No hostname or token, run [[canvaslms login]]}, a diagnosis that
+points at the wrong problem entirely.
+With the narrow handler the [[KeyboardInterrupt]] propagates and the command
+stops where the user asked it to.
+<<move on when the keyring cannot be read>>=
+except keyring.errors.KeyringError:
+  pass
+@
+
+Let's verify the same two halves as for the write path.
+An interrupted keyring read must abort even when the environment could have
+answered the question, so we make the fallback source available and assert
+that it is nevertheless not used:
+<<test functions>>=
+def test_load_credentials_aborts_on_keyboard_interrupt(monkeypatch):
+  """Ctrl-C at the keyring prompt must abort, not fall through to the env."""
+  def interrupt(*args, **kwargs):
+    raise KeyboardInterrupt
+
+  monkeypatch.setattr(canvaslms.cli.login.keyring, "get_password", interrupt)
+  monkeypatch.setenv("CANVAS_SERVER", "canvas.example.com")
+  monkeypatch.setenv("CANVAS_TOKEN", "secret-token")
+
+  with pytest.raises(KeyboardInterrupt):
+    canvaslms.cli.login.load_credentials({})
+@
+
+A keyring that genuinely cannot answer, on the other hand, must leave the
+remaining two sources reachable:
+<<test functions>>=
+def test_load_credentials_falls_back_without_keyring(monkeypatch):
+  """Without a keyring backend, the environment still supplies credentials."""
+  def no_backend(*args, **kwargs):
+    raise keyring.errors.NoKeyringError("no backend available")
+
+  monkeypatch.setattr(canvaslms.cli.login.keyring, "get_password", no_backend)
+  monkeypatch.setenv("CANVAS_SERVER", "canvas.example.com")
+  monkeypatch.setenv("CANVAS_TOKEN", "secret-token")
+
+  assert canvaslms.cli.login.load_credentials({}) == (
+    "canvas.example.com", "secret-token")
 @
 
