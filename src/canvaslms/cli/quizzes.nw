@@ -743,6 +743,12 @@ This pattern provides several benefits:
 
 Note that we reuse the [[-a/--assignment]] argument name for backward
 compatibility with existing scripts and user workflows.
+
+This is where [[quizzes view]] and interactive [[quizzes edit]] learn that
+they have nothing to work on, so the empty-selection message carries the
+stale-listing hint of \cref{sec:quiz-listing-invalidation}: a quiz created
+moments ago by another process is exactly the case where the criteria look
+wrong but are not.
 <<functions>>=
 def add_quiz_option(parser, required=False, suppress_help=False):
   """Adds quiz selection option to argparse parser
@@ -791,7 +797,7 @@ def process_quiz_option(canvas, args):
 
   if not quiz_list:
     raise canvaslms.cli.EmptyListError(
-      "No quizzes found matching the criteria")
+      "No quizzes found matching the criteria" + STALE_LISTING_HINT)
 
   return quiz_list
 @
@@ -2660,6 +2666,138 @@ when editing existing quizzes and allowing explicit type selection when creating
 new quizzes.
 
 
+\section{Keeping the quiz listing cache honest}
+\label{sec:quiz-listing-invalidation}
+
+Creating, editing and deleting a quiz changes what a course contains; every
+other quiz command begins by asking the course what it contains.  Between
+the two sits a cache that only the askers knew about, and that asymmetry is
+enough to break the export--create--edit workflow this chapter exists to
+support.
+
+\subsection{Why a write path has to clear a read cache}
+
+[[fetch_all_quizzes]] reaches Canvas through [[course.get_quizzes()]] and
+[[course.get_new_quizzes()]], and [[make_course_quizzes_cacheable]] has
+wrapped both in [[CacheGetMethods]].  The wrapper gives every [[Course]]
+object a dictionary of the quizzes it has seen---[[quiz_cache]] for Classic
+Quizzes, [[new_quiz_cache]] for New Quizzes---and a timestamp recording when
+it last asked for the \emph{complete} list, [[quiz_all_fetched]] and
+[[new_quiz_all_fetched]].  As long as a timestamp stands, the plural method
+does not call Canvas at all: it replays its dictionary.  And [[Course]]
+objects are pickled to disk between runs, so the timestamp outlives the
+process that set it.  The only thing that clears it on its own is the
+[[QUIZ_CACHE_TTL_DAYS]] timer (\cref{sec:cache-ttl-constants}), three days
+later.
+
+[[create_command]] creates a quiz with a raw [[POST]], a path the wrapper
+never sees.  The course's listing is then \emph{complete and wrong}: complete
+according to [[new_quiz_all_fetched]], wrong in fact.  The
+export--create--edit round trip documented above therefore fails on its last
+step, seconds after its first:
+\begin{minted}{bash}
+canvaslms quizzes create -c datintro26 -f quiz.json  # Created quiz (ID: 394105)
+canvaslms quizzes edit -c datintro26 -f quiz.json --replace-items
+# No quiz found with title: Git quiz: what you know already
+\end{minted}
+and it fails by reporting that a quiz whose ID we just printed does not
+exist---a diagnosis that sends the reader looking in the wrong place, since
+the same command with [[--no-cache]] finds the quiz immediately.
+
+Leaving this to the TTL is no answer even in principle.  Three days is far
+longer than the seconds separating two commands of a script, and shortening
+the interval enough to cover this case would discard the cache for every
+reader, including the many that never write anything.  A write is what makes
+the listing wrong, it is the only event that knows this, and the process
+performing it also knows exactly which course it wrote to.  Invalidating
+there is both precise and immediate; a TTL can be neither.
+
+\subsection{Two caches, two invalidations}
+
+The chapter already contains a function with a similar name and a different
+job, and the two must not be confused.  [[invalidate_quiz_items_cache]]
+(\cref{quiz-items-cache}) drops [[quiz._items_cache]]: the \emph{questions}
+of one quiz, fetched by [[export_new_quiz_items]] and held for minutes within
+a single run.  It answers \enquote{what is in this quiz?}.  The cache we
+clear here answers \enquote{which quizzes are in this course?}, lives on the
+[[Course]] rather than the quiz, and is written to disk.  Replacing a quiz's
+items leaves the course listing correct, and creating a quiz leaves every
+other quiz's items correct, so neither call substitutes for the other.
+
+Forgetting a listing means putting the [[Course]] back in the state it had
+before anything was fetched: an empty dictionary and no \enquote{all
+fetched} timestamp, which is exactly what the plural method treats as
+\enquote{ask Canvas}.  We reset both quiz systems on every call, because
+[[fetch_all_quizzes]] reads both and the caller cannot generally tell which
+system a title, an ID or a module placement will end up matching.
+
+The [[hasattr]] guards follow [[invalidate_module_items]] in
+[[canvaslms.cli.modules]].  The four attributes exist only on classes that
+[[make_course_quizzes_cacheable]] has wrapped, so on a plain [[canvasapi]]
+[[Course]]---what a caller holds when the hacks were never installed---the
+helper must be a silent no-op rather than an [[AttributeError]] raised right
+after a successful write.
+
+<<functions>>=
+def invalidate_quiz_listing_cache(course):
+  """Forget the cached quiz listing of `course` so the next access refetches.
+
+  Clears both the Classic and the New Quizzes listing; safe to call on a
+  course that was never wrapped for caching.
+  """
+  if hasattr(course, 'quiz_cache'):
+    course.quiz_cache.clear()
+  if hasattr(course, 'quiz_all_fetched'):
+    course.quiz_all_fetched = None
+  if hasattr(course, 'new_quiz_cache'):
+    course.new_quiz_cache.clear()
+  if hasattr(course, 'new_quiz_all_fetched'):
+    course.new_quiz_all_fetched = None
+@
+
+Let us verify that a course whose listing has been fully fetched is returned
+to the never-fetched state, and that a course without the caching attributes
+survives the call.
+
+<<test functions>>=
+def cached_course(course_id=1):
+  """A MagicMock course whose quiz listings are cached as fully fetched"""
+  course = MagicMock()
+  course.id = course_id
+  course.quiz_cache = {11: ("classic quiz", {})}
+  course.new_quiz_cache = {12: ("new quiz", {})}
+  course.quiz_all_fetched = "some timestamp"
+  course.new_quiz_all_fetched = "some timestamp"
+  return course
+
+def test_invalidate_quiz_listing_clears_both_quiz_systems():
+  course = cached_course()
+
+  quizzes.invalidate_quiz_listing_cache(course)
+
+  assert course.quiz_cache == {}
+  assert course.new_quiz_cache == {}
+  assert course.quiz_all_fetched is None
+  assert course.new_quiz_all_fetched is None
+
+def test_invalidate_quiz_listing_ignores_uncached_course():
+  quizzes.invalidate_quiz_listing_cache(object())
+@
+
+The same staleness also shapes what we say when a quiz cannot be found.
+\enquote{No quiz found} is true of a deleted quiz, of a typo in the pattern,
+and of a quiz created ten seconds ago by this very tool, and only the last
+of these has a remedy the user would never guess.  We therefore append the
+remedy to the not-found messages of the commands that select an existing
+quiz.
+
+<<constants>>=
+STALE_LISTING_HINT = (
+  "; if the quiz was created or renamed very recently, the cached quiz "
+  "listing may be stale, so retry with canvaslms --no-cache")
+@
+
+
 \section{The [[quizzes create]] subcommand}
 \label{sec:quizzes-create}
 
@@ -2825,6 +2963,14 @@ quiz and a meaningless [[quiz[modules]]].
 We validate the module specs before creating the quiz, for the same reason
 as in [[quizzes edit]], and apply them once the quiz exists and has an ID.
 
+The course's cached quiz listing is dropped
+(\cref{sec:quiz-listing-invalidation}) the moment Canvas confirms the
+creation, rather than at the end of the command, because the rest of the
+command is itself a reader: the Classic branch fetches the quiz back with
+[[course.get_quiz]] before adding its questions.  Clearing first means no
+step of this command---nor of the next command in the script---reads a
+listing that our own [[POST]] has already made wrong.
+
 <<functions>>=
 def create_command(config, canvas, args):
   """Creates a new quiz in a course"""
@@ -2890,6 +3036,8 @@ def create_command(config, canvas, args):
 
   if not quiz:
     canvaslms.cli.err(1, "Failed to create quiz")
+
+  invalidate_quiz_listing_cache(course)
 
   quiz_id = quiz.get('id', 'unknown')
   print(f"Created quiz: {quiz_params.get('title')} (ID: {quiz_id})")
@@ -2969,6 +3117,28 @@ if module_specs is not None:
   else:
     item_type = 'Assignment' if quiz_type == "new" else 'Quiz'
     apply_quiz_module_specs(course, item_type, item_id, module_specs)
+@
+
+Let us verify the case the issue reported: a New Quiz created against a
+course whose listing was already fully cached leaves that listing in the
+never-fetched state, so the next command asks Canvas.
+
+<<test functions>>=
+def test_create_command_invalidates_the_course_quiz_listing(monkeypatch):
+  course = cached_course()
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  monkeypatch.setattr(quizzes, "create_new_quiz",
+                      lambda course, requester, params: {"id": 394105})
+  args = argparse.Namespace(example=False, course=["datintro26"], file=None,
+                            title="Git quiz", type="new")
+
+  quizzes.create_command({}, MagicMock(), args)
+
+  assert course.quiz_cache == {}
+  assert course.new_quiz_cache == {}
+  assert course.quiz_all_fetched is None
+  assert course.new_quiz_all_fetched is None
 @
 
 \subsection{Creating a New Quiz via API}
@@ -3729,6 +3899,13 @@ The edit command has two modes: interactive (default) and file-based.
 In interactive mode, we open the editor for each matching quiz.
 In file mode, we read the content from the specified file.
 
+Both modes end by forgetting the cached listings, because an edit changes
+precisely the fields the listing is searched by---a renamed quiz is matched
+under its old title until the cache is refetched, and printed under it by
+[[quizzes list]].  Both modes leave the selection in [[quiz_list]], so one
+chunk after the branch covers them; the aborts inside the branches return
+before reaching it, which is right, since an abort changed nothing.
+
 <<functions>>=
 def edit_command(config, canvas, args):
   """Edits quiz settings and instructions"""
@@ -3741,6 +3918,55 @@ def edit_command(config, canvas, args):
       canvaslms.cli.err(1, "-a/--assignment is required unless -f/--file is used")
     quiz_list = process_quiz_option(canvas, args)
     <<edit quiz interactively>>
+
+  <<forget the cached quiz listings of the edited courses>>
+@
+
+A selection can span several courses, and usually spans several quizzes of
+the same one.  We invalidate per course rather than per quiz because the
+listing is a property of the course, not of the quiz that happened to lead us
+to it; deduplicating by course ID says that in the code as well.  A quiz
+reaches us from [[filter_quizzes]] with its course attached, but we ask
+rather than assume, so that a quiz assembled some other way cannot turn a
+successful edit into an [[AttributeError]].
+
+<<forget the cached quiz listings of the edited courses>>=
+invalidated_courses = set()
+for quiz in quiz_list:
+  course = getattr(quiz, 'course', None)
+  if course is None or course.id in invalidated_courses:
+    continue
+  invalidated_courses.add(course.id)
+  invalidate_quiz_listing_cache(course)
+@
+
+Editing two quizzes of one course must clear that course once, which we can
+observe by recording the calls:
+
+<<test functions>>=
+def test_edit_command_invalidates_each_course_once(monkeypatch):
+  course = cached_course()
+  quiz_list = [MagicMock(course=course), MagicMock(course=course)]
+  monkeypatch.setattr(quizzes, "read_quiz_from_file",
+                      lambda path: {"format": "json",
+                                    "settings": {"title": "Git quiz"}})
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  monkeypatch.setattr(quizzes, "filter_quizzes",
+                      lambda course_list, regex: iter(quiz_list))
+  monkeypatch.setattr(quizzes, "apply_quiz_edit",
+                      lambda *args, **kwargs: True)
+  monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+  invalidated = []
+  monkeypatch.setattr(quizzes, "invalidate_quiz_listing_cache",
+                      invalidated.append)
+  args = argparse.Namespace(file="quiz.json", assignment="Git quiz",
+                            course=["datintro26"], replace_items=False,
+                            html=False)
+
+  quizzes.edit_command({}, MagicMock(), args)
+
+  assert invalidated == [course]
 @
 
 In file mode, we use [[read_quiz_from_file]] to detect the format and parse
@@ -3791,7 +4017,8 @@ course_list = courses.process_course_option(canvas, args)
 if getattr(args, 'assignment', None):
   quiz_list = list(filter_quizzes(course_list, args.assignment))
   if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
+    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}"
+                         f"{STALE_LISTING_HINT}")
 else:
   quiz_id = settings.get('id')
   quiz_regex = settings.get('regex')
@@ -3805,13 +4032,15 @@ else:
           quiz.course = course
           quiz_list.append(quiz)
     if not quiz_list:
-      canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found")
+      canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found"
+                           f"{STALE_LISTING_HINT}")
     if len(quiz_list) > 1:
       canvaslms.cli.err(1, f"Multiple quizzes match ID {quiz_id}")
   elif quiz_regex is not None and str(quiz_regex).strip() != "":
     quiz_list = list(filter_quizzes(course_list, str(quiz_regex)))
     if not quiz_list:
-      canvaslms.cli.err(1, f"No quiz found matching file regex: {quiz_regex}")
+      canvaslms.cli.err(1, f"No quiz found matching file regex: {quiz_regex}"
+                           f"{STALE_LISTING_HINT}")
   elif quiz_title is not None and str(quiz_title).strip() != "":
     quiz_list = []
     title = str(quiz_title)
@@ -3830,7 +4059,8 @@ else:
         quiz_list.extend(matches)
 
     if not quiz_list:
-      canvaslms.cli.err(1, f"No quiz found with title: {title}")
+      canvaslms.cli.err(1, f"No quiz found with title: {title}"
+                           f"{STALE_LISTING_HINT}")
   else:
     canvaslms.cli.err(
       1,
@@ -5061,6 +5291,13 @@ delete_parser.add_argument("--force", "-F",
 
 \subsection{Processing the delete command}
 
+Deletion makes the cached listing wrong in the opposite direction from
+creation: the quiz is gone from Canvas but still listed here, so a following
+[[quizzes edit]] or [[quizzes view]] would select it and then fail against
+Canvas with a 404, instead of saying plainly that there is no such quiz.  We
+drop the listing as soon as the deletion is confirmed, using the course that
+[[filter_quizzes]] attached to the quiz.
+
 <<functions>>=
 def delete_command(config, canvas, args):
   """Deletes a quiz"""
@@ -5069,7 +5306,8 @@ def delete_command(config, canvas, args):
   quiz_list = list(filter_quizzes(course_list, args.assignment))
 
   if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
+    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}"
+                         f"{STALE_LISTING_HINT}")
   if len(quiz_list) > 1:
     canvaslms.cli.err(1, f"Multiple quizzes match '{args.assignment}'. "
                          "Please use a more specific pattern.")
@@ -5095,6 +5333,7 @@ def delete_command(config, canvas, args):
     result = delete_classic_quiz(quiz)
 
   if result:
+    invalidate_quiz_listing_cache(quiz.course)
     print(f"Deleted quiz: {quiz.title}")
   else:
     canvaslms.cli.err(1, "Failed to delete quiz")
