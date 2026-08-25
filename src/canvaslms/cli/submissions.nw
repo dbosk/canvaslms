@@ -1846,9 +1846,41 @@ Like every other section, the rubric assessment must inherit
 Otherwise a rubric nested inside a history version would open a top-level
 heading underneath that version's subsection heading, and [[rich]] would
 render it as a document title.
+
+That repair still left the guard as it was: one [[try]] wrapped around the
+entire block.
+The scope is the remaining defect, and it is worth removing rather than
+remembering.
+The guard has exactly one job---tolerate a submission that carries no rubric
+data---and no business deciding what happens when [[format_rubric]] or
+[[format_section]] misbehaves.
+A guard that spans the work as well as the lookup cannot tell the two apart:
+every mistake inside the block arrives at the same [[except]] clause and leaves
+by the same silent [[pass]], which is why a mistyped parenthesis could go
+unnoticed for as long as it did.
+The submission-history sections later in this chapter already show the shape we
+want instead: guard the attribute read, and do the work in the [[else]] branch,
+where nothing is caught.
+The remaining four sections of this chapter are narrowed the same way, so all of
+them fail loudly and none of them fails at reading an absent field.
+
+The read itself can no longer fail, in fact.
+\Cref{MissingPreviewURL} traced how normalization at ingress turned absence into
+a value: [[rubric_assessment]] is one of the [[SUBMISSION_ATTRS]] that
+[[ensure_submission_attrs]] fills in with [[None]], and [[format_submission]]
+normalizes its submission before any of these blocks run.
+The truthiness test on the value is therefore the guard that does the work
+today, and the narrow [[try]] is what survives of the one that used to.
+We keep it because [[format_submission]] is public and its blocks are reached
+from the history recursion as well, and because it now costs a single line that
+can swallow nothing but the lookup it names.
 <<add rubric assessment to output>>=
 try:
-  if submission.rubric_assessment:
+  rubric_assessment = submission.rubric_assessment
+except AttributeError:
+  pass
+else:
+  if rubric_assessment:
     if json_format:
       formatted_submission.update(format_section(
         "rubric_assessment",
@@ -1859,8 +1891,60 @@ try:
         "Rubric assessment",
         format_rubric(submission),
         md_title_level=md_title_level)
-except AttributeError:
-  pass
+@
+
+Let us verify that the block no longer hides a broken formatter.
+We break [[format_rubric]] in the way the parenthesis bug did---an
+[[AttributeError]] raised while formatting a submission that does have rubric
+data---and require the error to reach the caller instead of the output silently
+losing a section.
+
+<<test functions>>=
+class TestFormattingErrorsAreNotSwallowed:
+    """Test that errors inside the section blocks reach the caller."""
+
+    def make_submission(self):
+        """Build a submission with nothing worth rendering."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_rubric_formatting_error_propagates(self, monkeypatch, tmp_path):
+        """A failing format_rubric must not silently drop the section."""
+        def broken_format_rubric(*args, **kwargs):
+            raise AttributeError("rubric")
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.format_rubric", broken_format_rubric)
+
+        submission = self.make_submission()
+        submission.rubric_assessment = {"crit": {"points": 1}}
+
+        with pytest.raises(AttributeError):
+            format_submission(submission, tmpdir=tmp_path)
+
+    def test_missing_rubric_attribute_is_still_tolerated(self, tmp_path):
+        """A submission without the attribute must still format."""
+        submission = self.make_submission()
+        del submission.rubric_assessment
+
+        output = format_submission(submission, tmpdir=tmp_path)
+
+        assert "Rubric assessment" not in output
 @
 
 \subsection{General comments}
@@ -1868,24 +1952,30 @@ except AttributeError:
 The comments section inherits [[md_title_level]] for the same reason as the
 rubric section above: a version's comments belong under that version's
 heading, not at the top of the document.
+It also inherits the narrow guard (\cref{RubricData}), and here the difference
+is easy to see: the loop reaches into every comment dictionary, so a comment
+Canvas delivered in an unexpected shape used to cost the reader the entire
+comment section rather than announcing itself.
 <<add comments to output>>=
 try:
-  if submission.submission_comments:
+  submission_comments = submission.submission_comments
+except AttributeError:
+  pass
+else:
+  if submission_comments:
     if json_format:
       formatted_submission.update(format_section(
-        "comments", submission.submission_comments,
+        "comments", submission_comments,
         json_format=True))
     else:
       body = ""
-      for comment in submission.submission_comments:
+      for comment in submission_comments:
         created_at = canvaslms.cli.utils.format_local_time(
           comment['created_at'])
         body += f"{comment['author_name']} ({created_at}):\n\n"
         body += comment["comment"] + "\n\n"
       formatted_submission += format_section("Comments", body,
                                              md_title_level=md_title_level)
-except AttributeError:
-  pass
 @
 
 \subsection{Verifying that nested sections stay nested}
@@ -1938,36 +2028,52 @@ class TestFormatSubmissionTitleLevel:
 
 \subsection{Body}
 
+A text submission arrives as [[submission.body]], which is [[None]] for every
+submission made by uploading a file instead of typing an answer.
+That is the only absence this section knows how to handle, so it is the only
+thing its guard covers (\cref{RubricData}).
+
 <<add body to output>>=
 try:
-  if submission.body:
-    if json_format:
-      formatted_submission.update(format_section(
-        "body", submission.body, json_format=True,
-        md_title_level=md_title_level))
-    else:
-      formatted_submission += format_section("Body", submission.body,
-                                             md_title_level=md_title_level)
+  submission_body = submission.body
 except AttributeError:
   pass
+else:
+  if submission_body:
+    if json_format:
+      formatted_submission.update(format_section(
+        "body", submission_body, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Body", submission_body,
+                                             md_title_level=md_title_level)
 @
 
 \subsection{Quiz answers}
 
+Quiz answers arrive as [[submission_data]], and only for submissions that came
+from a quiz.
+The section serializes them with [[json.dumps]], which is exactly the kind of
+call the old block-wide guard should never have covered: a value [[json]] cannot
+serialize is a bug to be reported, not a section to be skipped
+(\cref{RubricData}).
+
 <<add quiz answers to output>>=
 try:
-  if submission.submission_data:
+  submission_data = submission.submission_data
+except AttributeError:
+  pass
+else:
+  if submission_data:
     if json_format:
       formatted_submission.update(format_section(
-        "quiz_answers", submission.submission_data,
+        "quiz_answers", submission_data,
         json_format=True, md_title_level=md_title_level))
     else:
       formatted_submission += format_section(
         "Quiz answers",
-        json.dumps(submission.submission_data, indent=2),
+        json.dumps(submission_data, indent=2),
         md_title_level=md_title_level)
-except AttributeError:
-  pass
 @
 
 \subsection{Attachments}
@@ -1983,12 +2089,26 @@ submission.
 
 In the JSON version, we want to introduce one more level: the attachments 
 should be found under the key [[attachments]].
+
+This is the block where the wide guard was most expensive, because it is the
+block that does the most work.
+The next subsection makes a failed \emph{conversion} cost one file; but every
+other step of the loop---reading a file's name, building its section, updating
+the JSON dictionary---was covered by an [[except AttributeError]] whose only
+purpose was to notice a submission with no files.
+A single misnamed attribute anywhere in that loop looked exactly like a
+submission that had nothing attached.
+So the guard covers the lookup and nothing else (\cref{RubricData}).
 <<add attachments to output>>=
 try:
+  submission_attachments = submission.attachments
+except AttributeError:
+  pass
+else:
   <<attachment iteration variables>>
   if json_format:
     attachments = {}
-  for attachment in submission.attachments:
+  for attachment in submission_attachments:
     <<let [[contents]] be the converted [[attachment]]>>
     formatted_attachment = format_section(attachment.filename, contents,
                                           json_format=json_format,
@@ -2003,8 +2123,64 @@ try:
     formatted_submission.update(format_section("attachments", attachments,
                                                json_format=True,
                                                md_title_level=md_title_level))
-except AttributeError:
-  pass
+@
+
+Let us verify the distinction this block now draws.
+An attachment whose name cannot be read is a broken object, and the caller must
+hear about it; a submission whose [[attachments]] attribute is missing entirely
+is an ordinary submission, and formatting it must still succeed.
+
+<<test functions>>=
+class TestAttachmentErrorsAreNotSwallowed:
+    """Test that the attachment loop no longer hides its own errors."""
+
+    def make_submission(self):
+        """Build a submission carrying no attachments."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_broken_attachment_propagates(self, monkeypatch, tmp_path):
+        """A file whose name cannot be read must not look like no files."""
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: "contents")
+
+        class BrokenAttachment:
+            """An attachment whose file name cannot be read."""
+
+            @property
+            def filename(self):
+                raise AttributeError("filename")
+
+        submission = self.make_submission()
+        submission.attachments = [BrokenAttachment()]
+
+        with pytest.raises(AttributeError):
+            format_submission(submission, tmpdir=tmp_path)
+
+    def test_missing_attachments_attribute_is_tolerated(self, tmp_path):
+        """A submission without the attribute must still format."""
+        submission = self.make_submission()
+        del submission.attachments
+
+        output = format_submission(submission, tmpdir=tmp_path)
+
+        assert "Course: C1" in output
 @
 
 Let's look at the conversion.
