@@ -1057,8 +1057,29 @@ For this we need
 \item a user or group,
 \item to know if we aim for all or just ungraded submissions.
 \end{itemize}
-We add the [[required]] parameter to specify if we want to have required 
+We add the [[required]] parameter to specify if we want to have required
 arguments, \eg for the [[grade]] command.
+
+Selecting a submission is not the only thing that several commands must agree
+on, so this section gathers the neighbouring option groups as well: the two
+options for setting a grade, and the larger group governing how a submission
+is displayed.
+Each group gets a function of its own, which is what lets
+[[submissions grade]] and the standalone [[grade]] alias---or
+[[submissions view]] and the standalone [[submission]] alias---offer exactly
+the same options without either command having to know how the other spells
+them.
+
+Callers do not always arrive with a clean parser: [[submissions list]], for
+one, adds the assignment option itself before delegating here.
+The duplication can also arise inside the function, since
+[[add_assignment_option]] contributes a [[-U]] of its own before we get to
+ours.
+Either way argparse refuses a second option sharing a [[dest]] with an
+existing one, so we add each part inside a [[try]] that swallows
+[[argparse.ArgumentError]].
+That makes the function idempotent: whether a caller adds some of the options
+itself or leaves all of them to us, it ends up with the same parser.
 <<functions>>=
 def add_submission_options(parser, required=False, suppress_help=False):
   """Adds submission selection options to argparse parser
@@ -1084,7 +1105,18 @@ def add_submission_options(parser, required=False, suppress_help=False):
       help=argparse.SUPPRESS if suppress_help else "Only ungraded submissions.")
   except argparse.ArgumentError:
     pass
+@
 
+\subsection{Options for setting a grade}
+
+The [[submissions grade]] subcommand and the standalone [[grade]] command set
+a grade, a comment, or both; when neither is given they fall back to opening
+SpeedGrader.
+Both commands take the pair from here, so that adding an option for one of
+them cannot leave the other behind.
+What the options mean for the grading itself we postpone to where grading is
+implemented.
+<<functions>>=
 def add_grading_options(parser):
   """Adds grading options to argparse parser
 
@@ -1100,7 +1132,21 @@ def add_grading_options(parser):
     help="The grade to set for the submissions")
   grade_options.add_argument("-m", "--message",
     help="A comment to the student")
+@
 
+\subsection{Options for viewing a submission}
+
+[[submissions view]] and the standalone [[submission]] command share a much
+larger group of options: where the output goes ([[-o]], [[--open]],
+[[--sort-order]]), what it looks like ([[--json]], [[-H]], [[--diff]] and its
+thresholds), and how a container is run over the submitted files
+([[--docker-image]], [[--docker-cmd]], [[--docker-args]]).
+Collecting them in one function rather than at each subparser is what keeps
+the alias a true alias: an option added to the group turns up in both commands
+at once.
+Each of them is motivated where the behaviour it controls is implemented,
+which is why the function reads as a bare list of [[add_argument]] calls here.
+<<functions>>=
 def add_view_options(parser):
   """Adds submission viewing options to argparse parser
 
@@ -1171,7 +1217,23 @@ def add_view_options(parser):
          "This is used with the `docker` option for `--open`. "
          "Note that this must be the last option on the command line, it takes "
          "the rest of the line as arguments for Docker.")
+@
 
+\subsection{Turning the options into submissions}
+
+Finally the counterpart of [[add_submission_options]]: it resolves what the
+selection options asked for into the submissions themselves.
+The commands that use it all show or grade individual submissions, so we ask
+Canvas for the history, the comments and the rubric assessment in the same
+request rather than paying a round-trip per submission later.
+Resolving the users first is what lets us hand their identifiers to the
+listing helpers, scoping the cache's bulk-refresh decision to the submissions
+we will actually read; the restriction to those users then happens locally in
+[[filter_submissions]], which is also where each submission gets the [[user]]
+attribute its callers read.
+An empty result is an error rather than an empty list, so that the CLI exits
+telling the user that nothing matched instead of printing nothing at all.
+<<functions>>=
 def process_submission_options(canvas, args):
   assignment_list = assignments.process_assignment_option(canvas, args)
   user_list = users.process_user_or_group_option(canvas, args)
@@ -2903,16 +2965,19 @@ if prev_text != curr_text:
     diff_lines.append("\n")
 @
 
-Attachments require special handling since they're nested dictionaries of files.
-However, when there's only one file in each version, we try to match them even 
-if names differ.
+Attachments require special handling since they're nested dictionaries of
+files.
+Unlike the other content types, the two versions need not agree on their keys:
+a student who renames a file between submissions would otherwise get a
+deletion and an addition where a diff was wanted.
+So we pair the files across versions first.
+That step leaves us with [[filename_mapping]], which records for each current
+filename the previous name it was matched with, and with [[prev_attachments]]
+re-keyed under the current names---after which the union of the two key sets
+is the set of files to diff.
 <<handle attachment diffs>>=
 prev_attachments = prev_content.get('attachments', {})
 curr_attachments = curr_content.get('attachments', {})
-
-# Dictionary to track original filenames for matched files
-# Maps current filename -> original filename in previous version
-filename_mapping = {}
 
 <<match single files with different names>>
 
@@ -3893,7 +3958,7 @@ if not args.grade and not args.message:
     <<open [[submission]] in SpeedGrader>>
 else:
   for submission in submission_list:
-    <<if verbose, print [[submission]] and [[results]] to stdout>>
+    <<log the grading of [[submission]]>>
     <<grade submission with error handling>>
 @
 
@@ -3935,7 +4000,11 @@ Its [[False]] default overwrote the count that [[-v]] had just produced, so
 the level never rose above [[WARNING]] and [[canvaslms -vv grade ...]] said
 nothing at all.
 Dropping the local flag is what lets these messages out.
-<<if verbose, print [[submission]] and [[results]] to stdout>>=
+
+The chunk is named for what it does---it logs---and not for a condition it
+tests, because it tests none: whether these lines reach the user is settled
+once, globally, by how many times [[-v]] was given.
+<<log the grading of [[submission]]>>=
 logger.info(f"Grading {submission.assignment.course.course_code} "
              f"{submission.assignment.name} for {submission.user.name}")
 if args.grade:
