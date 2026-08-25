@@ -2109,6 +2109,7 @@ else:
   if json_format:
     attachments = {}
   for attachment in submission_attachments:
+    <<let [[tmpdir]] be a fresh temporary directory>>
     <<let [[contents]] be the converted [[attachment]]>>
     formatted_attachment = format_section(attachment.filename, contents,
                                           json_format=json_format,
@@ -2200,9 +2201,123 @@ tmpdir = None,
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
 
+@
+
+The two ways of arriving at a [[tmpdir]] are not the same thing, and treating
+them alike is what made this block litter the file system.
+A directory the caller named belongs to the caller: the submission-history code
+hands each version its own directory and then writes that version's metadata
+file into it, relying on this block to bring the directory into existence
+whether or not the version has any attachments.
+Creating it eagerly is therefore part of the contract, not a convenience.
+
+A directory we invent belongs to nobody until a file goes into it.
+Creating it up front left one empty directory behind in the system temporary
+area for every submission formatted without a [[tmpdir]] of its own---and since
+most submissions have no attachments at all, most of those directories never
+had a reason to exist.
+Across a run over a whole assignment that is one leaked directory per student.
+Nobody misses a directory they never asked for, so we create ours at the first
+attachment we actually convert.
 <<attachment iteration variables>>=
-tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
-tmpdir.mkdir(parents=True, exist_ok=True)
+if tmpdir is not None:
+  tmpdir = pathlib.Path(tmpdir)
+  tmpdir.mkdir(parents=True, exist_ok=True)
+@
+
+The loop below reaches this chunk once per attachment, and after the first one
+[[tmpdir]] is set, so [[mkdtemp]] runs at most once per submission.
+
+The loop needs no guard against a missing list either, tempting as one looks
+next to the narrowed lookup above.
+[[canvasapi]] builds [[Submission.attachments]] in its constructor from
+[[attributes.get("attachments", [])]], so every submission that came from Canvas
+carries a list---including the history versions we rebuild from raw JSON, which
+go through that same constructor, and the submissions restored from the cache.
+Normalization consequently never finds the attribute missing and never
+substitutes [[None]] for it, and an [[or []]] here would be a guard against a
+state the program cannot reach.
+<<let [[tmpdir]] be a fresh temporary directory>>=
+if tmpdir is None:
+  tmpdir = pathlib.Path(tempfile.mkdtemp())
+@
+
+Let us verify all three cases: the submission with nothing to store must not
+reach [[mkdtemp]] at all, the submission with a file must still get somewhere to
+put it, and a directory the caller named must exist afterwards even when the
+submission turned out to have no files---that last one is what the history code
+depends on.
+
+<<test functions>>=
+class TestAttachmentTempDir:
+    """Test that temporary directories appear only where they are needed."""
+
+    def make_submission(self):
+        """Build a submission carrying no attachments."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_no_temp_dir_without_attachments(self, monkeypatch):
+        """A submission with no files must not create a directory."""
+        def fail_mkdtemp(*args, **kwargs):
+            raise AssertionError(
+                "created a temporary directory for a submission "
+                "without attachments")
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fail_mkdtemp)
+
+        output = format_submission(self.make_submission())
+
+        assert "Course: C1" in output
+
+    def test_temp_dir_created_for_the_first_attachment(self, monkeypatch,
+                                                       tmp_path):
+        """A submission with a file still gets somewhere to put it."""
+        target = tmp_path / "attachments"
+
+        def fake_mkdtemp(*args, **kwargs):
+            target.mkdir()
+            return str(target)
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: str(tmpdir))
+
+        attachment = Mock()
+        attachment.filename = "solution.py"
+        submission = self.make_submission()
+        submission.attachments = [attachment]
+
+        output = format_submission(submission)
+
+        assert target.is_dir()
+        assert str(target) in output
+
+    def test_caller_directory_is_created_regardless(self, tmp_path):
+        """The history code needs the directory it named to exist."""
+        version_dir = tmp_path / "version-0"
+
+        format_submission(self.make_submission(), tmpdir=version_dir)
+
+        assert version_dir.is_dir()
 @
 
 We'll use [[tmpdir]] as the temporary directory to store the files when we try 
