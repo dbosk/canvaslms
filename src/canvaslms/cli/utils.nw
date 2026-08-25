@@ -7,6 +7,7 @@ We outline the module:
 import arrow
 import datetime
 
+<<imports>>
 <<constants>>
 <<functions>>
 @
@@ -534,39 +535,121 @@ warning.
 <<functions>>=
 def format_canvas_time(iso_ts):
   """
-  Parses an ISO timestamp string as local time and converts to UTC ISO format.
-  Returns Canvas-compatible UTC timestamp ending with 'Z'.
+  Converts a timestamp to the UTC ISO format Canvas expects, ending with 'Z'.
 
   Accepts datetime, date, arrow.Arrow and str values; falsy values give None.
+  A value that names no timezone of its own is read as local time, using the
+  UTC offset that applied on that value's own date.
   Raises ValueError for unparseable strings and for unsupported types.
   """
   if not iso_ts:
     return None
   try:
     if isinstance(iso_ts, datetime.datetime):
-      # Already a datetime object
-      dt = iso_ts
-      if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=arrow.now().tzinfo)
-      return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00",
-                                                                      "Z")
+      <<read a naive [[datetime]] in the local zone>>
     elif isinstance(iso_ts, datetime.date):
-      # Date only, interpret as start of day in local timezone
-      dt = datetime.datetime.combine(iso_ts, datetime.time(0, 0))
-      dt = dt.replace(tzinfo=arrow.now().tzinfo)
-      return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00",
-                                                                      "Z")
+      <<read a [[date]] as the local start of its day>>
     elif isinstance(iso_ts, arrow.Arrow):
       return iso_ts.to('utc').isoformat().replace("+00:00", "Z")
     elif isinstance(iso_ts, str):
-      return arrow.get(iso_ts,
-                       tzinfo='local').to('utc').isoformat().replace("+00:00",
-                                                                     "Z")
+      <<read a string in the local zone>>
     else:
       raise TypeError(
         f"Unsupported date/time type: {type(iso_ts).__name__}")
   except Exception as e:
     raise ValueError(f"Invalid date/time format: {e}")
+@
+
+\subsection{Local time is a zone, not an offset}
+\label{sec:utils:local-zone}
+
+Three of the four branches are handed a wall-clock reading with no statement
+of which clock it was read from: a naive [[datetime]], a bare [[date]], and a
+string like [[2023-07-15T10:00:00]]. Our rule for all three is that the user
+means their own local time. Turning such a reading into an instant requires a
+UTC offset, and choosing \emph{which} offset is where this function used to go
+wrong.
+
+The tempting answer is to ask what the offset is right now, which is what the
+code did:
+\begin{quote}
+[[dt.replace(tzinfo=arrow.now().tzinfo)]]
+\end{quote}
+That expression does not hand back the local \emph{zone}. It hands back a
+[[datetime.timezone]]---a single frozen number together with the abbreviation
+that happened to be current, such as
+[[timezone(timedelta(seconds=7200), 'CEST')]]. Stamping it onto a naive value
+asserts that the target instant lies on the same side of every daylight-saving
+transition as today does.
+
+For roughly half of all date pairs, it does not. Setting a December deadline
+from a July terminal in Stockholm applied CEST ([[+02:00]]) to a date on which
+CET ([[+01:00]]) was actually in force, so [[assignments set-dates]] pushed the
+deadline an hour early; doing it the other way round pushed it an hour late.
+The error is invisible in the output---a plausible timestamp, just not the one
+the user asked for---and it only appears when the two dates straddle a
+transition, which is why the original tests never caught it: [[freeze_time]]
+put \enquote{now} on the same date as the input.
+
+Arrow's own shorthand, [[tzinfo='local']], looks like the cure and is the same
+disease. Its parser resolves the word by evaluating
+[[datetime.now().astimezone().tzinfo]]---again a fixed offset sampled at the
+moment of the call, not a zone.
+
+What the naive branches need is the zone itself: an object that is
+\emph{asked} for an offset and answers per instant, consulting the transition
+rules rather than reciting a stored number. [[dateutil]]'s [[tzlocal()]] is
+exactly that. We wrap it in a function rather than a module-level constant
+because it samples the process's zone configuration when it is constructed, so
+a constant would freeze the zone at import time---and the tests below change
+[[TZ]] while the module is already loaded.
+
+<<functions>>=
+def local_timezone():
+  """
+  Returns the local timezone as a zone rather than as a fixed UTC offset.
+
+  The result resolves its offset against the datetime it is asked about, so a
+  timestamp gets the offset that applied on its own date rather than the one
+  that happens to apply today.
+  """
+  return dateutil.tz.tzlocal()
+@
+
+[[dateutil]] is absent from our declared dependencies, yet it is not an
+optional extra: [[arrow]] requires it and imports it itself, so it is
+available wherever this module can be imported at all.
+
+<<imports>>=
+import dateutil.tz
+@
+
+With the zone in hand, the two object branches read alike. A [[datetime]] that
+already carries a timezone is left as it is---its caller has answered the
+question we would otherwise be guessing at.
+
+<<read a naive [[datetime]] in the local zone>>=
+dt = iso_ts
+if dt.tzinfo is None:
+  dt = dt.replace(tzinfo=local_timezone())
+return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+@
+
+A [[date]] names no time of day at all, so we read it as the moment its day
+begins locally---the reading a user means by \enquote{due on the 15th}.
+
+<<read a [[date]] as the local start of its day>>=
+dt = datetime.datetime.combine(iso_ts, datetime.time(0, 0))
+dt = dt.replace(tzinfo=local_timezone())
+return dt.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+@
+
+Strings get the same zone, passed to [[arrow]] as an object so that the
+shorthand's frozen offset stays out of the picture.
+
+<<read a string in the local zone>>=
+instant = arrow.get(iso_ts, tzinfo=local_timezone())
+return instant.to('utc').isoformat().replace("+00:00", "Z")
 @
 
 \subsection{Verifying [[format_canvas_time]]}
@@ -671,6 +754,58 @@ class TestFormatCanvasTime:
             format_canvas_time(20260306)
         assert "Invalid date/time format" in str(excinfo.value)
         assert "int" in str(excinfo.value)
+@
+
+\subsection{Verifying the offset comes from the target date}
+
+Every test above freezes \enquote{now} on the same date as its input, so none
+of them can distinguish an offset resolved at the input's own date from one
+sampled at \enquote{now}: on those inputs the two agree. Freezing does more
+damage than that, though. Under [[freezegun]] the very expression the old code
+relied on, [[arrow.now().tzinfo]], evaluates to a genuine zone object rather
+than to the frozen offset it yields in a live process---so a frozen test could
+not have caught this bug however far apart the two dates were placed. The
+tests were not merely pointed away from the defect; the harness had disarmed
+it.
+
+These tests therefore do not freeze the clock at all. That is not an
+oversight but the property under test: the answer must not depend on when it
+is computed. Each test pairs a summer expectation with a winter one, and no
+single offset satisfies both---so whichever season the machine's calendar
+happens to be in, one of the two assertions catches an offset that was
+sampled rather than resolved. The three tests vary only the input type,
+keeping that pairing invariant, which is what makes them read as one rule
+applied three times rather than three separate facts.
+
+<<test functions>>=
+class TestFormatCanvasTimeAcrossDST:
+    """The UTC offset must come from the target date, not from today"""
+
+    def test_naive_datetime_uses_the_offset_of_its_own_date(self):
+        """
+        Stockholm is CEST (+02:00) in July and CET (+01:00) in December.
+
+        A single offset sampled at 'now' cannot satisfy both assertions.
+        """
+        summer = format_canvas_time(dt_datetime(2023, 7, 15, 10, 0, 0))
+        winter = format_canvas_time(dt_datetime(2023, 12, 15, 10, 0, 0))
+        assert summer == "2023-07-15T08:00:00Z"
+        assert winter == "2023-12-15T09:00:00Z"
+
+    def test_date_uses_the_offset_of_its_own_date(self):
+        """A July day begins at 22:00 UTC, a December day at 23:00"""
+        from datetime import date
+        summer = format_canvas_time(date(2023, 7, 15))
+        winter = format_canvas_time(date(2023, 12, 15))
+        assert summer == "2023-07-14T22:00:00Z"
+        assert winter == "2023-12-14T23:00:00Z"
+
+    def test_naive_string_uses_the_offset_of_its_own_date(self):
+        """Naive strings follow the same rule as naive datetimes"""
+        summer = format_canvas_time("2023-07-15T10:00:00")
+        winter = format_canvas_time("2023-12-15T10:00:00")
+        assert summer == "2023-07-15T08:00:00Z"
+        assert winter == "2023-12-15T09:00:00Z"
 @
 
 \section{Timezone detection utilities}
