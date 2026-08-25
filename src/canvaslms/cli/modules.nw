@@ -1466,6 +1466,66 @@ elif item_type == 'Page':
       pass
 @
 
+The redirect branch is the one worth a test, because it runs only when
+Canvas has changed a page's slug behind our back---a state no test gets for
+free, and one a live course reaches only occasionally.
+We simulate it with a course whose [[get_page]] maps each slug to the
+canonical one it redirects to, so that a module item still holding the old
+slug resolves to the same page as the item we are looking for.
+
+The second test covers the case where that resolution is unavailable at
+all, which is why both [[get_page]] calls sit inside their own [[try]].
+Canvas can fail either of them---a deleted page, a revoked permission, a
+network error---and the fallbacks turn each failure into a raw comparison
+rather than an abandoned scan: the target URL falls back to the slug we
+were given, and an item whose slug will not resolve is simply not matched.
+The cost of degrading this way is a missed rename, not a wrong answer for
+the items that do resolve.
+<<test functions>>=
+def make_page_item(page_url, position=None):
+  """Create a Page module item mock for the page slug `page_url`."""
+  item = make_module_item(position, item_type="Page")
+  item.page_url = page_url
+  item.id = 200
+  return item
+
+def redirecting_course(items, canonical, name="Week 1"):
+  """Create a course mock resolving each slug in `canonical` to a page.
+
+  Slugs outside `canonical` raise, standing in for any reason Canvas
+  cannot hand us the page; the code under test catches them all alike.
+  """
+  course, module = one_module_course(items, name=name)
+  def get_page(slug):
+    if slug not in canonical:
+      raise LookupError(slug)
+    page = MagicMock()
+    page.url = canonical[slug]
+    return page
+  course.get_page.side_effect = get_page
+  return course, module
+
+# The worked example above: the module item kept the old slug.
+RENAMED_PAGE = {"page-on-campus+zoom": "page-on-zoom+campus",
+                "page-on-zoom+campus": "page-on-zoom+campus"}
+
+def test_page_item_matches_through_a_redirect():
+  item = make_page_item("page-on-campus+zoom", position=2)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert get_item_module_positions(
+      course, 'Page', "page-on-zoom+campus") == [("Week 1", 2, None)]
+
+def test_page_matching_falls_back_when_urls_do_not_resolve():
+  literal = make_page_item("intro", position=2)
+  course, module = redirecting_course([literal], {})
+  assert get_item_module_positions(course, 'Page', "intro") == [
+      ("Week 1", 2, None)]
+  renamed = make_page_item("page-on-campus+zoom", position=2)
+  course, module = redirecting_course([renamed], {})
+  assert get_item_module_positions(
+      course, 'Page', "page-on-zoom+campus") == []
+@
+
 Most readers of membership only want the names, so we keep the simpler
 function as a view of the richer one.
 <<functions>>=
@@ -1987,6 +2047,48 @@ except Exception:
   pass  # Page doesn't exist or can't be fetched
 @
 
+Let's verify the duplicate this branch exists to prevent.
+The page now carries the canonical slug, the module item still carries the
+old one; recognizing the two as the same item is what stops
+[[update_item_modules]] from calling [[create_module_item]] a second time,
+and what lets a spec with a position move the item that is already there
+instead of adding a rival beside it.
+
+The last test pins the fallback from the other direction: with nothing
+resolvable, a literal slug match still works, and a genuinely different
+page in the module is not mistaken for ours---the item is added, which is
+the pre-redirect behaviour, rather than an exception escaping the scan.
+<<test functions>>=
+def test_redirected_page_is_recognized_not_duplicated():
+  item = make_page_item("page-on-campus+zoom", position=1)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert update_item_modules(course, 'Page', "page-on-zoom+campus",
+                             ["^Week 1$"]) == ([], [], [], [])
+  module.create_module_item.assert_not_called()
+
+def test_redirected_page_is_moved_not_duplicated():
+  item = make_page_item("page-on-campus+zoom", position=5)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert update_item_modules(
+      course, 'Page', "page-on-zoom+campus",
+      [{"module": "^Week 1$", "position": 2}]) == ([], [], ["Week 1"], [])
+  item.edit.assert_called_once_with(module_item={'position': 2})
+  module.create_module_item.assert_not_called()
+
+def test_unresolvable_page_urls_fall_back_to_the_slug():
+  item = make_page_item("intro", position=1)
+  course, module = redirecting_course([item], {})
+  assert update_item_modules(course, 'Page', "intro",
+                             ["^Week 1$"]) == ([], [], [], [])
+  module.create_module_item.assert_not_called()
+  stranger = make_page_item("other-page", position=1)
+  course, module = redirecting_course([stranger], {})
+  assert update_item_modules(course, 'Page', "intro",
+                             ["^Week 1$"]) == (["Week 1"], [], [], [])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Page', 'page_url': 'intro'})
+@
+
 \subsubsection{Keeping the module item cache honest}
 
 Module items are cached, and the cache outlives the process: the
@@ -2185,6 +2287,40 @@ def test_update_rejects_malformed_specs():
   course, module = one_module_course([])
   with pytest.raises(ValueError):
     update_item_modules(course, 'Assignment', 42, [{"position": 1}])
+  module.create_module_item.assert_not_called()
+@
+
+The two whole-list forms deserve a test of their own, because they are one
+instruction with two spellings and the less obvious spelling is the one
+users actually write: a bare [[modules:]] line in front matter reaches us
+as [[None]], never as an empty list.
+Both mean \enquote{no modules}, and what that means in Canvas is a removal
+from every module the item is in.
+
+It is worth being explicit about what [[None]] does \emph{not} mean here,
+since the opposite reading is the tempting one: it is not \enquote{leave
+membership alone}.
+That reading belongs to an \emph{absent} [[modules]] key, which the callers
+implement by testing [[if 'modules' in attributes]] and never calling us at
+all---so no value of our argument can express it, and [[None]] least of
+all.
+Pinning this keeps a future reader who assumes [[None]] is inert from
+learning otherwise from a push that has already emptied an item's
+membership.
+<<test functions>>=
+def test_none_specs_mean_the_same_as_an_empty_list():
+  for specs in (None, []):
+    item = make_assignment_item(42, position=1)
+    course, module = one_module_course([item])
+    assert update_item_modules(course, 'Assignment', 42, specs) == (
+        [], ["Week 1"], [], [])
+    item.delete.assert_called_once()
+    module.create_module_item.assert_not_called()
+
+def test_none_specs_add_and_move_nothing():
+  course, module = one_module_course([])
+  assert update_item_modules(course, 'Assignment', 42, None) == (
+      [], [], [], [])
   module.create_module_item.assert_not_called()
 @
 
