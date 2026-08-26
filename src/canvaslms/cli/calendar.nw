@@ -1235,15 +1235,24 @@ Tests are thus the only cheap way to keep the guard honest, so we pin
 down the three cases that carry the decision---the default regex, an
 explicit regex, and an appointment group with no course at all.
 
+Every test here that names a wall-clock time expects a particular UTC
+timestamp back, and such an expectation is only absolute if the zone the
+tests run in is known.
+The fixture that settles it is autouse, so it governs the whole module; we
+define it beside the tests that turn on it (\cref{sec:calendar:local-zone}).
+
 <<test [[calendar.py]]>>=
 """Tests for creating calendar events"""
 import argparse
 import copy
+import time
 
 import arrow
 import pytest
 
 import canvaslms.cli.calendar as calendar
+
+<<pin the local timezone for every test>>
 
 <<test helper functions>>
 <<test functions>>
@@ -1445,3 +1454,131 @@ def test_subsecond_end_before_start_is_rejected(self, mock_canvas):
                         end_time="2026-08-01 10:00:00"))
 
     mock_canvas.create_calendar_event.assert_not_called()
+
+@
+
+\section{Verifying that the offset comes from the event's own date}
+\label{sec:calendar:local-zone}
+
+Both parse sites read a wall-clock argument as local time, and both used to
+settle what \enquote{local} means once, at the moment the command ran.
+The error that follows is an hour, in whichever direction the two dates
+differ, and it is invisible: the timestamp Canvas stores is a perfectly
+ordinary one, merely not the one that was typed.
+Only a test can see it, and only a test written to straddle a transition.
+
+These tests therefore never freeze the clock, which is what kept the defect
+hidden before: with \enquote{now} on the same date as the input, an offset
+sampled at [[now]] and one resolved at the input's own date are the same
+number.
+Each test instead pairs a summer input with a winter one, so that no single
+offset can satisfy both expectations---whichever season the machine running
+the suite is in, one half of every pair fails if the offset was sampled
+rather than resolved.
+The variation is deliberate and narrow: what changes from test to test is
+which parse site is exercised, while the summer/winter pairing stays put, so
+the three read as one rule applied three times.
+[[TestFormatCanvasTimeAcrossDST]] in the [[utils]] chapter pins the same rule
+one layer down, on [[format_canvas_time]] itself.
+
+Absolute expectations need a known zone, so we pin the process to
+[[Europe/Stockholm]]---CEST ([[+02:00]]) in July, CET ([[+01:00]]) in
+December---and restore whatever the machine had afterwards.
+[[time.tzset()]] has to run on both edges of that, since the platform caches
+the zone until it is told to look again; undoing the environment variable
+alone would leave the rest of the session running in Stockholm.
+
+<<pin the local timezone for every test>>=
+@pytest.fixture(autouse=True)
+def local_zone_is_stockholm(monkeypatch):
+    """Pin the process timezone so local-time expectations are absolute"""
+    monkeypatch.setenv("TZ", "Europe/Stockholm")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+@
+
+<<test functions>>=
+class TestCalendarLocalTimeAcrossDST:
+    """A time must be read with the offset of its own date, not today's"""
+
+    <<local zone test methods>>
+@
+
+The created event is the case from the bug report.
+Nine in the morning on a December day is [[08:00Z]], and ten on a July day is
+[[08:00Z]] as well---the same UTC hour reached from two different local
+readings, which is exactly what a single sampled offset cannot produce.
+
+<<local zone test methods>>=
+def test_created_event_uses_the_offset_of_its_own_date(self, mock_canvas):
+    """Stockholm is CEST (+02:00) in July and CET (+01:00) in December"""
+    mock_canvas.get_current_user.return_value.id = 42
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command(
+        {}, mock_canvas,
+        create_args(start_time="2023-07-15 10:00",
+                    end_time="2023-07-15 11:00"))
+    calendar.calendar_create_command(
+        {}, mock_canvas,
+        create_args(start_time="2023-12-15 09:00",
+                    end_time="2023-12-15 10:00"))
+
+    assert created[0]["calendar_event"]["start_at"] == "2023-07-15T08:00:00Z"
+    assert created[1]["calendar_event"]["start_at"] == "2023-12-15T08:00:00Z"
+
+@
+
+The window a listing asks Canvas for is the same question asked of the same
+strings, so we check it where it is observable: in the parameters the command
+hands to the API.
+Here the two seasons keep the local hour and must therefore differ in UTC,
+which is the mirror image of the pairing above.
+
+<<local zone test methods>>=
+def test_view_window_uses_the_offset_of_its_own_date(self, mock_canvas):
+    """The same local hour is a different UTC hour in the two seasons"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command(
+        {}, mock_canvas, view_args(start_time="2023-07-15 10:00",
+                                   end_time="2023-07-15 12:00"))
+    summer = mock_canvas.get_calendar_events.call_args.kwargs
+
+    calendar.calendar_view_command(
+        {}, mock_canvas, view_args(start_time="2023-12-15 10:00",
+                                   end_time="2023-12-15 12:00"))
+    winter = mock_canvas.get_calendar_events.call_args.kwargs
+
+    assert summer["start_date"] == "2023-07-15T08:00:00Z"
+    assert winter["start_date"] == "2023-12-15T09:00:00Z"
+
+@
+
+A bare date exercises the same rule at a coarser grain: [[--on]] asks for a
+whole day, and a day is bounded by two instants that both have to be read in
+the local zone.
+A July day in Stockholm begins at [[22:00Z]] the evening before and a
+December one at [[23:00Z]], so the pair pins the day boundaries as well as
+the zone.
+
+<<local zone test methods>>=
+def test_on_covers_the_local_day(self, mock_canvas):
+    """--on names a local day, whose bounds move with the offset"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(on="2023-07-15"))
+    summer = mock_canvas.get_calendar_events.call_args.kwargs
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(on="2023-12-15"))
+    winter = mock_canvas.get_calendar_events.call_args.kwargs
+
+    assert summer["start_date"] == "2023-07-14T22:00:00Z"
+    assert summer["end_date"] == "2023-07-15T22:00:00Z"
+    assert winter["start_date"] == "2023-12-14T23:00:00Z"
+    assert winter["end_date"] == "2023-12-15T23:00:00Z"
