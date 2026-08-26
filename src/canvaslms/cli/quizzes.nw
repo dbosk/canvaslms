@@ -3052,6 +3052,7 @@ def create_command(config, canvas, args):
     quiz_params['title'] = args.title
 
   <<take canvaslms-only keys out of the quiz settings>>
+  <<put the body under the key the target quiz system reads>>
 
   if quiz_type == "new":
     <<warn about ignored New Quiz settings>>
@@ -3165,6 +3166,135 @@ def test_strip_canvaslms_settings_without_modules():
   assert params == {'title': 'Quiz'}
 @
 
+\paragraph{The body goes where the target quiz system reads it.}
+One more key in the settings needs attention before they become API
+parameters, and it needs the opposite treatment.  The keys just removed were
+ours, and Canvas has no use for them.  The body is Canvas's own---but its
+\emph{name} is a property of the quiz system rather than of the body: New
+Quizzes read [[instructions]], Classic Quizzes [[description]]
+(\cref{sec:quiz-edit-processing}).  The name a file uses answers a different
+question, namely which system the quiz was exported \emph{from}, and
+[[create]] had been passing it on unread.  Feeding a Classic export to
+[[create --type new]] therefore sent [[quiz[description]]] to the New Quizzes
+API, which ignores unknown fields without complaint; the copy came out with
+no instructions, and nothing said so.  The opposite pairing loses them the
+same way.
+
+So this key is not dropped but translated.  We take the body from where
+[[read_quiz_from_file]] put it---already reconciled across the two spellings
+and the front matter, which is why nothing here has to look for it---remove
+both spellings from the settings, and write it back under the one the target
+system reads.  Removing \emph{both} is what makes this a translation rather
+than an addition: a [[description]] left standing beside a freshly written
+[[instructions]] would travel to Canvas too, and one body in two fields with
+the last write winning is precisely the arrangement that
+\cref{sec:quiz-edit-processing} had to take apart on the edit path.
+
+Two smaller decisions follow from the same reading.  A front-matter body is
+Markdown, because it was typed rather than exported, so it is converted;
+JSON and YAML bodies came out of Canvas and are already HTML.  And an absent
+body stays absent instead of being sent as an empty string: on the edit path
+the empty string must be sent, since that is how a user clears text the quiz
+already has, but a quiz being created has nothing to clear, and the key would
+only restate a default.
+
+<<put the body under the key the target quiz system reads>>=
+body = quiz_data['instructions']
+if quiz_data['format'] == 'frontmatter' and body.strip():
+  body = pypandoc.convert_text(body, 'html', format='md')
+
+quiz_params.pop('instructions', None)
+quiz_params.pop('description', None)
+if body:
+  quiz_params['instructions' if quiz_type == "new" else 'description'] = body
+@
+
+These checks and the file-format ones further down all ask one question---what
+would this command have sent Canvas?---so they share a harness that runs it on
+a real file and reports the parameters the API call would have carried.
+Everything between the file and that call is the code under test; only the two
+creation functions are replaced.
+
+<<test functions>>=
+def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
+                          quiz_type=None):
+  """Run quizzes create on a file, return the params it would send Canvas"""
+  path = tmp_path / name
+  path.write_text(contents, encoding='utf-8')
+  course = cached_course()
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  sent = {}
+  monkeypatch.setattr(
+    quizzes, "create_new_quiz",
+    lambda course, requester, params: sent.update(params) or {"id": 394105})
+  monkeypatch.setattr(
+    quizzes, "create_classic_quiz",
+    lambda course, params: sent.update(params) or {"id": 394105})
+  args = argparse.Namespace(example=False, course=["datintro26"],
+                            file=str(path), title=None, type=quiz_type)
+
+  quizzes.create_command({}, MagicMock(), args)
+
+  return sent
+@
+
+The cross-system case is the one that failed silently, so we vary exactly
+that: the same Classic export, created once as each kind of quiz.  What must
+stay invariant is the text; what must change is the field carrying it, and
+the other field must not be there at all.
+
+<<test functions>>=
+CLASSIC_EXPORT_JSON = (
+  '{"quiz_type": "classic", "settings": '
+  '{"title": "Exam", "description": "<p>Read carefully.</p>"}}')
+
+def test_create_command_maps_a_classic_body_to_a_new_quiz(monkeypatch,
+                                                          tmp_path):
+  sent = create_quiz_from_file(monkeypatch, tmp_path, 'classic.json',
+                               CLASSIC_EXPORT_JSON, quiz_type='new')
+
+  assert sent['instructions'] == '<p>Read carefully.</p>'
+  assert 'description' not in sent
+
+def test_create_command_keeps_a_classic_body_in_a_classic_quiz(monkeypatch,
+                                                               tmp_path):
+  sent = create_quiz_from_file(monkeypatch, tmp_path, 'classic.json',
+                               CLASSIC_EXPORT_JSON)
+
+  assert sent['description'] == '<p>Read carefully.</p>'
+  assert 'instructions' not in sent
+
+def test_create_command_maps_a_new_quiz_body_to_a_classic_quiz(monkeypatch,
+                                                               tmp_path):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'new.yaml',
+    'quiz_type: new\n'
+    'settings:\n'
+    '  title: Exam\n'
+    '  instructions: <p>Read carefully.</p>\n',
+    quiz_type='classic')
+
+  assert sent['description'] == '<p>Read carefully.</p>'
+  assert 'instructions' not in sent
+@
+
+The front-matter body needs one more step, and we check it separately so that
+the suite does not depend on a working [[pandoc]] to state what the step is:
+the Markdown below the delimiters reaches Canvas converted, not raw.
+
+<<test functions>>=
+def test_create_command_converts_the_front_matter_body(monkeypatch, tmp_path):
+  monkeypatch.setattr(quizzes.pypandoc, "convert_text",
+                      lambda text, to, format=None: f"<p>{text}</p>")
+
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'quiz.md',
+    '---\ntitle: Exam\n---\n\nRead carefully.\n')
+
+  assert sent['instructions'] == '<p>Read carefully.</p>'
+@
+
 A New Quiz appears in modules as the [[Assignment]] item whose ID Canvas
 just returned; a Classic Quiz as a [[Quiz]] item with the quiz ID.
 Should Canvas have answered without an ID we cannot place the quiz, and say
@@ -3205,32 +3335,11 @@ def test_create_command_invalidates_the_course_quiz_listing(monkeypatch):
 The claim to check about the shared reader is that formats [[create]] could
 never read before now reach Canvas, and reach it with the same meaning
 [[quizzes edit -f]] gives them.  We therefore run the command on a real file
-of each format and look at what the API call would have carried.  The quiz
-type is left to the file so that its own [[quiz_type]] is exercised too.
+of each format, through the harness above, and look at what the API call would
+have carried.  The quiz type is left to the file so that its own
+[[quiz_type]] is exercised too.
 
 <<test functions>>=
-def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
-                          quiz_type=None):
-  """Run quizzes create on a file, return the params it would send Canvas"""
-  path = tmp_path / name
-  path.write_text(contents, encoding='utf-8')
-  course = cached_course()
-  monkeypatch.setattr(quizzes.courses, "process_course_option",
-                      lambda canvas, args: [course])
-  sent = {}
-  monkeypatch.setattr(
-    quizzes, "create_new_quiz",
-    lambda course, requester, params: sent.update(params) or {"id": 394105})
-  monkeypatch.setattr(
-    quizzes, "create_classic_quiz",
-    lambda course, params: sent.update(params) or {"id": 394105})
-  args = argparse.Namespace(example=False, course=["datintro26"],
-                            file=str(path), title=None, type=quiz_type)
-
-  quizzes.create_command({}, MagicMock(), args)
-
-  return sent
-
 def test_create_command_reads_a_yaml_file(monkeypatch, tmp_path):
   sent = create_quiz_from_file(
     monkeypatch, tmp_path, 'quiz.yaml',
