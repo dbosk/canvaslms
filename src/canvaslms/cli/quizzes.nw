@@ -6423,16 +6423,89 @@ Normalizing first costs nothing for the list this function normally receives,
 and means a mapping arriving here by mistake renders the wrong \emph{kind} of
 answer instead of aborting the whole view with an [[AttributeError]].
 
+The choices are one half of the question; the other half is the answer key,
+and it is written in one of two ways.  The [[view]] command reads a live quiz,
+but the same renderer is reached from a file, and the file need not be the one
+Canvas wrote: [[--importable]] strips the choice identifiers and puts positions
+in their place (\cref{sec:cleaning-export}).  So the same question arrives here
+under two descriptions:
+\begin{description}
+\item[As Canvas delivers it] Every choice carries its [[id]], and
+  [[scoring_data.value]] names the correct ones by that identifier---one string
+  for [[choice]], a list of strings for [[multi-answer]].
+\item[As a cleaned export writes it] The identifiers are gone, each choice
+  keeps its [[position]], and the answer key names those positions---the
+  integer [[1]], or a list of integers such as [[1, 2, 4]].
+\end{description}
+
+Reading only the first of the two had two consequences, and the
+harmless-looking one was the worse.  An integer is not a list and not a
+string, so the coercion left it alone and [[choice_id in 1]] took down the
+whole view with a [[TypeError]]; a list of integers, in contrast, compares
+perfectly happily against a set of identifiers and matches nothing, so a
+cleaned export rendered every choice as wrong and said nothing about it.
+
+We therefore ask how each reference is written instead of assuming, which is
+the reading [[remap_choice_reference]] already applies on the import side: an
+integer names a position, a string names an identifier.  Keeping the two apart
+is what makes the test honest in both worlds---a position can only ever match a
+position---so no identifier can be mistaken for the choice that happens to sit
+in that place, and no position for the choice whose identifier happens to be
+spelled that way.  The [[bool]] exclusion is the one
+[[remap_choice_reference]] needs as well, and for the same reason:
+[[isinstance(True, int)]] holds in Python, and a true/false answer that reaches
+this function by mistake must not be read as \enquote{position~1}.
+
+<<functions>>=
+def new_quiz_answer_key_references(scoring_data):
+  """Returns the positions and the identifiers an answer key names
+
+  A choice or multi-answer answer key names its choices either by
+  position (an integer, as a cleaned export writes it) or by identifier
+  (a string, as Canvas delivers it); the two are returned separately so
+  that neither can match the other.
+  """
+  value = scoring_data.get('value', [])
+  references = value if isinstance(value, list) else [value]
+
+  positions = {reference for reference in references
+               if isinstance(reference, int)
+               and not isinstance(reference, bool)}
+  identifiers = {reference for reference in references
+                 if isinstance(reference, str)}
+
+  return positions, identifiers
+@
+
+Which position a choice answers to is the second half of that question, and it
+has one rule: the [[position]] the choice carries, or else where the choice
+sits among its siblings, counting from one.  That rule is not ours to choose
+here---it is the one the cleaning writes into the answer key and the one the
+import side reads back out of it ([[uuidify_choice_list]])---so the renderer
+must count the same way or mark a different line than the export meant.
+
+<<functions>>=
+def new_quiz_choice_position(choice, index):
+  """Returns the position by which an answer key can name a choice
+
+  A choice carrying its own position field is named by it; any other
+  choice is named by its place among the choices, counting from one.
+  """
+  if isinstance(choice, dict):
+    return choice.get('position', index)
+  return index
+@
+
 <<functions>>=
 def format_new_quiz_choice_answers(lines, interaction_data, scoring_data):
   """Format multiple choice or multi-answer question choices"""
-  correct_ids = scoring_data.get('value', [])
-  if isinstance(correct_ids, str):
-    correct_ids = [correct_ids]
+  positions, identifiers = new_quiz_answer_key_references(scoring_data)
 
-  for choice_id, choice in new_quiz_choice_pairs(
-      interaction_data.get('choices', [])):
-    marker = "✓" if choice_id in correct_ids else "○"
+  for index, (choice_id, choice) in enumerate(new_quiz_choice_pairs(
+      interaction_data.get('choices', [])), 1):
+    is_correct = (choice_id in identifiers
+                  or new_quiz_choice_position(choice, index) in positions)
+    marker = "✓" if is_correct else "○"
     lines.append(f"- {marker} {new_quiz_choice_text(choice)}")
 @
 
@@ -6555,6 +6628,44 @@ def test_format_new_quiz_choice_answers_survives_choice_mapping():
     lines, interaction_data, scoring_data)
 
   assert lines == ['- ✓ 5', '- ✓ 2', '- ✓ 8', '- ✓ 1']
+@
+
+The other description a question can arrive under is not a live quiz at all: it
+is the question as [[--importable]] leaves it.  We produce it with the cleaning
+code itself rather than by hand---through [[example_new_quiz_item]], the helper
+that picks an example item by title (\cref{sec:cleaning-export})---so that
+these tests keep holding the renderer to what the export actually writes, and
+fail the day the two sides drift apart.  What the export writes is asserted
+alongside, since it is the whole reason the renderer needs two readings: the
+bare integer that used to raise, and the list of integers that used to mark
+every choice wrong.
+
+<<test functions>>=
+def cleaned_example_entry(title):
+  """Returns an example item's entry as --importable writes it."""
+  item = example_new_quiz_item(title)
+  return quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+
+def test_format_new_quiz_choice_answers_reads_cleaned_positions():
+  entry = cleaned_example_entry('Multiple Choice Example')
+  assert entry['scoring_data']['value'] == 1
+
+  lines = []
+  quizzes.format_new_quiz_choice_answers(
+    lines, entry['interaction_data'], entry['scoring_data'])
+
+  assert lines == ['- ✓ Stockholm', '- ○ Gothenburg',
+                   '- ○ Malmö', '- ○ Uppsala']
+
+def test_format_new_quiz_multi_answer_reads_cleaned_positions():
+  entry = cleaned_example_entry('Multiple Answer Example')
+  assert entry['scoring_data']['value'] == [1, 2, 4]
+
+  lines = []
+  quizzes.format_new_quiz_choice_answers(
+    lines, entry['interaction_data'], entry['scoring_data'])
+
+  assert lines == ['- ✓ 2', '- ✓ 3', '- ○ 4', '- ✓ 5']
 @
 
 \paragraph{True/false questions.}
