@@ -15,6 +15,10 @@ all: compile doc/canvaslms.pdf test
 test:
 	${MAKE} -C tests test
 
+.PHONY: lint
+lint:
+	${MAKE} -C doc lint
+
 .PHONY: install
 install: compile
 	python3 -m pip install -e .

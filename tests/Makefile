@@ -1,6 +1,6 @@
 # Makefile for canvaslms test suite
 #
-# Tests are written in .nw files throughout the src/ tree using
+# Tests are written in .nw files throughout the src/ and doc/ trees using
 # chunks named "<<test modulename.py>>". This Makefile automatically
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
@@ -11,7 +11,7 @@
 # "attachment_cache".
 define find_tests
 ( \
-	find ../src -name '*.nw' | xargs grep -l '<<test \[\[.*\.py\]\]>>' | \
+	find ../src ../doc -name '*.nw' | xargs grep -l '<<test \[\[.*\.py\]\]>>' | \
 		while read file; do \
 			chunk=$$(grep -o '<<test \[\[\([^]]*\)\.py\]\]>>' "$$file" | head -1 | \
 			         sed 's/<<test \[\[\(.*\)\.py\]\]>>/\1/'); \
@@ -40,9 +40,16 @@ TEST_MODULES := $(foreach entry,$(TESTS),$(shell echo $(entry) | cut -d: -f1))
 # Also generate .tex for documentation
 DOC_MODULES := conftest.tex
 
+# The cross-reference lint is tangled next to the manual it audits, and
+# test_lint.py imports it from there, so build it along with the tests.
+LINT= ../doc/lint.py
+
+$(LINT): ../doc/lint.nw
+	$(MAKE) -C ../doc lint.py
+
 # Main targets
 .PHONY: all
-all: $(TEST_MODULES) $(DOC_MODULES)
+all: $(TEST_MODULES) $(DOC_MODULES) $(LINT)
 
 # Generate rules for each test
 $(foreach entry,$(TESTS),$(eval $(call def_target,$(entry))))
