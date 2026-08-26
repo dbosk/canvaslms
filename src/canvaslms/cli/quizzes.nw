@@ -2815,16 +2815,22 @@ to export a quiz with [[quizzes export]] and create a copy with this command.
 <<add quizzes create command to subp>>=
 create_parser = subp.add_parser("create",
     help="Create a new quiz",
-    description="""Create a new quiz in a course from a JSON file.
+    description="""Create a new quiz in a course from a file.
 
 Use --example to see the full JSON format with all supported attributes.
-The JSON can include both quiz settings and questions, enabling a complete
+The file can include both quiz settings and questions, enabling a complete
 export/create workflow:
 
   canvaslms quizzes export -c "Source Course" -a "Quiz" -I > quiz.json
   canvaslms quizzes create -c "Target Course" -f quiz.json
 
-JSON STRUCTURE:
+FILE FORMATS (same as quizzes edit -f, detected by extension and content):
+  .json          the structure below, as JSON
+  .yaml, .yml    the same structure, as YAML
+  .md            YAML front matter for the settings, Markdown body for the
+                 instructions; a New Quiz time_limit is in minutes here
+
+STRUCTURE:
   {
     "quiz_type": "new" or "classic",
     "settings": { ... quiz settings ... },
@@ -2872,17 +2878,18 @@ except argparse.ArgumentError:
   pass
 
 create_parser.add_argument("-f", "--file",
-    help="JSON file containing quiz settings and optionally questions",
+    help="JSON, YAML or Markdown front matter file containing quiz settings "
+         "and optionally questions",
     type=str)
 
 create_parser.add_argument("--type",
     choices=["new", "classic"],
     default=None,
     help="Quiz type: 'new' (New Quizzes) or 'classic' (Classic Quizzes). "
-         "Auto-detected from JSON if not specified. Default: new")
+         "Auto-detected from the file if not specified. Default: new")
 
 create_parser.add_argument("--title", "-t",
-    help="Quiz title (overrides title in JSON file)")
+    help="Quiz title (overrides title in the file)")
 
 create_parser.add_argument("--example", "-E",
     action="store_true",
@@ -2890,9 +2897,9 @@ create_parser.add_argument("--example", "-E",
 @
 
 
-\subsection{JSON format for quiz creation}
+\subsection{File formats for quiz creation}
 
-The JSON file format supports two structures: a simple settings-only format
+The file format supports two structures: a simple settings-only format
 and a full format that includes questions.
 
 \paragraph{Simple settings format.}
@@ -2928,7 +2935,15 @@ For creating a complete quiz including questions (the format produced by
 \end{verbatim}
 
 The command auto-detects the format: if [[settings]] key exists, it uses the
-full format; otherwise it treats the entire JSON as settings.
+full format; otherwise it treats the entire file as settings.
+
+Both structures may equally be written as YAML, or as a Markdown file whose
+YAML front matter carries the settings and whose body carries the
+instructions---the three formats [[quizzes edit -f]] accepts
+(\cref{sec:quiz-file-formats}), recognised by extension and content the same
+way.  Front matter is the format to hand-write a quiz in: it states a New Quiz
+[[time_limit]] in minutes rather than seconds, and writes the instructions as
+Markdown rather than HTML.
 
 For Classic Quizzes, the format uses [[description]] instead of [[instructions]],
 [[time_limit]] in minutes (not seconds), and [[questions]] instead of [[items]].
@@ -2940,7 +2955,7 @@ Canvas draw a random subset from a pool of questions per student (see
 \subsection{Processing the create command}
 
 The [[create_command]] function processes the create request, reading settings
-from a JSON file if provided, then calling the appropriate API based on the
+from a file if provided, then calling the appropriate API based on the
 selected quiz type.
 
 When [[--example]] is provided, we print example JSON for both quiz types and
@@ -2951,15 +2966,40 @@ canvaslms quizzes create --example > quiz.json
 canvaslms quizzes create -c "My Course" -f quiz.json
 \end{minted}
 
-Which of the two shapes the file uses---the settings nested under a
-[[settings]] key, as [[quizzes export]] writes them, or a dictionary that is
-itself the settings---is decided by [[quiz_settings_from_dict]]
-(\cref{sec:quiz-settings-extraction}).  That decision is shared with the file
-reader of [[quizzes edit]], so that a key one of them recognises as belonging
-to the format cannot be sent to Canvas as a quiz setting by the other.
+\paragraph{One reader for both commands.}
+A quiz file means the same thing to [[create]] as to [[edit]], so the same
+function reads it: [[read_quiz_from_file]] (\cref{sec:quiz-file-formats}).
+[[create]] used to call [[json.load]] itself, and that one line cost it
+everything the shared reader knows.  YAML and front matter were rejected---by
+a JSON parse error pointing at the first line of a perfectly good YAML
+file---although [[edit]] had accepted them all along, so the very file a user
+had just edited could not be used to create its copy.  A [[.json]] file
+someone had written YAML into failed somewhere downstream rather than at the
+extension check.  And the two shapes of the format were told apart by a third
+copy of the rule, the copy this chapter no longer contains
+(\cref{sec:quiz-settings-extraction}).
 
-If the JSON contains [[items]] (New Quizzes) or [[questions]] (Classic Quizzes),
-those are added after the quiz is created.
+What comes back is the unified structure of \cref{sec:quiz-file-formats}: the
+settings, the body under [[instructions]] whatever the file called it, the
+questions as a single [[items]] list whether the file spelled them [[items]]
+or [[questions]], and the [[quiz_type]] the file declared.  With no [[-f]] we
+build that same structure empty rather than reaching for a different shape, so
+that the [[--title]]-only path needs no second answer to any of these
+questions.
+
+The questions are added after the quiz is created, through the API that
+matches the quiz type.  Which spelling the file used no longer selects the
+API: [[--type]] does, or the file's [[quiz_type]] failing that.  A New Quiz
+export offered to [[--type classic]] therefore reports each question Canvas
+refuses instead of creating an empty quiz in silence.
+
+\paragraph{Front matter states a New Quiz time limit in minutes.}
+The one thing the unified structure cannot settle is the unit of
+[[time_limit]], because the answer depends on the quiz system being created
+rather than on the file (\cref{sec:front-matter-time-limit}).  We convert
+after the quiz type is decided and only for front matter; JSON and YAML
+already carry Canvas's units, and multiplying those would turn a 30-minute
+quiz into a 30-hour one.
 
 The settings written by [[quizzes export]] also carry keys that are ours,
 not Canvas's (the [[CANVASLMS_SETTINGS_KEYS]]): [[id]] and [[regex]]
@@ -3000,23 +3040,12 @@ def create_command(config, canvas, args):
     canvaslms.cli.err(1, "Please specify exactly one course for quiz creation")
   course = course_list[0]
 
-  # Read quiz data from file or use defaults
-  quiz_data = {}
-  if args.file:
-    try:
-      with open(args.file, 'r', encoding='utf-8') as f:
-        quiz_data = json.load(f)
-    except FileNotFoundError:
-      canvaslms.cli.err(1, f"File not found: {args.file}")
-    except json.JSONDecodeError as e:
-      canvaslms.cli.err(1, f"Invalid JSON in {args.file}: {e}")
+  <<read the quiz file, if there is one>>
 
-  # Determine quiz type from args or JSON
-  quiz_type = args.type
-  if quiz_type is None:
-    quiz_type = quiz_data.get('quiz_type', 'new')
+  # Determine quiz type from args or file
+  quiz_type = args.type or quiz_data['quiz_type'] or 'new'
 
-  quiz_params = quiz_settings_from_dict(quiz_data)
+  <<take the quiz settings from the file>>
 
   # Command-line title overrides file
   if args.title:
@@ -3047,23 +3076,52 @@ def create_command(config, canvas, args):
 
   <<place new quiz in requested modules>>
 
-  # Add questions if present in JSON
-  items = quiz_data.get('items', [])
-  questions = quiz_data.get('questions', [])
+  # Add questions if the file carried any
+  items = quiz_data['items'] or []
 
   if quiz_type == "new" and items:
     print(f"Adding {len(items)} question(s)...")
     success, failed = add_new_quiz_items(course, quiz_id, requester, items)
     print(f"Added {success} question(s), {failed} failed")
-  elif quiz_type == "classic" and questions:
+  elif quiz_type == "classic" and items:
     # For classic quizzes, we need to get the quiz object to add questions
     try:
       quiz_obj = course.get_quiz(quiz_id)
-      print(f"Adding {len(questions)} question(s)...")
-      success, failed = add_classic_questions(quiz_obj, questions)
+      print(f"Adding {len(items)} question(s)...")
+      success, failed = add_classic_questions(quiz_obj, items)
       print(f"Added {success} question(s), {failed} failed")
     except Exception as e:
       canvaslms.cli.warn(f"Failed to add questions: {e}")
+@
+
+Without [[-f]] the structure is the one [[read_quiz_from_file]] would have
+returned for a file stating nothing: no format, no settings, no body, no
+questions, no quiz type.  Building it explicitly rather than defaulting each
+lookup keeps the two paths through this function the same shape, which is what
+lets everything below ask the file for what it says without first asking
+whether there was one.
+<<read the quiz file, if there is one>>=
+quiz_data = {'format': None, 'settings': {}, 'instructions': '',
+             'items': None, 'quiz_type': None}
+if args.file:
+  try:
+    quiz_data = read_quiz_from_file(args.file)
+  except FileNotFoundError:
+    canvaslms.cli.err(1, f"File not found: {args.file}")
+  except ValueError as e:
+    canvaslms.cli.err(1, f"Invalid quiz file {args.file}: {e}")
+@
+
+We copy the settings because the steps below take keys out of them, and the
+front-matter conversion is entitled to hand back the very dictionary it was
+given (\cref{sec:front-matter-time-limit}); mutating that would rewrite the
+caller's file contents under it.
+<<take the quiz settings from the file>>=
+if quiz_data['format'] == 'frontmatter':
+  quiz_params = dict(convert_front_matter_units(quiz_data['settings'],
+                                                quiz_type == "new"))
+else:
+  quiz_params = dict(quiz_data['settings'])
 @
 
 
@@ -3142,6 +3200,55 @@ def test_create_command_invalidates_the_course_quiz_listing(monkeypatch):
   assert course.new_quiz_cache == {}
   assert course.quiz_all_fetched is None
   assert course.new_quiz_all_fetched is None
+@
+
+The claim to check about the shared reader is that formats [[create]] could
+never read before now reach Canvas, and reach it with the same meaning
+[[quizzes edit -f]] gives them.  We therefore run the command on a real file
+of each format and look at what the API call would have carried.  The quiz
+type is left to the file so that its own [[quiz_type]] is exercised too.
+
+<<test functions>>=
+def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
+                          quiz_type=None):
+  """Run quizzes create on a file, return the params it would send Canvas"""
+  path = tmp_path / name
+  path.write_text(contents, encoding='utf-8')
+  course = cached_course()
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  sent = {}
+  monkeypatch.setattr(
+    quizzes, "create_new_quiz",
+    lambda course, requester, params: sent.update(params) or {"id": 394105})
+  monkeypatch.setattr(
+    quizzes, "create_classic_quiz",
+    lambda course, params: sent.update(params) or {"id": 394105})
+  args = argparse.Namespace(example=False, course=["datintro26"],
+                            file=str(path), title=None, type=quiz_type)
+
+  quizzes.create_command({}, MagicMock(), args)
+
+  return sent
+
+def test_create_command_reads_a_yaml_file(monkeypatch, tmp_path):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'quiz.yaml',
+    'quiz_type: new\n'
+    'settings:\n'
+    '  title: Exam\n'
+    '  time_limit: 3600\n')
+
+  assert sent['title'] == 'Exam'
+  assert sent['time_limit'] == 3600
+
+def test_create_command_reads_a_front_matter_file(monkeypatch, tmp_path):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'quiz.md',
+    '---\ntitle: Exam\ntime_limit: 30\n---\n\nRead carefully.\n')
+
+  assert sent['title'] == 'Exam'
+  assert sent['time_limit'] == 1800
 @
 
 \subsection{Creating a New Quiz via API}
