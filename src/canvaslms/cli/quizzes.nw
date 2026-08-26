@@ -2951,11 +2951,12 @@ canvaslms quizzes create --example > quiz.json
 canvaslms quizzes create -c "My Course" -f quiz.json
 \end{minted}
 
-The command supports two JSON formats:
-\begin{enumerate}
-\item \textbf{Full format} with [[settings]] key: used by [[quizzes export]]
-\item \textbf{Simple format} without [[settings]]: treats entire JSON as settings
-\end{enumerate}
+Which of the two shapes the file uses---the settings nested under a
+[[settings]] key, as [[quizzes export]] writes them, or a dictionary that is
+itself the settings---is decided by [[quiz_settings_from_dict]]
+(\cref{sec:quiz-settings-extraction}).  That decision is shared with the file
+reader of [[quizzes edit]], so that a key one of them recognises as belonging
+to the format cannot be sent to Canvas as a quiz setting by the other.
 
 If the JSON contains [[items]] (New Quizzes) or [[questions]] (Classic Quizzes),
 those are added after the quiz is created.
@@ -3015,13 +3016,7 @@ def create_command(config, canvas, args):
   if quiz_type is None:
     quiz_type = quiz_data.get('quiz_type', 'new')
 
-  # Extract settings: support both full format (with 'settings' key) and simple format
-  if 'settings' in quiz_data:
-    quiz_params = quiz_data['settings'].copy()
-  else:
-    # Simple format: entire JSON is settings (excluding items/questions)
-    quiz_params = {k: v for k, v in quiz_data.items()
-                   if k not in ('quiz_type', 'items', 'questions')}
+  quiz_params = quiz_settings_from_dict(quiz_data)
 
   # Command-line title overrides file
   if args.title:
@@ -3920,6 +3915,108 @@ def detect_quiz_file_format(filepath):
     return actual, file_content
 @
 
+\subsection{What a quiz dictionary calls its settings}
+\label{sec:quiz-settings-extraction}
+
+Each of the three formats admits two shapes.  In the \emph{full} shape the
+settings are nested under a [[settings]] key, beside [[quiz_type]] and the
+questions; in the \emph{simple} shape the dictionary \emph{is} the settings,
+and what has to be left out are the keys that are not settings at all:
+[[quiz_type]], [[items]], [[questions]].
+
+Telling the shapes apart takes three lines, which is exactly why those three
+lines had been written three times---here, in [[apply_quiz_from_dict]]
+(\cref{sec:quiz-edit-processing}) for the dictionary the [[--full-json]]
+editor hands back, and in [[create_command]] (\cref{sec:quizzes-create}).
+A rule about which keys exist, stated three times, is three places to forget a
+key: add a fourth non-settings key to the format and two of the copies will
+happily pass it on to Canvas as a quiz setting.  The copies had in fact
+already drifted, so we state the rule once and make the one surviving
+difference an argument rather than an accident.
+
+That difference is which writer produced the dictionary.  A file is written by
+a human, who may reasonably state the quiz's identity at the top level next to
+[[quiz_type]] rather than bury it in [[settings]]; accepting it there costs us
+nothing, because [[id]] and [[regex]] are ours rather than Canvas's
+(\cref{sec:quiz-edit-processing}) and a [[title]] means the same quiz wherever
+it is written.  The [[--full-json]] editor hands back the export it was given,
+whose shape [[quizzes export]] fixed; hoisting there would honour a spelling
+that no writer produces, and silently change what an accepted diff meant.
+
+<<constants>>=
+QUIZ_NON_SETTINGS_KEYS = ('quiz_type', 'items', 'questions')
+QUIZ_IDENTIFYING_KEYS = ('id', 'regex', 'title')
+<<functions>>=
+def quiz_settings_from_dict(data, hoist_identifiers=False):
+    """Return the quiz settings stated by a parsed quiz dictionary
+
+    Accepts both shapes: the settings nested under a 'settings' key, and a
+    flat dictionary that is itself the settings apart from 'quiz_type',
+    'items' and 'questions'.
+
+    With `hoist_identifiers` true, an 'id', 'regex' or 'title' written at
+    the top level beside 'settings' is copied into the returned settings,
+    unless those already state it.
+
+    Args:
+        data: Parsed quiz dictionary
+        hoist_identifiers: Accept top-level id/regex/title beside 'settings'
+
+    Returns:
+        A new dictionary of settings; `data` is left untouched.
+    """
+    if 'settings' not in data:
+        return {key: value for key, value in data.items()
+                if key not in QUIZ_NON_SETTINGS_KEYS}
+
+    settings = data['settings'].copy()
+    if hoist_identifiers:
+        for key in QUIZ_IDENTIFYING_KEYS:
+            if key in data and key not in settings:
+                settings[key] = data[key]
+    return settings
+@
+
+Let's verify that both shapes yield the same settings for the same quiz, that
+the non-settings keys are dropped from the simple shape rather than passed on,
+and that hoisting happens only where it was asked for.
+
+<<test functions>>=
+def test_quiz_settings_from_dict_reads_both_shapes():
+  full = {'quiz_type': 'new',
+          'settings': {'title': 'Exam', 'time_limit': 3600},
+          'items': [{'entry': {}}]}
+  simple = {'quiz_type': 'new', 'title': 'Exam', 'time_limit': 3600,
+            'items': [{'entry': {}}]}
+
+  expected = {'title': 'Exam', 'time_limit': 3600}
+  assert quizzes.quiz_settings_from_dict(full) == expected
+  assert quizzes.quiz_settings_from_dict(simple) == expected
+
+def test_quiz_settings_from_dict_drops_classic_questions():
+  simple = {'quiz_type': 'classic', 'title': 'Exam',
+            'questions': [{'question_name': 'Q1'}]}
+
+  assert quizzes.quiz_settings_from_dict(simple) == {'title': 'Exam'}
+
+def test_quiz_settings_from_dict_hoists_only_when_asked():
+  data = {'id': 7, 'regex': '^Exam$', 'title': 'Exam',
+          'settings': {'time_limit': 3600}}
+
+  assert quizzes.quiz_settings_from_dict(data) == {'time_limit': 3600}
+  assert quizzes.quiz_settings_from_dict(data, hoist_identifiers=True) == {
+    'time_limit': 3600, 'id': 7, 'regex': '^Exam$', 'title': 'Exam'}
+
+def test_quiz_settings_from_dict_lets_settings_win_over_top_level():
+  data = {'title': 'Top level', 'settings': {'title': 'Nested'}}
+
+  settings = quizzes.quiz_settings_from_dict(data, hoist_identifiers=True)
+
+  assert settings['title'] == 'Nested'
+  assert data['settings'] == {'title': 'Nested'}
+@
+
+
 The [[read_quiz_from_file]] function reads quiz data from any supported format
 and returns a unified structure that can be used for updating the quiz.
 
@@ -3990,17 +4087,7 @@ def _parse_quiz_full_format(data, format_type):
     if not isinstance(data, dict):
         raise ValueError(f"Expected a dictionary, got {type(data).__name__}")
 
-    if 'settings' in data:
-        settings = data['settings'].copy()
-        # Allow metadata (like id/regex) at the top level.
-        # This makes the format more forgiving for hand-edited files.
-        for k in ('id', 'regex', 'title'):
-            if k in data and k not in settings:
-                settings[k] = data[k]
-    else:
-        # Simple format: entire dict is settings (excluding metadata keys)
-        settings = {k: v for k, v in data.items()
-                    if k not in ('quiz_type', 'items', 'questions')}
+    settings = quiz_settings_from_dict(data, hoist_identifiers=True)
 
     return {
         'format': format_type,
@@ -4767,8 +4854,13 @@ def show_json_diff_and_confirm(original, edited, title):
 @
 
 \paragraph{Applying changes from JSON.}
-We extract settings from the edited JSON and apply them.  If
-[[replace_items]] is True and items are present, we also update questions.
+The settings are taken out of the edited JSON by
+[[quiz_settings_from_dict]] (\cref{sec:quiz-settings-extraction}), the same
+function the file reader uses, so that the two paths cannot disagree about
+which keys of an export are settings.  We ask for no identifier hoisting: the
+dictionary is the export we just handed the editor, not a file someone wrote
+by hand.  If [[replace_items]] is True and items are present, we also update
+questions.
 
 The dictionary reaching this function is a quiz export the user has just
 edited, so the body arrives under whichever key the export used and we read
@@ -4790,14 +4882,7 @@ def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
   Returns:
     True on success, False on failure
   """
-  # Extract settings - handle both 'settings' key and flat structure
-  if 'settings' in data:
-    settings = data['settings'].copy()
-  else:
-    # Flat structure: everything except 'items' and 'quiz_type' is settings
-    settings = {k: v for k, v in data.items()
-                if k not in ('items', 'questions', 'quiz_type')}
-
+  settings = quiz_settings_from_dict(data)
   body = quiz_body_from_settings(settings)
 
   # Apply settings
