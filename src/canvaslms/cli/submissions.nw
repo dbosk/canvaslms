@@ -1634,6 +1634,7 @@ def format_submission(submission, history=False, json_format=False,
   <<add rubric assessment to output>>
   <<add comments to output>>
   if history:
+    <<let [[tmpdir]] be a directory to hold the versions>>
     if diff:
       <<add submission history diffs to output>>
     else:
@@ -2761,6 +2762,36 @@ To produce the history, we'll modify [[tmpdir]] to create a subdirectory for
 each version.
 We'll write a metadata file for each version.
 Then we'll return all of those in one main metadata file too.
+
+That subdirectory has to come from somewhere.
+Both history branches build it the same way, as
+[[tmpdir / f"version-{version}"]], so neither of them can take a single step
+without a [[tmpdir]] to build it from, and a caller who left the argument out
+met a [[TypeError]] from that division rather than an output.
+The [[submission]] command never ran into it, since it creates a directory
+before it formats anything; the callers who did were the library and test
+callers of [[format_submission]], for whom the argument was optional in name
+only.
+
+The attachment loop settles the same question lazily, and rightly so: a
+submission that turns out to have no files never needs a directory, so
+inventing one up front leaves an empty directory behind for every student in
+the run.
+A history has no such maybe.
+Every version's metadata goes into a file inside that version's own
+subdirectory, whether or not the version had any files at all, so here the
+directory is not a convenience---it is where the output goes.
+We can therefore settle the question once, before either branch looks at a
+version, and settle it with the very chunk the attachment loop uses rather than
+opening a second route to [[mkdtemp]].
+
+A caller who did name a directory keeps it.
+We only make sure that what we hold is a [[pathlib.Path]], since a plain string
+fails that division exactly as [[None]] does, and wrapping a path we just
+invented ourselves costs nothing.
+<<let [[tmpdir]] be a directory to hold the versions>>=
+<<let [[tmpdir]] be a fresh temporary directory>>
+tmpdir = pathlib.Path(tmpdir)
 <<add submission history to output>>=
 try:
   submission_history = submission.submission_history
@@ -2837,6 +2868,69 @@ if json_format:
 else:
   with open(version_dir/"metadata.md", "w") as f:
     f.write(prev_metadata)
+@
+
+\subsection{Verifying that the history brings its own directory}
+
+Now that we have seen the file a version writes, we can verify that it gets
+written when nobody named a directory to write it in.
+We point [[mkdtemp]] at a directory belonging to the test, so that finding the
+metadata file there proves both halves at once: the history invented a
+directory, and it invented it in the temporary area instead of leaving files
+wherever the process happened to be standing.
+The second test covers the other way a caller arrives without a usable path.
+A directory named as a plain string is still a named directory, but the string
+fails the division that builds the version subdirectory just as [[None]] does,
+so it must be turned into a path as well.
+
+<<test functions>>=
+class TestHistoryTempDir:
+    """Test that formatting a history needs no directory from the caller."""
+
+    def make_submission(self):
+        """Build a submission with one history version and no files."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.submission_history = [{"id": 1, "user_id": 2}]
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_history_without_a_directory_invents_one(self, monkeypatch,
+                                                     tmp_path):
+        """A caller may ask for the history and name no directory."""
+        target = tmp_path / "history"
+
+        def fake_mkdtemp(*args, **kwargs):
+            target.mkdir()
+            return str(target)
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fake_mkdtemp)
+
+        output = format_submission(self.make_submission(), history=True)
+
+        assert "Version 0" in output
+        assert (target / "version-0" / "metadata.md").is_file()
+
+    def test_named_directory_may_be_a_string(self, tmp_path):
+        """The caller's directory need not already be a path object."""
+        format_submission(self.make_submission(), history=True,
+                          tmpdir=str(tmp_path))
+
+        assert (tmp_path / "version-0" / "metadata.md").is_file()
 @
 
 
