@@ -3503,8 +3503,10 @@ different field names and units:
 
 The time limit forces every representation we generate to pick a unit, and our
 two representations pick differently.  The front matter we hand to the editor
-is written for a human who thinks in minutes, so a New Quiz value is divided
-on the way in and multiplied back on the way out.  The JSON (and equivalent
+is written for a human who thinks in minutes, so a New Quiz value is converted
+on the way in and back on the way out---in minutes where minutes can say it
+exactly, and in seconds naming the unit where they cannot
+(\cref{sec:front-matter-sub-minute}).  The JSON (and equivalent
 YAML) representation is the interchange format shared with [[quizzes export]]
 and [[quizzes create]]; there the value keeps Canvas's own unit, so that
 exporting a quiz and feeding the untouched file straight back is a no-op.
@@ -3567,7 +3569,8 @@ QUIZ_SCHEMA = {
         'default': None,
         'required': False,
         'canvas_attr': 'time_limit',
-        'description': 'Time limit in minutes (null for unlimited)'
+        'description': 'Time limit in minutes, or with a unit '
+                       '("90 seconds"); null for unlimited'
     },
     'due_at': {
         'default': None,
@@ -3806,7 +3809,10 @@ New Quiz: the front matter states it in minutes, JSON and YAML state it in
 seconds.  The split follows from what each format is for.  Front matter is
 typed by hand, so it uses the unit instructors think in; JSON and YAML are
 what [[quizzes export]] wrote, so they must repeat what Canvas reported or the
-export/edit round trip would not be idempotent.
+export/edit round trip would not be idempotent.  A front-matter limit may name
+a unit of its own ([[time_limit: 90 seconds]]), which is how it states the
+limits minutes cannot (\cref{sec:front-matter-sub-minute}); a bare number
+stays minutes.
 
 The format is detected by file extension and verified by checking the first
 characters of the file:
@@ -5098,6 +5104,58 @@ or missing limit becomes [[None]], because Canvas expresses \enquote{no time
 limit} both ways and the editor should show the absence rather than a
 misleading [[0]].
 
+\paragraph{Minutes cannot state every limit.}
+\label{sec:front-matter-sub-minute}
+Dividing by sixty says the same thing in another unit only while the limit is
+a whole number of minutes, and Canvas counts New Quizzes in seconds and
+accepts any number of them.  A quiz limited to ninety seconds therefore
+reached the editor as [[time_limit: 1]], and the multiplication on the way
+back (\cref{sec:front-matter-time-limit}) turned an untouched front matter
+into sixty seconds: correcting a typo in the title shortened the quiz by a
+third, with nothing in the output to say so.
+
+The viewer faces the same choice and refuses to round
+(\cref{sec:viewing-time-limit}); here, where the number is not merely read but
+written back afterwards, refusing matters more.  So a limit that is a whole
+number of minutes is stated in minutes, as before---that is the unit
+instructors set quizzes in, and the unit of very nearly every quiz---and a
+limit that is not is stated in seconds, naming its unit in the value itself:
+\begin{verbatim}
+time_limit: 90 seconds
+\end{verbatim}
+
+Two other representations were available, and both cost more than they save.
+Stating every limit in seconds is the simplest rule to describe, but it prices
+the common case for the sake of the rare one: a ninety-minute exam would read
+[[time_limit: 5400]], and the format whose reason to exist is being written by
+hand would have lost the unit humans write in---the interchange formats
+already state seconds for whoever wants Canvas's own units
+(\cref{sec:quiz-file-formats}).  A separate [[time_limit_unit]] key keeps the
+value a bare number, at the price of two keys that must agree: front matter is
+edited by hand, and a reader who deletes one line of a pair silently changes
+what the other line means.  A suffix cannot come apart from the number it
+qualifies.
+
+<<functions>>=
+def time_limit_for_front_matter(seconds):
+  """Return a time limit of `seconds` seconds as the front matter states it
+
+  A whole number of minutes is stated as that number, the unit the front
+  matter is written in; any other limit is stated in seconds, naming the
+  unit, so that no limit has to be rounded to be shown.  No limit at all
+  is stated as None.
+  """
+  if not seconds:
+    return None
+
+  minutes, remainder = divmod(seconds, SECONDS_PER_MINUTE)
+
+  if remainder:
+    return f"{seconds} seconds"
+
+  return minutes
+@
+
 \paragraph{Where a New Quiz keeps its time limit.}
 \label{sec:reading-new-quiz-time-limit}
 Those seconds do not arrive in the attribute named after them.  A New Quiz
@@ -5149,8 +5207,8 @@ def extract_quiz_attributes(quiz, requester=None):
     value = getattr(quiz, canvas_attr, spec.get('default'))
 
     if key == 'time_limit' and is_new:
-      seconds = new_quiz_time_limit(quiz, quiz_settings)
-      value = seconds // SECONDS_PER_MINUTE if seconds else None
+      value = time_limit_for_front_matter(
+        new_quiz_time_limit(quiz, quiz_settings))
 
     if value is not None:
       attrs[key] = value
@@ -5190,6 +5248,17 @@ def test_front_matter_shows_the_time_limit_from_quiz_settings():
   attributes = quizzes.extract_quiz_attributes(quiz, requester)
 
   assert attributes['time_limit'] == 30
+@
+
+A limit that minutes cannot state exactly is shown in the unit that can, and
+the editor is never handed a number we had to round:
+
+<<test functions>>=
+def test_front_matter_states_a_sub_minute_limit_in_seconds():
+  assert quizzes.time_limit_for_front_matter(90) == '90 seconds'
+  assert quizzes.time_limit_for_front_matter(45) == '45 seconds'
+  assert quizzes.time_limit_for_front_matter(1800) == 30
+  assert quizzes.time_limit_for_front_matter(None) is None
 @
 
 \paragraph{Fetching New Quiz settings.}
@@ -5236,17 +5305,38 @@ def fetch_new_quiz_settings(quiz, requester):
 \label{sec:front-matter-time-limit}
 
 Everything downstream of the editor---the confirm-and-edit loop,
-[[apply_quiz_edit]], the Canvas API---speaks seconds again, so the division
-[[extract_quiz_attributes]] performed has to be undone before the attributes
-leave the front-matter world.  The same undoing applies to a hand-written
-[[.md]] file, which uses that same representation.
+[[apply_quiz_edit]], the Canvas API---speaks seconds again, so what
+[[extract_quiz_attributes]] did has to be undone before the attributes leave
+the front-matter world.  The same undoing applies to a hand-written [[.md]]
+file, which uses that same representation.
 
-We undo it in a function of its own rather than inside [[apply_quiz_edit]]
-because [[apply_quiz_edit]] is shared with the JSON paths, whose attributes
-were never divided.  Provenance is the property that decides whether to
-multiply, and a sink that receives dictionaries from three callers cannot
-observe it; a function called once per front-matter ingress makes it visible
-in the caller list.
+Undoing it is a reading rather than a multiplication, because the front matter
+states its unit in the rare case where minutes cannot
+(\cref{sec:front-matter-sub-minute}).  The reading is the more forgiving of
+the two directions on purpose: we write [[90 seconds]], and accept
+[[90 seconds]], [[90 sec]] and [[90s]] alike, and the corresponding spellings
+of minutes, because a user who has just been shown a unit may well answer in
+one---editing [[90 seconds]] into [[2 minutes]] is the obvious next thing to
+do, and a format that punished it for not being [[2]] would be teaching the
+wrong lesson.  A bare number still means minutes, so every front matter
+written before this and every hand-written file that never mentions a unit
+mean what they always meant.
+
+A value we cannot read at all is the one case with no good answer.  We refuse
+to guess a number---a wrong time limit is worse than none of our doing---and
+we cannot ask, since the editor has already closed.  So we say what we could
+not read and leave the key out entirely, which by the rule of
+\cref{sec:quiz-null-attributes} means the quiz keeps the limit it has---as
+against leaving it in as [[null]], which would clear it.  The
+rest of the edit still applies: a misspelt duration should not cost the user
+the title and instructions they typed beside it.
+
+We do the reading in a function of its own rather than inside
+[[apply_quiz_edit]] because [[apply_quiz_edit]] is shared with the JSON paths,
+whose attributes were never in front-matter units.  Provenance is the property
+that decides whether to convert, and a sink that receives dictionaries from
+three callers cannot observe it; a function called once per front-matter
+ingress makes it visible in the caller list.
 
 The conversion is a no-op for Classic Quizzes, whose front matter and API
 agree on minutes, and for a missing or unlimited time limit.  In those cases
@@ -5258,9 +5348,11 @@ for [[modules]]---never finds them silently rewritten.
 def convert_front_matter_units(attributes, is_new):
   """Return quiz attributes with time_limit in the units Canvas expects
 
-  The YAML front matter states a New Quiz time limit in minutes, whereas
-  the New Quizzes API states it in seconds.  Classic Quizzes use minutes
-  on both sides, so their attributes are returned unchanged.
+  The YAML front matter states a New Quiz time limit in minutes, or in
+  seconds naming the unit when minutes cannot state it exactly, whereas the
+  New Quizzes API states it in seconds throughout.  Classic Quizzes use
+  minutes on both sides, so their attributes are returned unchanged.  A
+  limit we cannot read is left out, so that the quiz keeps the one it has.
 
   Args:
     attributes: Dictionary of attributes from YAML front matter
@@ -5272,9 +5364,49 @@ def convert_front_matter_units(attributes, is_new):
   if not is_new or not attributes.get('time_limit'):
     return attributes
 
+  seconds = time_limit_from_front_matter(attributes['time_limit'])
   converted = dict(attributes)
-  converted['time_limit'] = attributes['time_limit'] * SECONDS_PER_MINUTE
+
+  if seconds is None:
+    del converted['time_limit']
+  else:
+    converted['time_limit'] = seconds
+
   return converted
+@
+
+The reading itself is a number and an optional unit, and the units we accept
+are spelled out rather than matched by their first letter, so that the set a
+user may type is the set the document names.  A bare number is minutes, which
+is what the front matter has always meant by one.
+
+<<functions>>=
+def time_limit_from_front_matter(value):
+  """Return the seconds a front-matter time limit states, or None
+
+  A bare number states minutes; a number followed by a unit states what
+  the unit says.  Returns None, having warned, for a value we cannot
+  read---the caller drops the key rather than guess a duration.
+  """
+  if isinstance(value, (int, float)):
+    return round(value * SECONDS_PER_MINUTE)
+
+  match = TIME_LIMIT_PATTERN.fullmatch(str(value).strip().lower())
+
+  if match:
+    amount, unit = float(match.group(1)), match.group(2)
+    if unit in SECOND_UNITS:
+      return round(amount)
+    if not unit or unit in MINUTE_UNITS:
+      return round(amount * SECONDS_PER_MINUTE)
+
+  canvaslms.cli.warn(
+    f"Cannot read the time limit {value!r}; leaving the quiz's unchanged")
+  return None
+<<constants>>=
+TIME_LIMIT_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*([a-z]*)')
+SECOND_UNITS = ('s', 'sec', 'secs', 'second', 'seconds')
+MINUTE_UNITS = ('m', 'min', 'mins', 'minute', 'minutes')
 @
 
 Let's verify that a New Quiz limit is scaled, that a Classic one is not, and
@@ -5299,6 +5431,35 @@ def test_convert_front_matter_units_does_not_mutate_input():
   quizzes.convert_front_matter_units(attributes, True)
 
   assert attributes['time_limit'] == 30
+@
+
+A stated unit is obeyed, whichever of its spellings the user reached for, and
+a stated unit of minutes says exactly what a bare number says:
+
+<<test functions>>=
+def test_front_matter_time_limit_is_read_in_the_unit_it_states():
+  read = quizzes.time_limit_from_front_matter
+
+  assert read('90 seconds') == 90
+  assert read('90s') == 90
+  assert read('2 minutes') == 120
+  assert read('2 min') == 120
+  assert read(2) == 120
+  assert read('2') == 120
+@
+
+A limit we cannot read costs the user a warning and nothing else: the key
+leaves without a value, so the quiz keeps the limit it had, and the attributes
+beside it are still applied.
+
+<<test functions>>=
+def test_unreadable_front_matter_time_limit_leaves_the_limit_alone(caplog):
+  converted = quizzes.convert_front_matter_units(
+    {'title': 'Midterm', 'time_limit': 'half an hour'}, True)
+
+  assert 'time_limit' not in converted
+  assert converted['title'] == 'Midterm'
+  assert 'half an hour' in caplog.text
 @
 
 
@@ -5380,6 +5541,52 @@ API parameters, so the list is named once.
 CANVASLMS_SETTINGS_KEYS = ('id', 'regex', 'modules')
 @
 
+\paragraph{Saying nothing about a setting, and saying it is empty.}
+\label{sec:quiz-null-attributes}
+
+The loop below leaves out every attribute whose value is [[null]], and for
+almost all of them that is the only safe reading.  The dictionaries reaching
+this function are not what a user wrote: the editor starts from the schema
+template, so \emph{every} editable key is in the front matter and most of them
+are empty on any given quiz.  A rule that forwarded them all would rewrite a
+dozen settings nobody touched each time somebody fixed a typo in a title.
+
+The price is that the rule cannot tell an untouched empty key from one a user
+emptied on purpose, and those mean opposite things.  A [[time_limit: null]] in
+an edit file is the documented way to remove a time limit, and it removed
+nothing: dropped here, the key never reached [[build_new_quiz_api_params]],
+the one step that knows a null limit means switching the timer off
+(\cref{sec:new-quiz-time-limit-params}).  The quiz kept running on a clock its
+instructor had just deleted.  [[quizzes create]] cleared correctly all along,
+because its settings go to that function directly, with the key still in them.
+
+We therefore forward a null for the attributes whose null a later step can act
+on, and name that list rather than special-casing one key in the middle of a
+loop.  Today it holds [[time_limit]] and nothing else.
+
+<<constants>>=
+NULL_MEANS_CLEAR = ('time_limit',)
+@
+
+Extending it to the other nullable schema keys---[[due_at]], [[unlock_at]],
+[[lock_at]], [[points_possible]], [[access_code]], [[allowed_attempts]]---would
+change no outcome, and would not be free.  It would change no outcome because
+a forwarded null is dropped one step further on regardless: for a New Quiz by
+[[build_new_quiz_api_params]], which skips null values of its own accord, and
+for a Classic Quiz by [[requests]], which leaves a parameter with no value out
+of the form body it builds from what [[canvasapi]] passes it.  It would not be
+free because making any of them actually clear means first inventing the
+spelling Canvas accepts for each---an empty string for a date, perhaps, a
+[[false]] for a flag---and then confirming that guess against a live instance,
+one key at a time.  [[time_limit]] needs no invention: the parameters that
+clear it exist already, and the tests below exercise them.
+
+That is also why the carve-out is safe where the blanket rule was protective.
+A New Quiz without a time limit arrives in the editor with [[time_limit: null]]
+in its front matter and now sends the switch-off pair on every edit---but
+switching off a timer that is already off is a no-op, whereas sending a stale
+[[due_at]] would not be.
+
 <<functions>>=
 def quiz_attributes_to_api_params(attributes, is_new, html_body):
   """Convert schema attributes to Canvas API parameters
@@ -5387,6 +5594,10 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
   Values are passed through in the units they arrive in; time_limit must
   already be in the units Canvas expects (seconds for New Quizzes, minutes
   for Classic Quizzes).
+
+  Attributes with a null value are left out, since they are usually empty
+  schema fields rather than edits; the exceptions are listed in
+  NULL_MEANS_CLEAR, whose null is forwarded as an instruction to clear.
 
   Args:
     attributes: Dictionary of attributes from YAML
@@ -5402,7 +5613,7 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
     if key in CANVASLMS_SETTINGS_KEYS:
       continue
 
-    if value is None:
+    if value is None and key not in NULL_MEANS_CLEAR:
       continue
 
     # Skip quiz_type for New Quizzes: New Quizzes are always graded assignments
@@ -5491,6 +5702,45 @@ def test_classic_quiz_time_limit_stays_in_minutes():
   assert params['time_limit'] == 30
 @
 
+The two statements the loop now tells apart are worth pinning down from both
+ends, and both need [[build_new_quiz_api_params]] to be visible: a file that
+says nothing about the time limit must send nothing about it, and a file that
+says [[null]] must arrive as the parameters that stop the clock.
+
+<<test functions>>=
+def test_cleared_time_limit_reaches_canvas_as_the_switch_off_pair():
+  params = quizzes.quiz_attributes_to_api_params(
+    {'title': 'Midterm', 'time_limit': None}, True, '')
+  assert params['time_limit'] is None
+
+  api_params = quizzes.build_new_quiz_api_params(params)
+
+  assert api_params['quiz[quiz_settings][has_time_limit]'] is False
+  assert 'quiz[quiz_settings][session_time_limit_in_seconds]' not in api_params
+
+
+def test_absent_time_limit_sends_no_time_limit_parameters():
+  params = quizzes.quiz_attributes_to_api_params({'title': 'Midterm'}, True, '')
+  assert 'time_limit' not in params
+
+  api_params = quizzes.build_new_quiz_api_params(params)
+
+  assert 'quiz[quiz_settings][has_time_limit]' not in api_params
+  assert 'quiz[quiz_settings][session_time_limit_in_seconds]' not in api_params
+@
+
+The exception is an exception: every other empty attribute is still left out,
+so that the untouched keys of a schema template stay untouched.
+
+<<test functions>>=
+def test_other_null_attributes_are_still_left_out():
+  params = quizzes.quiz_attributes_to_api_params(
+    {'title': 'Midterm', 'due_at': None, 'access_code': None}, True, '')
+
+  assert 'due_at' not in params
+  assert 'access_code' not in params
+@
+
 The front-matter path must still reach Canvas in seconds, and it must reach it
 with the number Canvas started from.  This test walks the whole loop for a New
 Quiz: extraction into the editor buffer, conversion back, and the API
@@ -5512,6 +5762,28 @@ def test_front_matter_edit_returns_the_time_limit_canvas_gave_us():
     quizzes.convert_front_matter_units(attributes, True), True, '')
 
   assert params['time_limit'] == 1800
+@
+
+The same walk with a limit minutes cannot state is the one that used to lose
+time.  Ninety seconds must come back as ninety seconds, and the instructor
+must see the ninety in between rather than the one that flooring left:
+
+<<test functions>>=
+def test_a_sub_minute_limit_survives_the_front_matter_round_trip():
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.title = 'Reaction test'
+  quiz.time_limit = 90
+
+  attributes = quizzes.extract_quiz_attributes(quiz)
+  assert attributes['time_limit'] == '90 seconds'
+
+  params = quizzes.quiz_attributes_to_api_params(
+    quizzes.convert_front_matter_units(attributes, True), True, '')
+
+  assert params['time_limit'] == 90
 @
 
 
@@ -5835,6 +6107,32 @@ Canvas states it, because this file is read back by [[quizzes create]] and
 [[quizzes edit -f]], where rescaling it would break the round trip
 (\cref{sec:quiz-file-formats}).
 
+\paragraph{Not finding out is not the same as finding nothing.}
+That fetch can fail---a network hiccup, a permission, a Canvas outage---and it
+warns and answers [[None]] when it does.  What we hold afterwards is then not
+\enquote{this quiz has no time limit} but \enquote{we never learned this
+quiz's time limit}, and writing the first when we mean the second used to be
+harmless only by accident: the [[null]] it produced was ignored on the way
+back in.  It no longer is (\cref{sec:quiz-null-attributes}), so such a file
+would now arrive as an instruction to stop a clock we never managed to read.
+
+The exported settings therefore spend all three states the format has, and
+[[quizzes edit -f]] and [[quizzes create]] read them back the same way:
+\begin{description}
+\item[No key] We did not find out; leave whatever limit the quiz has.
+\item[A key set to [[null]] ] Canvas answered, and this quiz has no limit;
+  remove any the target quiz has.
+\item[A key set to a number] The limit, in the seconds Canvas states it in.
+\end{description}
+
+Reaching the first state takes both facts, not just the failed fetch: the
+quiz object must also have volunteered nothing, because an object that does
+carry a limit is believed (\cref{sec:reading-new-quiz-time-limit}).  We build
+the key and then drop it, rather than adding it only once known, so that the
+exported file lists its settings in the same order however the fetch went---a
+diff between two exports should show what changed on Canvas, not what happened
+to our network.
+
 <<functions>>=
 def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
   """Exports a complete New Quiz with settings and items
@@ -5846,7 +6144,9 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     importable: If True, clean output for direct import
 
   Returns:
-    Dictionary with quiz_type, settings (including quiz_settings), and items
+    Dictionary with quiz_type, settings (including quiz_settings), and items.
+    The settings carry no time_limit key at all when the settings fetch
+    failed, since we then have no time limit to report either way.
   """
   # Fetch quiz_settings from the API (contains multiple_attempts, result_view_settings, etc.)
   quiz_settings = fetch_new_quiz_settings(quiz, requester)
@@ -5863,6 +6163,8 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
   }
+
+  <<drop the time limit we never learned>>
 
   if quiz_settings:
     settings['quiz_settings'] = quiz_settings
@@ -5881,6 +6183,9 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'settings': settings,
     'items': items
   }
+<<drop the time limit we never learned>>=
+if quiz_settings is None and settings['time_limit'] is None:
+  del settings['time_limit']
 @
 
 Let's verify the reading rule the export depends on: the settings are
@@ -5904,6 +6209,66 @@ def test_new_quiz_time_limit_comes_from_the_quiz_settings():
            'session_time_limit_in_seconds': 1800}) is None
 
   assert quizzes.new_quiz_time_limit(quiz, None) is None
+@
+
+To watch the export make the three statements, we need a quiz whose settings
+fetch we control; everything else about the export is scenery here.
+
+<<test functions>>=
+def export_new_quiz_settings(monkeypatch, quiz_settings,
+                             object_time_limit=None):
+  """Return the settings exported for a quiz whose fetch gave quiz_settings"""
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.instructions = ''
+  quiz.time_limit = object_time_limit
+  quiz.course = MagicMock(id=1)
+
+  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
+  monkeypatch.setattr(quizzes, "fetch_new_quiz_settings",
+                      lambda q, r: quiz_settings)
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  monkeypatch.setattr(quizzes, "export_new_quiz_items",
+                      lambda q, r, include_banks=True: {'items': []})
+
+  return quizzes.export_full_new_quiz(quiz, MagicMock())['settings']
+@
+
+A fetch that failed leaves the key out, so that reading the file back changes
+no timer---unless the quiz object stated a limit itself, which we believe:
+
+<<test functions>>=
+def test_export_omits_a_time_limit_it_could_not_learn(monkeypatch):
+  settings = export_new_quiz_settings(monkeypatch, None)
+
+  assert 'time_limit' not in settings
+
+  believed = export_new_quiz_settings(monkeypatch, None,
+                                      object_time_limit=1800)
+
+  assert believed['time_limit'] == 1800
+@
+
+A fetch that succeeded states what it found, and \enquote{no limit} is a
+finding like any other:
+
+<<test functions>>=
+def test_export_states_the_time_limit_the_settings_gave(monkeypatch):
+  timed = export_new_quiz_settings(
+    monkeypatch, {'has_time_limit': True,
+                  'session_time_limit_in_seconds': 1800})
+
+  assert timed['time_limit'] == 1800
+
+  untimed = export_new_quiz_settings(
+    monkeypatch, {'has_time_limit': False})
+
+  assert untimed['time_limit'] is None
 @
 
 An exported New Quiz is therefore fed straight back into [[quizzes create]]
@@ -6172,6 +6537,7 @@ def format_new_quiz_as_markdown(quiz, course, requester):
 
 
 \subsection{Reporting the time limit in a unit that is true}
+\label{sec:viewing-time-limit}
 
 The Classic formatter below prints a quiz's time limit followed by the word
 [[minutes]], and it is right to: a Classic Quiz counts minutes.  Copying that
