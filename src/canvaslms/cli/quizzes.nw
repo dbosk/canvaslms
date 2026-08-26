@@ -6107,6 +6107,32 @@ Canvas states it, because this file is read back by [[quizzes create]] and
 [[quizzes edit -f]], where rescaling it would break the round trip
 (\cref{sec:quiz-file-formats}).
 
+\paragraph{Not finding out is not the same as finding nothing.}
+That fetch can fail---a network hiccup, a permission, a Canvas outage---and it
+warns and answers [[None]] when it does.  What we hold afterwards is then not
+\enquote{this quiz has no time limit} but \enquote{we never learned this
+quiz's time limit}, and writing the first when we mean the second used to be
+harmless only by accident: the [[null]] it produced was ignored on the way
+back in.  It no longer is (\cref{sec:quiz-null-attributes}), so such a file
+would now arrive as an instruction to stop a clock we never managed to read.
+
+The exported settings therefore spend all three states the format has, and
+[[quizzes edit -f]] and [[quizzes create]] read them back the same way:
+\begin{description}
+\item[No key] We did not find out; leave whatever limit the quiz has.
+\item[A key set to [[null]] ] Canvas answered, and this quiz has no limit;
+  remove any the target quiz has.
+\item[A key set to a number] The limit, in the seconds Canvas states it in.
+\end{description}
+
+Reaching the first state takes both facts, not just the failed fetch: the
+quiz object must also have volunteered nothing, because an object that does
+carry a limit is believed (\cref{sec:reading-new-quiz-time-limit}).  We build
+the key and then drop it, rather than adding it only once known, so that the
+exported file lists its settings in the same order however the fetch went---a
+diff between two exports should show what changed on Canvas, not what happened
+to our network.
+
 <<functions>>=
 def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
   """Exports a complete New Quiz with settings and items
@@ -6118,7 +6144,9 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     importable: If True, clean output for direct import
 
   Returns:
-    Dictionary with quiz_type, settings (including quiz_settings), and items
+    Dictionary with quiz_type, settings (including quiz_settings), and items.
+    The settings carry no time_limit key at all when the settings fetch
+    failed, since we then have no time limit to report either way.
   """
   # Fetch quiz_settings from the API (contains multiple_attempts, result_view_settings, etc.)
   quiz_settings = fetch_new_quiz_settings(quiz, requester)
@@ -6135,6 +6163,8 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
   }
+
+  <<drop the time limit we never learned>>
 
   if quiz_settings:
     settings['quiz_settings'] = quiz_settings
@@ -6153,6 +6183,9 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'settings': settings,
     'items': items
   }
+<<drop the time limit we never learned>>=
+if quiz_settings is None and settings['time_limit'] is None:
+  del settings['time_limit']
 @
 
 Let's verify the reading rule the export depends on: the settings are
@@ -6176,6 +6209,66 @@ def test_new_quiz_time_limit_comes_from_the_quiz_settings():
            'session_time_limit_in_seconds': 1800}) is None
 
   assert quizzes.new_quiz_time_limit(quiz, None) is None
+@
+
+To watch the export make the three statements, we need a quiz whose settings
+fetch we control; everything else about the export is scenery here.
+
+<<test functions>>=
+def export_new_quiz_settings(monkeypatch, quiz_settings,
+                             object_time_limit=None):
+  """Return the settings exported for a quiz whose fetch gave quiz_settings"""
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.instructions = ''
+  quiz.time_limit = object_time_limit
+  quiz.course = MagicMock(id=1)
+
+  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
+  monkeypatch.setattr(quizzes, "fetch_new_quiz_settings",
+                      lambda q, r: quiz_settings)
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  monkeypatch.setattr(quizzes, "export_new_quiz_items",
+                      lambda q, r, include_banks=True: {'items': []})
+
+  return quizzes.export_full_new_quiz(quiz, MagicMock())['settings']
+@
+
+A fetch that failed leaves the key out, so that reading the file back changes
+no timer---unless the quiz object stated a limit itself, which we believe:
+
+<<test functions>>=
+def test_export_omits_a_time_limit_it_could_not_learn(monkeypatch):
+  settings = export_new_quiz_settings(monkeypatch, None)
+
+  assert 'time_limit' not in settings
+
+  believed = export_new_quiz_settings(monkeypatch, None,
+                                      object_time_limit=1800)
+
+  assert believed['time_limit'] == 1800
+@
+
+A fetch that succeeded states what it found, and \enquote{no limit} is a
+finding like any other:
+
+<<test functions>>=
+def test_export_states_the_time_limit_the_settings_gave(monkeypatch):
+  timed = export_new_quiz_settings(
+    monkeypatch, {'has_time_limit': True,
+                  'session_time_limit_in_seconds': 1800})
+
+  assert timed['time_limit'] == 1800
+
+  untimed = export_new_quiz_settings(
+    monkeypatch, {'has_time_limit': False})
+
+  assert untimed['time_limit'] is None
 @
 
 An exported New Quiz is therefore fed straight back into [[quizzes create]]
