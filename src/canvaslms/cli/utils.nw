@@ -432,16 +432,39 @@ class TestEnsureSubmissionAttrs:
 
 \section{Time formatting utilities}
 
-Function to format ISO timestamps in local time for better readability.
+Canvas states its timestamps as instants---ISO~8601 strings in UTC---while a
+reader wants the reading a clock on their own wall showed at that moment.
+[[format_local_time]] performs that conversion for everything the CLI
+displays: submission times, calendar events, assignment deadlines.
+
+Turning an instant into a wall-clock reading requires a UTC offset, and
+choosing which offset is the same question \cref{sec:utils:local-zone} works
+through for the opposite direction, where a wall-clock reading had to become
+an instant. This function is the display-direction twin of that
+parse-direction bug, down to the spelling: [[arrow]]'s [[to('local')]]
+resolves the word by evaluating [[datetime.now().astimezone().tzinfo]] once,
+at the moment of the call, so what reaches [[to()]] is a frozen offset rather
+than the local zone. Reading a December deadline from an August terminal in
+Stockholm therefore rendered it in CEST: [[2023-12-15T13:30:00Z]] was
+displayed as [[15:30]], an hour past the [[14:30]] that Stockholm clocks
+actually read that afternoon.
+
+We therefore hand [[to()]] the zone itself, from [[local_timezone()]], and
+let it resolve the offset against the instant being displayed rather than
+against the instant of the call.
+
 <<functions>>=
 def format_local_time(iso_ts):
   """
   Formats an ISO timestamp string in local time (YYYY-MM-DD HH:mm).
+
+  The offset applied is the one in force at that timestamp's own instant,
+  not the one in force when the conversion runs.
   """
   if not iso_ts:
     return "N/A"
   try:
-    return arrow.get(iso_ts).to('local').format('YYYY-MM-DD HH:mm')
+    return arrow.get(iso_ts).to(local_timezone()).format('YYYY-MM-DD HH:mm')
   except Exception:
     return iso_ts
 @
@@ -451,7 +474,13 @@ def format_local_time(iso_ts):
 Now let's verify this function handles edge cases and formats timestamps correctly.
 The [[format_local_time()]] function is used to display timestamps to users.
 
-We use [[freeze_time]] to create a deterministic test environment---this is \emph{crucial} for time-dependent tests, as tests would otherwise pass or fail depending on the system timezone and current time.
+What these tests need pinned is \emph{where} they run, not \emph{when}: the
+input names its own instant, so the expected reading follows from the zone
+alone, and the fixture above supplies that. The conversion test used to
+freeze the clock as well, on the date of its own input---which is precisely
+the arrangement under which a sampled offset and a resolved one agree, so
+the freeze could only hide the defect above. We drop it and let the test say
+what it means: this answer does not depend on when it is computed.
 
 <<test functions>>=
 class TestFormatLocalTime:
@@ -465,14 +494,12 @@ class TestFormatLocalTime:
         """Empty string should return 'N/A'"""
         assert format_local_time("") == "N/A"
 
-    @freeze_time("2023-12-15 14:30:00")
     def test_formats_utc_to_local(self):
         """
         Should convert UTC timestamp to local time.
 
-        Frozen at 2023-12-15 14:30 CET (UTC+1, Europe/Stockholm winter time).
         Input: 2023-12-15 13:30:00 UTC
-        Expected output in local time (CET): 2023-12-15 14:30
+        Expected output in local time (CET, UTC+1 in Stockholm): 14:30
         """
         utc_time = "2023-12-15T13:30:00Z"
         result = format_local_time(utc_time)
@@ -483,6 +510,51 @@ class TestFormatLocalTime:
         invalid = "not-a-timestamp"
         result = format_local_time(invalid)
         assert result == invalid
+@
+
+\subsection{Verifying the displayed offset follows the instant}
+
+The conversion test above still cannot tell a zone from an offset on its
+own. It asks about a single instant, and a single instant is answered
+correctly by a sampled offset for half of every year---run it in December
+and CET is the right answer for the wrong reason. Only a second instant on
+the other side of a transition removes that escape, since no one offset
+satisfies both.
+
+The two tests below make that pairing the invariant and vary only how far
+apart the paired instants lie. The first takes them six months apart, where
+the two readings differ. The second is the sharper statement: [[2023-10-29]]
+is the morning Sweden turns its clocks back, and the pair sits an hour apart
+on that one date, so no offset chosen per run---or even per date---can
+produce both answers. It also shows what a zone does that an offset cannot,
+by holding the reading invariant while the instant varies: [[02:30]] happens
+twice that morning, once in CEST and once in CET.
+
+<<test functions>>=
+class TestFormatLocalTimeAcrossDST:
+    """The displayed offset must come from the instant, not from today"""
+
+    def test_summer_and_winter_instants_read_differently(self):
+        """
+        Stockholm reads 13:30 UTC as 15:30 in July and as 14:30 in December.
+
+        A single offset sampled at 'now' cannot satisfy both assertions.
+        """
+        summer = format_local_time("2023-07-15T13:30:00Z")
+        winter = format_local_time("2023-12-15T13:30:00Z")
+        assert summer == "2023-07-15 15:30"
+        assert winter == "2023-12-15 14:30"
+
+    def test_instants_an_hour_apart_straddle_the_transition(self):
+        """
+        Sweden turns its clocks back at 01:00 UTC on 2023-10-29.
+
+        Both instants read 02:30 locally: the first in CEST, the second CET.
+        """
+        before = format_local_time("2023-10-29T00:30:00Z")
+        after = format_local_time("2023-10-29T01:30:00Z")
+        assert before == "2023-10-29 02:30"
+        assert after == "2023-10-29 02:30"
 @
 
 Canvas expects every timestamp as an ISO~8601 string in UTC ending with
