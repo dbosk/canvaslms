@@ -14,13 +14,26 @@ We face several design choices for caching attachment files:
 
 \subsection{Where to store cached files}
 
-We use a platform-specific cache directory provided by the [[appdirs]] package.
-This follows the conventions of the host operating system:
+We store the files under the user's platform-specific cache directory, in an
+[[attachments]] subdirectory.
+The cache directory itself comes from the package-level [[dirs]] instance
+(\cref{sec:shared-appdirs}), which is what puts this store beside the encrypted
+object cache rather than somewhere near it:
 \begin{itemize}
 \item Linux: [[~/.cache/canvaslms/attachments/]]
 \item macOS: [[~/Library/Caches/canvaslms/attachments/]]
-\item Windows: [[C:\Users\<user>\AppData\Local\canvaslms\attachments\]]
+\item Windows: [[...\AppData\Local\dbosk@kth.se\canvaslms\Cache\attachments\]]
 \end{itemize}
+
+Sharing that instance is a correctness requirement, not tidiness.
+This module used to ask [[appdirs]] for the cache directory on its own,
+without naming the application author that the object cache passes.
+[[appdirs]] consults the author only on Windows, so on Linux and macOS both
+spellings resolved identically and nothing looked wrong---but on Windows the
+author is a path component, and the two stores landed in sibling trees.
+The visible consequence was that [[cache clear]] and [[cache clear-attachments]]
+cleaned different directories, and neither the documentation nor the code could
+honestly say where \enquote{the cache directory} was.
 
 This is superior to storing files in the pickle cache because:
 \begin{itemize}
@@ -140,7 +153,7 @@ import canvaslms.hacks.attachment_cache as attachment_cache
 <<[[attachment_cache.py]]>>=
 """Encrypted content-addressed cache for Canvas submission attachments"""
 
-import appdirs
+from canvaslms import dirs
 from cryptography.fernet import InvalidToken
 import hashlib
 import json
@@ -160,7 +173,7 @@ logger = logging.getLogger(__name__)
 
 \subsection{Cache directory initialization}
 
-We use [[appdirs]] to get the platform-specific cache directory, and create the
+We derive our directory from the shared [[dirs]] instance, and create the
 necessary subdirectories on first use.
 
 We [[chmod]] explicitly instead of passing [[mode=]] to [[mkdir]]: the
@@ -169,7 +182,7 @@ tightens directories and index files created by older canvaslms versions
 with default permissions.
 
 <<cache directory initialization>>=
-CACHE_DIR = pathlib.Path(appdirs.user_cache_dir("canvaslms")) / "attachments"
+CACHE_DIR = pathlib.Path(dirs.user_cache_dir) / "attachments"
 INDEX_FILE = CACHE_DIR / "index.json"
 
 def _ensure_cache_dir():
@@ -191,6 +204,32 @@ def _save_index(index: dict[str, dict[str, Any]]):
     with open(INDEX_FILE, 'w') as f:
         json.dump(index, f, indent=2)
     INDEX_FILE.chmod(0o600)
+@
+
+Let's pin the property the two stores must share.
+The obvious test---that [[CACHE_DIR]] sits inside the object cache's
+directory---is necessary but not sufficient, and its insufficiency is exactly
+how the original discrepancy survived review: on the platform this suite runs
+on, the two ways of asking [[appdirs]] for a cache directory return the same
+string even when they disagree about the application author.
+A passing path comparison here would therefore prove nothing about Windows.
+
+So we assert the cause as well as the effect.
+Requiring the two modules to hold the very same object rules out a second
+[[AppDirs]] instance regardless of what any platform does with its arguments,
+which makes this test meaningful everywhere it runs.
+
+<<test functions>>=
+def test_attachment_store_shares_the_object_cache_identity():
+  """Both caches must resolve through one shared AppDirs instance."""
+  import canvaslms
+  import canvaslms.cli.cache as object_cache
+
+  assert attachment_cache.dirs is canvaslms.dirs
+  assert object_cache.dirs is canvaslms.dirs
+
+  assert (attachment_cache.CACHE_DIR.parent
+          == pathlib.Path(object_cache.dirs.user_cache_dir))
 @
 
 \subsection{Holding the encryption key}
