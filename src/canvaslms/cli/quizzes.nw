@@ -6789,16 +6789,89 @@ Normalizing first costs nothing for the list this function normally receives,
 and means a mapping arriving here by mistake renders the wrong \emph{kind} of
 answer instead of aborting the whole view with an [[AttributeError]].
 
+The choices are one half of the question; the other half is the answer key,
+and it is written in one of two ways.  The [[view]] command reads a live quiz,
+but the same renderer is reached from a file, and the file need not be the one
+Canvas wrote: [[--importable]] strips the choice identifiers and puts positions
+in their place (\cref{sec:cleaning-export}).  So the same question arrives here
+under two descriptions:
+\begin{description}
+\item[As Canvas delivers it] Every choice carries its [[id]], and
+  [[scoring_data.value]] names the correct ones by that identifier---one string
+  for [[choice]], a list of strings for [[multi-answer]].
+\item[As a cleaned export writes it] The identifiers are gone, each choice
+  keeps its [[position]], and the answer key names those positions---the
+  integer [[1]], or a list of integers such as [[1, 2, 4]].
+\end{description}
+
+Reading only the first of the two had two consequences, and the
+harmless-looking one was the worse.  An integer is not a list and not a
+string, so the coercion left it alone and [[choice_id in 1]] took down the
+whole view with a [[TypeError]]; a list of integers, in contrast, compares
+perfectly happily against a set of identifiers and matches nothing, so a
+cleaned export rendered every choice as wrong and said nothing about it.
+
+We therefore ask how each reference is written instead of assuming, which is
+the reading [[remap_choice_reference]] already applies on the import side: an
+integer names a position, a string names an identifier.  Keeping the two apart
+is what makes the test honest in both worlds---a position can only ever match a
+position---so no identifier can be mistaken for the choice that happens to sit
+in that place, and no position for the choice whose identifier happens to be
+spelled that way.  The [[bool]] exclusion is the one
+[[remap_choice_reference]] needs as well, and for the same reason:
+[[isinstance(True, int)]] holds in Python, and a true/false answer that reaches
+this function by mistake must not be read as \enquote{position~1}.
+
+<<functions>>=
+def new_quiz_answer_key_references(scoring_data):
+  """Returns the positions and the identifiers an answer key names
+
+  A choice or multi-answer answer key names its choices either by
+  position (an integer, as a cleaned export writes it) or by identifier
+  (a string, as Canvas delivers it); the two are returned separately so
+  that neither can match the other.
+  """
+  value = scoring_data.get('value', [])
+  references = value if isinstance(value, list) else [value]
+
+  positions = {reference for reference in references
+               if isinstance(reference, int)
+               and not isinstance(reference, bool)}
+  identifiers = {reference for reference in references
+                 if isinstance(reference, str)}
+
+  return positions, identifiers
+@
+
+Which position a choice answers to is the second half of that question, and it
+has one rule: the [[position]] the choice carries, or else where the choice
+sits among its siblings, counting from one.  That rule is not ours to choose
+here---it is the one the cleaning writes into the answer key and the one the
+import side reads back out of it ([[uuidify_choice_list]])---so the renderer
+must count the same way or mark a different line than the export meant.
+
+<<functions>>=
+def new_quiz_choice_position(choice, index):
+  """Returns the position by which an answer key can name a choice
+
+  A choice carrying its own position field is named by it; any other
+  choice is named by its place among the choices, counting from one.
+  """
+  if isinstance(choice, dict):
+    return choice.get('position', index)
+  return index
+@
+
 <<functions>>=
 def format_new_quiz_choice_answers(lines, interaction_data, scoring_data):
   """Format multiple choice or multi-answer question choices"""
-  correct_ids = scoring_data.get('value', [])
-  if isinstance(correct_ids, str):
-    correct_ids = [correct_ids]
+  positions, identifiers = new_quiz_answer_key_references(scoring_data)
 
-  for choice_id, choice in new_quiz_choice_pairs(
-      interaction_data.get('choices', [])):
-    marker = "✓" if choice_id in correct_ids else "○"
+  for index, (choice_id, choice) in enumerate(new_quiz_choice_pairs(
+      interaction_data.get('choices', [])), 1):
+    is_correct = (choice_id in identifiers
+                  or new_quiz_choice_position(choice, index) in positions)
+    marker = "✓" if is_correct else "○"
     lines.append(f"- {marker} {new_quiz_choice_text(choice)}")
 @
 
@@ -6923,6 +6996,44 @@ def test_format_new_quiz_choice_answers_survives_choice_mapping():
   assert lines == ['- ✓ 5', '- ✓ 2', '- ✓ 8', '- ✓ 1']
 @
 
+The other description a question can arrive under is not a live quiz at all: it
+is the question as [[--importable]] leaves it.  We produce it with the cleaning
+code itself rather than by hand---through [[example_new_quiz_item]], the helper
+that picks an example item by title (\cref{sec:cleaning-export})---so that
+these tests keep holding the renderer to what the export actually writes, and
+fail the day the two sides drift apart.  What the export writes is asserted
+alongside, since it is the whole reason the renderer needs two readings: the
+bare integer that used to raise, and the list of integers that used to mark
+every choice wrong.
+
+<<test functions>>=
+def cleaned_example_entry(title):
+  """Returns an example item's entry as --importable writes it."""
+  item = example_new_quiz_item(title)
+  return quizzes.clean_for_import({'items': [item]})['items'][0]['entry']
+
+def test_format_new_quiz_choice_answers_reads_cleaned_positions():
+  entry = cleaned_example_entry('Multiple Choice Example')
+  assert entry['scoring_data']['value'] == 1
+
+  lines = []
+  quizzes.format_new_quiz_choice_answers(
+    lines, entry['interaction_data'], entry['scoring_data'])
+
+  assert lines == ['- ✓ Stockholm', '- ○ Gothenburg',
+                   '- ○ Malmö', '- ○ Uppsala']
+
+def test_format_new_quiz_multi_answer_reads_cleaned_positions():
+  entry = cleaned_example_entry('Multiple Answer Example')
+  assert entry['scoring_data']['value'] == [1, 2, 4]
+
+  lines = []
+  quizzes.format_new_quiz_choice_answers(
+    lines, entry['interaction_data'], entry['scoring_data'])
+
+  assert lines == ['- ✓ 2', '- ✓ 3', '- ○ 4', '- ✓ 5']
+@
+
 \paragraph{True/false questions.}
 A simplified choice between two options.
 Here the [[scoring_data]] value is not a choice identifier but the correct
@@ -6965,20 +7076,107 @@ def test_format_new_quiz_true_false_string_value():
 \paragraph{Matching questions.}
 These pair items from two columns.
 The API provides either [[questions]]/[[answers]] or [[stems]]/[[choices]] formats.
+The answer key is a mapping from stem identifier to the answer that stem takes,
+so a stem the mapping does not name is rendered with a [[?]]: the question is
+here, this one pairing is not.
+
+That marker only means that while there is a key for the stem to be missing
+from.  Two situations leave us without one---Canvas withholds [[scoring_data]]
+where the answers are not the reader's to see, and a hand-written or converted
+file can carry a [[value]] that is not a mapping at all---and in both of them
+every stem used to take a [[?]], which says instead that we read a key and it
+paired nothing.  The reader has no way to tell the two apart, and the second is
+a much stronger claim about the quiz than we are in a position to make.
+
+We answer this the way the ordering renderer answers a missing order: show what
+we have, promise nothing we cannot substantiate.  The stems are the question
+and are worth reading either way, so they stay; the arrow is what goes, since
+an arrow with a [[?]] after it promises a pairing that was never read; and a
+marker says why the right-hand column is missing rather than leaving the reader
+to guess.  An empty mapping is treated as no key for the same reason: it names
+no stem, so every line it produces would be a [[?]] as well.
 
 <<functions>>=
 def format_new_quiz_matching(lines, interaction_data, scoring_data):
   """Format matching question"""
-  questions = interaction_data.get('questions', []) or interaction_data.get('stems', [])
-  correct_matches = scoring_data.get('value', {})
+  questions = (interaction_data.get('questions', [])
+               or interaction_data.get('stems', []))
+  answer_key = scoring_data.get('value')
+  if not isinstance(answer_key, dict) or not answer_key:
+    answer_key = None
 
   lines.append("**Match the following:**")
   lines.append("")
-  for q in questions:
-    q_id = q.get('id', '')
-    q_text = html_to_markdown(q.get('item_body', '') or q.get('body', ''))
-    match_text = correct_matches.get(q_id, '?') if isinstance(correct_matches, dict) else '?'
-    lines.append(f"- {q_text} → {match_text}")
+  if answer_key is None:
+    lines.append("*(answer key unreadable)*")
+    lines.append("")
+
+  for question in questions:
+    stem = html_to_markdown(question.get('item_body', '')
+                            or question.get('body', ''))
+    if answer_key is None:
+      lines.append(f"- {stem}")
+    else:
+      match = answer_key.get(question.get('id', ''), '?')
+      lines.append(f"- {stem} → {match}")
+@
+
+Let's verify both readings on the [[Matching Example]] item of
+[[EXAMPLE_NEW_QUIZ_JSON]], with the stems wrapped in the markup a live quiz
+carries.  The first test is the one that must not change: a key we can read
+still pairs every stem, and says nothing about being unreadable.
+
+<<test functions>>=
+def matching_question_data():
+  """Returns interaction and scoring data of a matching question."""
+  interaction_data = {
+    'answers': ['Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Berlin'],
+    'questions': [
+      {'id': 'q1', 'item_body': '<p>Sweden</p>'},
+      {'id': 'q2', 'item_body': '<p>Norway</p>'},
+      {'id': 'q3', 'item_body': '<p>Denmark</p>'},
+      {'id': 'q4', 'item_body': '<p>Finland</p>'},
+    ],
+  }
+  scoring_data = {'value': {'q1': 'Stockholm', 'q2': 'Oslo',
+                            'q3': 'Copenhagen', 'q4': 'Helsinki'}}
+  return interaction_data, scoring_data
+
+def test_format_new_quiz_matching_pairs_every_stem():
+  interaction_data, scoring_data = matching_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_matching(lines, interaction_data, scoring_data)
+
+  assert lines == ['**Match the following:**', '',
+                   '- Sweden → Stockholm', '- Norway → Oslo',
+                   '- Denmark → Copenhagen', '- Finland → Helsinki']
+@
+
+The two ways of losing the key are the ones argued about above: it can be
+absent, as in a view of a quiz whose answers Canvas does not hand out, or
+present in a shape we cannot read, as in a file whose author wrote the answers
+as a list.  Both must leave the stems standing and say what is missing.
+
+<<test functions>>=
+def test_format_new_quiz_matching_announces_absent_answer_key():
+  interaction_data, _ = matching_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_matching(lines, interaction_data, {})
+
+  assert '*(answer key unreadable)*' in lines
+  assert lines[-4:] == ['- Sweden', '- Norway', '- Denmark', '- Finland']
+
+def test_format_new_quiz_matching_announces_unreadable_answer_key():
+  interaction_data, _ = matching_question_data()
+
+  lines = []
+  quizzes.format_new_quiz_matching(
+    lines, interaction_data, {'value': ['Stockholm', 'Oslo']})
+
+  assert '*(answer key unreadable)*' in lines
+  assert not any('?' in line for line in lines)
 @
 
 \paragraph{Numeric questions.}
@@ -10288,13 +10486,7 @@ def clean_scoring_data(scoring_data, original_interaction_data, interaction_type
     if value is None:
       return scoring_data
 
-    # Build UUID to position mapping from original choices
-    uuid_to_position = {}
-    choices = original_interaction_data.get('choices', [])
-    for i, choice in enumerate(choices):
-      choice_id = choice.get('id')
-      if choice_id:
-        uuid_to_position[choice_id] = choice.get('position', i + 1)
+    <<map each choice identifier to its position>>
 
     # Convert value(s) from UUIDs to position indices
     if interaction_type == 'choice':
@@ -10314,6 +10506,46 @@ def clean_scoring_data(scoring_data, original_interaction_data, interaction_type
         return {'value': new_value}
 
   return scoring_data
+@
+
+The mapping the answer key is rewritten against has to be built from whichever
+structure the choices arrived in.  Only a list is expected here---an ordering
+question keeps its identifiers, so its scoring data never reaches this
+branch---but \enquote{expected} is a claim about the caller, and the caller
+states the interaction type in an argument of its own.  Getting that argument
+wrong is all it takes to send an id-keyed mapping this way, and iterating a
+mapping yields its keys, so the loop would then ask a string for its [[id]] and
+raise the [[AttributeError]] the view side was taught to avoid.  Rather than
+teach this side the same lesson separately, we ask the same normalizer the
+renderers ask: the question of what shape [[choices]] is in gets one answer in
+this file, and answering it here also lets an export of bare identifier strings
+through, exactly as [[uuidify_choice_list]] lets one back in.
+
+<<map each choice identifier to its position>>=
+uuid_to_position = {}
+for index, (choice_id, choice) in enumerate(new_quiz_choice_pairs(
+    original_interaction_data.get('choices', [])), 1):
+  if choice_id:
+    uuid_to_position[choice_id] = new_quiz_choice_position(choice, index)
+@
+
+Let's verify that on the structure this branch does not expect.  We hand it the
+ordering question's mapping under both types that reach it---the caller's
+mistake the paragraph above describes---and check that the answer key comes
+back rewritten against the positions the mapping's own order gives, rather than
+the export dying on a choice identifier that has no [[id]] field.
+
+<<test functions>>=
+def test_clean_scoring_data_survives_choice_mapping():
+  interaction_data, scoring_data = ordering_question_data()
+
+  cleaned = quizzes.clean_scoring_data(
+    {'value': 'ord-2'}, interaction_data, 'choice')
+  assert cleaned == {'value': 2}
+
+  cleaned = quizzes.clean_scoring_data(
+    scoring_data, interaction_data, 'multi-answer')
+  assert cleaned == {'value': [4, 2, 1, 3]}
 @
 
 \paragraph{The round trip}
