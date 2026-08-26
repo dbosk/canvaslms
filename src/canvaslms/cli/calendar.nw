@@ -35,8 +35,6 @@ import arrow
 import re
 import textwrap
 
-DEFAULT_COURSE_REGEX = '.*'
-
 <<functions>>
 
 def add_command(subp):
@@ -84,7 +82,7 @@ def add_calendar_list_command(subp):
       "With -b/--bookings, output is one line per booked student and one line "
       "for free slots.")
   calendar_list_parser.set_defaults(func=calendar_list_command)
-  courses.add_course_option(calendar_list_parser)
+  courses.add_course_option(calendar_list_parser, default=None)
   <<add calendar list arguments>>
 
 def calendar_list_command(config, canvas, args):
@@ -207,18 +205,53 @@ end_time = utils.format_canvas_time(end_time)
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
+Both readings are legitimate, so the reading commands must be able to tell
+the two apart---and that turns out to be harder than it looks.
 
-The course option defaults to the regex [[.*]].
-We treat this default as \emph{no explicit course filter} and omit any
-context-code parameter, letting Canvas decide which calendars to include.
+The course option used to default to the match-all regex [[.*]], and the
+command recovered the user's intent by comparing [[args.course]] against
+that default: a regex that differed from [[.*]] was a filter, anything
+else was no filter at all.
+But the comparison reads a string, and a string cannot say where it came
+from.
+Somebody who writes
+\begin{center}
+  [[canvaslms calendar list -c '.*']]
+\end{center}
+is asking for the events of every course they are enrolled in---a request
+that names those courses to Canvas as context codes---yet argparse hands
+the command exactly the [[args]] it hands a user who wrote no [[-c]] at
+all.
+The comparison therefore threw the explicit request away without a word.
+
+[[calendar create]] ran into the same wall first, and at higher stakes
+(\cref{sec:calendar:create-course-default}), so we reuse the mechanism it
+introduced.
+Since the distinction cannot live in the value, it lives in the default:
+both reading commands register the option with [[default=None]], and then
+[[args.course]] is a string exactly when the user named courses.
+An absent [[-c]] leaves it [[None]], and we then omit any context-code
+parameter and let Canvas decide which calendars to include---the behaviour
+the old default produced---while an explicit regex, [[.*]] included, is
+honoured as the filter it is.
+
+Honouring it can now fail where ignoring it could not.
+Canvas accepts at most ten context codes per request, so
+[[-c '.*']] from a user enrolled in more courses than that stops the
+command (\cref{sec:calendar:context-code-limit}) where the old default
+quietly listed something else instead.
+That is the better failure: the request the user made is one Canvas cannot
+express, and saying so is more useful than substituting a different
+request under the same name.
 <<process course option for calendar list>>=
 course_list = None
-if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+if args.course:
   course_list = courses.process_course_option(canvas, args)
 @
 
 
 \section{Getting and outputting calendar events}
+\label{sec:calendar:context-code-limit}
 
 We fetch the calendar events and output them in CSV format.
 
@@ -443,7 +476,7 @@ def calendar_view_command(config, canvas, args):
 The view command matches events by regex and dates rather than requiring an event ID. If no filters are provided, it searches the coming week and shows the first event. Use --count/-n to show more than one event.
 <<add calendar view arguments>>=
 # Regex to match course
-courses.add_course_option(calendar_view_parser)
+courses.add_course_option(calendar_view_parser, default=None)
 # Regex to match against event title/description
 calendar_view_parser.add_argument("--match",
   help="Regular expression to match against event title and description")
@@ -466,13 +499,24 @@ calendar_view_parser.add_argument("--count", "-n", type=int, default=1,
 We fetch events in the requested date window, filter them by regex (if
 provided), sort by start time, print up to the requested count---and then say
 how many matches that count left out.
+
+The course selection is read the same way as in [[calendar list]]
+(\cref{sec:calendar:course-default}): a [[None]] means no [[-c]] was given
+and we ask Canvas for the user's calendars unrestricted, while any regex
+the user did write becomes context codes.
+Restricting the request is not the whole filter, though.
+Canvas answers a context-code query with the events it considers reachable
+from those contexts, and an appointment reservation comes back labelled
+with the reserving user's calendar rather than the course's, so we filter
+the answer against the same set of context codes before showing it
+([[event_in_any_context]] knows where a reservation hides its course).
 <<get and display calendar event details>>=
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
 
 try:
   course_list = None
-  if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+  if args.course:
     course_list = courses.process_course_option(canvas, args)
 
   events = get_calendar_events(
@@ -1039,16 +1083,18 @@ if end_time and end_time < start_time:
 @
 
 \subsection{Distinguishing no course from all courses}
+\label{sec:calendar:create-course-default}
 
 Both event types must know which course contexts the new event belongs
 to, and both learn it from the [[-c]] option added by
 [[courses.add_course_option]].
-For the listing commands that option defaults to the match-all regex
-[[.*]] (\cref{sec:calendar:course-default}), and for them the default is
-harmless: reading every calendar and reading with no filter are the same
-request.
+That option used to default to the match-all regex [[.*]], which cost the
+reading commands an explicit [[-c '.*']] and cost [[calendar create]] a
+great deal more; the reading commands eventually adopted the same
+[[default=None]] we arrive at here
+(\cref{sec:calendar:course-default}), but creating is where the default
+first became untenable.
 
-Creating is not so forgiving.
 [[calendar create]] used to share that default and test [[args.course]]
 for truthiness only; since the default regex matches every course the
 user is enrolled in,
@@ -1391,6 +1437,134 @@ def test_appointment_group_requires_explicit_course(self, mock_canvas,
                         time_slot_duration=30))
 
     mock_canvas.create_appointment_group.assert_not_called()
+
+@
+
+\section{Verifying the course filter on the reading commands}
+
+[[calendar list]] and [[calendar view]] draw the same distinction from
+the same [[default=None]] (\cref{sec:calendar:course-default}), and we
+verify it here, next to the create-guard tests, because the two share both
+the mechanism and the fixtures.
+Ignoring a course selection hides even better when reading than when
+creating: the run prints events, just not the ones that were asked for,
+and only a reader who already knows which events belong to which course
+can tell the difference.
+
+What separates the two readings is the request that leaves for Canvas, so
+that is what the tests inspect.
+The context codes \emph{are} the course filter---their presence or absence
+is the entire decision---and reading them off the recorded call says
+whether the selection was honoured without depending on which events the
+server would have returned.
+
+<<test helper functions>>=
+def context_codes_sent(canvas):
+    """Return the context codes of the last calendar-events request"""
+    return canvas.get_calendar_events.call_args.kwargs.get("context_codes")
+
+@
+
+[[calendar list]] has no test namespace yet, so we build one as we did for
+the other two commands, with [[course]] defaulting to the [[None]] that
+argparse now produces for an absent [[-c]].
+
+<<test helper functions>>=
+def list_args(**overrides):
+    """Build the args namespace that `calendar list` would receive"""
+    args = argparse.Namespace(
+        on=None,
+        start_time="2026-03-09",
+        end_time="2026-03-14",
+        course=None,
+        type=None,
+        bookings=False,
+        show_context=False,
+        delimiter="\t",
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+<<test functions>>=
+class TestCalendarReadCourseFilter:
+    """An explicit -c must filter the commands that read, too"""
+
+    <<read course filter test methods>>
+@
+
+The match-all regex is the case the discarded comparison got wrong, so it
+is the one to pin down: spelled out on the command line it must reach
+Canvas as the context codes of every matching course.
+
+<<read course filter test methods>>=
+def test_list_explicit_match_all_filters(self, mock_canvas, mock_courses):
+    """`calendar list -c '.*'` must send the courses as context codes"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = []
+
+    calendar.calendar_list_command({}, mock_canvas, list_args(course=".*"))
+
+    assert context_codes_sent(mock_canvas) == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+Leaving the option out must still mean what it always meant: no context
+codes---and, since there is no regex to match courses against, no course
+lookup at all.
+The second assertion is what keeps the first honest, as a command that
+asked Canvas for the course list would be deciding something the user
+never asked it to decide.
+
+<<read course filter test methods>>=
+def test_list_without_course_sends_no_contexts(self, mock_canvas,
+                                               mock_courses):
+    """`calendar list` without -c must not restrict the contexts"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = []
+
+    calendar.calendar_list_command({}, mock_canvas, list_args())
+
+    assert context_codes_sent(mock_canvas) is None
+    mock_canvas.get_courses.assert_not_called()
+
+@
+
+[[calendar view]] must answer both questions the same way.
+It also drops events that fall outside the selected contexts, so the event
+we hand it carries a context code from the fixture: without one the
+command would report no matching events, and the test would fail for a
+reason that has nothing to do with the selection.
+
+<<read course filter test methods>>=
+def test_view_explicit_match_all_filters(self, mock_canvas, mock_courses):
+    """`calendar view -c '.*'` must send the courses as context codes"""
+    mock_canvas.get_courses.return_value = mock_courses
+    event, = calendar_events(1)
+    event.context_code = "course_1001"
+    mock_canvas.get_calendar_events.return_value = [event]
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(course=".*"))
+
+    assert context_codes_sent(mock_canvas) == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+<<read course filter test methods>>=
+def test_view_without_course_sends_no_contexts(self, mock_canvas,
+                                               mock_courses):
+    """`calendar view` without -c must not restrict the contexts"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args())
+
+    assert context_codes_sent(mock_canvas) is None
+    mock_canvas.get_courses.assert_not_called()
 
 @
 
