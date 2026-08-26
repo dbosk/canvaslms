@@ -922,9 +922,7 @@ lands on a different instant, and only the last of the four still agrees.
 
 We choose [[-05:00]] rather than a nearby offset on purpose: Stockholm is
 [[+01:00]] or [[+02:00]], never [[-05:00]], so the assertion holds regardless
-of which side of the year the test happens to run on. It also exercises the
-hyphen-counting half of [[_has_explicit_timezone]], which the [[Z]] and
-[[+]] spellings leave untouched.
+of which side of the year the test happens to run on.
 
 <<test functions>>=
 class TestFormatCanvasTimeExplicitOffset:
@@ -959,48 +957,266 @@ class TestFormatCanvasTimeExplicitOffset:
 \section{Timezone detection utilities}
 \label{sec:utils:timezone-detection}
 
-When parsing user-provided datetime strings, we face a challenge: distinguishing
-between strings with explicit timezone information and those without.
+Two entry points in this module have to settle the same question about a
+string before they can turn it into an instant: does the string already say
+which clock its wall-clock reading was taken from?
+[[format_canvas_time]] (\cref{sec:utils:explicit-offset}) asks it of the
+values a command is about to send to Canvas, and [[parse_date]] asks it of
+whatever the user typed. Both act on the answer identically---apply the local
+zone when the string leaves the question open, stand back when it does
+not---so a wrong answer costs the same in either place.
 
-Consider these examples using variation theory's contrast pattern:
+What it costs is an instant that quietly moves, and it moves in both
+directions:
+
 \begin{description}
-\item[Naive strings] [[2023-12-15 14:30]] --- no timezone marker, should be
-  interpreted as local time
-\item[Explicit UTC] [[2023-12-15T14:30:00Z]] --- the [[Z]] suffix explicitly
-  marks UTC
-\item[Explicit offset] [[2023-12-15T14:30:00+02:00]] --- explicit timezone
-  offset
+\item[Calling a naive string explicit] withholds the local zone, so [[arrow]]
+  falls back on its own default and reads the digits as UTC. A December
+  deadline typed in Stockholm is then stored an hour late.
+\item[Calling an explicit string naive] hands it to
+  [[arrow.get(s, tzinfo=local_timezone())]], and that argument does not
+  \emph{convert} a stated offset---it \emph{overrides} it. In CET,
+  [[20231215T083000-0500]] came back as [[2023-12-15T07:30:00Z]] instead of
+  [[2023-12-15T13:30:00Z]], six hours off.
 \end{description}
 
-Arrow's [[tzinfo]] parameter forces timezone interpretation on all strings.
-If we always use [[tzinfo='local']], explicit timezone strings would be
-incorrectly reinterpreted as local time, breaking their intended meaning.
+Either way the output is a well-formed timestamp that no caller can tell
+apart from a right one, which is what makes the detector worth the care that
+follows.
 
-We need to detect explicit timezone markers first, then conditionally apply
-local timezone interpretation only for naive strings.
+\subsection{The spellings the detector must judge}
+
+Four producers feed strings into those two entry points, and between them
+they fix what the answer has to be right about:
+
+\begin{description}
+\item[Canvas] answers in ISO~8601 UTC with a trailing [[Z]], as in
+  [[2023-12-15T13:30:00Z]]; the [[discussions]] module sends such values back
+  through [[format_canvas_time]].
+\item[ [[calendar list]] ] normalizes [[--start-time]] and [[--end-time]]
+  through [[arrow]] before passing them on, and [[arrow]]'s default rendering
+  is [[YYYY-MM-DD HH:mm:ssZZ]]: a space where ISO~8601 writes [[T]], and the
+  offset spelled [[+00:00]].
+\item[YAML front matter] carries whatever an assignment author wrote, which
+  may or may not name a zone.
+\item[The command line] carries free text, the widest source of the four:
+  anything a user might reasonably type after [[--due-at]].
+\end{description}
+
+A fifth constraint sits underneath those. Whatever we report as explicit is
+handed on to [[arrow.get]] with no zone argument, so the answers that
+\emph{do} anything are the ones [[arrow]] can read back: a trailing [[Z]], or
+an offset written [[+HH:MM]], [[+HHMM]] or [[+HH]], following either an
+extended time ([[13:30]], [[13:30:00]]) or a basic one ([[1330]],
+[[133000]]).
+
+\subsection{Why substring tests cannot answer this}
+
+The first implementation looked for those markers anywhere in the string:
+
+\begin{quote}
+[['Z' in date_str]] \quad or \quad [[date_str.count('-') > 2]]
+\end{quote}
+
+Neither test is anchored, so both answer a different question from the one
+asked. [[Z]] is an ordinary letter as well as a zone marker, and
+[[2023-12-15 10:00 NZST]] was therefore reported as stating UTC on the
+strength of the [[Z]] in the middle of a zone abbreviation---as was any input
+containing the letter at all, down to [[not-a-valid-date-xyz123]].
+
+The hyphen count is a proxy, and it misses in both directions at once. It
+over-fires because a hyphen is also a date separator, so a third one need not
+mean an offset. It under-fires because it assumes the date spends exactly two
+of them, which [[20231215T083000-0500]] and [[2023/12/15 08:30:00-05:00]] do
+not---each states an offset the count cannot see, and each is the six-hour
+error above.
+
+\subsection{An offset is a suffix on a time}
+
+Anchoring the marker to the end of the string cures the first failure but not
+the second, because the end of a plain date is indistinguishable from an
+offset: [[2023-12-15]] ends in [[-15]], spelled exactly as a two-digit offset
+like [[-05]] is. Length cannot separate them, and neither can the value:
+[[-12]] is both a legal UTC offset and December.
+
+What separates them is what the marker is attached to. An offset qualifies a
+time of day and never a date, so we require a time immediately in front of it
+and read the marker only there. That one rule disposes of the whole family at
+once: the [[-15]] in [[2023-12-15]] follows [[12]], and [[12]] is not a time.
+
+A time announces itself in two shapes. The extended shape carries a colon
+([[13:30]], [[13:30:00]]), and the colon is proof by itself. The basic shape
+is bare digits ([[0830]], [[083000]]), which proves nothing on its own---read
+that way, [[2023-12]] would be the year 2023 at offset [[-12]], and [[arrow]]
+parses that same string as December~2023 today. So we accept a basic time
+only where ISO~8601 puts one: directly after the [[T]] or the space that ends
+the date.
+
+\subsection{What we decline to recognize}
+
+Three spellings that do name a zone are deliberately left out, for one shared
+reason: nothing downstream would act differently on a [[True]] answer.
+
+\begin{description}
+\item[Zone abbreviations] ([[13:30:00 UTC]], [[10:00 NZST]]) name a zone that
+  [[arrow]] cannot read at all, so [[format_canvas_time]] rejects such a
+  string whichever answer we give. In [[parse_date]] they fall through to
+  [[dateutil]], which turns the abbreviations it knows---[[UTC]] among
+  them---into an aware [[datetime]] that [[format_canvas_time]] then leaves
+  alone, and hands back the ones it does not know, [[NZST]] included, as a
+  naive [[datetime]] that our local-time rule governs.
+\item[ A lowercase [[z]] ] is likewise beyond [[arrow]]'s parser, and
+  likewise resolved by [[dateutil]] on the one path that reaches that far.
+\item[An offset behind a space] ([[13:30:00 +00:00]]) is that story once
+  more: it is [[arrow]]'s own rendering plus a single space, and [[arrow]]
+  will not read it back.
+\end{description}
+
+We do accept one spelling that no reader here parses: an offset carrying
+seconds, [[+01:12:12]]. Python's [[datetime.isoformat()]] emits exactly that
+for zones with sub-minute historical offsets, and when both answers are
+operationally identical---each ends in the same [[ValueError]]---we would
+rather record the true one.
+
+<<imports>>=
+import re
+@
+
+Compiled once at import, the pattern reads as the rule above: a time, an
+optional fractional part, a zone marker, end of string.
+
+<<constants>>=
+EXPLICIT_TIMEZONE_SUFFIX = re.compile(
+  r"""
+  (?: (?<=[T\ ]) \d{4} (?: \d{2} )?    # basic time, after the date
+    | \d{2} : \d{2} (?: : \d{2} )?     # extended time, proved by its colon
+  )
+  (?: [.,] \d+ )?                      # fractional seconds
+  (?: Z                                # UTC
+    | [+-] \d{2} (?: :? \d{2} (?: :? \d{2} )? )?   # offset from UTC
+  )
+  $
+  """,
+  re.VERBOSE)
+@
+
+Values that are not strings answer [[False]]: they cannot state a zone in
+their text, and the callers that pass them have already decided the question
+by type.
 
 <<functions>>=
 def _has_explicit_timezone(date_str):
   """
-  Detect if a string contains explicit timezone information.
+  Report whether a date string states the timezone it was read in.
 
-  Markers indicating explicit timezone:
-  - 'Z' suffix (UTC)
-  - '+' or '-' with time offset (e.g., +02:00, -05:00)
-
-  Returns True if timezone is explicit, False for naive strings.
+  True for a trailing 'Z' and for a trailing UTC offset such as +02:00,
+  -0500 or -05, provided a time of day precedes it.  False for a string
+  naming no zone, for a zone abbreviation such as NZST, and for any value
+  that is not a string.
   """
   if not isinstance(date_str, str):
     return False
-  # Check for Z suffix indicating UTC
-  if 'Z' in date_str:
-    return True
-  # Check for timezone offset (+/- with time)
-  # Date strings like YYYY-MM-DD have 2 hyphens
-  # Timezone offsets add more: YYYY-MM-DDTHH:MM:SS-05:00 has 3+ hyphens
-  if '+' in date_str or date_str.count('-') > 2:
-    return True
-  return False
+  return EXPLICIT_TIMEZONE_SUFFIX.search(date_str) is not None
+@
+
+\subsection{Verifying the detector}
+
+The rule under test is a single one---a zone marker counts when it is
+attached to a time---so the tests vary the spelling while holding that rule
+invariant. The first group sweeps the shapes [[arrow]] accepts, the second
+sweeps zone-less spellings, and both keep the answer constant across the
+sweep; a detector that keys on any one surface feature rather than on the
+rule breaks somewhere inside one of them.
+
+The helper is private, so the module's [[import *]] does not carry it and we
+name it here, beside the tests that need it.
+
+<<test functions>>=
+
+from canvaslms.cli.utils import _has_explicit_timezone
+
+
+class TestExplicitTimezoneDetection:
+    """A zone marker counts only when it is attached to a time"""
+
+    <<timezone detection test methods>>
+@
+
+<<timezone detection test methods>>=
+@pytest.mark.parametrize("spelling", [
+    "2023-12-15T13:30:00Z",
+    "2023-12-15T13:30Z",
+    "2023-12-15T133000Z",
+    "20231215T083000Z",
+    "20231215T0830Z",
+    "2023-12-15T13:30:00.123456Z",
+    "2023-12-15 13:30:00+00:00",
+    "2023-12-15T13:30+02:00",
+    "2023-12-15T08:30:00-05:00",
+    "2023-12-15T08:30:00-0500",
+    "2023-12-15T08:30:00-05",
+    "2023-12-15T13:30:00+01:12:12",
+])
+def test_a_marker_on_a_time_states_a_zone(self, spelling):
+    """Every spelling here is one arrow reads back with its offset"""
+    assert _has_explicit_timezone(spelling) is True
+
+@pytest.mark.parametrize("spelling", [
+    "2023-12-15 14:30",
+    "2023-12-15T14:30:00",
+    "December 15 2023",
+    "Dec 15 2023",
+    "12/15/2023",
+    "2023/12/15",
+    "",
+])
+def test_a_reading_without_a_marker_states_none(self, spelling):
+    """The contrast: same shapes, no zone marker at the end"""
+    assert _has_explicit_timezone(spelling) is False
+
+@
+
+Below the sweeps sit the four inputs that motivated this section. Each names
+one specific way the old substring tests answered a question they were not
+asked, and each is the reason for one clause of the pattern.
+
+<<timezone detection test methods>>=
+def test_a_z_inside_a_word_is_not_a_marker(self):
+    """NZST does name a zone, but its Z is a letter, not a suffix"""
+    assert _has_explicit_timezone("2023-12-15 10:00 NZST") is False
+
+def test_a_stray_z_anywhere_is_not_a_marker(self):
+    """Unparseable input contains letters too, and must not qualify"""
+    assert _has_explicit_timezone("not-a-valid-date-xyz123") is False
+
+def test_a_day_of_month_is_not_an_offset(self):
+    """'-15' ends this date and is spelled exactly like an offset"""
+    assert _has_explicit_timezone("2023-12-15") is False
+
+def test_a_month_is_not_an_offset(self):
+    """arrow reads 2023-12 as December, so '-12' must stay a month"""
+    assert _has_explicit_timezone("2023-12") is False
+
+@
+
+The counting is not merely imprecise; it points the wrong way. These two
+strings state an offset while spending a single hyphen on the date, so the
+old test called them naive and the local zone overrode what they had already
+settled. We assert on the instant rather than on the detector, because that
+is where the damage was, and the assertions are independent of the machine's
+own zone: [[-05:00]] fixes the answer wherever the test runs.
+
+<<timezone detection test methods>>=
+def test_basic_iso_offset_is_converted_not_replaced(self):
+    """One hyphen, yet -05:00 is stated and must be honoured"""
+    result = format_canvas_time("20231215T083000-0500")
+    assert result == "2023-12-15T13:30:00Z"
+
+def test_slash_dated_offset_is_converted_not_replaced(self):
+    """A slash-separated date spends no hyphens at all"""
+    result = format_canvas_time("2023/12/15 08:30:00-05:00")
+    assert result == "2023-12-15T13:30:00Z"
+
 @
 
 \section{Date parsing utilities}
