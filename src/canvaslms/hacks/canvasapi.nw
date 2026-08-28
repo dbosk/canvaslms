@@ -15,6 +15,7 @@ We do this as follows:
 
 import cachetools
 import canvasapi.assignment
+import canvasapi.exceptions
 from canvasapi.user import User
 from datetime import datetime, timedelta
 import functools
@@ -105,6 +106,9 @@ from datetime import datetime, timedelta
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.submission import Submission
 from canvasapi.user import User
+
+# The errors Canvas raises, for the tests that exercise failing requests.
+import canvasapi.exceptions
 
 # This import applies the monkey-patches
 import canvaslms.hacks.canvasapi
@@ -4019,12 +4023,41 @@ a caller ever write a payload attribute such as [[grade]] through the wrapper,
 the value just fetched from Canvas is the truth and must win over the stale
 local write.
 
+\subsubsection{When the submission is gone}
+\label{sec:missing-submission}
+
+A refetch can also fail outright.  On a finished course, students who have
+since left it no longer have a submission to fetch: Canvas answers the
+per-student submission request with a 404, which [[canvasapi]] raises as
+[[ResourceDoesNotExist]].  Because the refresh is triggered from deep inside
+an ordinary attribute read---[[submission.grade]] in [[results --missing]],
+[[submission.submission_history]] in a grading criterion---an escaping
+exception aborts the \emph{entire} command over a single departed student,
+and the user gets a traceback instead of the results for everyone else.  One
+student's gap must degrade into one student's stale row, not into total
+failure, so we log a warning naming the submission we could not refresh and
+go on serving the cached copy: it is the best answer we still have.
+
+Marking the wrapper as refreshed although nothing was fetched looks wrong at
+first glance, and it is a deliberate trade-off.  [[_needs_refresh]] is
+consulted on \emph{every} read of a mutable attribute, so a wrapper left
+stale would re-issue the doomed request for [[grade]], then again for
+[[submission_history]], and so on for each such student---turning one missing
+submission into a stream of 404s that slows the command to a crawl.
+Advancing [[_last_refresh]] instead spends the failure once per TTL window.
+The price is that a submission genuinely deleted on Canvas keeps its cached
+value until the window expires, which is the cheaper of the two errors.
+
 <<LazySubmission methods>>=
 def _refresh(self):
   """Refresh the wrapped submission from Canvas.
 
   Caller annotations (attributes set through the wrapper, e.g. `user`)
   are carried over to the fresh submission unless Canvas sent that name.
+
+  A submission Canvas no longer has (404) leaves the cached one in place;
+  the wrapper still counts as refreshed, so the failing request is not
+  repeated on every subsequent attribute access.
   """
   assignment = object.__getattribute__(self, '_assignment')
   submission = object.__getattribute__(self, '_submission')
@@ -4033,18 +4066,23 @@ def _refresh(self):
   annotations = object.__getattribute__(self, '_annotations')
 
   # Call original method directly (bypasses decorator, no double-wrapping)
-  fresh_submission = original_get_submission(
-    assignment,
-    submission.user_id,
-    include=list(includes)
-  )
+  try:
+    fresh_submission = original_get_submission(
+      assignment,
+      submission.user_id,
+      include=list(includes)
+    )
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    logger.warning(f"Could not refresh submission: user_id="
+                   f"{submission.user_id} on assignment {assignment} "
+                   f"no longer exists, keeping the cached submission")
+  else:
+    for name, value in annotations.items():
+      if not hasattr(fresh_submission, name):
+        setattr(fresh_submission, name, value)
 
-  for name, value in annotations.items():
-    if not hasattr(fresh_submission, name):
-      setattr(fresh_submission, name, value)
+    object.__setattr__(self, '_submission', fresh_submission)
 
-  # Update internal state (cache automatically updated via reference)
-  object.__setattr__(self, '_submission', fresh_submission)
   object.__setattr__(self, '_last_refresh', datetime.now())
 @
 
@@ -4107,6 +4145,57 @@ class TestLazySubmissionAnnotationsSurviveRefresh:
         lazy.submission_history
 
         assert not hasattr(fresh, "rubric_assessment")
+@
+
+The departed student deserves a test of its own, because what we want is an
+\emph{absence}---no traceback---and an absence is easy to lose again without
+anyone noticing.  We build the same stale wrapper as above, but let its
+refetch raise the 404 a vanished submission produces.  Reading a mutable
+attribute must then hand back the cached value instead of raising, say what
+happened in the log, and---on a second read---not go back to Canvas at all.
+
+<<test functions>>=
+class TestLazySubmissionRefreshNotFound:
+    """A submission Canvas no longer has degrades to a warning."""
+
+    class StandInSubmission:
+        """A submission carrying a value we can recognise afterwards."""
+
+        def __init__(self, grade="F"):
+            self.grade = grade
+            self.user_id = 1
+            self.submission_history = ("cached",)
+
+    def vanished_wrapper(self):
+        """A stale wrapper whose refetch answers 404, with that refetch."""
+        refetch = MagicMock(
+            side_effect=canvasapi.exceptions.ResourceDoesNotExist(
+                "Not Found"))
+        lazy = LazySubmission(
+            self.StandInSubmission(), MagicMock(),
+            {"submission_history"}, refetch)
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
+        return lazy, refetch
+
+    def test_missing_submission_serves_cached_value(self, caplog):
+        """The read succeeds with the cached value and logs a warning."""
+        lazy, _ = self.vanished_wrapper()
+
+        with caplog.at_level(logging.WARNING):
+            assert lazy.submission_history == ("cached",)
+
+        assert "user_id=1" in caplog.text
+
+    def test_missing_submission_is_fetched_only_once(self):
+        """The wrapper counts as refreshed, so reads stop retrying."""
+        lazy, refetch = self.vanished_wrapper()
+
+        lazy.submission_history
+        lazy.submission_history
+
+        refetch.assert_called_once()
 @
 
 \paragraph{Intercepting reads}
@@ -5007,7 +5096,9 @@ return list(self.__cache.values())
 @
 
 The bulk refresh pre-check logic counts how many submissions would need refresh
-and triggers a bulk fetch if the count exceeds the threshold.
+and triggers a bulk fetch if the count exceeds the threshold.  The fetch is the
+one part that can fail, so it is the only part we wrap; what we do when it does
+is the subject of \cref{sec:bulk-refresh-failure} below.
 <<check staleness threshold and bulk refresh if needed>>=
 stale_count = count_stale_submissions(self.__cache, student_ids)
 threshold = bulk_refresh_threshold(
@@ -5021,18 +5112,166 @@ all_includes = set(to_include)
 for lazy_submission in self.__cache.values():
   all_includes |= set(lazy_submission._includes)
 
-for raw_submission in get_submissions(self, include=list(all_includes)):
-  if raw_submission.user_id in self.__cache:
-    lazy_submission = self.__cache[raw_submission.user_id]
-    object.__setattr__(lazy_submission, '_submission', raw_submission)
-    object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
-    object.__setattr__(lazy_submission, '_includes', all_includes)
-  else:
-    lazy_submission = LazySubmission(raw_submission, self, all_includes,
-                                     original_get_submission)
-    self.__cache[raw_submission.user_id] = lazy_submission
+try:
+  for raw_submission in get_submissions(self, include=list(all_includes)):
+    if raw_submission.user_id in self.__cache:
+      lazy_submission = self.__cache[raw_submission.user_id]
+      object.__setattr__(lazy_submission, '_submission', raw_submission)
+      object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+      object.__setattr__(lazy_submission, '_includes', all_includes)
+    else:
+      lazy_submission = LazySubmission(raw_submission, self, all_includes,
+                                       original_get_submission)
+      self.__cache[raw_submission.user_id] = lazy_submission
+except canvasapi.exceptions.CanvasException as error:
+  <<keep the cached submissions after a failed bulk refresh>>
+else:
+  self.__all_fetched = datetime.now()
+@
 
-self.__all_fetched = datetime.now()
+\subsubsection{When the bulk refresh fails}
+\label{sec:bulk-refresh-failure}
+
+That refetch asks Canvas for an entire assignment's submissions, and such a
+request can fail like any other: a 404 for an assignment removed while the
+report was running, a 500 from an overloaded Canvas.  Uncaught, the exception
+travels out of [[get_submissions]], through the listing generators in
+[[submissions.nw]], and aborts the whole [[results]] or [[submissions]]
+command---although we are holding, right here, a complete copy of every
+submission that is at worst a few minutes stale.  This is the failure class
+\cref{sec:missing-submission} fixed one level down for the per-submission
+refresh, and it deserves the same answer: a failed request should cost the
+report one assignment's freshness, not the report itself.  So we log which
+assignment we could not refresh and keep serving the cache.
+
+The two guards differ in \emph{which} exceptions they excuse, deliberately so.
+[[_refresh]] catches only [[ResourceDoesNotExist]], because it knows precisely
+which failure it is excusing---the one student who has left the course---and a
+500 on a single submission is a surprise worth a traceback.  The bulk refetch
+has no such precision: it stands between the user and \emph{every} row of the
+report, so whatever it lets escape takes all the other assignments and students
+with it.  Its scope is collateral where [[_refresh]]'s is targeted, and we
+therefore catch [[CanvasException]], the base class of everything [[canvasapi]]
+raises.
+
+The objection to so broad a catch is that it also swallows systemic failures,
+an expired token say, which the user would rather see at once.  It does not,
+and the reason is structural: only the \emph{re}fresh of data we already have
+is guarded.  The first fetch of an assignment's submissions---the
+[[need_refetch]] branch above---is left unguarded precisely because there is no
+cached answer to fall back on there, so a dead server or a rejected token still
+fails loudly on the first assignment the command touches, long before this code
+could hide it.
+
+Logging and moving on is not enough on its own, because of how the code finds
+its way back here.  [[should_bulk_refresh_submissions]] asks the wrappers
+whether they would refresh, and the listing commands call [[get_submissions]]
+several times per assignment in a single run.  Leave the wrappers untouched and
+the cache answers that question the same way on the next call, re-issuing the
+same doomed request; and in between, every read of a mutable attribute falls
+back to its own per-submission refresh.  One failed bulk fetch would thus
+produce exactly the storm the bulk path exists to prevent---the 40 calls we
+went to this trouble to turn into 1.
+
+We therefore mark every cached wrapper as refreshed as of now, just as
+[[_refresh]] advances [[_last_refresh]] on the single submission it could not
+fetch (\cref{sec:missing-submission}).  The resulting invariant is easy to
+state: once this code has run, in success or in failure, every cached wrapper
+counts as fresh for one TTL window.  Marking \emph{all} of them, rather than
+only those in [[student_ids]], mirrors what a successful fetch does---it
+replaces the whole collection---and it is what makes the invariant hold for the
+next caller, who may well arrive with a different scope.  If the failure struck
+partway through a paginated response, the submissions already replaced simply
+have their timestamp set to now a second time.
+
+The price is [[_refresh]]'s price one notch wider: data Canvas would have
+handed us is served stale until the window expires.  Against a report that does
+not run at all, that is the cheaper error.
+
+We leave [[__all_fetched]] alone.  It records when the collection was last
+genuinely fetched---for the cache-age log line above, and through its [[None]]
+value for the question of whether any fetch has happened at all---so letting a
+failed refetch touch it would only make that log lie.  It is [[_last_refresh]]
+on the wrappers, not [[__all_fetched]], that gates the retry.
+
+<<keep the cached submissions after a failed bulk refresh>>=
+logger.warning(f"Could not refresh all submissions for assignment "
+               f"id={self.id}: {error}; keeping the "
+               f"{len(self.__cache)} cached submissions")
+
+for lazy_submission in self.__cache.values():
+  object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+@
+
+This failure deserves a test of its own for the same reason the departed
+student did: what we want is an \emph{absence}---no traceback---and an absence
+is easy to lose again unnoticed.  We build an assignment whose cached
+submissions are all stale enough to trigger the bulk refresh and whose Canvas
+requests all fail.  Reading the collection must then hand back the cached
+submissions with their cached values, say in the log which assignment went
+unrefreshed, and---on a second listing, the way a command really calls
+this---go back to Canvas no more.
+
+The cache lives in attributes the decorator writes on the assignment.  They
+look private, but the decorator is a plain function rather than a class body,
+so Python performs no name mangling and the test can populate them by name.
+
+<<test functions>>=
+class TestBulkRefreshFailureKeepsCache:
+    """A failing bulk refetch degrades to a warning, not a traceback."""
+
+    class StandInSubmission:
+        """A submission carrying a value we can recognise afterwards."""
+
+        def __init__(self, user_id):
+            self.grade = "cached"
+            self.user_id = user_id
+
+    def stale_assignment(self):
+        """An assignment with a stale cache and a failing Canvas.
+
+        Returns the assignment, the requester its bulk fetch goes through
+        and the per-submission refetch its wrappers would fall back to.
+        """
+        requester = MagicMock()
+        requester.request.side_effect = canvasapi.exceptions.CanvasException(
+            "Internal Server Error")
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+
+        refetch = MagicMock()
+        cache = getattr(assignment, "__cache")
+        for user_id in range(5):
+            lazy = LazySubmission(
+                self.StandInSubmission(user_id), assignment, set(), refetch)
+            object.__setattr__(
+                lazy, "_last_refresh",
+                datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
+            cache[user_id] = lazy
+        setattr(assignment, "__all_fetched", datetime.now())
+
+        return assignment, requester, refetch
+
+    def test_failed_bulk_refresh_serves_cached_submissions(self, caplog):
+        """The listing still gets its submissions, with cached values."""
+        assignment, _, _ = self.stale_assignment()
+
+        with caplog.at_level(logging.WARNING):
+            submissions = assignment.get_submissions(check_bulk_refresh=True)
+
+        assert [each.grade for each in submissions] == ["cached"] * 5
+        assert "Could not refresh all submissions" in caplog.text
+        assert "id=17" in caplog.text
+
+    def test_failed_bulk_refresh_is_not_retried(self):
+        """The wrappers count as refreshed, so the reads stop retrying."""
+        assignment, requester, refetch = self.stale_assignment()
+
+        assignment.get_submissions(check_bulk_refresh=True)
+        for each in assignment.get_submissions(check_bulk_refresh=True):
+            each.grade
+
+        requester.request.assert_called_once()
+        refetch.assert_not_called()
 @
 
 Let's verify that the bulk-refresh pre-check stays optional and only flips to a

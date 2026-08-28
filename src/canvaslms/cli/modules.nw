@@ -1394,7 +1394,9 @@ The function handles three item types, in two ways:
 \item[Quiz] Identified by [[content_id]] matching the quiz's numeric ID; this
   is how Canvas lists a Classic Quiz in a module (a New Quiz is an
   assignment and appears as one)
-\item[Page] Identified by [[page_url]] matching the page's URL slug
+\item[Page] Identified by [[page_url]] matching the page's URL slug---but
+  only up to the slug rewrites Canvas leaves behind when a page is renamed,
+  which is a matching rule of its own (\cref{sec:page-url-resolution})
 \end{description}
 The numeric types share their matching logic, so we name the set once.
 <<constants>>=
@@ -1405,6 +1407,14 @@ Since we visit the matching module item anyway, we return its position along
 with the module name; the exporters need both
 (\cref{sec:export-module-specs}), and a second scan of every module just for
 the positions would double the API traffic of every export.
+
+Pages need one thing settled before the scan starts.
+The slug we are handed need not be the one Canvas now considers canonical,
+so we ask Canvas which page it is and remember the answer
+(\cref{sec:page-url-resolution}).
+That question is about the page, not about any module, so its answer is the
+same for every module we are about to visit---which is why it is asked here,
+once, and not inside the loop.
 <<functions>>=
 def get_item_module_positions(course, item_type, item_id):
   """Get the modules containing an item and the item's position in each.
@@ -1419,13 +1429,9 @@ def get_item_module_positions(course, item_type, item_id):
       List of (module name, position, completion requirement) triples;
       position and requirement may be None.
   """
-  target_url = None
+  canonical_url = None
   if item_type == 'Page':
-    try:
-      target_url = course.get_page(item_id).url
-    except Exception:
-      # If we can't resolve the target page, fall back to raw comparisons.
-      target_url = item_id
+    canonical_url = resolve_page_url(course, item_id)
 
   modules = []
   for module in course.get_modules():
@@ -1442,29 +1448,149 @@ def get_item_module_positions(course, item_type, item_id):
 @
 
 The matching logic differs by item type.
-For assignments and quizzes, Canvas stores the numeric ID in [[content_id]].
-For pages, Canvas stores the URL slug in [[page_url]]. However, Canvas may
-redirect old URLs to new ones, so we need to resolve the URL before comparing
-(see [[<<check if page item matches by resolving url>>]]).
+For assignments and quizzes, Canvas stores the numeric ID in [[content_id]],
+and equality settles the question.
+For pages, Canvas stores the URL slug in [[page_url]], and equality does
+not settle it: two different slugs can name the same page.
+So the page branch asks [[page_item_matches]] instead of comparing
+(\cref{sec:page-url-resolution}).
 <<check if item matches and add module to list>>=
 if item_type in CONTENT_ID_ITEM_TYPES:
   if item.content_id == item_id:
     modules.append((module.name, item.position, item.completion_requirement))
     break
 elif item_type == 'Page':
-  if item.page_url:
-    if item.page_url == item_id:
-      modules.append((module.name, item.position, item.completion_requirement))
-      break
-    # Compare canonical URLs to avoid duplicates when Canvas redirects old slugs.
-    try:
-      resolved_page = course.get_page(item.page_url)
-      if resolved_page.url == target_url:
-        modules.append((module.name, item.position, item.completion_requirement))
-        break
-    except Exception:
-      pass
+  if page_item_matches(course, item, item_id, canonical_url):
+    modules.append((module.name, item.position, item.completion_requirement))
+    break
 @
+
+\subsubsection{Resolving pages through Canvas's redirects}
+\label{sec:page-url-resolution}
+
+A page is identified by its URL slug, and Canvas rewrites that slug when the
+page is renamed.
+A page added to a module as \enquote{page-on-campus+zoom} is served as
+\enquote{page-on-zoom+campus} after such a rename, while the module item
+keeps the slug it was created with.
+Comparing the two slugs directly therefore answers \enquote{not in this
+module} about an item that is right there, and the callers act on that
+answer: the membership listing loses a module, and [[update_item_modules]]
+(\cref{sec:updating-membership}) adds the page to the module a second time,
+beside itself.
+
+Asking Canvas for the page turns either spelling into the same canonical
+[[url]], which is what makes the comparison honest.
+Both scans need that, and until now both carried their own copy of it under
+different variable names.
+Two copies of a rule that is only exercised when Canvas renames something
+behind our back is two chances to fix a bug in one of them, so the rule
+lives in one place from here on.
+<<functions>>=
+def resolve_page_url(course, page_url):
+  """Return the canonical URL of the page `page_url` in `course`.
+
+  Falls back to `page_url` itself if Canvas cannot give us the page.
+  """
+  try:
+    return course.get_page(page_url).url
+  except Exception:
+    return page_url
+@
+
+Canvas can fail such a lookup for reasons that have nothing to do with
+renaming: a deleted page, a revoked permission, a network error.
+Neither scan may abandon its work over that, so both degrade---but in
+opposite directions, and the difference is deliberate:
+\begin{description}
+\item[The page we are looking for] falls back to the slug the caller gave
+  us, so the scan carries on as a plain slug comparison and finds every
+  item that was never renamed.
+\item[A module item's own slug] is left unmatched, because the fallback
+  available here would be to trust the item's stale slug, and an item we
+  cannot ask about is exactly the item we know nothing about.
+\end{description}
+The cost of degrading this way is a missed rename, not a wrong answer about
+the items that do resolve.
+
+We try the plain comparison first, and not only for speed: the slug the
+caller passed is the one most items carry, so the common case costs no
+request at all.
+Only a slug that does not match literally is worth a round trip.
+<<functions>>=
+def page_item_matches(course, item, item_id, canonical_url):
+  """Tell whether the module `item` points at the page `item_id`.
+
+  `canonical_url` is the canonical URL of `item_id`, as returned by
+  `resolve_page_url`. An item whose own slug Canvas cannot resolve does
+  not match.
+  """
+  if not item.page_url:
+    return False
+  if item.page_url == item_id:
+    return True
+  try:
+    return course.get_page(item.page_url).url == canonical_url
+  except Exception:
+    return False
+@
+
+The redirect branch is the one worth a test, because it runs only when
+Canvas has changed a page's slug behind our back---a state no test gets for
+free, and one a live course reaches only occasionally.
+We simulate it with a course whose [[get_page]] maps each slug to the
+canonical one it redirects to, so that a module item still holding the old
+slug resolves to the same page as the item we are looking for.
+
+The second test drives both fallbacks above from the outside: with nothing
+resolvable, a literal slug still matches (the target fell back to it) and a
+renamed one no longer does (the item was left unmatched).
+<<test functions>>=
+def make_page_item(page_url, position=None):
+  """Create a Page module item mock for the page slug `page_url`."""
+  item = make_module_item(position, item_type="Page")
+  item.page_url = page_url
+  item.id = 200
+  return item
+
+def redirecting_course(items, canonical, name="Week 1"):
+  """Create a course mock resolving each slug in `canonical` to a page.
+
+  Slugs outside `canonical` raise, standing in for any reason Canvas
+  cannot hand us the page; the code under test catches them all alike.
+  """
+  course, module = one_module_course(items, name=name)
+  def get_page(slug):
+    if slug not in canonical:
+      raise LookupError(slug)
+    page = MagicMock()
+    page.url = canonical[slug]
+    return page
+  course.get_page.side_effect = get_page
+  return course, module
+
+# The worked example above: the module item kept the old slug.
+RENAMED_PAGE = {"page-on-campus+zoom": "page-on-zoom+campus",
+                "page-on-zoom+campus": "page-on-zoom+campus"}
+
+def test_page_item_matches_through_a_redirect():
+  item = make_page_item("page-on-campus+zoom", position=2)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert get_item_module_positions(
+      course, 'Page', "page-on-zoom+campus") == [("Week 1", 2, None)]
+
+def test_page_matching_falls_back_when_urls_do_not_resolve():
+  literal = make_page_item("intro", position=2)
+  course, module = redirecting_course([literal], {})
+  assert get_item_module_positions(course, 'Page', "intro") == [
+      ("Week 1", 2, None)]
+  renamed = make_page_item("page-on-campus+zoom", position=2)
+  course, module = redirecting_course([renamed], {})
+  assert get_item_module_positions(
+      course, 'Page', "page-on-zoom+campus") == []
+@
+
+\subsubsection{Membership without the positions}
 
 Most readers of membership only want the names, so we keep the simpler
 function as a view of the richer one.
@@ -1812,6 +1938,7 @@ def test_validate_returns_no_errors_for_valid_specs():
 @
 
 \subsection{Updating module membership based on patterns}
+\label{sec:updating-membership}
 
 The [[update_item_modules]] function synchronizes an item's module membership
 with a list of module specs (\cref{sec:module-positions}).
@@ -1916,11 +2043,26 @@ For each module, we determine the current state (is the item present, and
 where, with which requirement?) and the desired state (does the module match
 a spec, and with which position and requirement?).
 Then we add, remove, move or re-require as needed.
+
+A page brings the same question as in \cref{sec:page-url-resolution}---which
+page is this slug, really?---and we settle it here, once, before the loop.
+It used to be settled inside the loop, which asked Canvas the same question
+once per module in the course.
+Caching does not rescue that: the page cache is keyed on the canonical URL
+the page came back with, so a lookup by the slug Canvas has since replaced
+misses it every time, and the renamed page is precisely the case this code
+exists for.
+A course with fifteen modules therefore paid fifteen requests to learn one
+slug, on every page pushed to it.
 <<compute and apply module membership changes>>=
 added = []
 removed = []
 moved = []
 required = []
+
+canonical_url = None
+if item_type == 'Page':
+  canonical_url = resolve_page_url(course, item_id)
 
 for module in all_modules:
   <<find current module item if present>>
@@ -1931,30 +2073,12 @@ for module in all_modules:
 @
 
 We search the module's items to find if our item is currently present.
-
-For pages, we need to handle URL redirects. Canvas may store an old URL in the
-module item that redirects to the canonical URL we're checking against. For
-example, a page might have been added to a module with URL
-\enquote{page-on-campus+zoom}, but Canvas later changed the canonical URL to
-\enquote{page-on-zoom+campus}. The module item still stores the old URL, but
-when we fetch the page using [[course.get_page()]], Canvas returns the page
-with its new canonical URL.
-
-Without handling this, the direct comparison [[item.page_url == item_id]] would
-fail, causing the page to be added to the module again (creating duplicates).
-
-To detect this, we fetch both the target page ([[item_id]]) and the module
-item's page ([[item.page_url]]) and compare canonical [[url]] values. This adds
-API calls, but only when the direct comparison fails.
+The search is the one from \cref{sec:page-url-resolution}, down to the
+function that decides whether a page item is ours: what counts as \enquote{the
+same page} cannot mean one thing when we list an item's modules and another
+when we change them, or a push would undo what an export just described.
 <<find current module item if present>>=
 current_item = None
-canonical_page_url = None
-if item_type == 'Page':
-  try:
-    canonical_page_url = course.get_page(item_id).url
-  except Exception:
-    canonical_page_url = item_id
-
 try:
   for item in list_module_items(module):
     if item.type != item_type:
@@ -1964,27 +2088,69 @@ try:
         current_item = item
         break
     elif item_type == 'Page':
-      if item.page_url:
-        <<check if page item matches by resolving url>>
+      if page_item_matches(course, item, item_id, canonical_url):
+        current_item = item
+        break
 except Exception:
   pass
 @
 
-When comparing page URLs, we first try a direct match. If that fails, we fetch
-the page to get its canonical URL and compare that. This handles the case where
-Canvas has created a redirect from an old URL to a new one.
-<<check if page item matches by resolving url>>=
-if item.page_url == item_id:
-  current_item = item
-  break
-# URLs don't match directly; compare canonical URLs to avoid duplicates.
-try:
-  resolved_page = course.get_page(item.page_url)
-  if resolved_page.url == canonical_page_url:
-    current_item = item
-    break
-except Exception:
-  pass  # Page doesn't exist or can't be fetched
+Let's verify the duplicate this recognition exists to prevent.
+The page now carries the canonical slug, the module item still carries the
+old one; recognizing the two as the same item is what stops
+[[update_item_modules]] from calling [[create_module_item]] a second time,
+and what lets a spec with a position move the item that is already there
+instead of adding a rival beside it.
+
+The last test pins the fallback from the other direction: with nothing
+resolvable, a literal slug match still works, and a genuinely different
+page in the module is not mistaken for ours---the item is added, which is
+the pre-redirect behaviour, rather than an exception escaping the scan.
+<<test functions>>=
+def test_redirected_page_is_recognized_not_duplicated():
+  item = make_page_item("page-on-campus+zoom", position=1)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert update_item_modules(course, 'Page', "page-on-zoom+campus",
+                             ["^Week 1$"]) == ([], [], [], [])
+  module.create_module_item.assert_not_called()
+
+def test_redirected_page_is_moved_not_duplicated():
+  item = make_page_item("page-on-campus+zoom", position=5)
+  course, module = redirecting_course([item], RENAMED_PAGE)
+  assert update_item_modules(
+      course, 'Page', "page-on-zoom+campus",
+      [{"module": "^Week 1$", "position": 2}]) == ([], [], ["Week 1"], [])
+  item.edit.assert_called_once_with(module_item={'position': 2})
+  module.create_module_item.assert_not_called()
+
+def test_unresolvable_page_urls_fall_back_to_the_slug():
+  item = make_page_item("intro", position=1)
+  course, module = redirecting_course([item], {})
+  assert update_item_modules(course, 'Page', "intro",
+                             ["^Week 1$"]) == ([], [], [], [])
+  module.create_module_item.assert_not_called()
+  stranger = make_page_item("other-page", position=1)
+  course, module = redirecting_course([stranger], {})
+  assert update_item_modules(course, 'Page', "intro",
+                             ["^Week 1$"]) == (["Week 1"], [], [], [])
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Page', 'page_url': 'intro'})
+@
+
+Where the lookup sits needs a test of its own, because none of the tests
+above can notice it moving back inside the loop: the answer is the same
+either way, only the bill differs.
+So we count the asking instead of the answer.
+A course of five modules resolves the page once; with the lookup back where
+it was, the same scan would resolve it five times---and in a real course
+that number is the number of modules, on every page pushed.
+<<test functions>>=
+def test_target_page_is_resolved_once_for_the_whole_course():
+  course = MagicMock()
+  course.get_modules.return_value = [
+      make_cached_module(f"Week {i}", 10 + i, []) for i in range(5)]
+  update_item_modules(course, 'Page', "intro", ["^Week 0$"])
+  assert course.get_page.call_count == 1
 @
 
 \subsubsection{Keeping the module item cache honest}
@@ -2185,6 +2351,40 @@ def test_update_rejects_malformed_specs():
   course, module = one_module_course([])
   with pytest.raises(ValueError):
     update_item_modules(course, 'Assignment', 42, [{"position": 1}])
+  module.create_module_item.assert_not_called()
+@
+
+The two whole-list forms deserve a test of their own, because they are one
+instruction with two spellings and the less obvious spelling is the one
+users actually write: a bare [[modules:]] line in front matter reaches us
+as [[None]], never as an empty list.
+Both mean \enquote{no modules}, and what that means in Canvas is a removal
+from every module the item is in.
+
+It is worth being explicit about what [[None]] does \emph{not} mean here,
+since the opposite reading is the tempting one: it is not \enquote{leave
+membership alone}.
+That reading belongs to an \emph{absent} [[modules]] key, which the callers
+implement by testing [[if 'modules' in attributes]] and never calling us at
+all---so no value of our argument can express it, and [[None]] least of
+all.
+Pinning this keeps a future reader who assumes [[None]] is inert from
+learning otherwise from a push that has already emptied an item's
+membership.
+<<test functions>>=
+def test_none_specs_mean_the_same_as_an_empty_list():
+  for specs in (None, []):
+    item = make_assignment_item(42, position=1)
+    course, module = one_module_course([item])
+    assert update_item_modules(course, 'Assignment', 42, specs) == (
+        [], ["Week 1"], [], [])
+    item.delete.assert_called_once()
+    module.create_module_item.assert_not_called()
+
+def test_none_specs_add_and_move_nothing():
+  course, module = one_module_course([])
+  assert update_item_modules(course, 'Assignment', 42, None) == (
+      [], [], [], [])
   module.create_module_item.assert_not_called()
 @
 

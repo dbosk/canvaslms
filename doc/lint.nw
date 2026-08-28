@@ -1,0 +1,1116 @@
+\chapter{Linting the manual's cross-references}
+\label{chap:lint}
+\chapterprecis{Written by Dan-Claude under supervision of Daniel Bosk.}
+
+Every other chapter of this manual explains a program that talks to Canvas.
+This one explains a program that talks to \emph{the manual}: a small,
+dependency-free checker that reads the literate sources and refuses to let one
+particular kind of broken cross-reference reach the reader.
+
+The chapter exists because the error it hunts is invisible to every tool that
+already runs.
+\LaTeX{} compiles the document without a warning, \texttt{hyperref} produces a
+link that jumps to the right page, and the only symptom is a wrong number in
+the running text---the sort of defect that survives proofreading, because the
+eye reads \enquote{see \S14.11.2} and believes it.
+
+\section{The failure being hunted}
+\label{sec:lint:failure}
+
+A \verb|\label| does not attach itself to the heading above it.
+It attaches to whatever counter \LaTeX{} last stepped, which for a
+\emph{numbered} heading is that heading's own counter and for an
+\emph{unnumbered} one is the counter of the nearest numbered ancestor.
+A heading is numbered exactly when its level is no deeper than the document's
+\texttt{secnumdepth}.
+
+So while the manual numbered headings only down to subsection, this pair
+
+\begin{verbatim}
+\subsubsection{Completion requirements in module specs}
+\label{sec:completion-requirements}
+\end{verbatim}
+
+silently bound \texttt{sec:completion-requirements} to the enclosing
+\emph{subsection}.
+Every \verb|\cref| to it printed that subsection's number, and---because all
+the subsubsections of one subsection share the same enclosing counter---several
+different targets rendered as the same reference.
+Ten labels were affected, pointed at from thirty-three places, and the damage
+had accumulated unnoticed over a long stretch of the project's history.
+The one-off script that found them reported eleven; its eleventh was an
+enumerated step, whose label binds to the list and references perfectly well.
+That miscount is the reason \cref{sec:lint:binding-question} spends as long as
+it does deciding which labels belong to a heading at all.
+
+The repair was to raise the manual to \verb|\setsecnumdepth{subsubsection}|.
+That fixed the ten, but it cannot fix the eleventh.
+By the time this chapter was written, two fresh instances had already appeared
+on the same integration branch, both of them \verb|\paragraph| headings
+carrying \verb|\cref| targets---and a \verb|\paragraph| is unnumbered at any
+depth this document would sensibly choose.
+The class of error regenerates whenever someone labels a heading one level
+deeper than the numbering reaches, which is exactly the situation in which a
+mechanical check earns its keep.
+
+\section{What the checker has to know}
+\label{sec:lint:knowledge}
+
+The check is a comparison between three things the sources already state:
+how deep the numbering goes, how deep each labelled heading sits, and which
+labels are pointed at by a reference that prints a number.
+Each of the three needs a decision, and the decisions are where the interest
+lies; the code that follows is mostly bookkeeping.
+
+\subsection{How deep the numbering goes}
+\label{sec:lint:depth-question}
+
+\texttt{memoir} names the sectioning levels rather than numbering them, and
+maps the names onto \LaTeX's usual integers.
+Three settings stack in this project: the class itself ends its preamble with
+\verb|\setsecnumdepth{section}|, \texttt{didactic.sty} raises that to
+\texttt{subsection}, and \texttt{canvaslms.tex} raises it again to
+\texttt{subsubsection} \emph{after} loading \texttt{didactic}, so that the last
+word is its own.
+
+Hard-coding the answer would defeat the purpose---the whole point is that the
+setting can change, and a checker that disagrees with the document is worse
+than no checker.
+So the depth is read out of \texttt{doc/canvaslms.tex}, the master document
+whose setting wins.
+When the master document says nothing, we fall back to \texttt{memoir}'s own
+default, \texttt{section}.
+That is the most pessimistic reading available: a package the document loads
+can only \emph{raise} the depth from there, so assuming the class default makes
+the checker over-report rather than fall silent, and a lint that cries wolf is
+recoverable in a way that a lint which misses the bug it exists to catch is
+not.
+
+\subsection{Which references print a number}
+\label{sec:lint:reference-kinds}
+
+Not every reference is at risk.
+\verb|\cref|, \verb|\Cref| and plain \verb|\ref| print the counter, so they
+inherit the wrong value; \verb|\nameref| prints the heading's \emph{title} and
+\verb|\pageref| prints its page, and both stay correct however the numbering is
+configured.
+This is not a technicality: \verb|\nameref| was adopted in this project as a
+deliberate workaround for the very bug the checker looks for, so treating it as
+a violation would flag the fix.
+The checker therefore records every reference, but only lets the
+number-printing ones turn a deep label into an error.
+
+\subsection{Which labels belong to a heading}
+\label{sec:lint:binding-question}
+
+A label bound to a figure, an equation or a list item is not our problem---
+those counters are stepped by their own environments and reference just fine.
+The sources contain such labels, and one of them is the miscount of
+\cref{sec:lint:failure}: an enumerated step in the rename-matching algorithm of
+the submissions chapter, which sits inside a subsubsection and so looked deep
+to a rule that only asked which heading a label falls under.
+
+\begin{verbatim}
+\item\label{SetAsideUnchangedNames} Set aside every filename that ...
+\end{verbatim}
+
+We therefore bind a label to a heading only when nothing between them could
+have stepped another counter, treating \verb|\begin|, \verb|\item| and
+\verb|\caption| as the things that break the binding.
+That rule is deliberately conservative in one direction: a label sitting after
+an \texttt{itemize} block really does still belong to the heading in \LaTeX's
+eyes, and we will not flag it.
+Missing such a case costs a reader one wrong number; inventing one costs every
+future contributor a false alarm, and a lint nobody believes is a lint nobody
+runs.
+
+Consecutive labels, on the other hand, all belong to the same heading, because
+none of them steps anything:
+
+\begin{verbatim}
+\section{Find course based on course code}%
+\label{search-course-code}
+\label{filter-courses}
+\end{verbatim}
+
+Binding only the first would leave the second unexamined, so a label does not
+close the binding.
+
+\section{The shape of the program}
+\label{sec:lint:shape}
+
+The program is a filter in four stages: recover the prose from each source,
+scan the prose into labels and references, compare the two against the
+numbering depth, and print what does not add up.
+The stages appear in that order below, each followed by the tests that
+verify it.
+
+<<[[lint.py]]>>=
+"""Check that the manual's cross-referenced headings are numbered.
+
+A `\\label` on a heading deeper than the document's `secnumdepth` binds to
+the enclosing numbered heading instead, so `\\cref` prints the wrong number
+without any warning from LaTeX.  This script finds such labels in the
+literate sources and exits nonzero when any of them is referenced.
+"""
+
+<<imports>>
+<<pattern helpers>>
+<<constants>>
+<<data structures>>
+<<functions>>
+
+if __name__ == "__main__":
+    sys.exit(main())
+@
+
+The tests live in the ordinary test suite rather than beside the script, so
+that the guarantee this chapter describes is enforced by the same
+\texttt{pytest} run as everything else.
+They are distributed through the chapter, each next to the code it checks; the
+last of them (\cref{sec:lint:regression}) audits this repository itself.
+
+<<test [[lint.py]]>>=
+"""Tests for the manual's cross-reference lint.
+
+The lint is tangled into doc/, which is not on the import path, so these
+tests put it there before importing.
+"""
+<<test imports>>
+<<test helpers>>
+<<test functions>>
+@
+
+The script is not part of the installed package---it audits sources that are
+not shipped---so it is tangled next to the master document and imported from
+there by path.
+
+<<test imports>>=
+import pathlib
+import sys
+
+DOC_DIRECTORY = pathlib.Path(__file__).resolve().parents[2] / "doc"
+sys.path.insert(0, str(DOC_DIRECTORY))
+
+from lint import *
+@
+
+\section{The effective numbering depth}
+\label{sec:lint:secnumdepth}
+
+We start with the depth, because it is the number every later judgement is made
+against.
+\texttt{memoir}'s name-to-level table is the one the class uses internally,
+extended with the three pseudo-names it also accepts; keeping the two in one
+expression records that the depth names are exactly the sectioning names plus
+\texttt{none}, \texttt{book} and \texttt{all}.
+
+<<constants>>=
+HEADING_LEVELS = {
+    "part": -1,
+    "chapter": 0,
+    "section": 1,
+    "subsection": 2,
+    "subsubsection": 3,
+    "paragraph": 4,
+    "subparagraph": 5,
+}
+SECNUMDEPTH_LEVELS = dict(HEADING_LEVELS, none=-10, book=-2, all=50)
+MEMOIR_DEFAULT_SECNUMDEPTH = HEADING_LEVELS["section"]
+MASTER_DOCUMENT = "doc/canvaslms.tex"
+@
+
+Both spellings of the setting have to be recognised.
+\verb|\setsecnumdepth| is \texttt{memoir}'s interface and the one this project
+uses, but \verb|\setcounter| naming the counter directly is what a document
+inherited from another class would say, and a checker that ignored it would
+report the class default while the document did something else entirely.
+
+<<imports>>=
+import re
+@
+
+<<constants>>=
+SECNUMDEPTH_RE = re.compile(
+    r"\\setsecnumdepth\s*\{\s*(?P<name>[a-z]+)\s*\}"
+    r"|\\setcounter\s*\{\s*secnumdepth\s*\}\s*\{\s*(?P<number>-?\d+)\s*\}"
+)
+@
+
+The last setting in the file wins, mirroring \LaTeX's own behaviour: this is
+precisely why \texttt{canvaslms.tex} places its \verb|\setsecnumdepth| after
+\verb|\usepackage{didactic}|, and a checker that took the first match would
+read the value the document deliberately overrode.
+
+<<functions>>=
+def read_secnumdepth(path):
+    """Return the numbering depth set by the document at `path`.
+
+    Returns None when the document sets no depth, or does not exist.
+    """
+    if not path.exists():
+        return None
+    depth = None
+    for line in path.read_text().splitlines():
+        for match in SECNUMDEPTH_RE.finditer(strip_comment(line)):
+            if match.group("name") is not None:
+                depth = SECNUMDEPTH_LEVELS.get(match.group("name"), depth)
+            else:
+                depth = int(match.group("number"))
+    return depth
+@
+
+The depth also has to be expressible on the command line, where a name is
+kinder to type than the integer it stands for, while the integer must stay
+available for a document that sets the counter directly.
+
+<<functions>>=
+def parse_depth(text):
+    """Return the numbering depth named or numbered by `text`."""
+    if text in SECNUMDEPTH_LEVELS:
+        return SECNUMDEPTH_LEVELS[text]
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(f"unknown numbering depth: {text}") from None
+
+
+def depth_name(depth):
+    """Return the sectioning name for `depth`, or its number as text."""
+    for name, level in SECNUMDEPTH_LEVELS.items():
+        if level == depth:
+            return name
+    return str(depth)
+@
+
+Let us verify that the depth is read the way the manual's own preamble is
+written---the package's setting first, the document's own setting after it, and
+the latter winning.
+
+<<test helpers>>=
+def write(tmp_path, text, name="chapter.nw"):
+  """Write `text` to a source file under `tmp_path` and return its path."""
+  path = tmp_path / name
+  path.write_text(text)
+  return path
+@
+
+<<test functions>>=
+def test_the_last_depth_setting_wins(tmp_path):
+  """The document's own setting overrides the one the package made."""
+  path = write(tmp_path, r"""
+\usepackage{didactic}
+\setsecnumdepth{subsection}
+\setsecnumdepth{subsubsection}
+""", name="master.tex")
+  assert read_secnumdepth(path) == 3
+
+def test_setcounter_spelling_is_understood(tmp_path):
+  """A document inheriting the raw counter must not be misread."""
+  path = write(tmp_path, r"\setcounter{secnumdepth}{2}", name="master.tex")
+  assert read_secnumdepth(path) == 2
+
+def test_a_commented_out_setting_is_ignored(tmp_path):
+  """A setting behind a percent sign has no effect on the document."""
+  path = write(tmp_path, "%\\setsecnumdepth{paragraph}\n", name="master.tex")
+  assert read_secnumdepth(path) is None
+
+def test_a_document_without_a_setting_reports_nothing(tmp_path):
+  """Absence is reported as None so the caller can apply its fallback."""
+  path = write(tmp_path, r"\documentclass{memoir}", name="master.tex")
+  assert read_secnumdepth(path) is None
+
+def test_depths_can_be_named_or_numbered():
+  """Both spellings reach the same integer."""
+  assert parse_depth("subsubsection") == parse_depth("3") == 3
+@
+
+\section{Recovering the prose from a literate source}
+\label{sec:lint:prose}
+
+A \texttt{.nw} file is not \LaTeX{}; it is \LaTeX{} interleaved with code, and
+the code is full of text that looks like markup but is not.
+Feeding the raw file to the scanner would produce nonsense, so each source is
+first reduced to the lines \texttt{noweave} would actually pass through to the
+document.
+Blank lines take the place of everything removed, so that every finding still
+carries the line number a reader can jump to.
+
+<<functions>>=
+def documentation_lines(text, *, noweb):
+    """Return the LaTeX prose of `text`, one entry per source line."""
+    lines = text.splitlines()
+    if noweb:
+        lines = without_quoted_code(without_code_chunks(lines))
+    return without_comments(without_verbatim(lines))
+@
+
+\subsection{Code chunks}
+\label{sec:lint:code-chunks}
+
+The most convincing argument for discarding code chunks is in the quizzes
+chapter (\cref{quizzes-command}), where the exporter \emph{writes} a manual of
+its own:
+
+\begin{verbatim}
+output_buffer.append(f"\\subsection{{{title}}}\\label{{{label}}}\n\n")
+\end{verbatim}
+
+That line defines no heading in this document, and a checker that believed it
+would report a label the reader can never see.
+Chunks are recognised the way \texttt{noweb} recognises them: a definition line
+opens one, and a line whose first character is \texttt{@}, followed by space or
+end of line, returns to documentation---carrying whatever else that line holds.
+
+The two patterns below have to write \texttt{noweb}'s own markup inside a
+\texttt{noweb} code chunk, so the opening angle brackets are escaped with
+\texttt{@} to keep \texttt{notangle} from reading them as a chunk reference.
+
+<<constants>>=
+CHUNK_START_RE = re.compile(r"^@<<.*>>=\s*$")
+CHUNK_END_RE = re.compile(r"^@(\s|$)")
+@
+
+<<functions>>=
+def without_code_chunks(lines):
+    """Blank the code chunks of a noweb source, keeping line numbers."""
+    prose = []
+    in_code = False
+    for line in lines:
+        if CHUNK_START_RE.match(line):
+            in_code = True
+            prose.append("")
+        elif in_code and CHUNK_END_RE.match(line):
+            in_code = False
+            prose.append(line[1:])
+        elif in_code:
+            prose.append("")
+        else:
+            prose.append(line)
+    return prose
+@
+
+\subsection{Verbatim examples}
+\label{sec:lint:verbatim}
+
+This chapter is its own best argument for discarding verbatim blocks too.
+\Cref{sec:lint:failure} displays a broken heading-and-label pair in order to
+explain the bug; without this step the checker would dutifully report its own
+illustration, and every attempt to document a cross-reference convention would
+trip the tool meant to enforce it.
+
+<<constants>>=
+VERBATIM_ENVIRONMENTS = ("verbatim", "Verbatim", "minted", "lstlisting")
+VERBATIM_BEGIN_RE = re.compile(
+    r"\\begin\{(" + "|".join(VERBATIM_ENVIRONMENTS) + r")\*?\}"
+)
+@
+
+<<functions>>=
+def without_verbatim(lines):
+    """Blank verbatim-like environments, keeping line numbers."""
+    prose = []
+    environment = None
+    for line in lines:
+        if environment is None:
+            begun = VERBATIM_BEGIN_RE.search(line)
+            environment = begun.group(1) if begun else None
+            prose.append("" if begun else line)
+        else:
+            if re.search(r"\\end\{" + environment + r"\*?\}", line):
+                environment = None
+            prose.append("")
+    return prose
+@
+
+\subsection{Quoted code and comments}
+\label{sec:lint:quotes}
+
+Two smaller reductions remain.
+\texttt{noweb}'s double-bracket quotes hold code, not markup, so prose that
+mentions a macro by quoting it must not be mistaken for a use of it---this
+chapter's own paragraphs would otherwise register as references.
+\LaTeX{} comments are dropped for the reason a compiler drops them: a
+commented-out reference points at nothing, and a commented-out heading numbers
+nothing.
+
+The comment rule respects the escaped percent sign, but not the rarer case of a
+literal backslash immediately before a real comment.
+Telling those apart needs a character-by-character walk over the escapes, and
+no source in this project writes the second.
+
+<<constants>>=
+QUOTED_CODE_RE = re.compile(r"\[\[.*?\]\]")
+COMMENT_RE = re.compile(r"(?<!\\)%.*$")
+@
+
+<<functions>>=
+def without_quoted_code(lines):
+    """Blank noweb's code quotes, which are not LaTeX markup."""
+    return [QUOTED_CODE_RE.sub("", line) for line in lines]
+
+
+def strip_comment(line):
+    """Return `line` without its trailing LaTeX comment."""
+    return COMMENT_RE.sub("", line)
+
+
+def without_comments(lines):
+    """Return `lines` with every LaTeX comment removed."""
+    return [strip_comment(line) for line in lines]
+@
+
+Let us verify that each of the four reductions hides what it should.
+Building the chunk delimiters in a helper keeps the escaping of
+\cref{sec:lint:code-chunks} in one place instead of in every test that needs a
+code chunk.
+
+<<test helpers>>=
+def chunk(name, *lines, ending="@"):
+  """Return a noweb code chunk called `name` with `lines` as its body."""
+  return "\n".join([f"@<<{name}>>=", *lines, ending, ""])
+@
+
+<<test functions>>=
+def test_a_heading_inside_a_code_chunk_is_invisible():
+  """LaTeX that a program prints is not LaTeX this document contains."""
+  text = chunk("[[export.py]]",
+               'buffer.append("\\\\subsection{X}\\\\label{sec:x}")')
+  assert documentation_lines(text, noweb=True) == ["", "", ""]
+
+def test_prose_after_the_at_sign_survives():
+  """A documentation chunk may start on the same line as its @."""
+  text = chunk("[[a.py]]", "pass", ending="@ \\label{sec:kept}")
+  assert "\\label{sec:kept}" in documentation_lines(text, noweb=True)[2]
+
+def test_a_verbatim_example_is_invisible():
+  """A displayed example must not be read as markup."""
+  text = "\\begin{verbatim}\n\\subsubsection{X}\n\\label{sec:x}\n" \
+         "\\end{verbatim}\n"
+  assert documentation_lines(text, noweb=True) == ["", "", "", ""]
+
+def test_a_quoted_macro_is_not_a_use_of_it():
+  """Prose that quotes a reference does not thereby make one."""
+  text = "We write [[\\cref{sec:x}]] to point at it.\n"
+  assert "cref" not in documentation_lines(text, noweb=True)[0]
+
+def test_a_commented_reference_is_invisible():
+  """A commented-out reference points at nothing."""
+  assert documentation_lines("% \\cref{sec:x}\n", noweb=True) == [""]
+@
+
+\section{Scanning for headings, labels and references}
+\label{sec:lint:scan}
+
+What the scanner produces is two lists: the labels, each remembering the
+heading it belongs to, and the references, each remembering the macro that made
+it.
+Recording the macro rather than a boolean keeps the finding messages able to
+name what they saw, and lets \cref{sec:lint:reference-kinds}'s distinction stay
+a property of the data instead of a decision taken at scan time.
+
+<<imports>>=
+import dataclasses
+import pathlib
+@
+
+<<data structures>>=
+@dataclasses.dataclass(frozen=True)
+class Heading:
+    """A sectioning command and the line it was found on."""
+
+    kind: str
+    line: int
+
+    @property
+    def level(self):
+        """The LaTeX sectioning level of this heading."""
+        return HEADING_LEVELS[self.kind]
+
+
+@dataclasses.dataclass(frozen=True)
+class Label:
+    """A label, and the heading it binds to when it binds to one."""
+
+    name: str
+    path: pathlib.Path
+    line: int
+    heading: Heading | None
+
+
+@dataclasses.dataclass(frozen=True)
+class Reference:
+    """One use of one label by one referencing macro."""
+
+    name: str
+    path: pathlib.Path
+    line: int
+    macro: str
+
+    @property
+    def prints_a_number(self):
+        """Whether this macro renders the target's counter."""
+        return self.macro in NUMBERED_REFERENCE_MACROS
+@
+
+The referencing macros are grouped by what they print rather than by which
+package defines them, since that is the only distinction the check cares about.
+The range forms of \texttt{cleveref} are separated out again because they take
+two arguments, and reading only the first would leave the far end of every
+range unchecked.
+
+<<constants>>=
+NUMBERED_REFERENCE_MACROS = (
+    "cref",
+    "Cref",
+    "crefrange",
+    "Crefrange",
+    "labelcref",
+    "autoref",
+    "eqref",
+    "ref",
+)
+SILENT_REFERENCE_MACROS = ("nameref", "Nameref", "pageref")
+RANGE_REFERENCE_MACROS = ("crefrange", "Crefrange")
+SINGLE_REFERENCE_MACROS = tuple(
+    macro
+    for macro in NUMBERED_REFERENCE_MACROS + SILENT_REFERENCE_MACROS
+    if macro not in RANGE_REFERENCE_MACROS
+)
+BINDING_BREAKERS = ("begin", "item", "caption")
+@
+
+All of it is recognised by a single expression, because the order in which the
+tokens appear on a line is what decides the binding: a label before a
+\verb|\begin| on the same line belongs to the heading above, one after it does
+not.
+Scanning with separate patterns would throw that ordering away.
+
+The alternatives are emitted longest first, so \verb|\subsubsection| is not
+consumed by the shorter \verb|\subsection| branch and \verb|\crefrange| reaches
+its two-argument branch instead of matching \verb|\cref| and failing.
+Sorting them rather than writing them out in a careful order means the
+constants above can stay grouped by meaning.
+
+<<pattern helpers>>=
+def alternatives(names):
+    """Return a regex alternation of `names`, longest first."""
+    return "|".join(sorted(names, key=len, reverse=True))
+@
+
+<<constants>>=
+TOKEN_RE = re.compile(
+    r"\\(?P<heading>" + alternatives(HEADING_LEVELS) + r")\*?\s*(?=[\[{])"
+    r"|\\label\s*\{(?P<label>[^}]*)\}"
+    r"|\\(?P<range_macro>" + alternatives(RANGE_REFERENCE_MACROS) + r")\*?"
+    r"\s*\{(?P<first>[^}]*)\}\s*\{(?P<last>[^}]*)\}"
+    r"|\\(?P<macro>" + alternatives(SINGLE_REFERENCE_MACROS) + r")\*?"
+    r"\s*\{(?P<targets>[^}]*)\}"
+    r"|\\(?P<breaker>" + alternatives(BINDING_BREAKERS) + r")\b"
+)
+@
+
+The scan itself is the binding rule of \cref{sec:lint:binding-question} written
+out: a heading arms the binding, a breaker disarms it, and a label does
+neither, so consecutive labels all bind to the same heading.
+
+<<functions>>=
+def scan(text, path):
+    """Return the (labels, references) of a LaTeX or noweb source.
+
+    `text` is the file's content and `path` is the name to report it by.
+    """
+    labels, references = [], []
+    heading = None
+    prose = documentation_lines(text, noweb=path.suffix == ".nw")
+    for number, line in enumerate(prose, 1):
+        for token in TOKEN_RE.finditer(line):
+            <<record what the token is>>
+    return labels, references
+@
+
+<<record what the token is>>=
+if token.group("heading"):
+    heading = Heading(token.group("heading"), number)
+elif token.group("label") is not None:
+    labels.append(Label(token.group("label").strip(), path, number, heading))
+elif token.group("breaker"):
+    heading = None
+else:
+    <<record a reference to every target named>>
+@
+
+A \verb|\cref| may name several targets at once, and a range names its two
+endpoints; flattening both into one reference per target lets everything
+downstream work with a single, simple kind of thing.
+
+<<record a reference to every target named>>=
+macro = token.group("macro") or token.group("range_macro")
+targets = token.group("targets")
+if targets is None:
+    targets = f"{token.group('first')},{token.group('last')}"
+for target in targets.split(","):
+    if target.strip():
+        references.append(Reference(target.strip(), path, number, macro))
+@
+
+Now let us verify the binding rule against the three shapes
+\cref{sec:lint:binding-question} discussed: the ordinary one, the
+consecutive-labels one that a first-match-wins rule would half-miss, and the
+list item that must not be mistaken for a heading label at all.
+
+<<test helpers>>=
+def scan_text(text, name="chapter.nw"):
+  """Scan `text` as though it were a source file called `name`."""
+  return scan(text, pathlib.Path(name))
+@
+
+<<test functions>>=
+def test_a_label_binds_to_the_heading_above_it():
+  labels, _ = scan_text("\\subsection{Title}\n\\label{sec:x}\n")
+  assert labels[0].heading.kind == "subsection"
+  assert labels[0].heading.level == 2
+
+def test_consecutive_labels_all_bind_to_the_same_heading():
+  """Both labels on a heading are at risk, so both must be examined."""
+  labels, _ = scan_text(
+    "\\section{Title}%\n\\label{search}\n\\label{filter}\n"
+  )
+  assert [label.name for label in labels] == ["search", "filter"]
+  assert all(label.heading.kind == "section" for label in labels)
+
+def test_a_list_item_label_is_not_a_heading_label():
+  """An enumerated step has a counter of its own and references correctly."""
+  labels, _ = scan_text(
+    "\\subsection{Title}\n\\begin{enumerate}\n\\item\\label{step} Do it\n"
+  )
+  assert labels[0].heading is None
+
+def test_every_target_of_a_cref_is_recorded():
+  _, references = scan_text("See \\cref{sec:a,sec:b}.\n")
+  assert [reference.name for reference in references] == ["sec:a", "sec:b"]
+
+def test_both_ends_of_a_range_are_recorded():
+  _, references = scan_text("See \\crefrange{sec:a}{sec:b}.\n")
+  assert [reference.name for reference in references] == ["sec:a", "sec:b"]
+
+def test_a_nameref_is_recorded_but_prints_no_number():
+  _, references = scan_text("See \\nameref{sec:a}.\n")
+  assert not references[0].prints_a_number
+@
+
+\section{The audit}
+\label{sec:lint:audit}
+
+A finding is deliberately one line of text with a file and a line number in
+front of it, the shape every editor and every \texttt{grep} pipeline already
+knows how to follow.
+
+<<data structures>>=
+@dataclasses.dataclass(frozen=True)
+class Finding:
+    """Something the audit wants a human to look at."""
+
+    severity: str
+    path: pathlib.Path
+    line: int
+    message: str
+
+    def __str__(self):
+        return f"{self.path}:{self.line}: {self.severity}: {self.message}"
+@
+
+The audit reads every source once, indexes the references by the name they
+point at, and then asks three questions of the result.
+
+<<imports>>=
+import collections
+@
+
+<<functions>>=
+def audit(paths, *, secnumdepth, report_unreferenced=False, root=None):
+    """Return the findings of auditing `paths` at depth `secnumdepth`.
+
+    `root` is the directory that findings are reported relative to.
+    """
+    labels, references = [], []
+    for path in paths:
+        found_labels, found_references = scan(
+            path.read_text(), display_path(path, root)
+        )
+        labels.extend(found_labels)
+        references.extend(found_references)
+    <<index the references by the label they name>>
+    findings = []
+    <<flag referenced headings that carry no number>>
+    <<flag references to labels that do not exist>>
+    <<flag labels that nothing refers to>>
+    return sorted(findings, key=lambda f: (str(f.path), f.line, f.message))
+
+
+def display_path(path, root):
+    """Return `path` relative to `root` when it lies below it."""
+    if root is None:
+        return path
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return path
+@
+
+Two indexes are needed rather than one, because the two questions differ:
+whether a label is \emph{at risk} depends only on the number-printing uses,
+while whether it is used at all counts every kind.
+
+<<index the references by the label they name>>=
+numbered_uses = collections.defaultdict(list)
+every_use = collections.defaultdict(list)
+for reference in references:
+    every_use[reference.name].append(reference)
+    if reference.prints_a_number:
+        numbered_uses[reference.name].append(reference)
+@
+
+The central question is the one from \cref{sec:lint:failure}.
+A deep label nobody points at is harmless---it prints nothing---so the error is
+reserved for the combination, and the message names the sites so that the
+reader can judge the damage without running a search of their own.
+
+<<flag referenced headings that carry no number>>=
+for label in labels:
+    if label.heading is None or label.heading.level <= secnumdepth:
+        continue
+    uses = numbered_uses[label.name]
+    if not uses:
+        continue
+    sites = ", ".join(f"{use.path}:{use.line}" for use in uses)
+    findings.append(
+        Finding(
+            "error",
+            label.path,
+            label.line,
+            f"label {label.name!r} is on a \\{label.heading.kind}, which is "
+            f"unnumbered at secnumdepth {secnumdepth} "
+            f"({depth_name(secnumdepth)}); "
+            f"{len(uses)} reference(s) print the enclosing number: {sites}",
+        )
+    )
+@
+
+A reference to a label no source defines is a different fault with the same
+cause---usually a label renamed while one of its uses was missed---and \LaTeX{}
+reports it only as a question mark in the output.
+Since the audit has already collected every label in the tree, catching it
+costs one comparison.
+
+<<flag references to labels that do not exist>>=
+defined = {label.name for label in labels}
+for reference in references:
+    if reference.name not in defined:
+        findings.append(
+            Finding(
+                "error",
+                reference.path,
+                reference.line,
+                f"reference to undefined label {reference.name!r}",
+            )
+        )
+@
+
+The third question is the one the original audit answered with a long list of
+harmless leftovers.
+An unreferenced label is not an error---it may be a deliberate anchor for a
+chapter not yet written---so it is reported only when asked for, and never
+affects the exit status.
+
+<<flag labels that nothing refers to>>=
+if report_unreferenced:
+    for label in labels:
+        if not every_use[label.name]:
+            findings.append(
+                Finding(
+                    "info",
+                    label.path,
+                    label.line,
+                    f"label {label.name!r} is never referenced",
+                )
+            )
+@
+
+Now let us verify the audit, and in particular that one and the same source is
+judged differently at different depths---which is the whole reason the depth is
+read from the document instead of assumed.
+
+<<test helpers>>=
+def audit_text(tmp_path, text, *, secnumdepth=3, **kwargs):
+  """Audit `text` as a single source file and return the findings."""
+  return audit([write(tmp_path, text)], secnumdepth=secnumdepth, **kwargs)
+
+def errors(findings):
+  """Return only the findings that make the lint fail."""
+  return [finding for finding in findings if finding.severity == "error"]
+@
+
+<<test functions>>=
+REFERENCED_SUBSUBSECTION = """
+\\section{Enclosing}
+\\label{sec:enclosing}
+\\subsubsection{Deep}
+\\label{sec:deep}
+See \\cref{sec:deep} and \\cref{sec:enclosing}.
+"""
+
+def test_a_referenced_subsubsection_is_fine_when_numbered(tmp_path):
+  """At subsubsection depth the label has a counter of its own."""
+  findings = audit_text(tmp_path, REFERENCED_SUBSUBSECTION, secnumdepth=3)
+  assert errors(findings) == []
+
+def test_the_same_source_breaks_at_subsection_depth(tmp_path):
+  """The failure the manual used to have, reproduced by lowering the depth."""
+  findings = audit_text(tmp_path, REFERENCED_SUBSUBSECTION, secnumdepth=2)
+  assert len(errors(findings)) == 1
+  assert "sec:deep" in errors(findings)[0].message
+
+def test_a_referenced_paragraph_is_an_error(tmp_path):
+  """A paragraph is unnumbered at every depth this manual would choose."""
+  findings = audit_text(tmp_path, """
+\\subsection{Enclosing}
+\\paragraph{Deep}
+\\label{sec:deep}
+See \\cref{sec:deep}.
+""")
+  assert len(errors(findings)) == 1
+  assert "\\paragraph" in errors(findings)[0].message
+
+def test_a_nameref_to_a_deep_label_is_accepted(tmp_path):
+  """The sanctioned workaround must not be reported as the bug."""
+  findings = audit_text(tmp_path, """
+\\subsection{Enclosing}
+\\paragraph{Deep}
+\\label{sec:deep}
+See \\nameref{sec:deep}.
+""")
+  assert errors(findings) == []
+
+def test_an_unreferenced_deep_label_is_not_an_error(tmp_path):
+  """A label nobody points at prints nothing, so it breaks nothing."""
+  findings = audit_text(tmp_path, """
+\\subsection{Enclosing}
+\\paragraph{Deep}
+\\label{sec:deep}
+""")
+  assert errors(findings) == []
+
+def test_an_unreferenced_label_is_reported_on_request(tmp_path):
+  findings = audit_text(tmp_path, """
+\\section{Alone}
+\\label{sec:alone}
+""", report_unreferenced=True)
+  assert [finding.severity for finding in findings] == ["info"]
+
+def test_a_reference_to_nothing_is_an_error(tmp_path):
+  findings = audit_text(tmp_path, "See \\cref{sec:typo}.\n")
+  assert len(errors(findings)) == 1
+  assert "undefined" in errors(findings)[0].message
+@
+
+\section{Choosing what to audit}
+\label{sec:lint:files}
+
+Left to itself the script audits the whole repository, because the bug is a
+property of the document as a whole: a label in one chapter is referenced from
+another, and a check that saw only one file could not tell a deep label from an
+undefined one.
+
+The patterns name the hand-written sources.
+\texttt{src} is searched recursively because the package is a tree; the other
+two are not, which is what keeps the \texttt{didactic} submodule under
+\texttt{doc} out of the audit---its sources belong to another project and are
+not part of this document.
+
+<<constants>>=
+SOURCE_PATTERNS = ("src/**/*.nw", "tests/*.nw", "doc/*.nw", "doc/*.tex")
+@
+
+One filter is still needed.
+\texttt{doc} holds both hand-written \texttt{.tex} files and the ones
+\texttt{noweave} produces from the \texttt{.nw} sources beside them, and
+auditing both would report every label in those chapters as its own duplicate,
+while pointing the findings at a generated file nobody can edit.
+A \texttt{.tex} with a \texttt{.nw} of the same name is therefore taken to be
+that file's weave.
+
+<<functions>>=
+def is_woven(path):
+    """Return whether `path` was woven from a noweb source beside it."""
+    return path.suffix == ".tex" and path.with_suffix(".nw").exists()
+
+
+def source_files(root):
+    """Return the manual's hand-written sources below `root`."""
+    paths = []
+    for pattern in SOURCE_PATTERNS:
+        paths.extend(sorted(root.glob(pattern)))
+    return [path for path in paths if not is_woven(path)]
+@
+
+<<test functions>>=
+def test_a_woven_tex_file_is_not_audited(tmp_path):
+  """Auditing a chapter and its weave would duplicate every label."""
+  (tmp_path / "doc").mkdir()
+  (tmp_path / "doc" / "intro.nw").write_text("")
+  (tmp_path / "doc" / "intro.tex").write_text("")
+  (tmp_path / "doc" / "preamble.tex").write_text("")
+  found = [path.name for path in source_files(tmp_path)]
+  assert found == ["intro.nw", "preamble.tex"]
+@
+
+\section{The command line}
+\label{sec:lint:cli}
+
+The interface is small: where the repository is, how deep the numbering goes,
+and whether to mention unused labels.
+The depth is an option rather than a constant so that the checker can be
+pointed at an older revision of the sources, where the document was configured
+differently---which is how the eleven labels of \cref{sec:lint:failure} can
+still be demonstrated today.
+
+<<imports>>=
+import argparse
+import sys
+@
+
+<<constants>>=
+DEFAULT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+@
+
+<<functions>>=
+def parse_arguments(argv=None):
+    """Return the parsed command line."""
+    parser = argparse.ArgumentParser(
+        description="Check that cross-referenced headings are numbered."
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        type=pathlib.Path,
+        help="sources to audit (default: every source in the repository)",
+    )
+    parser.add_argument(
+        "-r",
+        "--root",
+        type=pathlib.Path,
+        default=DEFAULT_ROOT,
+        help="repository root (default: the one this script lives in)",
+    )
+    parser.add_argument(
+        "-d",
+        "--secnumdepth",
+        help="numbering depth, named or numbered "
+        f"(default: as set in {MASTER_DOCUMENT})",
+    )
+    parser.add_argument(
+        "-u",
+        "--unreferenced",
+        action="store_true",
+        help="also report labels that nothing references",
+    )
+    return parser.parse_args(argv)
+@
+
+What remains is the assembly: settle the depth, choose the files, audit them,
+print the result.
+
+<<functions>>=
+def main(argv=None):
+    """Audit the manual; return 0 when it is clean and 1 when it is not."""
+    options = parse_arguments(argv)
+    <<settle the numbering depth>>
+    paths = options.files or source_files(options.root)
+    findings = audit(
+        paths,
+        secnumdepth=secnumdepth,
+        report_unreferenced=options.unreferenced,
+        root=options.root,
+    )
+    <<print the findings and choose the exit status>>
+@
+
+The fallback of \cref{sec:lint:depth-question} is announced rather than applied
+silently, because a checker running against a document it could not read is
+exactly the situation in which a clean report means least.
+
+<<settle the numbering depth>>=
+if options.secnumdepth is not None:
+    secnumdepth = parse_depth(options.secnumdepth)
+else:
+    secnumdepth = read_secnumdepth(options.root / MASTER_DOCUMENT)
+    if secnumdepth is None:
+        print(
+            f"warning: no numbering depth found in {MASTER_DOCUMENT}; "
+            f"assuming memoir's default, "
+            f"{depth_name(MEMOIR_DEFAULT_SECNUMDEPTH)}",
+            file=sys.stderr,
+        )
+        secnumdepth = MEMOIR_DEFAULT_SECNUMDEPTH
+@
+
+Findings go to standard output so that they can be piped, and the verdict to
+standard error so that piping the findings does not swallow it.
+Only errors change the exit status; the informational findings are advice.
+
+<<print the findings and choose the exit status>>=
+for finding in findings:
+    print(finding)
+failures = [finding for finding in findings if finding.severity == "error"]
+if failures:
+    print(f"{len(failures)} broken cross-reference(s)", file=sys.stderr)
+    return 1
+return 0
+@
+
+\section{Guarding the manual from the test suite}
+\label{sec:lint:regression}
+
+The checker is wired in twice.
+\texttt{make lint} in \texttt{doc} runs it directly, which is what a
+contributor reaches for while editing; and the test below runs the same audit
+over this repository as part of the ordinary \texttt{pytest} run, which is what
+actually stops a regression, since that is the check nobody has to remember to
+invoke.
+
+The test reads the depth from the master document rather than naming a number,
+so that raising or lowering the numbering stays a one-line change in
+\texttt{canvaslms.tex}---the test follows the document instead of contradicting
+it.
+
+<<test functions>>=
+def test_the_manual_has_no_broken_cross_references():
+  """Every referenced heading in this repository is numbered."""
+  depth = read_secnumdepth(DEFAULT_ROOT / MASTER_DOCUMENT)
+  assert depth is not None, f"no numbering depth in {MASTER_DOCUMENT}"
+  findings = audit(
+    source_files(DEFAULT_ROOT), secnumdepth=depth, root=DEFAULT_ROOT
+  )
+  assert errors(findings) == [], "\n".join(
+    str(finding) for finding in errors(findings)
+  )
+@
+
+\section{What this check does not catch}
+\label{sec:lint:limitations}
+
+Three limitations are worth stating, all of them consequences of choices made
+earlier.
+
+\begin{description}
+\item[Labels behind an environment] A label separated from its heading by a
+  \verb|\begin| is left alone, per \cref{sec:lint:binding-question}.  In
+  \LaTeX{} it may still belong to the heading; here it is assumed to belong to
+  something with a counter of its own.
+\item[Duplicate labels] Two labels with the same name are a genuine fault, but
+  one \LaTeX{} does warn about, so the checker leaves it to the build.
+\item[Labels defined outside the sources] A reference to a label that a package
+  defines would be reported as undefined.  No such reference exists in this
+  manual, and adding one would be unusual enough to deserve the reminder.
+\end{description}

@@ -52,6 +52,7 @@ canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cache.tex
 canvaslms.pdf: ${TEST_DIR}/conftest.tex
+canvaslms.pdf: lint.tex
 
 canvaslms.pdf: src
 
@@ -64,6 +65,15 @@ src:
 
 # Introduction chapter
 intro.tex: intro.nw
+
+# Cross-reference lint - both the chapter and the script it explains.
+# `make lint` audits the sources; the same audit also runs as a unit test.
+lint.tex: lint.nw
+lint.py: lint.nw
+
+.PHONY: lint
+lint: lint.py
+	python3 lint.py
 
 # Example scripts - tangled from intro.nw
 examples:
@@ -78,6 +88,7 @@ ${EXAMPLES}: intro.nw | examples
 clean:
 	${RM} canvaslms.pdf
 	${RM} intro.tex
+	${RM} lint.tex lint.py
 	${RM} -r examples
 	${RM} -r __pycache__
 

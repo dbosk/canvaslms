@@ -32,7 +32,9 @@ The cache persistence mechanism works as follows:
 \item If it does, we decrypt and unpickle it using the Canvas token as the key.
 \item If not, we create a new Canvas object from the API.
 \item After each command completes, we save the Canvas object to the cache.
-\item The cache is stored in the user's cache directory (from [[appdirs]]).
+\item The cache is stored in the user's cache directory, which we take from
+the package-level [[dirs]] instance (\cref{sec:shared-appdirs}) so that this
+cache and the attachment store share one directory.
 \item We provide [[cache clear]] and [[cache clear-attachments]] subcommands.
 \end{enumerate}
 
@@ -46,7 +48,6 @@ inaccessible (which is correct behavior, as it's tied to a specific account).
 <<[[cache.py]]>>=
 """Cache persistence with authenticated encryption"""
 
-import appdirs
 import base64
 from canvasapi import Canvas
 from cryptography.hazmat.primitives import hashes
@@ -61,6 +62,7 @@ import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from canvaslms import dirs
 import canvaslms.hacks.attachment_cache as attachment_cache
 from canvaslms.hacks.canvasapi import (
     SUBMISSION_TTL_MINUTES,
@@ -70,7 +72,6 @@ from canvaslms.hacks.canvasapi import (
 )
 
 logger = logging.getLogger(__name__)
-dirs = appdirs.AppDirs("canvaslms", "dbosk@kth.se")
 
 <<constants>>
 <<classes and exceptions>>
@@ -87,6 +88,7 @@ the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
 <<test [[cache.py]]>>=
 """Tests for cache-backed Canvas loading."""
 
+import pathlib
 import pytest
 
 import canvaslms.cli.cache as cache
@@ -340,12 +342,25 @@ The cache is stored in the user's cache directory with a filename based on the
 Canvas hostname.
 This allows us to maintain separate caches for different Canvas instances
 (e.g., production vs. test servers).
+
+The fixed prefix and suffix around the hostname are constants rather than
+literals inside [[get_cache_path]], because this function is not the only
+place that needs the naming pattern.
+Anything that has to recognise a cache file without being told which host it
+belongs to---clearing the cache is the case we meet below---can only go by
+that pattern.
+A pattern spelled out in two places drifts as soon as either changes, and the
+reader would then either miss cache files or match files it must not touch;
+naming it once makes the writer and the reader provably agree.
+<<constants>>=
+CACHE_FILE_PREFIX = "canvas_cache_"
+CACHE_FILE_SUFFIX = ".enc"
 <<functions>>=
 def get_cache_path(hostname):
   """Returns the path to the cache file for a given hostname"""
   # Create a safe filename from the hostname
   safe_hostname = hostname.replace("://", "_").replace("/", "_")
-  cache_file = f"canvas_cache_{safe_hostname}.enc"
+  cache_file = f"{CACHE_FILE_PREFIX}{safe_hostname}{CACHE_FILE_SUFFIX}"
   return os.path.join(dirs.user_cache_dir, cache_file)
 @
 
@@ -647,6 +662,85 @@ def clear_cache(hostname):
     return False
 @
 
+That covers the case where we know which host to clear for.
+But cache files outlive credentials: a user who revoked their token, lost
+their keyring, or wiped their configuration still has cache files on disk,
+and no configured hostname to name them by.
+That is not an exotic situation---it is one of the main reasons to clear a
+cache in the first place---so we also support clearing every host at once.
+
+The sweep is deliberately narrow rather than a directory wipe.
+The cache directory is shared: the attachment store lives there too, and on
+some platforms so do other applications' files.
+We therefore look only in the directory [[get_cache_path]] writes to, and only
+at names built from the same prefix and suffix, so the sweep can only ever
+delete files this module created.
+
+Names that match but cannot be removed (a directory that happens to fit the
+pattern, a file owned by someone else) are logged and skipped.
+Aborting on the first such file would leave the user with a half-cleared cache
+and no way to finish the job, which is the opposite of what the command is for.
+<<functions>>=
+def clear_all_caches():
+  """Clears the cache of every hostname, returns the number of files removed"""
+  cache_dir = pathlib.Path(dirs.user_cache_dir)
+  removed = 0
+
+  for path in cache_dir.glob(f"{CACHE_FILE_PREFIX}*{CACHE_FILE_SUFFIX}"):
+    try:
+      path.unlink()
+      removed += 1
+    except OSError as error:
+      logger.warning(f"could not remove {path}: {error}")
+
+  return removed
+@
+
+Let's verify the two properties the sweep rests on: that it removes the cache
+of every host, and that it leaves everything else in the shared cache
+directory alone.
+We also check that an empty cache directory is reported as zero removals
+rather than treated as a failure, since the command must succeed when there is
+nothing to clear.
+
+<<test functions>>=
+@pytest.fixture
+def tmp_cache_dir(monkeypatch, tmp_path):
+  """Redirect the cache directory to a temporary path."""
+  import types
+
+  monkeypatch.setattr(cache, "dirs",
+                      types.SimpleNamespace(user_cache_dir=str(tmp_path)))
+  return tmp_path
+
+def write_cache_file(hostname):
+  """Create a cache file for hostname the way the module would name it."""
+  path = pathlib.Path(cache.get_cache_path(hostname))
+  path.write_bytes(b"encrypted cache")
+  return path
+
+def test_clear_all_caches_removes_every_host(tmp_cache_dir):
+  """Cache files of all hosts should be removed."""
+  write_cache_file("https://one.example.com")
+  write_cache_file("https://two.example.com")
+
+  assert cache.clear_all_caches() == 2
+  assert list(tmp_cache_dir.iterdir()) == []
+
+def test_clear_all_caches_spares_unrelated_files(tmp_cache_dir):
+  """Files not matching the cache naming pattern should survive."""
+  bystander = tmp_cache_dir / "attachments.db"
+  bystander.write_bytes(b"not a Canvas cache")
+  write_cache_file("https://one.example.com")
+
+  assert cache.clear_all_caches() == 1
+  assert bystander.exists()
+
+def test_clear_all_caches_with_nothing_to_clear(tmp_cache_dir):
+  """An empty cache directory should yield zero removals, not an error."""
+  assert cache.clear_all_caches() == 0
+@
+
 
 \section{The cache command and subcommands}
 
@@ -719,23 +813,147 @@ clear_parser = cache_subp.add_parser(
 clear_parser.set_defaults(func=clear_command)
 @
 
+The command used to require a configured hostname: with none, it aborted with
+\enquote{No hostname configured, run [[canvaslms login]]}.
+That turned away the very users who need it most.
+Clearing the cache is a local file operation that never contacts Canvas, so
+making it depend on credentials means a user who cleared their credentials, or
+never had a working keyring, cannot clean up the files an earlier install left
+behind---and is told to log in to delete files that logging in would not touch.
+
+A missing hostname therefore selects the sweep from above instead of an error.
+The hostname is not a permission to delete; it is only the piece of
+information that narrows \emph{which} cache file to delete, and without it the
+honest interpretation of [[cache clear]] is \enquote{clear the caches}.
+
+We discard the token that [[load_credentials]] returns alongside the hostname.
+Everywhere else in this module the token is the key that decrypts a cache
+file, so binding it to a name here would suggest this command reads one---but
+clearing only unlinks files, and never needs to open them.
+Discarding it into [[_]] states that at the call site.
+
 <<functions>>=
 def clear_command(config, canvas, args):
   """Clears the Canvas cache"""
   import canvaslms.cli.login
-  hostname, token = canvaslms.cli.login.load_credentials(config)
+  hostname, _ = canvaslms.cli.login.load_credentials(config)
 
-  if not hostname:
-    import canvaslms.cli
-    canvaslms.cli.err(1, "No hostname configured, run `canvaslms login`")
-
-  if "://" not in hostname:
-    hostname = f"https://{hostname}"
-
-  if clear_cache(hostname):
-    logger.info(f"Cache cleared for {hostname}")
+  if hostname:
+    <<clear the configured host's cache>>
   else:
-    logger.info(f"No cache found for {hostname}")
+    <<clear the caches of all hosts>>
+@
+
+Both branches print their report to standard output.
+Deleting files is this command's entire effect, and it leaves nothing behind
+for the user to look at afterwards, so the report \emph{is} the result---the
+same role the printed listing plays for [[courses]] or [[users]].
+That is the line this project draws: results go to stdout, diagnostics go to
+the logger.
+
+The reporting used to go through [[logger.info]], which put it on the wrong
+side of that line.
+The logger is filtered to [[WARNING]] by default, so [[canvaslms cache clear]]
+printed nothing at all unless the user thought to add [[-v]]---and a command
+whose only output is suppressed by default cannot be told apart from one that
+silently did nothing.
+The sibling [[cache clear-attachments]] already printed its report, so the two
+[[cache]] subcommands disagreed about whether to say anything.
+
+Genuine diagnostics stay with the logger: [[clear_all_caches]] still logs a
+warning for each file it could not remove, because that is information about
+how the sweep went rather than what the command achieved.
+
+With a hostname we behave exactly as before.
+The scheme prefix is part of the cache file name and [[login]] happily stores
+a bare host name, so the hostname has to be normalized before we derive the
+path.
+We normalize through [[normalize_hostname]] rather than repeating the test
+here: the loader ran the hostname through that same function before writing
+the cache, so sharing it is what guarantees that the name we delete is the
+name that was written.
+<<clear the configured host's cache>>=
+hostname = normalize_hostname(hostname)
+
+if clear_cache(hostname):
+  print(f"Cache cleared for {hostname}")
+else:
+  print(f"No cache found for {hostname}")
+@
+
+Without one we sweep, and report how many files went.
+Neither branch fails when there was nothing to remove: an already-empty cache
+is the state the user asked for, and scripts that clear the cache before a run
+should not have to distinguish \enquote{cleared} from \enquote{already clear}.
+Both outcomes are still reported, though, so that the user can tell which one
+they got.
+<<clear the caches of all hosts>>=
+removed = clear_all_caches()
+
+if removed:
+  print(f"Cleared {removed} cache file(s) in {dirs.user_cache_dir}")
+else:
+  print(f"No cache files found in {dirs.user_cache_dir}")
+@
+
+Let's verify both branches, since the choice between them is the whole point
+of the command's structure.
+Without credentials every cache file must go; with credentials only the
+configured host's file may go, even when it was configured without a scheme.
+
+Each branch also has to say what it did, on stdout, without the user asking
+for extra verbosity.
+We assert that through [[capsys]] rather than [[caplog]], which is what makes
+these tests notice a regression back to logger-only reporting: the default
+[[WARNING]] threshold would swallow the message, and the command would go
+silent again while its file-level assertions still passed.
+
+<<test functions>>=
+def test_clear_command_without_hostname_clears_all(
+    tmp_cache_dir, monkeypatch, capsys):
+  """Without a configured hostname, all cache files should be cleared."""
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: (None, None),
+  )
+  write_cache_file("https://one.example.com")
+  write_cache_file("https://two.example.com")
+
+  cache.clear_command({}, None, None)
+
+  assert list(tmp_cache_dir.iterdir()) == []
+  assert "2 cache file(s)" in capsys.readouterr().out
+
+def test_clear_command_with_hostname_spares_other_hosts(
+    tmp_cache_dir, monkeypatch, capsys):
+  """With a configured hostname, only that host's cache should be cleared."""
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: ("one.example.com", "token"),
+  )
+  cleared = write_cache_file("https://one.example.com")
+  spared = write_cache_file("https://two.example.com")
+
+  cache.clear_command({}, None, None)
+
+  assert not cleared.exists()
+  assert spared.exists()
+  assert "one.example.com" in capsys.readouterr().out
+
+def test_clear_command_reports_when_there_was_nothing_to_clear(
+    tmp_cache_dir, monkeypatch, capsys):
+  """An empty cache directory should still produce a report, not silence."""
+  monkeypatch.setattr(
+      canvaslms.cli.login,
+      "load_credentials",
+      lambda config: (None, None),
+  )
+
+  cache.clear_command({}, None, None)
+
+  assert "No cache files found" in capsys.readouterr().out
 @
 
 \subsection{The cache clear-attachments subcommand}

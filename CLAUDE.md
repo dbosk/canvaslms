@@ -605,6 +605,45 @@ make clean         # Removes generated files
 - `src/canvaslms/__init__.py` is generated from `src/canvaslms/canvaslms.nw` via intermediate `init.py`
 - `cli/__init__.py` is generated from `cli.nw` via intermediate `cli.py`
 
+### Submodules Required for Building
+
+A fresh clone or **git worktree** has no initialized submodules, and the
+failures this causes are cryptic:
+
+```bash
+# Required for ANY make (tangling/weaving):
+git submodule update --init makefiles
+
+# Additionally required for building the manual (make -C doc):
+git submodule update --init doc/didactic
+```
+
+`doc/Makefile` includes `didactic/didactic.mk`, so without the `doc/didactic`
+submodule **every** doc target fails — even targets that have no didactic
+dependency — because the missing include aborts the Makefile before any
+target runs.
+
+**Worktree/venv trap**: after initializing submodules in a worktree you must
+tangle the *whole* source tree (`make -C src/canvaslms all` plus the `cli`,
+`hacks` and `grades` Makefiles) before running tests. Without the generated
+top-level `src/canvaslms/__init__.py`, the worktree's `src/canvaslms` is only
+a PEP 420 namespace-package portion, and `PYTHONPATH=$PWD/src` silently loses
+to the main checkout's installed package — the tests then run against the
+main repo's code while appearing green. Always verify with
+`python -c "import canvaslms.cli; print(canvaslms.cli.__file__)"` that the
+printed path is inside the worktree.
+
+### LaTeX Numbering and didactic.sty
+
+`didactic.sty` (the `doc/didactic` submodule) unconditionally executes
+`\setsecnumdepth{subsection}` and `\maxtocdepth{subsection}` at load time.
+Any `\setsecnumdepth`/`\maxtocdepth` the document needs (the manual uses
+`\setsecnumdepth{subsubsection}` so `\cref` can target subsubsection labels)
+**must come after** `\usepackage{didactic}` in `doc/canvaslms.tex` — set
+before it, the value is silently overridden. A `\label` on a heading deeper
+than the effective `secnumdepth` binds to the enclosing numbered heading, so
+`\cref` prints the wrong number (see issue #381).
+
 ## Code Structure
 
 ### Directory Layout

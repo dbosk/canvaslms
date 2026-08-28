@@ -35,8 +35,6 @@ import arrow
 import re
 import textwrap
 
-DEFAULT_COURSE_REGEX = '.*'
-
 <<functions>>
 
 def add_command(subp):
@@ -84,7 +82,7 @@ def add_calendar_list_command(subp):
       "With -b/--bookings, output is one line per booked student and one line "
       "for free slots.")
   calendar_list_parser.set_defaults(func=calendar_list_command)
-  courses.add_course_option(calendar_list_parser)
+  courses.add_course_option(calendar_list_parser, default=None)
   <<add calendar list arguments>>
 
 def calendar_list_command(config, canvas, args):
@@ -134,42 +132,66 @@ def add_time_filtering_arguments(parser):
 add_time_filtering_arguments(calendar_list_parser)
 @
 
-When we process these, we want the [[--on]] option to override the start/end 
+When we process these, we want the [[--on]] option to override the start/end
 options.
 When we use [[--on]], we use the start and end to be the same.
-This works with Canvas, which includes events that start or end within the 
+This works with Canvas, which includes events that start or end within the
 given range---that is, a minimal window, as expected.
+A bare date names no time of day, so there the window is the whole day it
+names: from when that day begins to when the next one does.
+
+Which clock those wall-clock readings are read from is not a question we may
+leave to [[arrow]].
+Handed a format string and nothing else, [[arrow.get]] reads the result as
+UTC---and the very default we print into the help text,
+[[arrow.now().format('YYYY-MM-DD HH:mm')]], is a reading of the \emph{local}
+clock, so the parse contradicted the value it was parsing and asked Canvas
+for a window displaced by the user's own offset.
+Naming the zone settles that, and the zone we name is
+[[utils.local_timezone()]] rather than [[arrow]]'s [[tzinfo='local']]:
+\cref{sec:utils:local-zone} explains why the latter is an offset sampled when
+the command runs rather than a zone that answers per instant, which for a
+window on the far side of a daylight-saving transition is an hour wrong.
+
+What we hand onwards is the instant, not its printed form.
+The parses used to end in [[.to('utc').format()]], and the chunk then passed
+those strings to [[format_canvas_time]], which parsed them right back---a
+round trip through text that arrived where it started, while costing the
+[[--on]] branch the ability to say [[shift(days=1)]] on a value it had
+already flattened into a string.
+Formatting once, where the values leave for Canvas, keeps the conversion at
+that boundary; [[calendar create]] treats its own instants the same way in
+[[<<parse start and end times>>]].
 <<determine [[start_time]] and [[end_time]] from [[args]]>>=
 if args.on:
   try:
-    start_time = arrow.get(args.on, 'YYYY-MM-DD HH:mm').to('utc')
+    start_time = arrow.get(args.on, 'YYYY-MM-DD HH:mm',
+                           tzinfo=utils.local_timezone())
     end_time = start_time
   except Exception:
     try:
-      start_time = arrow.get(args.on, 'YYYY-MM-DD').to('utc')
+      start_time = arrow.get(args.on, 'YYYY-MM-DD',
+                             tzinfo=utils.local_timezone())
       end_time = start_time.shift(days=1)
     except Exception as e:
       canvaslms.cli.err(1, f"Invalid date format for --on: {e}")
-
-  start_time = start_time.format()
-  end_time = end_time.format()
 else:
   try:
-    start_time = arrow.get(args.start_time,
-                          'YYYY-MM-DD HH:mm').to('utc').format()
+    start_time = arrow.get(args.start_time, 'YYYY-MM-DD HH:mm',
+                           tzinfo=utils.local_timezone())
   except:
     try:
-      start_time = arrow.get(args.start_time,
-                            'YYYY-MM-DD').to('utc').format()
+      start_time = arrow.get(args.start_time, 'YYYY-MM-DD',
+                             tzinfo=utils.local_timezone())
     except Exception as e:
       canvaslms.cli.err(1, f"Invalid date format for --start-time: {e}")
   try:
-    end_time = arrow.get(args.end_time,
-                        'YYYY-MM-DD HH:mm').to('utc').format()
+    end_time = arrow.get(args.end_time, 'YYYY-MM-DD HH:mm',
+                         tzinfo=utils.local_timezone())
   except:
     try:
-      end_time = arrow.get(args.end_time,
-                          'YYYY-MM-DD').to('utc').format()
+      end_time = arrow.get(args.end_time, 'YYYY-MM-DD',
+                           tzinfo=utils.local_timezone())
     except Exception as e:
       canvaslms.cli.err(1, f"Invalid date format for --end-time: {e}")
 
@@ -183,18 +205,53 @@ end_time = utils.format_canvas_time(end_time)
 
 If a course is specified, we get events for that course context.
 Otherwise, we get all events for the user.
+Both readings are legitimate, so the reading commands must be able to tell
+the two apart---and that turns out to be harder than it looks.
 
-The course option defaults to the regex [[.*]].
-We treat this default as \emph{no explicit course filter} and omit any
-context-code parameter, letting Canvas decide which calendars to include.
+The course option used to default to the match-all regex [[.*]], and the
+command recovered the user's intent by comparing [[args.course]] against
+that default: a regex that differed from [[.*]] was a filter, anything
+else was no filter at all.
+But the comparison reads a string, and a string cannot say where it came
+from.
+Somebody who writes
+\begin{center}
+  [[canvaslms calendar list -c '.*']]
+\end{center}
+is asking for the events of every course they are enrolled in---a request
+that names those courses to Canvas as context codes---yet argparse hands
+the command exactly the [[args]] it hands a user who wrote no [[-c]] at
+all.
+The comparison therefore threw the explicit request away without a word.
+
+[[calendar create]] ran into the same wall first, and at higher stakes
+(\cref{sec:calendar:create-course-default}), so we reuse the mechanism it
+introduced.
+Since the distinction cannot live in the value, it lives in the default:
+both reading commands register the option with [[default=None]], and then
+[[args.course]] is a string exactly when the user named courses.
+An absent [[-c]] leaves it [[None]], and we then omit any context-code
+parameter and let Canvas decide which calendars to include---the behaviour
+the old default produced---while an explicit regex, [[.*]] included, is
+honoured as the filter it is.
+
+Honouring it can now fail where ignoring it could not.
+Canvas accepts at most ten context codes per request, so
+[[-c '.*']] from a user enrolled in more courses than that stops the
+command (\cref{sec:calendar:context-code-limit}) where the old default
+quietly listed something else instead.
+That is the better failure: the request the user made is one Canvas cannot
+express, and saying so is more useful than substituting a different
+request under the same name.
 <<process course option for calendar list>>=
 course_list = None
-if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+if args.course:
   course_list = courses.process_course_option(canvas, args)
 @
 
 
 \section{Getting and outputting calendar events}
+\label{sec:calendar:context-code-limit}
 
 We fetch the calendar events and output them in CSV format.
 
@@ -419,7 +476,7 @@ def calendar_view_command(config, canvas, args):
 The view command matches events by regex and dates rather than requiring an event ID. If no filters are provided, it searches the coming week and shows the first event. Use --count/-n to show more than one event.
 <<add calendar view arguments>>=
 # Regex to match course
-courses.add_course_option(calendar_view_parser)
+courses.add_course_option(calendar_view_parser, default=None)
 # Regex to match against event title/description
 calendar_view_parser.add_argument("--match",
   help="Regular expression to match against event title and description")
@@ -439,14 +496,27 @@ calendar_view_parser.add_argument("--count", "-n", type=int, default=1,
        "set to 0 to show all matches")
 @
 
-We fetch events in the requested date window, filter them by regex (if provided), sort by start time, and print up to the requested count.
+We fetch events in the requested date window, filter them by regex (if
+provided), sort by start time, print up to the requested count---and then say
+how many matches that count left out.
+
+The course selection is read the same way as in [[calendar list]]
+(\cref{sec:calendar:course-default}): a [[None]] means no [[-c]] was given
+and we ask Canvas for the user's calendars unrestricted, while any regex
+the user did write becomes context codes.
+Restricting the request is not the whole filter, though.
+Canvas answers a context-code query with the events it considers reachable
+from those contexts, and an appointment reservation comes back labelled
+with the reserving user's calendar rather than the course's, so we filter
+the answer against the same set of context codes before showing it
+([[event_in_any_context]] knows where a reservation hides its course).
 <<get and display calendar event details>>=
 <<determine [[start_time]] and [[end_time]] from [[args]]>>
 <<compile regex patterns>>
 
 try:
   course_list = None
-  if hasattr(args, 'course') and args.course and args.course != DEFAULT_COURSE_REGEX:
+  if args.course:
     course_list = courses.process_course_option(canvas, args)
 
   events = get_calendar_events(
@@ -474,13 +544,7 @@ def start_key(ev):
 
 filtered.sort(key=start_key)
 
-# Take the top N
-if args.count == 0:
-  count = len(filtered)  # Show all matches
-else:
-  count = max(1, args.count)
-
-selected = filtered[:count]
+<<let [[selected]] be the first [[count]] events>>
 
 if not selected:
   canvaslms.cli.err(1, "No matching events found in the specified date range")
@@ -493,6 +557,71 @@ else:
     print_event_details(event)
     if idx != len(selected) - 1:
       print()
+
+<<warn about matches hidden by [[--count]]>>
+@
+
+\subsection{Selecting the events to show}
+
+The count is a slice length, so its two out-of-band values need translating
+before we can slice with it.
+Zero is the documented \enquote{show everything} spelling, which we turn
+into the length of the match list.
+A negative count is nonsense we cannot honour, and handing it to the slice
+would be worse than clamping it: Python counts a negative bound from the
+end, so $-1$ would show every match \emph{but} the last, and anything below
+minus the number of matches would slice to nothing---which the empty check
+below would then report as \enquote{no matching events}, blaming the
+calendar for what was a bad argument.
+Clamping to a single match keeps the outcome legible.
+
+<<let [[selected]] be the first [[count]] events>>=
+if args.count == 0:
+  count = len(filtered)
+else:
+  count = max(1, args.count)
+
+selected = filtered[:count]
+@
+
+\subsection{Saying what the count hid}
+
+The count defaults to one because [[calendar view]] is meant for reading a
+single event in detail; listing many is what [[calendar list]] is for.
+Truncation is therefore the \emph{normal} case rather than an exceptional
+one---and that is precisely why it must be announced.
+A range query such as
+\begin{center}
+  [[canvaslms calendar view --start-time 2026-03-09 --end-time 2026-03-14]]
+\end{center}
+looks like a query for a week's events, but prints the first match and
+nothing else.
+Without a word about the other matches, a single event is indistinguishable
+from a week that really did hold one event, and the reader concludes the
+fetch is broken rather than the count too small.
+
+The notice goes to standard error, never to standard output.
+Standard output carries either the labelled lines or the JSON array, and a
+consumer piping [[--json]] into [[jq]] would choke on a human sentence
+mixed into the stream; diagnostics are exactly what standard error is for.
+We say it with [[canvaslms.cli.warn]] rather than a bare
+[[print(..., file=sys.stderr)]], because [[warn]] routes through the
+logging setup that [[cli.nw]] configures: the message lands on standard
+error, and the [[-q]] flag already means \enquote{spare me the warnings},
+so a script that wants pure output has a way to ask for it.
+
+Truncation is a property of the selection, not of the output format---both
+branches above lose the same events---so a single notice after them covers
+both and cannot drift apart the way two copies would.
+Putting it after the events, rather than before, also leaves it as the last
+line on the terminal, where a reader who has just scrolled past a screenful
+of output will still see it.
+
+<<warn about matches hidden by [[--count]]>>=
+if len(selected) < len(filtered):
+  canvaslms.cli.warn(
+    f"showing {len(selected)} of {len(filtered)} matching events; "
+    f"use --count 0 to show all")
 @
 
 \subsection{Machine-readable output}
@@ -670,6 +799,135 @@ print(f"Start:    {canvaslms.cli.utils.format_local_time(getattr(event, 'start_a
 print(f"End:      {canvaslms.cli.utils.format_local_time(getattr(event, 'end_at', None))}")
 @
 
+\section{Verifying the truncation notice}
+
+Both halves of the notice are easy to lose in a later edit: someone tuning
+the wording could route it to standard output, and someone reworking the
+selection could stop emitting it altogether.
+Neither mistake announces itself---a truncated run looks exactly like an
+honest one---so we pin the notice down with tests instead.
+The test file itself, with its imports and the fixtures it draws on, is
+introduced further down in this chapter; the chunks below add to it.
+
+The command reads its arguments straight off [[args]], so, as for
+[[calendar create]], we build the namespace that [[argparse]] would have
+produced and let each test override only what it varies.
+
+<<test helper functions>>=
+def view_args(**overrides):
+    """Build the args namespace that `calendar view` would receive"""
+    args = argparse.Namespace(
+        on=None,
+        start_time="2026-03-09",
+        end_time="2026-03-14",
+        course=None,
+        match=None,
+        title=None,
+        description=None,
+        ignore_case=False,
+        count=1,
+        json=False,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+The events themselves are plain attribute bags rather than mocks.
+A [[MagicMock]] answers every attribute lookup, so
+[[get_appointment_booking_data]] would see booking metadata on every event
+and the printer would try to walk a mock's [[child_events]]; a namespace
+answers only what we put in it, which is what [[getattr(event, ..., None)]]
+expects of a real event that is not an appointment group.
+Serialising to JSON needs nothing more either, since
+[[format_events_json]] works from [[__dict__]].
+We give the events distinct start times so the sort is deterministic and
+the first match is predictable.
+
+<<test helper functions>>=
+import json
+import types
+
+
+def calendar_events(count):
+    """Build `count` events, an hour apart, as Canvas would return them"""
+    return [
+        types.SimpleNamespace(
+            title=f"Event {number}",
+            description=f"Description {number}",
+            start_at=f"2026-03-09T{9 + number:02d}:00:00Z",
+            end_at=f"2026-03-09T{10 + number:02d}:00:00Z",
+            location_name="Room",
+            html_url=f"https://canvas.example.com/events/{number}",
+        )
+        for number in range(count)
+    ]
+
+@
+
+<<test functions>>=
+class TestCalendarViewCount:
+    """`calendar view` must say when --count hides matching events"""
+
+    <<count notice test methods>>
+@
+
+The default count of one on a week-long range is the case from the bug
+report.
+The notice must name both numbers---one shown, three matched---since
+knowing only that something was hidden leaves the reader no way to ask for
+the rest.
+Standard output must stay free of it: there, the events are the output.
+
+<<count notice test methods>>=
+def test_truncation_is_announced(self, mock_canvas, capsys, caplog):
+    """A count smaller than the number of matches must be reported"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(count=1))
+
+    assert "1 of 3" in caplog.text
+    assert "of 3" not in capsys.readouterr().out
+
+@
+
+Showing everything is the case that must stay quiet: a notice there would
+be noise on every unrestricted run, and users learn to ignore warnings that
+fire when nothing is wrong.
+
+<<count notice test methods>>=
+def test_showing_all_matches_is_silent(self, mock_canvas, caplog):
+    """With --count 0 nothing is hidden, so nothing is reported"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(count=0))
+
+    assert "matching events" not in caplog.text
+
+@
+
+The JSON path is where a notice on the wrong stream does the most damage,
+since the consumer is a parser rather than a person.
+We therefore check both properties at once: the array on standard output
+still parses and holds exactly the selected event, and the count is still
+reported beside it.
+
+<<count notice test methods>>=
+def test_json_output_stays_parsable(self, mock_canvas, capsys, caplog):
+    """The notice must not leak into the JSON on standard output"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(3)
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(count=1, json=True))
+
+    events = json.loads(capsys.readouterr().out)
+    assert len(events) == 1
+    assert "1 of 3" in caplog.text
+
+@
+
+
 \section{The \texttt{calendar create} subcommand}
 
 The \texttt{calendar create} subcommand creates a new calendar event.
@@ -736,8 +994,9 @@ calendar_create_parser.add_argument("--max-appointments", type=int, default=1,
 @
 
 Creating an event takes three steps: we turn the user's date and time strings
-into Canvas timestamps, we sanity-check them against each other, and only then
-do we call the API for the requested event type.
+into instants, we sanity-check them against each other, and only then do we
+call the API for the requested event type, which is where the instants are
+finally written out as Canvas timestamps.
 <<create calendar event>>=
 <<parse start and end times>>
 <<reject events that end before they start>>
@@ -752,7 +1011,17 @@ except canvasapi.exceptions.CanvasException as e:
 @
 
 We interpret the start and end times ([[args.start_time]] and
-[[args.end_time]]) as local time in the system timezone.
+[[args.end_time]]) as local time in the system timezone, resolved through
+[[utils.local_timezone()]].
+The predecessor here was [[arrow]]'s own [[tzinfo='local']], which reads like
+the local zone and is a single offset sampled when the command runs
+(\cref{sec:utils:local-zone}).
+Scheduling ahead is where the two part company: entered from a Stockholm
+terminal in July, [[--start-time '2023-12-15 09:00']] was stamped with CEST
+and reached Canvas as [[07:00Z]] instead of [[08:00Z]], putting the meeting an
+hour before the one the user typed---and every timestamp in the exchange looks
+perfectly ordinary, so nothing in the output says so.
+
 The start time is always there, since [[--start-time]] is required, but the end
 time is [[None]] whenever the user omitted [[--end-time]]---and [[arrow.get]]
 does not parse [[None]], it raises a [[TypeError]] instead.
@@ -767,20 +1036,45 @@ typo from a missing value: parsing [[None]] unconditionally reported
 \enquote{no end time given} as the fatal and misleading
 \enquote{Invalid date/time format: Cannot parse argument of type None},
 which made open-ended events impossible to create at all.
+
+What we keep is the parsed instant, not its printed form.
+Everything the command does with these values before it calls Canvas asks a
+question about \emph{time}---is the end after the start, how many slots fit
+between them---and only the request we finally hand to [[canvasapi]] asks for
+text.
+Formatting here would satisfy the last of those steps and leave the earlier
+ones to either reparse the string or reason about how it was spelled; keeping
+[[arrow]] objects until the API boundary lets them compare and add instants
+instead.
 <<parse start and end times>>=
 try:
-  start_time = utils.format_canvas_time(
-    arrow.get(args.start_time, tzinfo='local'))
-  end_time = utils.format_canvas_time(
-    arrow.get(args.end_time, tzinfo='local')) if args.end_time else None
+  start_time = arrow.get(args.start_time, tzinfo=utils.local_timezone())
+  end_time = arrow.get(
+    args.end_time, tzinfo=utils.local_timezone()) if args.end_time else None
 except Exception as e:
   canvaslms.cli.err(1, f"Invalid date/time format: {e} "
                        f"(did you write 8:15 instead of 08:15?)")
 @
 
-Both timestamps come out of [[format_canvas_time]] in the same shape, a UTC ISO
-string ending in [[Z]], so comparing them as strings orders them
-chronologically---no reparsing needed.
+The check is a comparison, and it matters a great deal \emph{what} we compare.
+Formatted timestamps invite a shortcut: both come out of
+[[format_canvas_time]] as UTC ISO text ending in [[Z]], and for two strings of
+the same shape the alphabetical order and the chronological one agree.
+That coincidence is the trap.
+It holds only while every timestamp is spelled identically, and [[isoformat]]
+does not spell them identically---it prints fractional seconds only when there
+are any.
+An event starting at [[10:00:00]] and ending half a second later thus yields
+[[...T10:00:00Z]] and [[...T10:00:00.500000Z]], where the [[.]] sorts before
+the [[Z]]: alphabetically the end precedes the start, and the command rejects
+an event that is perfectly well formed.
+Swap the two times and the same rule accepts an event that really does end
+before it starts.
+
+Comparing the [[arrow]] instants removes the question rather than answering it.
+[[arrow]] orders by the moment a value denotes, not by how it is written, so
+the check stops depending on how many digits [[isoformat]] chose to print---or
+on both bounds having been printed by the same function at all.
 An event that never ends cannot end too early, so the ordering check applies
 only when the user actually gave us an end time.
 <<reject events that end before they start>>=
@@ -789,16 +1083,18 @@ if end_time and end_time < start_time:
 @
 
 \subsection{Distinguishing no course from all courses}
+\label{sec:calendar:create-course-default}
 
 Both event types must know which course contexts the new event belongs
 to, and both learn it from the [[-c]] option added by
 [[courses.add_course_option]].
-For the listing commands that option defaults to the match-all regex
-[[.*]] (\cref{sec:calendar:course-default}), and for them the default is
-harmless: reading every calendar and reading with no filter are the same
-request.
+That option used to default to the match-all regex [[.*]], which cost the
+reading commands an explicit [[-c '.*']] and cost [[calendar create]] a
+great deal more; the reading commands eventually adopted the same
+[[default=None]] we arrive at here
+(\cref{sec:calendar:course-default}), but creating is where the default
+first became untenable.
 
-Creating is not so forgiving.
 [[calendar create]] used to share that default and test [[args.course]]
 for truthiness only; since the default regex matches every course the
 user is enrolled in,
@@ -846,16 +1142,22 @@ That is what carries an open-ended event through to Canvas: we say
 altogether, rather than by sending a key whose value is [[None]].
 The parse above and this assembly thus agree---when [[args.end_time]] is
 missing, [[end_time]] stays [[None]] and never reaches the request.
+
+This is also where the instants become text.
+[[params]] is what leaves for Canvas, so the entries we put into it are the
+last values we can still reason about as times, and applying
+[[format_canvas_time]] as they enter is what keeps the conversion at that
+boundary instead of ahead of it.
 <<create regular calendar event>>=
 params = {
   'calendar_event': {
     'title': args.title,
-    'start_at': start_time,
+    'start_at': utils.format_canvas_time(start_time),
   }
 }
 
 if args.end_time:
-  params['calendar_event']['end_at'] = end_time
+  params['calendar_event']['end_at'] = utils.format_canvas_time(end_time)
 if args.description:
   params['calendar_event']['description'] = args.description  
 if args.location:
@@ -940,6 +1242,12 @@ The timeslots should be added to a \emph{dictionary} called
 [[new_appointments]].
 Although numbered by index, as a list, the API requires a dictionary with
 string keys.
+
+The bounds arrive here as instants, which is exactly what stepping through the
+interval needs: the loop walks [[current_start]] forward by whole slot
+durations and stops when the next slot would overshoot [[end]].
+Each slot is formatted as it is emitted, because the pair of strings is what
+Canvas stores---the arithmetic that produced them never sees text at all.
 <<compute time slots>>=
 if not args.end_time:
   canvaslms.cli.err(1, "--end-time is required for appointment groups")
@@ -949,8 +1257,8 @@ if not args.time_slot_duration:
 params["appointment_group"]["new_appointments"] = {}
 
 slot_duration = datetime.timedelta(minutes=args.time_slot_duration)
-current_start = arrow.get(start_time)
-end = arrow.get(end_time)
+current_start = start_time
+end = end_time
 
 slot_num = 0
 while current_start + slot_duration <= end:
@@ -973,14 +1281,24 @@ Tests are thus the only cheap way to keep the guard honest, so we pin
 down the three cases that carry the decision---the default regex, an
 explicit regex, and an appointment group with no course at all.
 
+Every test here that names a wall-clock time expects a particular UTC
+timestamp back, and such an expectation is only absolute if the zone the
+tests run in is known.
+The fixture that settles it is autouse, so it governs the whole module; we
+define it beside the tests that turn on it (\cref{sec:calendar:local-zone}).
+
 <<test [[calendar.py]]>>=
 """Tests for creating calendar events"""
 import argparse
 import copy
+import time
 
+import arrow
 import pytest
 
 import canvaslms.cli.calendar as calendar
+
+<<pin the local timezone for every test>>
 
 <<test helper functions>>
 <<test functions>>
@@ -1119,3 +1437,322 @@ def test_appointment_group_requires_explicit_course(self, mock_canvas,
                         time_slot_duration=30))
 
     mock_canvas.create_appointment_group.assert_not_called()
+
+@
+
+\section{Verifying the course filter on the reading commands}
+
+[[calendar list]] and [[calendar view]] draw the same distinction from
+the same [[default=None]] (\cref{sec:calendar:course-default}), and we
+verify it here, next to the create-guard tests, because the two share both
+the mechanism and the fixtures.
+Ignoring a course selection hides even better when reading than when
+creating: the run prints events, just not the ones that were asked for,
+and only a reader who already knows which events belong to which course
+can tell the difference.
+
+What separates the two readings is the request that leaves for Canvas, so
+that is what the tests inspect.
+The context codes \emph{are} the course filter---their presence or absence
+is the entire decision---and reading them off the recorded call says
+whether the selection was honoured without depending on which events the
+server would have returned.
+
+<<test helper functions>>=
+def context_codes_sent(canvas):
+    """Return the context codes of the last calendar-events request"""
+    return canvas.get_calendar_events.call_args.kwargs.get("context_codes")
+
+@
+
+[[calendar list]] has no test namespace yet, so we build one as we did for
+the other two commands, with [[course]] defaulting to the [[None]] that
+argparse now produces for an absent [[-c]].
+
+<<test helper functions>>=
+def list_args(**overrides):
+    """Build the args namespace that `calendar list` would receive"""
+    args = argparse.Namespace(
+        on=None,
+        start_time="2026-03-09",
+        end_time="2026-03-14",
+        course=None,
+        type=None,
+        bookings=False,
+        show_context=False,
+        delimiter="\t",
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+@
+
+<<test functions>>=
+class TestCalendarReadCourseFilter:
+    """An explicit -c must filter the commands that read, too"""
+
+    <<read course filter test methods>>
+@
+
+The match-all regex is the case the discarded comparison got wrong, so it
+is the one to pin down: spelled out on the command line it must reach
+Canvas as the context codes of every matching course.
+
+<<read course filter test methods>>=
+def test_list_explicit_match_all_filters(self, mock_canvas, mock_courses):
+    """`calendar list -c '.*'` must send the courses as context codes"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = []
+
+    calendar.calendar_list_command({}, mock_canvas, list_args(course=".*"))
+
+    assert context_codes_sent(mock_canvas) == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+Leaving the option out must still mean what it always meant: no context
+codes---and, since there is no regex to match courses against, no course
+lookup at all.
+The second assertion is what keeps the first honest, as a command that
+asked Canvas for the course list would be deciding something the user
+never asked it to decide.
+
+<<read course filter test methods>>=
+def test_list_without_course_sends_no_contexts(self, mock_canvas,
+                                               mock_courses):
+    """`calendar list` without -c must not restrict the contexts"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = []
+
+    calendar.calendar_list_command({}, mock_canvas, list_args())
+
+    assert context_codes_sent(mock_canvas) is None
+    mock_canvas.get_courses.assert_not_called()
+
+@
+
+[[calendar view]] must answer both questions the same way.
+It also drops events that fall outside the selected contexts, so the event
+we hand it carries a context code from the fixture: without one the
+command would report no matching events, and the test would fail for a
+reason that has nothing to do with the selection.
+
+<<read course filter test methods>>=
+def test_view_explicit_match_all_filters(self, mock_canvas, mock_courses):
+    """`calendar view -c '.*'` must send the courses as context codes"""
+    mock_canvas.get_courses.return_value = mock_courses
+    event, = calendar_events(1)
+    event.context_code = "course_1001"
+    mock_canvas.get_calendar_events.return_value = [event]
+
+    calendar.calendar_view_command({}, mock_canvas, view_args(course=".*"))
+
+    assert context_codes_sent(mock_canvas) == \
+        ["course_1001", "course_1002", "course_1003"]
+
+@
+
+<<read course filter test methods>>=
+def test_view_without_course_sends_no_contexts(self, mock_canvas,
+                                               mock_courses):
+    """`calendar view` without -c must not restrict the contexts"""
+    mock_canvas.get_courses.return_value = mock_courses
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command({}, mock_canvas, view_args())
+
+    assert context_codes_sent(mock_canvas) is None
+    mock_canvas.get_courses.assert_not_called()
+
+@
+
+\section{Verifying that the ordering check reads instants}
+
+The comparison the check used to make was right in the common case and wrong
+in both directions outside it, and neither error shows up in an ordinary
+session: minute-precision command lines format identically, so the mistake
+needs sub-second times to surface at all.
+That is precisely what a test can supply, and we use it to pin down each
+direction---a well-formed event that alphabetical order rejects, and a
+malformed one that it lets through.
+
+<<test functions>>=
+class TestCalendarCreateTimeOrdering:
+    """Ordering must follow the instants, not the spelling of the timestamps"""
+
+    <<time ordering test methods>>
+@
+
+Half a second is enough to spring the trap.
+[[isoformat]] prints the fraction for the end time and omits it for the start,
+so alphabetically the end sorts first even though it happens last---and the
+string comparison rejected this event.
+We compare the recorded timestamps as instants for the same reason the command
+now does: the assertion should say that the event ends after it starts, not
+that its two fields are spelled in a particular order.
+
+<<time ordering test methods>>=
+def test_subsecond_end_after_start_is_accepted(self, mock_canvas):
+    """An end half a second after the start is a valid event"""
+    mock_canvas.get_current_user.return_value.id = 42
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command(
+        {}, mock_canvas,
+        create_args(start_time="2026-08-01 10:00:00",
+                    end_time="2026-08-01 10:00:00.500000"))
+
+    assert len(created) == 1
+    event = created[0]["calendar_event"]
+    assert arrow.get(event["end_at"]) > arrow.get(event["start_at"])
+
+@
+
+Exchanging the two times exposes the other direction.
+The fraction now belongs to the start, so the end sorts last alphabetically
+and the string comparison waved through an event that ends before it begins.
+[[canvaslms.cli.err]] exits, so a rejection surfaces as [[SystemExit]] and
+nothing reaches Canvas.
+
+<<time ordering test methods>>=
+def test_subsecond_end_before_start_is_rejected(self, mock_canvas):
+    """An end half a second before the start must be rejected"""
+    mock_canvas.get_current_user.return_value.id = 42
+
+    with pytest.raises(SystemExit):
+        calendar.calendar_create_command(
+            {}, mock_canvas,
+            create_args(start_time="2026-08-01 10:00:00.500000",
+                        end_time="2026-08-01 10:00:00"))
+
+    mock_canvas.create_calendar_event.assert_not_called()
+
+@
+
+\section{Verifying that the offset comes from the event's own date}
+\label{sec:calendar:local-zone}
+
+Both parse sites read a wall-clock argument as local time, and both used to
+settle what \enquote{local} means once, at the moment the command ran.
+The error that follows is an hour, in whichever direction the two dates
+differ, and it is invisible: the timestamp Canvas stores is a perfectly
+ordinary one, merely not the one that was typed.
+Only a test can see it, and only a test written to straddle a transition.
+
+These tests therefore never freeze the clock, which is what kept the defect
+hidden before: with \enquote{now} on the same date as the input, an offset
+sampled at [[now]] and one resolved at the input's own date are the same
+number.
+Each test instead pairs a summer input with a winter one, so that no single
+offset can satisfy both expectations---whichever season the machine running
+the suite is in, one half of every pair fails if the offset was sampled
+rather than resolved.
+The variation is deliberate and narrow: what changes from test to test is
+which parse site is exercised, while the summer/winter pairing stays put, so
+the three read as one rule applied three times.
+[[TestFormatCanvasTimeAcrossDST]] in the [[utils]] chapter pins the same rule
+one layer down, on [[format_canvas_time]] itself.
+
+Absolute expectations need a known zone, so we pin the process to
+[[Europe/Stockholm]]---CEST ([[+02:00]]) in July, CET ([[+01:00]]) in
+December---and restore whatever the machine had afterwards.
+[[time.tzset()]] has to run on both edges of that, since the platform caches
+the zone until it is told to look again; undoing the environment variable
+alone would leave the rest of the session running in Stockholm.
+
+<<pin the local timezone for every test>>=
+@pytest.fixture(autouse=True)
+def local_zone_is_stockholm(monkeypatch):
+    """Pin the process timezone so local-time expectations are absolute"""
+    monkeypatch.setenv("TZ", "Europe/Stockholm")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+@
+
+<<test functions>>=
+class TestCalendarLocalTimeAcrossDST:
+    """A time must be read with the offset of its own date, not today's"""
+
+    <<local zone test methods>>
+@
+
+The created event is the case from the bug report.
+Nine in the morning on a December day is [[08:00Z]], and ten on a July day is
+[[08:00Z]] as well---the same UTC hour reached from two different local
+readings, which is exactly what a single sampled offset cannot produce.
+
+<<local zone test methods>>=
+def test_created_event_uses_the_offset_of_its_own_date(self, mock_canvas):
+    """Stockholm is CEST (+02:00) in July and CET (+01:00) in December"""
+    mock_canvas.get_current_user.return_value.id = 42
+    created = record_created_events(mock_canvas)
+
+    calendar.calendar_create_command(
+        {}, mock_canvas,
+        create_args(start_time="2023-07-15 10:00",
+                    end_time="2023-07-15 11:00"))
+    calendar.calendar_create_command(
+        {}, mock_canvas,
+        create_args(start_time="2023-12-15 09:00",
+                    end_time="2023-12-15 10:00"))
+
+    assert created[0]["calendar_event"]["start_at"] == "2023-07-15T08:00:00Z"
+    assert created[1]["calendar_event"]["start_at"] == "2023-12-15T08:00:00Z"
+
+@
+
+The window a listing asks Canvas for is the same question asked of the same
+strings, so we check it where it is observable: in the parameters the command
+hands to the API.
+Here the two seasons keep the local hour and must therefore differ in UTC,
+which is the mirror image of the pairing above.
+
+<<local zone test methods>>=
+def test_view_window_uses_the_offset_of_its_own_date(self, mock_canvas):
+    """The same local hour is a different UTC hour in the two seasons"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command(
+        {}, mock_canvas, view_args(start_time="2023-07-15 10:00",
+                                   end_time="2023-07-15 12:00"))
+    summer = mock_canvas.get_calendar_events.call_args.kwargs
+
+    calendar.calendar_view_command(
+        {}, mock_canvas, view_args(start_time="2023-12-15 10:00",
+                                   end_time="2023-12-15 12:00"))
+    winter = mock_canvas.get_calendar_events.call_args.kwargs
+
+    assert summer["start_date"] == "2023-07-15T08:00:00Z"
+    assert winter["start_date"] == "2023-12-15T09:00:00Z"
+
+@
+
+A bare date exercises the same rule at a coarser grain: [[--on]] asks for a
+whole day, and a day is bounded by two instants that both have to be read in
+the local zone.
+A July day in Stockholm begins at [[22:00Z]] the evening before and a
+December one at [[23:00Z]], so the pair pins the day boundaries as well as
+the zone.
+
+<<local zone test methods>>=
+def test_on_covers_the_local_day(self, mock_canvas):
+    """--on names a local day, whose bounds move with the offset"""
+    mock_canvas.get_calendar_events.return_value = calendar_events(1)
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(on="2023-07-15"))
+    summer = mock_canvas.get_calendar_events.call_args.kwargs
+
+    calendar.calendar_view_command({}, mock_canvas,
+                                   view_args(on="2023-12-15"))
+    winter = mock_canvas.get_calendar_events.call_args.kwargs
+
+    assert summer["start_date"] == "2023-07-14T22:00:00Z"
+    assert summer["end_date"] == "2023-07-15T22:00:00Z"
+    assert winter["start_date"] == "2023-12-14T23:00:00Z"
+    assert winter["end_date"] == "2023-12-15T23:00:00Z"

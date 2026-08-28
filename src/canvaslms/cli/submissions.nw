@@ -1057,8 +1057,29 @@ For this we need
 \item a user or group,
 \item to know if we aim for all or just ungraded submissions.
 \end{itemize}
-We add the [[required]] parameter to specify if we want to have required 
+We add the [[required]] parameter to specify if we want to have required
 arguments, \eg for the [[grade]] command.
+
+Selecting a submission is not the only thing that several commands must agree
+on, so this section gathers the neighbouring option groups as well: the two
+options for setting a grade, and the larger group governing how a submission
+is displayed.
+Each group gets a function of its own, which is what lets
+[[submissions grade]] and the standalone [[grade]] alias---or
+[[submissions view]] and the standalone [[submission]] alias---offer exactly
+the same options without either command having to know how the other spells
+them.
+
+Callers do not always arrive with a clean parser: [[submissions list]], for
+one, adds the assignment option itself before delegating here.
+The duplication can also arise inside the function, since
+[[add_assignment_option]] contributes a [[-U]] of its own before we get to
+ours.
+Either way argparse refuses a second option sharing a [[dest]] with an
+existing one, so we add each part inside a [[try]] that swallows
+[[argparse.ArgumentError]].
+That makes the function idempotent: whether a caller adds some of the options
+itself or leaves all of them to us, it ends up with the same parser.
 <<functions>>=
 def add_submission_options(parser, required=False, suppress_help=False):
   """Adds submission selection options to argparse parser
@@ -1084,7 +1105,18 @@ def add_submission_options(parser, required=False, suppress_help=False):
       help=argparse.SUPPRESS if suppress_help else "Only ungraded submissions.")
   except argparse.ArgumentError:
     pass
+@
 
+\subsection{Options for setting a grade}
+
+The [[submissions grade]] subcommand and the standalone [[grade]] command set
+a grade, a comment, or both; when neither is given they fall back to opening
+SpeedGrader.
+Both commands take the pair from here, so that adding an option for one of
+them cannot leave the other behind.
+What the options mean for the grading itself we postpone to where grading is
+implemented.
+<<functions>>=
 def add_grading_options(parser):
   """Adds grading options to argparse parser
 
@@ -1100,7 +1132,21 @@ def add_grading_options(parser):
     help="The grade to set for the submissions")
   grade_options.add_argument("-m", "--message",
     help="A comment to the student")
+@
 
+\subsection{Options for viewing a submission}
+
+[[submissions view]] and the standalone [[submission]] command share a much
+larger group of options: where the output goes ([[-o]], [[--open]],
+[[--sort-order]]), what it looks like ([[--json]], [[-H]], [[--diff]] and its
+thresholds), and how a container is run over the submitted files
+([[--docker-image]], [[--docker-cmd]], [[--docker-args]]).
+Collecting them in one function rather than at each subparser is what keeps
+the alias a true alias: an option added to the group turns up in both commands
+at once.
+Each of them is motivated where the behaviour it controls is implemented,
+which is why the function reads as a bare list of [[add_argument]] calls here.
+<<functions>>=
 def add_view_options(parser):
   """Adds submission viewing options to argparse parser
 
@@ -1171,7 +1217,23 @@ def add_view_options(parser):
          "This is used with the `docker` option for `--open`. "
          "Note that this must be the last option on the command line, it takes "
          "the rest of the line as arguments for Docker.")
+@
 
+\subsection{Turning the options into submissions}
+
+Finally the counterpart of [[add_submission_options]]: it resolves what the
+selection options asked for into the submissions themselves.
+The commands that use it all show or grade individual submissions, so we ask
+Canvas for the history, the comments and the rubric assessment in the same
+request rather than paying a round-trip per submission later.
+Resolving the users first is what lets us hand their identifiers to the
+listing helpers, scoping the cache's bulk-refresh decision to the submissions
+we will actually read; the restriction to those users then happens locally in
+[[filter_submissions]], which is also where each submission gets the [[user]]
+attribute its callers read.
+An empty result is an error rather than an empty list, so that the CLI exits
+telling the user that nothing matched instead of printing nothing at all.
+<<functions>>=
 def process_submission_options(canvas, args):
   assignment_list = assignments.process_assignment_option(canvas, args)
   user_list = users.process_user_or_group_option(canvas, args)
@@ -1572,6 +1634,7 @@ def format_submission(submission, history=False, json_format=False,
   <<add rubric assessment to output>>
   <<add comments to output>>
   if history:
+    <<let [[tmpdir]] be a directory to hold the versions>>
     if diff:
       <<add submission history diffs to output>>
     else:
@@ -1662,7 +1725,33 @@ The trade-off is that the JSON output carries the string [[N/A]] here rather
 than [[null]]; we accept it because the timestamps in this dictionary already
 behave that way, and consistency within the section is worth more than a null
 for a field that only ever means \enquote{no page to link to}.
+
+The grade and the grader are absent far more often than the preview URL is.
+Every submission nobody has looked at yet carries [[grade]] and [[grader_id]]
+as [[None]], and [[resolve_grader]] passes that absence on unchanged, so
+rendering the two fields raw printed the word [[None]] twice in the same
+section---once as a grade and once as a person.
+That reads as a value rather than as an absence, which is precisely the
+confusion the placeholder exists to prevent, and it is the last field in this
+dictionary that still had it.
+
+The two fields cannot be written the same way as [[speedgrader]], though.
+[[speedgrader]] can end in [[or "N/A"]] because none of its falsy values carry
+information: an empty URL is no URL.
+A grade of [[0]] is an ordinary grade, and a truthiness test would hide that
+real result behind the placeholder that means \enquote{not graded}---turning a
+cosmetic fix into a reporting error.
+We therefore test [[grade]] against [[None]] explicitly, and keep the falsy
+test only for the field whose falsy values all mean the same thing.
+
+We also give the resolved grader a name before building the dictionary.
+The placeholder needs the value twice, once to decide and once to render, and
+[[resolve_grader]] reaches Canvas through [[get_course_user]] to turn a grader
+ID into a user; calling it twice would pay for a network round-trip to answer a
+question we have already answered.
 <<add metadata to output>>=
+grader = resolve_grader(submission)
+
 metadata = {
   "course": submission.assignment.course.course_code,
   "assignment": submission.assignment.name,
@@ -1672,8 +1761,8 @@ metadata = {
     submission.submitted_at),
   "graded_at": canvaslms.cli.utils.format_local_time(
     submission.graded_at),
-  "grade": submission.grade,
-  "graded_by": str(resolve_grader(submission)),
+  "grade": "N/A" if submission.grade is None else submission.grade,
+  "graded_by": "N/A" if grader is None else str(grader),
   "speedgrader": speedgrader(submission) or "N/A"
 }
 
@@ -1732,6 +1821,65 @@ removed.
 return get_course_user(submission.assignment.course, submission.grader_id)
 @
 
+\subsection{Verifying the placeholders in the metadata}
+
+An ungraded submission exercises both placeholders at once, since a submission
+that carries no grade carries no grader either.
+The second test is the one that keeps the fix honest: a zero grade is falsy but
+real, so it must survive a section whose other fields are written with falsy
+tests.
+
+<<test functions>>=
+class TestMetadataPlaceholders:
+    """Test that absent metadata fields render as N/A."""
+
+    def make_submission(self):
+        """Build an ungraded submission with nothing else to render."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = None
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_ungraded_submission_shows_placeholders(self, tmp_path):
+        """Neither the grade nor the grader may render as None."""
+        output = format_submission(self.make_submission(), tmpdir=tmp_path)
+
+        assert "Grade: N/A" in output
+        assert "Graded by: N/A" in output
+        assert "Grade: None" not in output
+        assert "Graded by: None" not in output
+
+    def test_zero_grade_is_not_a_placeholder(self, tmp_path):
+        """A zero grade is a real grade, not an absent one."""
+        submission = self.make_submission()
+        submission.grade = 0
+
+        output = format_submission(submission, tmpdir=tmp_path)
+
+        assert "Grade: 0" in output
+
+    def test_json_output_uses_the_same_placeholders(self, tmp_path):
+        """The JSON output must not carry None values either."""
+        output = format_submission(self.make_submission(), json_format=True,
+                                   tmpdir=tmp_path)
+
+        assert output["metadata"]["grade"] == "N/A"
+        assert output["metadata"]["graded_by"] == "N/A"
+@
+
 
 \subsection{Rubric data}\label{RubricData}
 
@@ -1761,9 +1909,41 @@ Like every other section, the rubric assessment must inherit
 Otherwise a rubric nested inside a history version would open a top-level
 heading underneath that version's subsection heading, and [[rich]] would
 render it as a document title.
+
+That repair still left the guard as it was: one [[try]] wrapped around the
+entire block.
+The scope is the remaining defect, and it is worth removing rather than
+remembering.
+The guard has exactly one job---tolerate a submission that carries no rubric
+data---and no business deciding what happens when [[format_rubric]] or
+[[format_section]] misbehaves.
+A guard that spans the work as well as the lookup cannot tell the two apart:
+every mistake inside the block arrives at the same [[except]] clause and leaves
+by the same silent [[pass]], which is why a mistyped parenthesis could go
+unnoticed for as long as it did.
+The submission-history sections later in this chapter already show the shape we
+want instead: guard the attribute read, and do the work in the [[else]] branch,
+where nothing is caught.
+The remaining four sections of this chapter are narrowed the same way, so all of
+them fail loudly and none of them fails at reading an absent field.
+
+The read itself can no longer fail, in fact.
+\Cref{MissingPreviewURL} traced how normalization at ingress turned absence into
+a value: [[rubric_assessment]] is one of the [[SUBMISSION_ATTRS]] that
+[[ensure_submission_attrs]] fills in with [[None]], and [[format_submission]]
+normalizes its submission before any of these blocks run.
+The truthiness test on the value is therefore the guard that does the work
+today, and the narrow [[try]] is what survives of the one that used to.
+We keep it because [[format_submission]] is public and its blocks are reached
+from the history recursion as well, and because it now costs a single line that
+can swallow nothing but the lookup it names.
 <<add rubric assessment to output>>=
 try:
-  if submission.rubric_assessment:
+  rubric_assessment = submission.rubric_assessment
+except AttributeError:
+  pass
+else:
+  if rubric_assessment:
     if json_format:
       formatted_submission.update(format_section(
         "rubric_assessment",
@@ -1774,8 +1954,60 @@ try:
         "Rubric assessment",
         format_rubric(submission),
         md_title_level=md_title_level)
-except AttributeError:
-  pass
+@
+
+Let us verify that the block no longer hides a broken formatter.
+We break [[format_rubric]] in the way the parenthesis bug did---an
+[[AttributeError]] raised while formatting a submission that does have rubric
+data---and require the error to reach the caller instead of the output silently
+losing a section.
+
+<<test functions>>=
+class TestFormattingErrorsAreNotSwallowed:
+    """Test that errors inside the section blocks reach the caller."""
+
+    def make_submission(self):
+        """Build a submission with nothing worth rendering."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_rubric_formatting_error_propagates(self, monkeypatch, tmp_path):
+        """A failing format_rubric must not silently drop the section."""
+        def broken_format_rubric(*args, **kwargs):
+            raise AttributeError("rubric")
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.format_rubric", broken_format_rubric)
+
+        submission = self.make_submission()
+        submission.rubric_assessment = {"crit": {"points": 1}}
+
+        with pytest.raises(AttributeError):
+            format_submission(submission, tmpdir=tmp_path)
+
+    def test_missing_rubric_attribute_is_still_tolerated(self, tmp_path):
+        """A submission without the attribute must still format."""
+        submission = self.make_submission()
+        del submission.rubric_assessment
+
+        output = format_submission(submission, tmpdir=tmp_path)
+
+        assert "Rubric assessment" not in output
 @
 
 \subsection{General comments}
@@ -1783,24 +2015,30 @@ except AttributeError:
 The comments section inherits [[md_title_level]] for the same reason as the
 rubric section above: a version's comments belong under that version's
 heading, not at the top of the document.
+It also inherits the narrow guard (\cref{RubricData}), and here the difference
+is easy to see: the loop reaches into every comment dictionary, so a comment
+Canvas delivered in an unexpected shape used to cost the reader the entire
+comment section rather than announcing itself.
 <<add comments to output>>=
 try:
-  if submission.submission_comments:
+  submission_comments = submission.submission_comments
+except AttributeError:
+  pass
+else:
+  if submission_comments:
     if json_format:
       formatted_submission.update(format_section(
-        "comments", submission.submission_comments,
+        "comments", submission_comments,
         json_format=True))
     else:
       body = ""
-      for comment in submission.submission_comments:
+      for comment in submission_comments:
         created_at = canvaslms.cli.utils.format_local_time(
           comment['created_at'])
         body += f"{comment['author_name']} ({created_at}):\n\n"
         body += comment["comment"] + "\n\n"
       formatted_submission += format_section("Comments", body,
                                              md_title_level=md_title_level)
-except AttributeError:
-  pass
 @
 
 \subsection{Verifying that nested sections stay nested}
@@ -1853,36 +2091,52 @@ class TestFormatSubmissionTitleLevel:
 
 \subsection{Body}
 
+A text submission arrives as [[submission.body]], which is [[None]] for every
+submission made by uploading a file instead of typing an answer.
+That is the only absence this section knows how to handle, so it is the only
+thing its guard covers (\cref{RubricData}).
+
 <<add body to output>>=
 try:
-  if submission.body:
-    if json_format:
-      formatted_submission.update(format_section(
-        "body", submission.body, json_format=True,
-        md_title_level=md_title_level))
-    else:
-      formatted_submission += format_section("Body", submission.body,
-                                             md_title_level=md_title_level)
+  submission_body = submission.body
 except AttributeError:
   pass
+else:
+  if submission_body:
+    if json_format:
+      formatted_submission.update(format_section(
+        "body", submission_body, json_format=True,
+        md_title_level=md_title_level))
+    else:
+      formatted_submission += format_section("Body", submission_body,
+                                             md_title_level=md_title_level)
 @
 
 \subsection{Quiz answers}
 
+Quiz answers arrive as [[submission_data]], and only for submissions that came
+from a quiz.
+The section serializes them with [[json.dumps]], which is exactly the kind of
+call the old block-wide guard should never have covered: a value [[json]] cannot
+serialize is a bug to be reported, not a section to be skipped
+(\cref{RubricData}).
+
 <<add quiz answers to output>>=
 try:
-  if submission.submission_data:
+  submission_data = submission.submission_data
+except AttributeError:
+  pass
+else:
+  if submission_data:
     if json_format:
       formatted_submission.update(format_section(
-        "quiz_answers", submission.submission_data,
+        "quiz_answers", submission_data,
         json_format=True, md_title_level=md_title_level))
     else:
       formatted_submission += format_section(
         "Quiz answers",
-        json.dumps(submission.submission_data, indent=2),
+        json.dumps(submission_data, indent=2),
         md_title_level=md_title_level)
-except AttributeError:
-  pass
 @
 
 \subsection{Attachments}
@@ -1898,12 +2152,27 @@ submission.
 
 In the JSON version, we want to introduce one more level: the attachments 
 should be found under the key [[attachments]].
+
+This is the block where the wide guard was most expensive, because it is the
+block that does the most work.
+The next subsection makes a failed \emph{conversion} cost one file; but every
+other step of the loop---reading a file's name, building its section, updating
+the JSON dictionary---was covered by an [[except AttributeError]] whose only
+purpose was to notice a submission with no files.
+A single misnamed attribute anywhere in that loop looked exactly like a
+submission that had nothing attached.
+So the guard covers the lookup and nothing else (\cref{RubricData}).
 <<add attachments to output>>=
 try:
+  submission_attachments = submission.attachments
+except AttributeError:
+  pass
+else:
   <<attachment iteration variables>>
   if json_format:
     attachments = {}
-  for attachment in submission.attachments:
+  for attachment in submission_attachments:
+    <<let [[tmpdir]] be a fresh temporary directory>>
     <<let [[contents]] be the converted [[attachment]]>>
     formatted_attachment = format_section(attachment.filename, contents,
                                           json_format=json_format,
@@ -1918,8 +2187,64 @@ try:
     formatted_submission.update(format_section("attachments", attachments,
                                                json_format=True,
                                                md_title_level=md_title_level))
-except AttributeError:
-  pass
+@
+
+Let us verify the distinction this block now draws.
+An attachment whose name cannot be read is a broken object, and the caller must
+hear about it; a submission whose [[attachments]] attribute is missing entirely
+is an ordinary submission, and formatting it must still succeed.
+
+<<test functions>>=
+class TestAttachmentErrorsAreNotSwallowed:
+    """Test that the attachment loop no longer hides its own errors."""
+
+    def make_submission(self):
+        """Build a submission carrying no attachments."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_broken_attachment_propagates(self, monkeypatch, tmp_path):
+        """A file whose name cannot be read must not look like no files."""
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: "contents")
+
+        class BrokenAttachment:
+            """An attachment whose file name cannot be read."""
+
+            @property
+            def filename(self):
+                raise AttributeError("filename")
+
+        submission = self.make_submission()
+        submission.attachments = [BrokenAttachment()]
+
+        with pytest.raises(AttributeError):
+            format_submission(submission, tmpdir=tmp_path)
+
+    def test_missing_attachments_attribute_is_tolerated(self, tmp_path):
+        """A submission without the attribute must still format."""
+        submission = self.make_submission()
+        del submission.attachments
+
+        output = format_submission(submission, tmpdir=tmp_path)
+
+        assert "Course: C1" in output
 @
 
 Let's look at the conversion.
@@ -1939,9 +2264,123 @@ tmpdir = None,
 `tmpdir` is the directory to store all the submission files. Defaults to None, 
 which creates a temporary directory.
 
+@
+
+The two ways of arriving at a [[tmpdir]] are not the same thing, and treating
+them alike is what made this block litter the file system.
+A directory the caller named belongs to the caller: the submission-history code
+hands each version its own directory and then writes that version's metadata
+file into it, relying on this block to bring the directory into existence
+whether or not the version has any attachments.
+Creating it eagerly is therefore part of the contract, not a convenience.
+
+A directory we invent belongs to nobody until a file goes into it.
+Creating it up front left one empty directory behind in the system temporary
+area for every submission formatted without a [[tmpdir]] of its own---and since
+most submissions have no attachments at all, most of those directories never
+had a reason to exist.
+Across a run over a whole assignment that is one leaked directory per student.
+Nobody misses a directory they never asked for, so we create ours at the first
+attachment we actually convert.
 <<attachment iteration variables>>=
-tmpdir = pathlib.Path(tmpdir or tempfile.mkdtemp())
-tmpdir.mkdir(parents=True, exist_ok=True)
+if tmpdir is not None:
+  tmpdir = pathlib.Path(tmpdir)
+  tmpdir.mkdir(parents=True, exist_ok=True)
+@
+
+The loop below reaches this chunk once per attachment, and after the first one
+[[tmpdir]] is set, so [[mkdtemp]] runs at most once per submission.
+
+The loop needs no guard against a missing list either, tempting as one looks
+next to the narrowed lookup above.
+[[canvasapi]] builds [[Submission.attachments]] in its constructor from
+[[attributes.get("attachments", [])]], so every submission that came from Canvas
+carries a list---including the history versions we rebuild from raw JSON, which
+go through that same constructor, and the submissions restored from the cache.
+Normalization consequently never finds the attribute missing and never
+substitutes [[None]] for it, and an [[or []]] here would be a guard against a
+state the program cannot reach.
+<<let [[tmpdir]] be a fresh temporary directory>>=
+if tmpdir is None:
+  tmpdir = pathlib.Path(tempfile.mkdtemp())
+@
+
+Let us verify all three cases: the submission with nothing to store must not
+reach [[mkdtemp]] at all, the submission with a file must still get somewhere to
+put it, and a directory the caller named must exist afterwards even when the
+submission turned out to have no files---that last one is what the history code
+depends on.
+
+<<test functions>>=
+class TestAttachmentTempDir:
+    """Test that temporary directories appear only where they are needed."""
+
+    def make_submission(self):
+        """Build a submission carrying no attachments."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_no_temp_dir_without_attachments(self, monkeypatch):
+        """A submission with no files must not create a directory."""
+        def fail_mkdtemp(*args, **kwargs):
+            raise AssertionError(
+                "created a temporary directory for a submission "
+                "without attachments")
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fail_mkdtemp)
+
+        output = format_submission(self.make_submission())
+
+        assert "Course: C1" in output
+
+    def test_temp_dir_created_for_the_first_attachment(self, monkeypatch,
+                                                       tmp_path):
+        """A submission with a file still gets somewhere to put it."""
+        target = tmp_path / "attachments"
+
+        def fake_mkdtemp(*args, **kwargs):
+            target.mkdir()
+            return str(target)
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: str(tmpdir))
+
+        attachment = Mock()
+        attachment.filename = "solution.py"
+        submission = self.make_submission()
+        submission.attachments = [attachment]
+
+        output = format_submission(submission)
+
+        assert target.is_dir()
+        assert str(target) in output
+
+    def test_caller_directory_is_created_regardless(self, tmp_path):
+        """The history code needs the directory it named to exist."""
+        version_dir = tmp_path / "version-0"
+
+        format_submission(self.make_submission(), tmpdir=version_dir)
+
+        assert version_dir.is_dir()
 @
 
 We'll use [[tmpdir]] as the temporary directory to store the files when we try 
@@ -2323,6 +2762,36 @@ To produce the history, we'll modify [[tmpdir]] to create a subdirectory for
 each version.
 We'll write a metadata file for each version.
 Then we'll return all of those in one main metadata file too.
+
+That subdirectory has to come from somewhere.
+Both history branches build it the same way, as
+[[tmpdir / f"version-{version}"]], so neither of them can take a single step
+without a [[tmpdir]] to build it from, and a caller who left the argument out
+met a [[TypeError]] from that division rather than an output.
+The [[submission]] command never ran into it, since it creates a directory
+before it formats anything; the callers who did were the library and test
+callers of [[format_submission]], for whom the argument was optional in name
+only.
+
+The attachment loop settles the same question lazily, and rightly so: a
+submission that turns out to have no files never needs a directory, so
+inventing one up front leaves an empty directory behind for every student in
+the run.
+A history has no such maybe.
+Every version's metadata goes into a file inside that version's own
+subdirectory, whether or not the version had any files at all, so here the
+directory is not a convenience---it is where the output goes.
+We can therefore settle the question once, before either branch looks at a
+version, and settle it with the very chunk the attachment loop uses rather than
+opening a second route to [[mkdtemp]].
+
+A caller who did name a directory keeps it.
+We only make sure that what we hold is a [[pathlib.Path]], since a plain string
+fails that division exactly as [[None]] does, and wrapping a path we just
+invented ourselves costs nothing.
+<<let [[tmpdir]] be a directory to hold the versions>>=
+<<let [[tmpdir]] be a fresh temporary directory>>
+tmpdir = pathlib.Path(tmpdir)
 <<add submission history to output>>=
 try:
   submission_history = submission.submission_history
@@ -2399,6 +2868,69 @@ if json_format:
 else:
   with open(version_dir/"metadata.md", "w") as f:
     f.write(prev_metadata)
+@
+
+\subsection{Verifying that the history brings its own directory}
+
+Now that we have seen the file a version writes, we can verify that it gets
+written when nobody named a directory to write it in.
+We point [[mkdtemp]] at a directory belonging to the test, so that finding the
+metadata file there proves both halves at once: the history invented a
+directory, and it invented it in the temporary area instead of leaving files
+wherever the process happened to be standing.
+The second test covers the other way a caller arrives without a usable path.
+A directory named as a plain string is still a named directory, but the string
+fails the division that builds the version subdirectory just as [[None]] does,
+so it must be turned into a path as well.
+
+<<test functions>>=
+class TestHistoryTempDir:
+    """Test that formatting a history needs no directory from the caller."""
+
+    def make_submission(self):
+        """Build a submission with one history version and no files."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = []
+        submission.preview_url = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.submission_history = [{"id": 1, "user_id": 2}]
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_history_without_a_directory_invents_one(self, monkeypatch,
+                                                     tmp_path):
+        """A caller may ask for the history and name no directory."""
+        target = tmp_path / "history"
+
+        def fake_mkdtemp(*args, **kwargs):
+            target.mkdir()
+            return str(target)
+
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.tempfile.mkdtemp", fake_mkdtemp)
+
+        output = format_submission(self.make_submission(), history=True)
+
+        assert "Version 0" in output
+        assert (target / "version-0" / "metadata.md").is_file()
+
+    def test_named_directory_may_be_a_string(self, tmp_path):
+        """The caller's directory need not already be a path object."""
+        format_submission(self.make_submission(), history=True,
+                          tmpdir=str(tmp_path))
+
+        assert (tmp_path / "version-0" / "metadata.md").is_file()
 @
 
 
@@ -2903,16 +3435,19 @@ if prev_text != curr_text:
     diff_lines.append("\n")
 @
 
-Attachments require special handling since they're nested dictionaries of files.
-However, when there's only one file in each version, we try to match them even 
-if names differ.
+Attachments require special handling since they're nested dictionaries of
+files.
+Unlike the other content types, the two versions need not agree on their keys:
+a student who renames a file between submissions would otherwise get a
+deletion and an addition where a diff was wanted.
+So we pair the files across versions first.
+That step leaves us with [[filename_mapping]], which records for each current
+filename the previous name it was matched with, and with [[prev_attachments]]
+re-keyed under the current names---after which the union of the two key sets
+is the set of files to diff.
 <<handle attachment diffs>>=
 prev_attachments = prev_content.get('attachments', {})
 curr_attachments = curr_content.get('attachments', {})
-
-# Dictionary to track original filenames for matched files
-# Maps current filename -> original filename in previous version
-filename_mapping = {}
 
 <<match single files with different names>>
 
@@ -3102,7 +3637,7 @@ here---that no current name it writes is already a key of
 When that guarantee fails, a [[pop]] can carry away an entry a later
 iteration still needs, and the baseline for a file the student never
 renamed is silently destroyed.
-The discussion under \nameref{UnchangedNamesNotCandidates} above explains
+The discussion in \cref{UnchangedNamesNotCandidates} above explains
 why the matcher used to produce exactly such mappings.
 Rebuilding the dictionary makes this step correct on its own terms, for any
 mapping whatsoever, so a future change to the matcher cannot resurrect the
@@ -3257,15 +3792,23 @@ limitations instructors should be aware of:
   The pager helps navigate this, but instructors may prefer to use
   [[--output-dir]] to save files for inspection in an editor.
 
-\item[Multiple file handling]
-  When multiple files exist in a version, file matching uses exact names only.
-  If a student renames one of several files between submissions, that file will
-  appear as separate delete/add operations rather than a diff.
-  This is intentional to avoid incorrect pairings, but means the instructor
-  must manually correlate the old and new versions.
+\item[Renames the heuristic will not pair]
+  Files are paired across versions by the edit distance between their names,
+  for any number of files, but only when the two names carry the same
+  non-empty extension.
+  A student who renames [[lab.py]] to [[lab_final.txt]], or who submits files
+  with no extension at all, still gets a deletion and an addition where a diff
+  was wanted.
+  The pairing is also greedy rather than globally optimal: among several
+  similar names, accepting the cheapest pair first can rule out a combination
+  of pairs that would have been better overall.
+  Raising [[--diff-threshold-fixed]] or [[--diff-threshold-percent]] does not
+  help here, since they widen how far apart two matched names may be, not
+  which files are candidates for matching; in these cases the instructor must
+  correlate the old and new versions manually.
 
 \item[File matching heuristic accuracy]
-  The smart file matching heuristic (§\ref{SubmissionDiff}) may occasionally
+  The smart file matching heuristic (\cref{SubmissionDiff}) may occasionally
   match unrelated files if they happen to share common naming patterns.
   For example, [[intro.py]] and [[intro_to_python.py]] might be matched despite
   being different programs.
@@ -3473,7 +4016,7 @@ We only consider pairs with matching file extensions, since students rarely
 change extensions when renaming (\eg [[.py]] to [[.txt]]).
 
 We also drop any pair involving a filename that occurs in both versions,
-for the reasons given under \nameref{UnchangedNamesNotCandidates}: such a
+for the reasons given in \cref{UnchangedNamesNotCandidates}: such a
 file is matched to itself, so it can be neither the source nor the target
 of a rename.
 Note that testing both endpoints is what makes this work, and that a weaker
@@ -3551,7 +4094,7 @@ return filename_mapping
 Let us now check that the matcher still detects genuine renames while
 leaving files that survived under their own name alone.
 The first test is the scenario from
-\nameref{UnchangedNamesNotCandidates}, which is the case the exclusion rule
+\cref{UnchangedNamesNotCandidates}, which is the case the exclusion rule
 exists for; the remaining ones guard the behaviour it must not break.
 
 <<test functions>>=
@@ -3885,7 +4428,7 @@ if not args.grade and not args.message:
     <<open [[submission]] in SpeedGrader>>
 else:
   for submission in submission_list:
-    <<if verbose, print [[submission]] and [[results]] to stdout>>
+    <<log the grading of [[submission]]>>
     <<grade submission with error handling>>
 @
 
@@ -3927,7 +4470,11 @@ Its [[False]] default overwrote the count that [[-v]] had just produced, so
 the level never rose above [[WARNING]] and [[canvaslms -vv grade ...]] said
 nothing at all.
 Dropping the local flag is what lets these messages out.
-<<if verbose, print [[submission]] and [[results]] to stdout>>=
+
+The chunk is named for what it does---it logs---and not for a condition it
+tests, because it tests none: whether these lines reach the user is settled
+once, globally, by how many times [[-v]] was given.
+<<log the grading of [[submission]]>>=
 logger.info(f"Grading {submission.assignment.course.course_code} "
              f"{submission.assignment.name} for {submission.user.name}")
 if args.grade:
