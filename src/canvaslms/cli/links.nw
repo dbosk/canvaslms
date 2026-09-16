@@ -153,8 +153,8 @@ else in the package: [[content.nw]] imports it, and the content modules
 import [[content.nw]], so a dependency back would be a cycle.
 For the same reason it talks to the [[canvasapi]] course object directly
 rather than through the filter functions of [[pages.nw]] or
-[[assignments.nw]]; those objects go through the caches of
-the caches described later in this chapter anyway.
+[[assignments.nw]]; those objects go through the caches described
+later in this chapter anyway.
 <<[[links.py]]>>=
 """Translate links between course-specific and symbolic form.
 
@@ -470,4 +470,370 @@ def test_volatile_params_are_dropped_and_the_rest_kept():
   assert drop_query_params(query, VOLATILE_PARAMS) == "?wrap=1"
   assert drop_query_params("?module_item_id=345", VOLATILE_PARAMS) == ""
   assert drop_query_params("", VOLATILE_PARAMS) == ""
+@
+
+\section{Looking things up in a course}
+\label{sec:course-links-index}
+
+Both directions need the same tables about a course, read in opposite
+directions: on the way out an id must become a name, on the way in a name
+must become an id.
+We build the tables once per body in a [[CourseIndex]] and build each
+table only when a link of its kind occurs.
+A page body typically links to one or two other pages and nothing else,
+and fetching the assignment list to translate it would be a request the
+user pays for without getting anything.
+The lists come from the [[canvasapi]] course object, which the cache
+decorators in [[hacks/canvasapi.nw]] wrap for assignments, quizzes,
+modules and module items, so on a warm cache most tables cost no
+request at all; discussion topics, files and folders are not cached and
+are fetched when first needed.
+<<classes>>=
+class CourseIndex:
+  """Lazy name and id tables for the objects a course links to."""
+
+  def __init__(self, course):
+    self.course = course
+    self._tables = {}
+    self._files = {}
+    self._folders = {}
+
+  <<course index methods>>
+@
+
+\subsection{Objects named by their name}
+
+Assignments, quizzes, discussion topics and modules are all looked up
+the same way, so one table type serves them all; only the fetching call
+and the name attribute differ.
+Announcements are discussion topics that the plain listing leaves out,
+so the topic table asks for both.
+<<constants>>=
+NAMED_KINDS = {
+  "assignments": ("name", lambda course: course.get_assignments()),
+  "quizzes": ("title", lambda course: course.get_quizzes()),
+  "discussion_topics": ("title", lambda course:
+    list(course.get_discussion_topics())
+    + list(course.get_discussion_topics(only_announcements=True))),
+  "modules": ("name", lambda course: course.get_modules()),
+}
+@
+
+A name is not guaranteed unique---two assignments called
+\enquote{Lab 1} are legal---so the name table maps a name to a list of
+objects rather than to one object.
+Callers that need one object decide what an empty or a long list means;
+that decision is different when exporting (warn, the name is still the
+best we have) and when importing (refuse to guess).
+<<course index methods>>=
+def table(self, kind):
+  """Return `(by_id, by_name)` for the objects of `kind`."""
+  if kind not in self._tables:
+    name_attr, fetch = NAMED_KINDS[kind]
+    objects = list(fetch(self.course))
+    by_id = {obj.id: obj for obj in objects}
+    by_name = {}
+    for obj in objects:
+      by_name.setdefault(getattr(obj, name_attr), []).append(obj)
+    self._tables[kind] = (by_id, by_name)
+  return self._tables[kind]
+
+def name(self, kind, object_id):
+  """Return the name of the object of `kind` with `object_id`, or None."""
+  by_id, _ = self.table(kind)
+  obj = by_id.get(object_id)
+  return getattr(obj, NAMED_KINDS[kind][0]) if obj is not None else None
+
+def is_ambiguous(self, kind, name):
+  """Whether more than one object of `kind` has the name `name`."""
+  return len(self.table(kind)[1].get(name, [])) > 1
+@
+
+When resolving a name we try it exactly first and fall back to a
+case-insensitive match, because a title retyped by hand is the one
+plausible source of a mismatch that is still safe to accept.
+We do not go further than that: no substring, no regular expression.
+The names in a symbol were written by this tool from the real names, and
+a fuzzy match that quietly picks the wrong assignment is precisely the
+corruption the translation exists to prevent.
+Contrast [[match_item_by_regex]] in [[content.nw]], which serves names a
+human typed into a YAML header and where a regular expression is the
+convenience the user asked for.
+<<course index methods>>=
+def candidates(self, kind, name):
+  """Return the objects of `kind` named `name`, exactly or ignoring case."""
+  _, by_name = self.table(kind)
+  if name in by_name:
+    return by_name[name]
+  folded = name.casefold()
+  return [obj for candidate, objects in by_name.items()
+          if candidate.casefold() == folded
+          for obj in objects]
+@
+
+\subsection{Module items}
+
+A module item is named by its module and its title, so its table is the
+module table with every module's items fetched.
+Building it costs one request per module, which is why it is a table of
+its own that only a link to a module item pays for.
+<<course index methods>>=
+def module_items(self):
+  """Return `{item id: (module, item)}` for every item in the course."""
+  if "module_items" not in self._tables:
+    by_id = {}
+    for module in self.table("modules")[0].values():
+      for item in module.get_module_items():
+        by_id[item.id] = (module, item)
+    self._tables["module_items"] = by_id
+  return self._tables["module_items"]
+
+def module_item_candidates(self, module_name, title):
+  """Return the items titled `title` in the modules named `module_name`."""
+  return [item
+          for module in self.candidates("modules", module_name)
+          for item in module.get_module_items()
+          if item.title == title]
+@
+
+\subsection{Pages}
+
+Pages are the easy case on the way out (the slug is in the URL) and the
+subtle case on the way in.
+Canvas derives the slug from the title, and keeps a page reachable under
+its old slugs after a rename, so asking Canvas for the slug directly is
+both the cheapest and the most faithful lookup: it follows the same
+redirects the browser would.
+Only when Canvas has no page under the slug do we fall back to a page
+whose title produces the slug, which catches a page that was recreated
+by hand in the new course under the same title.
+The slug derivation is Canvas's: lower case, and every run of characters
+that is not a letter, digit or plus sign becomes a single dash.
+<<course index methods>>=
+def page_candidates(self, slug):
+  """Return the pages reachable under `slug`, by redirect or by title."""
+  try:
+    return [self.course.get_page(slug)]
+  except Exception:
+    pass
+  return [page for page in self.course.get_pages()
+          if page.url == slug or slugify(page.title) == slug]
+<<functions>>=
+def slugify(title):
+  """Return the URL slug Canvas derives from the page title `title`."""
+  return re.sub(r"[^a-z0-9+]+", "-", title.lower()).strip("-")
+@
+
+\subsection{Files}
+
+A file is named by its path below the course files root, the way a
+Canvas export names it.
+On the way out we have a file id and need its folder: one request for
+the file, one for the folder, both remembered so that a body with many
+links to the same folder pays once.
+Canvas's root folder is called [[course files]] and every folder's
+[[full_name]] starts with it, so that prefix is stripped from the path
+and put back when resolving.
+<<constants>>=
+ROOT_FOLDER = "course files"
+<<course index methods>>=
+def file_path(self, file_id):
+  """Return `(folder path, display name)` for `file_id`, or None."""
+  if file_id not in self._files:
+    try:
+      file = self.course.get_file(file_id)
+      folder = self.folder(file.folder_id)
+      self._files[file_id] = (folder_path(folder), file.display_name)
+    except Exception:
+      self._files[file_id] = None
+  return self._files[file_id]
+
+def folder(self, folder_id):
+  """Return the folder with `folder_id`, fetching it once."""
+  if folder_id not in self._folders:
+    self._folders[folder_id] = self.course.get_folder(folder_id)
+  return self._folders[folder_id]
+<<functions>>=
+def folder_path(folder):
+  """Return the path of `folder` below the course files root."""
+  path = folder.full_name
+  if path == ROOT_FOLDER:
+    return ""
+  if path.startswith(ROOT_FOLDER + "/"):
+    return path[len(ROOT_FOLDER) + 1:]
+  return path
+@
+
+On the way in we have the path and need the file id.
+[[canvasapi]] resolves a folder path to the list of folders along it,
+ending with the folder asked for, and the folder lists its files.
+A file has two names: [[display_name]] is what the user sees and what
+the export wrote, [[filename]] is the name on disk, which Canvas may
+have altered (a space becomes a plus).
+The display name is matched first, the filename as a fallback.
+<<course index methods>>=
+def file_candidates(self, folder, name):
+  """Return the files named `name` in the folder at path `folder`."""
+  try:
+    folders = list(self.course.resolve_path(folder) if folder
+                   else self.course.resolve_path())
+    files = list(folders[-1].get_files())
+  except Exception:
+    return []
+  return ([file for file in files if file.display_name == name]
+          or [file for file in files if file.filename == name])
+@
+
+\subsection{A fake course to look links up in}
+\label{sec:course-links-fake}
+
+The tests need a course with one object of each linkable kind, and a
+second course with the same names but other ids to stand in for next
+year's instance.
+The numeric ids are parameters so that the twin is the same function
+called twice.
+Two assignments share a name to exercise ambiguity, and the file's
+display name contains a space and differs from its filename, as it does
+in Canvas.
+<<test functions>>=
+def obj(**attrs):
+  return types.SimpleNamespace(**attrs)
+
+IDS = {"assignment": 123456, "lab": 7, "lab2": 8, "quiz": 34,
+       "topic": 56, "announcement": 57, "module": 12, "item": 345,
+       "file": 789, "folder": 5}
+
+def fake_course(course_id=59543, ids=None):
+  """A course with one object of each kind links can point at."""
+  n = dict(IDS, **(ids or {}))
+  course = MagicMock()
+  course.id = course_id
+  course.name = f"Course {course_id}"
+  course._requester.original_url = SERVER
+  <<fake pages>>
+  <<fake named objects>>
+  <<fake modules and items>>
+  <<fake files and folders>>
+  return course
+@
+
+The page lookup raises for an unknown slug, as [[canvasapi]] does.
+<<fake pages>>=
+pages = {"grading-criteria": obj(url="grading-criteria",
+                                 title="Grading criteria"),
+         "setup": obj(url="setup", title="Setup")}
+course.get_pages.return_value = list(pages.values())
+def get_page(slug):
+  if slug in pages:
+    return pages[slug]
+  raise LookupError(slug)
+course.get_page.side_effect = get_page
+@
+
+<<fake named objects>>=
+course.get_assignments.return_value = [
+  obj(id=n["assignment"], name="HAC Ch 6: Stream ciphers"),
+  obj(id=n["lab"], name="Lab 1"),
+  obj(id=n["lab2"], name="Lab 1")]
+course.get_quizzes.return_value = [obj(id=n["quiz"], title="INL1Quiz")]
+def topics(only_announcements=False):
+  if only_announcements:
+    return [obj(id=n["announcement"], title="Welcome")]
+  return [obj(id=n["topic"], title="General discussion")]
+course.get_discussion_topics.side_effect = topics
+@
+
+<<fake modules and items>>=
+module = MagicMock()
+module.id = n["module"]
+module.name = "Week 1"
+module.get_module_items.return_value = [obj(id=n["item"],
+                                            title="Lecture: Intro")]
+course.get_modules.return_value = [module]
+@
+
+<<fake files and folders>>=
+root = MagicMock()
+root.id = 1
+root.full_name = "course files"
+root.get_files.return_value = []
+folder = MagicMock()
+folder.id = n["folder"]
+folder.full_name = "course files/slides"
+file = obj(id=n["file"], display_name="intro a.pdf",
+           filename="intro+a.pdf", folder_id=n["folder"])
+folder.get_files.return_value = [file]
+def get_file(file_id):
+  if file_id == n["file"]:
+    return file
+  raise LookupError(file_id)
+course.get_file.side_effect = get_file
+course.get_folder.side_effect = lambda folder_id: \
+  {root.id: root, folder.id: folder}[folder_id]
+def resolve_path(path=None):
+  if not path:
+    return [root]
+  if path == "slides":
+    return [root, folder]
+  raise LookupError(path)
+course.resolve_path.side_effect = resolve_path
+@
+
+Let's verify the tables: names by id, candidates exactly and ignoring
+case, ambiguity, the module item and page fallbacks, the file path both
+ways, and that a page lookup fetches no assignment list.
+<<test functions>>=
+def test_index_names_objects_by_id():
+  index = CourseIndex(fake_course())
+  assert index.name("assignments", 123456) == "HAC Ch 6: Stream ciphers"
+  assert index.name("quizzes", 34) == "INL1Quiz"
+  assert index.name("discussion_topics", 57) == "Welcome"
+  assert index.name("modules", 12) == "Week 1"
+  assert index.name("assignments", 999) is None
+
+def test_index_finds_candidates_exactly_then_ignoring_case():
+  index = CourseIndex(fake_course())
+  assert [a.id for a in index.candidates("assignments", "hac ch 6: STREAM ciphers")] == [123456]
+  assert [a.id for a in index.candidates("assignments", "Lab 1")] == [7, 8]
+  assert index.candidates("assignments", "Lab 2") == []
+  assert index.is_ambiguous("assignments", "Lab 1")
+  assert not index.is_ambiguous("assignments", "Lab 2")
+
+def test_index_finds_module_items():
+  index = CourseIndex(fake_course())
+  module, item = index.module_items()[345]
+  assert module.name == "Week 1" and item.title == "Lecture: Intro"
+  found = index.module_item_candidates("Week 1", "Lecture: Intro")
+  assert [i.id for i in found] == [345]
+  assert index.module_item_candidates("Week 2", "Lecture: Intro") == []
+
+def test_index_finds_pages_by_slug_then_by_title():
+  index = CourseIndex(fake_course())
+  assert index.page_candidates("setup")[0].title == "Setup"
+  assert index.page_candidates("grading-criteria")[0].url == \
+    "grading-criteria"
+  assert index.page_candidates("missing") == []
+
+def test_slugify_matches_canvas():
+  assert slugify("Grading criteria") == "grading-criteria"
+  assert slugify("Page on zoom+campus!") == "page-on-zoom+campus"
+
+def test_index_names_files_by_path_both_ways():
+  index = CourseIndex(fake_course())
+  assert index.file_path(789) == ("slides", "intro a.pdf")
+  assert index.file_path(1) is None
+  assert [f.id for f in index.file_candidates("slides", "intro a.pdf")] == [789]
+  assert [f.id for f in index.file_candidates("slides", "intro+a.pdf")] == [789]
+  assert index.file_candidates("slides", "other.pdf") == []
+  assert index.file_candidates("nowhere", "intro a.pdf") == []
+
+def test_index_fetches_only_the_kinds_asked_for():
+  course = fake_course()
+  index = CourseIndex(course)
+  index.page_candidates("setup")
+  course.get_assignments.assert_not_called()
+  course.get_modules.assert_not_called()
+  index.name("assignments", 7)
+  index.name("assignments", 8)
+  course.get_assignments.assert_called_once()
 @
