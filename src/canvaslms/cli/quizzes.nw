@@ -369,6 +369,7 @@ import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
 import canvaslms.cli.content as content
+import canvaslms.cli.links
 import canvaslms.cli.modules as modules
 import canvaslms.cli.utils
 from rich.console import Console
@@ -2871,6 +2872,7 @@ QUESTION GROUPS (Classic Quizzes only):
 For question format details, see: canvaslms quizzes items add --example""")
 
 create_parser.set_defaults(func=create_command)
+canvaslms.cli.links.add_link_options(create_parser, push=True)
 
 try:
   courses.add_course_option(create_parser, required=False)
@@ -3078,7 +3080,7 @@ def create_command(config, canvas, args):
   <<place new quiz in requested modules>>
 
   # Add questions if the file carried any
-  items = quiz_data['items'] or []
+  items = content.resolve_tree_for(quiz_data['items'] or [], course, args)
 
   if quiz_type == "new" and items:
     print(f"Adding {len(items)} question(s)...")
@@ -3198,10 +3200,17 @@ the empty string must be sent, since that is how a user clears text the quiz
 already has, but a quiz being created has nothing to clear, and the key would
 only restate a default.
 
+A quiz body links to the course's pages and files like a page does, and
+so do its questions, so the translation of \cref{sec:course-links}
+applies to both: the body is resolved against the course here, whatever
+format it came in, and the questions are resolved as a tree just before
+they are added.
 <<put the body under the key the target quiz system reads>>=
 body = quiz_data['instructions']
 if quiz_data['format'] == 'frontmatter' and body.strip():
   body = content.markdown_to_html(body)
+if body:
+  body = content.resolve_body_for(body, course, args)
 
 quiz_params.pop('instructions', None)
 quiz_params.pop('description', None)
@@ -4408,6 +4417,7 @@ ITEM HANDLING:
 The quiz type (New or Classic) is auto-detected.""")
 
 edit_parser.set_defaults(func=edit_command)
+canvaslms.cli.links.add_link_options(edit_parser, push=True)
 
 try:
   courses.add_course_option(edit_parser, required=True)
@@ -4745,7 +4755,8 @@ for quiz in quiz_list:
   else:
     api_settings = convert_front_matter_units(settings, is_new_quiz(quiz))
 
-  success = apply_quiz_edit(quiz, api_settings, body, requester, args.html)
+  success = apply_quiz_edit(quiz, api_settings, body, requester, args.html,
+                            args=args)
   if success:
     print(f"Updated quiz: {quiz.title}")
     <<update quiz module membership from file>>
@@ -5381,7 +5392,8 @@ The chunk [[<<check submissions and replace items>>]] combines submission
 checking with item replacement for the file-based workflow:
 
 <<check submissions and replace items>>=
-item_success = replace_quiz_items(quiz, items, requester)
+item_success = replace_quiz_items(
+  quiz, content.resolve_tree_for(items, quiz.course, args), requester)
 if item_success:
   print(f"Replaced items for quiz: {quiz.title}")
 else:
@@ -5780,7 +5792,8 @@ produced.  Only the front-matter callers convert; here [[time_limit]] is
 already in Canvas's units and travels through unchanged.
 
 <<functions>>=
-def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
+def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
+                    args=None):
   """Apply edited attributes and body to a quiz
 
   Args:
@@ -5789,6 +5802,8 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
     body: Instructions/description content
     requester: Canvas API requester
     html_mode: If True, body is already HTML
+    args: Command-line arguments; when given, symbolic links in the
+      body are resolved against the quiz's course as they ask
 
   Returns:
     True on success, False on failure
@@ -5799,6 +5814,8 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False):
     html_body = content.markdown_to_html(body)
   else:
     html_body = ''
+  if args is not None and html_body:
+    html_body = content.resolve_body_for(html_body, quiz.course, args)
 
   # Build API parameters
   quiz_params = quiz_attributes_to_api_params(
@@ -6318,6 +6335,7 @@ Use --importable/-I for clean JSON ready for 'quizzes create'.
 Without -I, the output includes Canvas IDs and metadata for reference.""")
 
 export_parser.set_defaults(func=export_command)
+canvaslms.cli.links.add_link_options(export_parser)
 
 try:
   courses.add_course_option(export_parser, required=True)
@@ -6382,6 +6400,8 @@ def export_command(config, canvas, args):
 
   # Preserve the user's selection expression for round-trip syncing.
   export.setdefault('settings', {})['regex'] = args.assignment
+  export = content.symbolize_tree(
+    export, content.translation_course(quiz.course, args))
 
   # Output as JSON
   print(json.dumps(export, indent=2, ensure_ascii=False))
@@ -6684,6 +6704,7 @@ Output format depends on terminal:
 - Pipe: Plain markdown for further processing""")
 
 view_parser.set_defaults(func=view_command)
+canvaslms.cli.links.add_link_options(view_parser)
 
 try:
   courses.add_course_option(view_parser, required=True)
@@ -6722,10 +6743,12 @@ def view_command(config, canvas, args):
       if course_id:
         course = canvas.get_course(course_id)
 
+    link_course = content.translation_course(course, args)
     if is_new_quiz(quiz):
-      markdown = format_new_quiz_as_markdown(quiz, course, requester)
+      markdown = format_new_quiz_as_markdown(quiz, course, requester,
+                                             link_course)
     else:
-      markdown = format_classic_quiz_as_markdown(quiz)
+      markdown = format_classic_quiz_as_markdown(quiz, link_course)
 
     output_parts.append(markdown)
 
@@ -6773,13 +6796,14 @@ New Quizzes store their content differently from Classic Quizzes. We use the
 each item according to its type.
 
 <<functions>>=
-def format_new_quiz_as_markdown(quiz, course, requester):
+def format_new_quiz_as_markdown(quiz, course, requester, link_course=None):
   """Format a New Quiz as markdown
 
   Args:
     quiz: NewQuiz object
     course: Course object
     requester: Canvas API requester
+    link_course: Course whose links to show in symbolic form, or None
 
   Returns:
     Markdown string with quiz content
@@ -6810,14 +6834,14 @@ def format_new_quiz_as_markdown(quiz, course, requester):
     lines.append("## Instructions")
     lines.append("")
     # Convert HTML to plain text (basic cleanup)
-    clean_instructions = html_to_markdown(instructions)
+    clean_instructions = html_to_markdown(instructions, link_course)
     lines.append(clean_instructions)
     lines.append("")
 
   # Fetch and format questions
   try:
     export_data = export_new_quiz_items(quiz, requester, include_banks=True)
-    items = export_data.get('items', [])
+    items = content.symbolize_tree(export_data.get('items', []), link_course)
 
     if items:
       lines.append("## Questions")
@@ -7590,11 +7614,12 @@ Classic Quizzes have a more straightforward structure. We use the
 [[export_classic_questions]] function to get all questions with their answers.
 
 <<functions>>=
-def format_classic_quiz_as_markdown(quiz):
+def format_classic_quiz_as_markdown(quiz, link_course=None):
   """Format a Classic Quiz as markdown
 
   Args:
     quiz: Quiz object
+    link_course: Course whose links to show in symbolic form, or None
 
   Returns:
     Markdown string with quiz content
@@ -7627,13 +7652,14 @@ def format_classic_quiz_as_markdown(quiz):
   if description:
     lines.append("## Instructions")
     lines.append("")
-    lines.append(html_to_markdown(description))
+    lines.append(html_to_markdown(description, link_course))
     lines.append("")
 
   # Fetch and format questions
   try:
     export_data = export_classic_questions(quiz)
-    questions = export_data.get('questions', [])
+    questions = content.symbolize_tree(export_data.get('questions', []),
+                                       link_course)
 
     if questions:
       lines.append("## Questions")
@@ -7972,11 +7998,12 @@ We fall back to regex stripping only if Pandoc is unavailable or fails---this
 provides degraded but functional output rather than crashing.
 
 <<functions>>=
-def html_to_markdown(html_string):
+def html_to_markdown(html_string, course=None):
   """Convert HTML to markdown using pypandoc
 
   Args:
     html_string: String containing HTML content
+    course: Course whose links to show in symbolic form, or None
 
   Returns:
     Markdown string
@@ -7985,7 +8012,7 @@ def html_to_markdown(html_string):
     return ""
 
   try:
-    markdown = content.html_to_markdown(html_string)
+    markdown = content.html_to_markdown(html_string, course)
     return markdown.strip()
   except Exception:
     # Fallback: return the string with tags stripped if pandoc fails
@@ -8064,6 +8091,7 @@ The file should contain an array of questions.
 
 Use --example to print example JSON for all supported question types.""")
   parser.set_defaults(func=items_add_command)
+  canvaslms.cli.links.add_link_options(parser, push=True)
 
   parser.add_argument("--example", "-E",
       action="store_true",
@@ -8087,6 +8115,7 @@ def add_items_edit_command(subp):
       help="Edit a question in a quiz",
       description="Edit an existing question in a quiz")
   parser.set_defaults(func=items_edit_command)
+  canvaslms.cli.links.add_link_options(parser, push=True)
 
   try:
     courses.add_course_option(parser, required=True)
@@ -8147,6 +8176,7 @@ For New Quizzes, if the quiz uses item banks (BankEntry items), the actual
 questions from those banks are also exported. This allows complete backup
 and migration of quiz content.""")
   parser.set_defaults(func=items_export_command)
+  canvaslms.cli.links.add_link_options(parser)
 
   try:
     courses.add_course_option(parser, required=True)
@@ -9581,12 +9611,14 @@ def items_add_command(config, canvas, args):
     items = data.get('items', [])
     if not items:
       canvaslms.cli.err(1, "No 'items' array found in JSON file")
+    items = content.resolve_tree_for(items, quiz.course, args)
     success, failed = add_new_quiz_items(quiz.course, quiz.id,
                                           canvas._Canvas__requester, items)
   else:
     questions = data.get('questions', [])
     if not questions:
       canvaslms.cli.err(1, "No 'questions' array found in JSON file")
+    questions = content.resolve_tree_for(questions, quiz.course, args)
     success, failed = add_classic_questions(quiz, questions)
 
   print(f"Added {success} question(s), {failed} failed")
@@ -10188,6 +10220,7 @@ def items_edit_command(config, canvas, args):
     canvaslms.cli.err(1, f"File not found: {args.file}")
   except json.JSONDecodeError as e:
     canvaslms.cli.err(1, f"Invalid JSON in {args.file}: {e}")
+  update_data = content.resolve_tree_for(update_data, quiz.course, args)
 
   # Find the item ID if position was given
   item_id = args.id
@@ -10544,6 +10577,8 @@ def items_export_command(config, canvas, args):
     export = export_classic_questions(quiz)
     if getattr(args, 'importable', False):
       export = clean_for_import(export, quiz_type='classic')
+  export = content.symbolize_tree(
+    export, content.translation_course(quiz.course, args))
 
   # Output as JSON
   print(json.dumps(export, indent=2, ensure_ascii=False))
