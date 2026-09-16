@@ -91,6 +91,7 @@ import rich.markdown
 import yaml
 
 import canvaslms.cli
+import canvaslms.cli.links
 @
 
 \section{Testing overview}
@@ -736,6 +737,9 @@ We contrast this with the [[--html]] export modes, which never convert and
 therefore never had the problem; the fix belongs to the Markdown path only.
 Every caller goes through this one function so that the exports of all
 content types agree on how embeds look.
+Given a [[course]], the links into it are rewritten to their symbolic
+form before the conversion (\cref{sec:content-links}), so that every
+export agrees on that too.
 <<content constants>>=
 RAW_HTML_FENCE = re.compile(r"```\{=html\}\n(.*?)\n```", re.S)
 RAW_HTML_SPAN = re.compile(r"`([^`]*)`\{=html\}")
@@ -743,14 +747,17 @@ EMBED_TAGS = "iframe|embed|object|video|audio"
 SPLIT_EMBED = re.compile(rf"(<({EMBED_TAGS})\b[^>]*>)\n+(</\2>)")
 BLOCK_EMBED_END = re.compile(rf"(</(?:{EMBED_TAGS})>)\n(?!\n)")
 <<html conversion functions>>=
-def html_to_markdown(html):
+def html_to_markdown(html, course=None):
     """Convert Canvas HTML to Markdown, keeping embeds as raw HTML.
 
     Elements pandoc cannot represent (iframe, embed, object, video, audio)
     come out as plain HTML tags in the Markdown, which pandoc's Markdown
     reader passes through unchanged when the content is converted back.
+    With `course`, links into that course are first rewritten to their
+    course-independent symbolic form (see `symbolize_body`).
     Raises whatever pypandoc raises if pandoc is missing or fails.
     """
+    html = symbolize_body(html, course)
     markdown = pypandoc.convert_text(html, 'md', format='html+raw_html')
     markdown = RAW_HTML_FENCE.sub(lambda m: m.group(1), markdown)
     markdown = RAW_HTML_SPAN.sub(lambda m: m.group(1), markdown)
@@ -876,6 +883,153 @@ class TestMarkdownToHtml:
 @
 
 
+\section{Translating course links on the way in and out}
+\label{sec:content-links}
+
+Both directions of the workflow pass through this module, which makes it
+the one place to translate the links between course objects that
+\cref{sec:course-links} describes: a body leaving Canvas has its links
+into the course rewritten to the symbolic form, and a body going to
+Canvas has its symbols resolved against the course it is pushed into.
+A command that asked for [[--no-link-translation]] passes no course, and
+nothing is translated; that is the whole implementation of the option,
+and it keeps every caller that predates the translation unchanged.
+
+On the way out a stale link is a warning: the file is still what the
+user asked for.
+<<html conversion functions>>=
+def symbolize_body(html, course):
+    """Return `html` with links into `course` in symbolic form.
+
+    With `course` None the body is returned as it is. Links whose
+    target no longer exists or whose name is not unique are reported as
+    warnings.
+    """
+    if course is None:
+        return html
+    html, problems = canvaslms.cli.links.symbolize_links(
+        html, course, canvaslms.cli.links.server_url_for(course))
+    canvaslms.cli.links.report_link_problems(problems, course, fatal=False)
+    return html
+@
+
+On the way in the body is first converted, unless it is HTML already,
+and then resolved.
+The order matters: the symbols sit in link destinations, which pandoc
+copies verbatim, and resolving after the conversion means the
+[[--html]] path and the Markdown path meet in the same HTML.
+An unresolved symbol stops the push unless the caller allows it, for the
+reasons given in \cref{sec:course-links-report}.
+<<html conversion functions>>=
+def prepare_body(body, course=None, html_mode=False,
+                 allow_unresolved=False):
+    """Turn an edited body into the HTML Canvas should store.
+
+    `body` is Markdown unless `html_mode`. With `course`, symbolic links
+    are resolved against it; a symbol that cannot be resolved exits
+    with an error unless `allow_unresolved`, in which case it is kept
+    and warned about.
+    """
+    html = body if html_mode else markdown_to_html(body)
+    if course is None:
+        return html
+    html, problems = canvaslms.cli.links.resolve_links(html, course)
+    canvaslms.cli.links.report_link_problems(
+        problems, course, fatal=not allow_unresolved)
+    return html
+@
+
+The commands know the course at different moments.
+A view has the object, and its course, before rendering.
+An edit converts the body once and then writes it to every matched
+object, possibly in several courses, so the symbols must be resolved at
+each write, against that object's course.
+Two helpers keep the option handling out of the commands: one picks the
+course to translate for, honouring [[--no-link-translation]], and one
+resolves an already converted body at a write site.
+Both read the options with a default so that a command which has not
+added them behaves as if translation were off.
+<<html conversion functions>>=
+def translation_course(course, args):
+    """Return `course` unless `args` asked for no link translation."""
+    if getattr(args, 'no_link_translation', False):
+        return None
+    return course
+
+def resolve_body_for(html, course, args):
+    """Resolve the symbolic links in `html` for `course` as `args` ask.
+
+    `html` is the converted body; the result is what to store in
+    `course`. Unresolved links exit unless `--allow-unresolved-links`.
+    """
+    return prepare_body(
+        html, translation_course(course, args), html_mode=True,
+        allow_unresolved=getattr(args, 'allow_unresolved_links', False))
+@
+
+Let's verify the contract the commands rely on: without a course
+nothing is looked up, and with one the links are translated in each
+direction, as the options say.
+<<test html conversion functions>>=
+class TestLinkTranslation:
+    def fake_course(self):
+        from unittest.mock import MagicMock
+        import types
+        course = MagicMock()
+        course.id = 71234
+        course.name = "Twin"
+        course._requester.original_url = "https://canvas.kth.se"
+        course.get_page.side_effect = \
+            lambda slug: types.SimpleNamespace(url=slug)
+        return course
+
+    def test_without_a_course_nothing_is_touched(self):
+        body = '<a href="$WIKI_REFERENCE$/pages/x">x</a>'
+        assert content.prepare_body(body, html_mode=True) == body
+        assert content.symbolize_body(body, None) == body
+
+    def test_prepare_body_resolves_symbols(self):
+        body = '<a href="$WIKI_REFERENCE$/pages/x">x</a>'
+        html = content.prepare_body(body, self.fake_course(), html_mode=True)
+        assert html == '<a href="/courses/71234/pages/x">x</a>'
+
+    def test_prepare_body_exits_on_an_unresolved_symbol(self):
+        course = self.fake_course()
+        course.get_page.side_effect = LookupError
+        course.get_pages.return_value = []
+        body = '<a href="$WIKI_REFERENCE$/pages/x">x</a>'
+        with pytest.raises(SystemExit):
+            content.prepare_body(body, course, html_mode=True)
+        assert content.prepare_body(body, course, html_mode=True,
+                                    allow_unresolved=True) == body
+
+    def test_symbolize_body_rewrites_links_into_the_course(self):
+        body = '<a href="/courses/71234/pages/x">x</a>'
+        assert content.symbolize_body(body, self.fake_course()) == \
+            '<a href="$WIKI_REFERENCE$/pages/x">x</a>'
+
+    def test_options_select_the_course_and_the_policy(self):
+        import argparse
+        course = self.fake_course()
+        body = '<a href="$WIKI_REFERENCE$/pages/x">x</a>'
+        on = argparse.Namespace(no_link_translation=False,
+                                allow_unresolved_links=False)
+        off = argparse.Namespace(no_link_translation=True)
+        assert content.translation_course(course, on) is course
+        assert content.translation_course(course, off) is None
+        assert content.resolve_body_for(body, course, off) == body
+        assert content.resolve_body_for(body, course, on) == \
+            '<a href="/courses/71234/pages/x">x</a>'
+        course.get_page.side_effect = LookupError
+        course.get_pages.return_value = []
+        with pytest.raises(SystemExit):
+            content.resolve_body_for(body, course, on)
+        lenient = argparse.Namespace(no_link_translation=False,
+                                     allow_unresolved_links=True)
+        assert content.resolve_body_for(body, course, lenient) == body
+@
+
+
 \section{Rendering Canvas objects to Markdown}
 
 The [[render_to_markdown]] function implements the Canvas-to-file direction.
@@ -887,7 +1041,8 @@ For example, module membership is stored separately from page or assignment
 objects. The [[extra_attributes]] parameter allows callers to include such
 additional attributes in the YAML front matter without modifying the schema.
 <<rendering functions>>=
-def render_to_markdown(obj, schema, content_attr='message', extra_attributes=None):
+def render_to_markdown(obj, schema, content_attr='message',
+                       extra_attributes=None, course=None):
     """Render a Canvas object to Markdown with YAML front matter.
 
     This is the Canvas-to-file direction: take a Canvas object and produce
@@ -900,6 +1055,7 @@ def render_to_markdown(obj, schema, content_attr='message', extra_attributes=Non
                      (e.g., 'message' for announcements, 'description' for assignments)
         extra_attributes: Optional dict of additional attributes to include
                          in the YAML front matter (e.g., {'modules': ['Module 1']})
+        course: Course whose links to rewrite in symbolic form, or None
 
     Returns:
         Markdown string with YAML front matter
@@ -911,7 +1067,7 @@ def render_to_markdown(obj, schema, content_attr='message', extra_attributes=Non
     html_content = getattr(obj, content_attr, '') or ''
     if html_content:
         try:
-            markdown_content = html_to_markdown(html_content)
+            markdown_content = html_to_markdown(html_content, course)
         except Exception as e:
             logger.warning(f"Failed to convert HTML to Markdown: {e}")
             markdown_content = html_content
@@ -929,19 +1085,25 @@ to Markdown. This is useful when pages contain elements that don't convert well:
 embedded videos, iframes, complex tables, or custom HTML formatting. The
 [[render_to_html]] function is the counterpart to [[render_to_markdown]]---it
 produces the same YAML front matter format, but leaves the body as raw HTML.
+Raw does not mean untranslated: the links are symbolized here too, since
+the HTML path is the one users choose precisely when the file must
+survive a round trip unchanged.
 <<rendering functions>>=
-def render_to_html(obj, schema, content_attr='message', extra_attributes=None):
+def render_to_html(obj, schema, content_attr='message',
+                   extra_attributes=None, course=None):
     """Render a Canvas object to HTML with YAML front matter.
 
     Unlike render_to_markdown, this outputs the HTML content as-is,
     without converting to Markdown. Use this when HTML elements must
     be preserved exactly (embedded videos, iframes, custom formatting).
+    Links into `course`, if given, are still rewritten to symbolic form.
 
     Args:
         obj: Canvas API object
         schema: Schema for attribute extraction
         content_attr: Name of the attribute containing HTML content
         extra_attributes: Optional dict of additional attributes
+        course: Course whose links to rewrite in symbolic form, or None
 
     Returns:
         String with YAML front matter and HTML body
@@ -951,6 +1113,7 @@ def render_to_html(obj, schema, content_attr='message', extra_attributes=None):
         attributes.update(extra_attributes)
 
     html_content = getattr(obj, content_attr, '') or ''
+    html_content = symbolize_body(html_content, course)
     return format_yaml_front_matter(attributes, html_content)
 
 @
