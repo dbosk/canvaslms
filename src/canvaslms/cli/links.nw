@@ -1110,3 +1110,500 @@ def test_symbolize_reports_an_ambiguous_name_but_uses_it():
   assert [p.kind for p in problems] == ["ambiguous"]
   assert "'Lab 1'" in problems[0].reason
 @
+
+\section{From a symbol to a course}
+\label{sec:course-links-resolve}
+
+Importing is the inverse: every symbolic link becomes a link into the
+course the body is pushed into, and every other link is left alone.
+A symbol that cannot be resolved is also left alone, in symbolic form,
+and reported.
+That choice is what makes pushing a whole course possible at all: the
+first page pushed into an empty course links to pages that do not exist
+yet, and a symbol that stays symbolic is resolved by the next push once
+they do.
+Whether an unresolved link stops the push is decided by the caller
+(\cref{sec:course-links-report}); the function itself never guesses.
+<<functions>>=
+def resolve_links(body, course, server_url=None):
+  """Rewrite the symbolic links in `body` into links into `course`.
+
+  Returns `(body, problems)`: the body with every symbol replaced by a
+  course URL, and a list of `LinkProblem` for symbols that name no
+  object in `course`, several objects, or use a form we cannot
+  resolve. Those symbols are left as they are. `server_url` is used
+  for the absolute `data-api-endpoint` attribute and defaults to the
+  server `course` came from.
+  """
+  index = CourseIndex(course)
+  server_url = server_url or server_url_for(course)
+  problems = []
+
+  def rewrite(attribute, url):
+    symbol = parse_symbolic_url(url)
+    if symbol is None:
+      return None
+    resolved = resolve_symbol(url, symbol, index, problems)
+    if resolved is None:
+      return None
+    path, query = resolved
+    <<shape the resolved URL for its attribute>>
+
+  return rewrite_link_attributes(body, rewrite), problems
+@
+
+\subsection{Why the API endpoint needs no separate repair}
+
+Canvas's importer leaves [[data-api-endpoint]] stale because it treats
+it as an attribute it does not know.
+We symbolized it like any other link, so on the way back it is resolved
+like any other link; the only difference is the shape of the result.
+The editor writes [[href]] and [[src]] relative, which survives a change
+of server, and [[data-api-endpoint]] absolute with the API prefix.
+The attribute name is all that is needed to tell them apart, and
+[[data-api-returntype]] names the object's type, which does not change,
+so it is never touched.
+<<shape the resolved URL for its attribute>>=
+if attribute == "data-api-endpoint":
+  base = f"{server_url or ''}/api/v1/courses/{course.id}"
+else:
+  base = f"/courses/{course.id}"
+return base + path + query + symbol.fragment
+@
+
+The server URL comes from the requester the course object carries,
+which is the base URL the user logged in with.
+<<functions>>=
+def server_url_for(course):
+  """Return the base URL of the Canvas server `course` came from."""
+  try:
+    return course._requester.original_url.rstrip("/")
+  except AttributeError:
+    return None
+@
+
+\subsection{Matching order}
+
+The token says what the path names, and within the course token the
+same positional rule as on export applies, in reverse.
+Every branch returns the path and query to put after the course, or
+[[None]] after recording why.
+<<constants>>=
+PAGE_SYMBOL = re.compile(r'^/(?:pages|wiki)/(?P<slug>[^/]+)(?P<tail>/.*)?$')
+MODULE_ITEM_SYMBOL = re.compile(
+  r'^/modules/items/(?P<module>[^/]+)/(?P<title>[^/]+)$')
+<<functions>>=
+def resolve_symbol(url, symbol, index, problems):
+  """Return `(path, query)` under the course for `symbol`, or None."""
+  if symbol.token == OBJECT_TOKEN:
+    problems.append(LinkProblem(
+      url, "unsupported",
+      "migration ids are not available through the API"))
+    return None
+  if symbol.token == FILE_TOKEN:
+    return resolve_file(url, symbol, index, problems)
+  if symbol.token == WIKI_TOKEN:
+    match = PAGE_SYMBOL.match(symbol.path)
+    if not match:
+      problems.append(LinkProblem(url, "unsupported",
+                                  "not a page reference"))
+      return None
+    return resolve_page(url, match['slug'], match['tail'] or "",
+                        symbol.query, index, problems)
+  <<resolve a course token path>>
+@
+
+Under the course token, module items come first for the same reason as
+on export.
+Then the object types with names; a name that starts with [[id:]] was
+written because the object was already gone when the body was exported,
+which is worth its own message.
+Whatever is left is a literal path.
+<<resolve a course token path>>=
+match = MODULE_ITEM_SYMBOL.match(symbol.path)
+if match:
+  return resolve_module_item(url, decode_name(match['module']),
+                             decode_name(match['title']),
+                             symbol.query, index, problems)
+match = OBJECT_PATH.match(symbol.path)
+if match:
+  kind, ident, tail = match['type'], match['id'], match['tail'] or ""
+  if kind == "pages":
+    return resolve_page(url, ident, tail, symbol.query, index, problems)
+  if ident.startswith("id:"):
+    problems.append(LinkProblem(
+      url, "missing",
+      f"the {kind_label(kind)} no longer existed when the link was "
+      "exported"))
+    return None
+  if kind in NAMED_KINDS and ident != "syllabus":
+    return resolve_named(url, kind, decode_name(ident), tail,
+                         symbol.query, index, problems)
+return symbol.path, symbol.query
+@
+
+The three lookups share one shape: ask the index for candidates, accept
+exactly one, and report zero or several.
+<<functions>>=
+def resolve_named(url, kind, name, tail, query, index, problems):
+  """Return the path of the object of `kind` named `name`, or None."""
+  found = index.candidates(kind, name)
+  if len(found) == 1:
+    return f"/{kind}/{found[0].id}{tail}", query
+  report_candidates(url, found, f"{kind_label(kind)} named {name!r}",
+                    kind_label(kind, 2), problems)
+  return None
+
+def resolve_page(url, slug, tail, query, index, problems):
+  """Return the path of the page reachable under `slug`, or None."""
+  found = index.page_candidates(slug)
+  if len(found) == 1:
+    return f"/pages/{found[0].url}{tail}", query
+  report_candidates(url, found, f"page with slug {slug!r}", "pages",
+                    problems)
+  return None
+
+def resolve_module_item(url, module_name, title, query, index, problems):
+  """Return the path of the item `title` in module `module_name`."""
+  found = index.module_item_candidates(module_name, title)
+  if len(found) == 1:
+    return f"/modules/items/{found[0].id}", query
+  report_candidates(url, found,
+                    f"item {title!r} in module {module_name!r}",
+                    "module items", problems)
+  return None
+
+def report_candidates(url, found, what, plural, problems):
+  """Record why `found` is not exactly one object."""
+  if not found:
+    problems.append(LinkProblem(url, "missing",
+                                f"no {what} in the course"))
+  else:
+    problems.append(LinkProblem(
+      url, "ambiguous", f"{len(found)} {plural} match {what}"))
+@
+
+A file symbol carries its verb in the query; on resolution the verb goes
+back after the id and its parameter disappears from the query.
+<<constants>>=
+FILE_VERB_PARAMS = ("canvas_download", "canvas_preview",
+                    "canvas_inline_view")
+<<functions>>=
+def resolve_file(url, symbol, index, problems):
+  """Return the path of the file at the path in `symbol`, or None."""
+  segments = [decode_name(s) for s in symbol.path.split("/") if s]
+  if not segments:
+    problems.append(LinkProblem(url, "unsupported", "no file name"))
+    return None
+  folder, name = "/".join(segments[:-1]), segments[-1]
+  found = index.file_candidates(folder, name)
+  if len(found) != 1:
+    report_candidates(url, found, f"file {symbol.path[1:]!r}", "files",
+                      problems)
+    return None
+  params = dict(urllib.parse.parse_qsl(symbol.query[1:],
+                                       keep_blank_values=True)) \
+    if symbol.query else {}
+  verbs = [p[len("canvas_"):] for p in FILE_VERB_PARAMS if p in params]
+  tail = f"/{verbs[0]}" if verbs else ""
+  return (f"/files/{found[0].id}{tail}",
+          drop_query_params(symbol.query, FILE_VERB_PARAMS))
+@
+
+Let's verify resolution into the twin course: the worked example
+resolves with a relative [[href]], an absolute API endpoint and an
+untouched return type; every kind of symbol lands on the twin's id; and
+Canvas's own spellings are accepted.
+<<test functions>>=
+TWIN_IDS = {"assignment": 654321, "lab": 70, "lab2": 80, "quiz": 43,
+            "topic": 65, "announcement": 75, "module": 21, "item": 543,
+            "file": 987, "folder": 50}
+
+def twin_course():
+  return fake_course(71234, TWIN_IDS)
+
+def test_resolve_the_worked_example_into_the_twin():
+  symbolic, _ = symbolize_links(RCE_LINK, fake_course(), SERVER)
+  out, problems = resolve_links(symbolic, twin_course())
+  assert out == (
+    '<a href="/courses/71234/pages/grading-criteria" '
+    'data-api-endpoint="https://canvas.kth.se/api/v1/courses/71234/pages/'
+    'grading-criteria" data-api-returntype="Page" '
+    'title="Grading criteria">grading criteria</a>')
+  assert problems == []
+
+def resolve(url, course=None):
+  course = course or twin_course()
+  out, problems = resolve_links(f'<a href="{url}">t</a>', course)
+  return out[len('<a href="'):-len('">t</a>')], problems
+
+@pytest.mark.parametrize("symbol, url", [
+  ("$WIKI_REFERENCE$/pages/grading-criteria",
+   "/courses/71234/pages/grading-criteria"),
+  ("$WIKI_REFERENCE$/wiki/grading-criteria",
+   "/courses/71234/pages/grading-criteria"),
+  ("$CANVAS_COURSE_REFERENCE$/pages/grading-criteria",
+   "/courses/71234/pages/grading-criteria"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/HAC%20Ch%206%3A%20Stream%20ciphers",
+   "/courses/71234/assignments/654321"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/hac%20ch%206%3A%20stream%20ciphers",
+   "/courses/71234/assignments/654321"),
+  ("$CANVAS_COURSE_REFERENCE$/quizzes/INL1Quiz", "/courses/71234/quizzes/43"),
+  ("$CANVAS_COURSE_REFERENCE$/discussion_topics/Welcome",
+   "/courses/71234/discussion_topics/75"),
+  ("$CANVAS_COURSE_REFERENCE$/modules/Week%201", "/courses/71234/modules/21"),
+  ("$CANVAS_COURSE_REFERENCE$/modules/items/Week%201/Lecture%3A%20Intro",
+   "/courses/71234/modules/items/543"),
+  ("$IMS-CC-FILEBASE$/slides/intro%20a.pdf", "/courses/71234/files/987"),
+  ("$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_download=1&amp;wrap=1",
+   "/courses/71234/files/987/download?wrap=1"),
+  ("$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_preview=1",
+   "/courses/71234/files/987/preview"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments", "/courses/71234/assignments"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/syllabus",
+   "/courses/71234/assignments/syllabus"),
+  ("$CANVAS_COURSE_REFERENCE$/files/folder/slides",
+   "/courses/71234/files/folder/slides"),
+  ("$CANVAS_COURSE_REFERENCE$/", "/courses/71234/"),
+  ("$WIKI_REFERENCE$/pages/setup#h2", "/courses/71234/pages/setup#h2"),
+])
+def test_resolve_each_kind_of_symbol(symbol, url):
+  assert resolve(symbol) == (url, [])
+
+def test_resolve_leaves_other_links_alone():
+  for url in ["/courses/59543/pages/setup",
+              "https://www.youtube.com/watch?v=1", "mailto:x@y", "#top"]:
+    assert resolve(url) == (url, [])
+
+def test_resolve_is_idempotent():
+  symbolic, _ = symbolize_links(RCE_LINK, fake_course(), SERVER)
+  once, _ = resolve_links(symbolic, twin_course())
+  twice, _ = resolve_links(once, twin_course())
+  assert once == twice
+@
+
+\subsection{What stays symbolic}
+
+A missing page, a missing or ambiguous name, an [[id:]] symbol and
+Canvas's migration-id form all stay in the body as written, each with
+one problem describing it.
+<<test functions>>=
+@pytest.mark.parametrize("symbol, kind, words", [
+  ("$WIKI_REFERENCE$/pages/missing", "missing", "no page"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/Lab%202", "missing",
+   "no assignment named 'Lab 2'"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/Lab%201", "ambiguous",
+   "2 assignments match"),
+  ("$CANVAS_COURSE_REFERENCE$/assignments/id:999", "missing",
+   "no longer existed"),
+  ("$CANVAS_COURSE_REFERENCE$/modules/items/Week%202/Lecture", "missing",
+   "no item"),
+  ("$IMS-CC-FILEBASE$/slides/other.pdf", "missing", "no file"),
+  ("$CANVAS_OBJECT_REFERENCE$/assignments/i1234", "unsupported",
+   "migration ids"),
+])
+def test_resolve_leaves_unresolved_symbols_and_reports_them(symbol, kind,
+                                                            words):
+  out, problems = resolve(symbol)
+  assert out == symbol
+  assert [(p.url, p.kind) for p in problems] == [(symbol, kind)]
+  assert words in problems[0].reason
+@
+
+\section{Reporting what could not be resolved}
+\label{sec:course-links-report}
+
+The problems come back as data so that the command decides what they
+mean.
+On export they are warnings: the file is what the user asked for, and
+the stale link is in it for them to see.
+On import the default is to stop before anything is written.
+A link that stays symbolic in Canvas is visibly broken to students, and
+a push that half succeeds is harder to notice than one that refuses;
+the user who is bootstrapping a course and knows the targets come later
+asks for the warning instead with [[--allow-unresolved-links]], and
+pushes again once they exist.
+<<functions>>=
+def report_link_problems(problems, course, fatal):
+  """Report `problems` for `course`; exit with status 1 if `fatal`."""
+  if not problems:
+    return
+  seen = []
+  for problem in problems:
+    line = f"  {problem.url}: {problem.reason}"
+    if line not in seen:
+      seen.append(line)
+  course_name = getattr(course, "name", None) or f"course {course.id}"
+  message = (f"{len(seen)} link(s) could not be translated in "
+             f"{course_name}:\n" + "\n".join(seen))
+  if fatal:
+    canvaslms.cli.err(1, message)
+  canvaslms.cli.warn(message)
+@
+
+<<test functions>>=
+def test_report_is_silent_without_problems(capsys):
+  report_link_problems([], fake_course(), fatal=True)
+
+def test_report_exits_when_fatal_and_warns_otherwise(caplog):
+  problems = [LinkProblem("$WIKI_REFERENCE$/pages/x", "missing", "no page"),
+              LinkProblem("$WIKI_REFERENCE$/pages/x", "missing", "no page")]
+  with pytest.raises(SystemExit) as exit_info:
+    report_link_problems(problems, fake_course(), fatal=True)
+  assert exit_info.value.code == 1
+  caplog.clear()
+  with caplog.at_level("WARNING"):
+    report_link_problems(problems, fake_course(), fatal=False)
+  assert "1 link(s) could not be translated in Course 59543" in caplog.text
+  assert caplog.text.count("$WIKI_REFERENCE$/pages/x: no page") == 1
+@
+
+\section{Links inside structured content}
+
+Quiz questions do not arrive as one body but as a JSON tree in which
+question stems, answers and comments are HTML strings, each of which may
+contain links.
+Rather than knowing every field name for every question type, we
+translate every string in the tree: a string without a link attribute is
+returned by [[rewrite_link_attributes]] as it was, so the walk is safe on
+titles and identifiers, and it needs no update when Canvas adds a field.
+<<functions>>=
+def rewrite_links_in_tree(tree, rewrite):
+  """Apply `rewrite(text) -> (text, problems)` to every string in `tree`.
+
+  `tree` is nested dicts, lists and scalars as loaded from JSON or
+  YAML. Returns `(new tree, problems)` with all problems collected.
+  """
+  problems = []
+
+  def walk(node):
+    if isinstance(node, str):
+      new, found = rewrite(node)
+      problems.extend(found)
+      return new
+    if isinstance(node, dict):
+      return {key: walk(value) for key, value in node.items()}
+    if isinstance(node, list):
+      return [walk(value) for value in node]
+    return node
+
+  return walk(tree), problems
+@
+
+<<test functions>>=
+def test_tree_walk_translates_strings_at_any_depth():
+  course = fake_course()
+  tree = {"title": "Q1", "points": 2,
+          "item_body": '<p>See <a href="/courses/59543/pages/setup">s</a></p>',
+          "choices": [{"id": "a", "item_body": '<img src="/courses/59543/files/789/preview">'},
+                      {"id": "b", "item_body": "plain"}]}
+  out, problems = rewrite_links_in_tree(
+    tree, lambda text: symbolize_links(text, course, SERVER))
+  assert out["title"] == "Q1" and out["points"] == 2
+  assert '"$WIKI_REFERENCE$/pages/setup"' in out["item_body"]
+  assert '"$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_preview=1"' in \
+    out["choices"][0]["item_body"]
+  assert out["choices"][1]["item_body"] == "plain"
+  assert problems == []
+@
+
+\section{Round trips}
+
+The property the whole chapter exists for: a body exported from one
+course and imported into its twin links to the twin's objects, and the
+symbols survive the Markdown round trip of \cref{sec:html-to-markdown}
+in between.
+The Markdown test needs [[pandoc]] on the machine and is skipped without
+it, like the other pandoc-dependent tests in the project.
+<<test functions>>=
+ALL_KINDS = (
+  '<p><a href="/courses/59543/pages/setup">p</a>'
+  '<a href="/courses/59543/assignments/123456">a</a>'
+  '<a href="/courses/59543/quizzes/34">q</a>'
+  '<a href="/courses/59543/discussion_topics/56">d</a>'
+  '<a href="/courses/59543/modules/12">m</a>'
+  '<a href="/courses/59543/modules/items/345">i</a>'
+  '<a href="/courses/59543/files/789/download?wrap=1">f</a>'
+  '<img src="/courses/59543/files/789/preview"></p>')
+
+RESOLVED_IN_TWIN = (
+  '<p><a href="/courses/71234/pages/setup">p</a>'
+  '<a href="/courses/71234/assignments/654321">a</a>'
+  '<a href="/courses/71234/quizzes/43">q</a>'
+  '<a href="/courses/71234/discussion_topics/65">d</a>'
+  '<a href="/courses/71234/modules/21">m</a>'
+  '<a href="/courses/71234/modules/items/543">i</a>'
+  '<a href="/courses/71234/files/987/download?wrap=1">f</a>'
+  '<img src="/courses/71234/files/987/preview"></p>')
+
+def test_round_trip_into_the_twin_course():
+  symbolic, problems = symbolize_links(ALL_KINDS, fake_course(), SERVER)
+  assert problems == []
+  assert "/courses/59543/" not in symbolic
+  resolved, problems = resolve_links(symbolic, twin_course())
+  assert (resolved, problems) == (RESOLVED_IN_TWIN, [])
+
+def pandoc_available():
+  try:
+    import pypandoc
+    pypandoc.get_pandoc_version()
+    return True
+  except Exception:
+    return False
+
+@pytest.mark.skipif(not pandoc_available(), reason="pandoc not installed")
+def test_symbols_survive_the_markdown_round_trip():
+  import canvaslms.cli.content as content
+  symbolic, _ = symbolize_links(ALL_KINDS, fake_course(), SERVER)
+  html = content.markdown_to_html(content.html_to_markdown(symbolic))
+  resolved, problems = resolve_links(html, twin_course())
+  assert problems == []
+  for url in ["/courses/71234/pages/setup",
+              "/courses/71234/assignments/654321",
+              "/courses/71234/modules/items/543",
+              "/courses/71234/files/987/download?wrap=1",
+              "/courses/71234/files/987/preview"]:
+    assert f'"{url}"' in resolved
+@
+
+\section{Translating at the command line}
+
+Every command that reads or writes a body offers the same options, added
+by one function so that they are spelled and explained the same way
+everywhere.
+Translation is on by default: the whole point is that a pulled file is
+portable without the user remembering a flag, and a push without
+symbolic links is unaffected.
+[[--no-link-translation]] turns it off, for the user who wants the
+numeric links exactly as Canvas has them.
+[[--allow-unresolved-links]] exists only on the commands that push, since
+the export never fails on a link (\cref{sec:course-links-report}).
+<<functions>>=
+def add_link_options(parser, push=False):
+  """Add the link translation options to `parser`.
+
+  With `push`, also add the option that turns an unresolved link from
+  an error into a warning.
+  """
+  parser.add_argument("--no-link-translation", action="store_true",
+    help="Keep links to course objects exactly as they are instead of "
+         "translating them between the course-independent symbolic form "
+         "and this course's numeric URLs.")
+  if push:
+    parser.add_argument("--allow-unresolved-links", action="store_true",
+      help="Warn and keep the symbolic form when a link cannot be "
+           "resolved in the target course, instead of refusing to push.")
+@
+
+<<test functions>>=
+def test_link_options_are_added():
+  import argparse
+  view = argparse.ArgumentParser()
+  add_link_options(view)
+  assert view.parse_args(["--no-link-translation"]).no_link_translation
+  assert not hasattr(view.parse_args([]), "allow_unresolved_links")
+  push = argparse.ArgumentParser()
+  add_link_options(push, push=True)
+  args = push.parse_args(["--allow-unresolved-links"])
+  assert args.allow_unresolved_links and not args.no_link_translation
+@
