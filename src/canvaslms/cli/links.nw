@@ -837,3 +837,276 @@ def test_index_fetches_only_the_kinds_asked_for():
   index.name("assignments", 8)
   course.get_assignments.assert_called_once()
 @
+
+\section{From a course to a symbol}
+\label{sec:course-links-symbolize}
+
+Exporting a body means visiting every link attribute, keeping every link
+that does not point into this course, and rewriting the ones that do.
+The course id in the URL must be this course's: a link to another course
+on the same server is a cross-course link the author made on purpose,
+and Canvas's own exporter leaves those alone too.
+
+What could go wrong is recorded rather than raised.
+An export must never fail because a link is stale---the user wants the
+file, and a stale link is exactly what they will find and fix in
+it---so the function returns the rewritten body together with a list of
+[[LinkProblem]]s for the caller to report.
+<<classes>>=
+@dataclasses.dataclass
+class LinkProblem:
+  """A link that could not be translated, and why.
+
+  `kind` is `missing` (no such object), `ambiguous` (several objects
+  of that name) or `unsupported` (a form we cannot translate).
+  """
+  url: str
+  kind: str
+  reason: str
+<<functions>>=
+def symbolize_links(body, course, server_url=None):
+  """Rewrite the links into `course` in `body` to symbolic form.
+
+  Returns `(body, problems)`: the body with every link into `course`
+  replaced by its symbol (see the chapter on course links in the
+  manual), and a list of `LinkProblem` for links whose target no
+  longer exists or whose name is not unique. Links to other courses,
+  other sites and already symbolic links are left untouched.
+  `server_url` is the base URL of the Canvas server, needed to
+  recognise absolute links; without it only relative links are
+  translated.
+  """
+  index = CourseIndex(course)
+  problems = []
+
+  def rewrite(attribute, url):
+    link = parse_course_url(url, server_url)
+    if link is None or link.course_id != course.id:
+      return None
+    symbol, extra = symbolize_path(link.path, index, problems)
+    query = drop_query_params(link.query, VOLATILE_PARAMS)
+    return symbol + add_query_params(query, extra) + link.fragment
+
+  return rewrite_link_attributes(body, rewrite), problems
+@
+
+\subsection{One mapping per object type}
+
+The path under the course decides the symbol, following the rules of
+\cref{sec:links-syntax}.
+Module items are matched before the generic object pattern, because
+[[/modules/items/345]] would otherwise parse as a module named
+[[items]].
+<<constants>>=
+MODULE_ITEM_PATH = re.compile(r'^/modules/items/(?P<id>\d+)$')
+OBJECT_PATH = re.compile(
+  r'^/(?P<type>pages|assignments|quizzes|discussion_topics|modules|files)'
+  r'/(?P<id>[^/]+)(?P<tail>/.*)?$')
+FILE_VERB = re.compile(r'^/(?P<verb>download|preview|inline_view)$')
+<<functions>>=
+def symbolize_path(path, index, problems):
+  """Return `(symbol, extra query parameters)` for the course path `path`.
+
+  `problems` collects a `LinkProblem` for an id that names nothing or
+  a name that is not unique.
+  """
+  match = MODULE_ITEM_PATH.match(path)
+  if match:
+    return symbolize_module_item(int(match['id']), index, problems), []
+  match = OBJECT_PATH.match(path)
+  if match:
+    kind, ident, tail = match['type'], match['id'], match['tail'] or ""
+    if kind == "pages":
+      return f"{WIKI_TOKEN}/pages/{ident}{tail}", []
+    if ident.isdigit():
+      if kind == "files":
+        return symbolize_file(int(ident), tail, index, problems)
+      return symbolize_named(kind, int(ident), tail, index, problems), []
+  return COURSE_TOKEN + path, []
+@
+
+An object named by its name is the common case.
+When the name is shared with another object of the same kind the symbol
+is still written, since the name is the best identity we have, but the
+problem is reported so that the user learns about the clash a year
+before it makes the import refuse the link.
+<<functions>>=
+def symbolize_named(kind, object_id, tail, index, problems):
+  """Return the symbol for the object of `kind` with `object_id`."""
+  name = index.name(kind, object_id)
+  if name is None:
+    problems.append(LinkProblem(
+      f"/{kind}/{object_id}", "missing",
+      f"no {kind_label(kind)} with id {object_id} in the course"))
+    return f"{COURSE_TOKEN}/{kind}/id:{object_id}{tail}"
+  if index.is_ambiguous(kind, name):
+    problems.append(LinkProblem(
+      f"/{kind}/{object_id}", "ambiguous",
+      f"the name {name!r} is shared by several {kind_label(kind, 2)}"))
+  return f"{COURSE_TOKEN}/{kind}/{encode_name(name)}{tail}"
+
+def symbolize_module_item(item_id, index, problems):
+  """Return the symbol for the module item with `item_id`."""
+  found = index.module_items().get(item_id)
+  if found is None:
+    problems.append(LinkProblem(
+      f"/modules/items/{item_id}", "missing",
+      f"no module item with id {item_id} in the course"))
+    return f"{COURSE_TOKEN}/modules/items/id:{item_id}"
+  module, item = found
+  return (f"{COURSE_TOKEN}/modules/items/{encode_name(module.name)}"
+          f"/{encode_name(item.title)}")
+@
+
+A file link may end in a verb ([[/download]], [[/preview]],
+[[/inline_view]]) that says what the browser should do with the file.
+The verb travels as a query parameter, [[canvas_download=1]] and so on,
+in the spelling Canvas's own exports use for the download case.
+<<functions>>=
+def symbolize_file(file_id, tail, index, problems):
+  """Return `(symbol, extra query parameters)` for the file `file_id`."""
+  verb = FILE_VERB.match(tail)
+  extra = [(f"canvas_{verb['verb']}", "1")] if verb else []
+  tail = "" if verb else tail
+  found = index.file_path(file_id)
+  if found is None:
+    problems.append(LinkProblem(
+      f"/files/{file_id}", "missing",
+      f"no file with id {file_id} in the course"))
+    return f"{COURSE_TOKEN}/files/id:{file_id}{tail}", extra
+  folder, name = found
+  path = "/".join(encode_name(part) for part in folder.split("/") if part)
+  return f"{FILE_TOKEN}/{path}/{encode_name(name)}".replace("//", "/") \
+    + tail, extra
+@
+
+The names go through the encoding of \cref{sec:links-syntax}; the
+labels in messages are the English words for the kinds.
+<<constants>>=
+KIND_LABELS = {
+  "assignments": ("assignment", "assignments"),
+  "quizzes": ("quiz", "quizzes"),
+  "discussion_topics": ("discussion", "discussions"),
+  "modules": ("module", "modules"),
+  "pages": ("page", "pages"),
+  "files": ("file", "files"),
+}
+<<functions>>=
+def encode_name(name):
+  """Percent-encode `name` so that it is one URL path segment."""
+  return urllib.parse.quote(name, safe="")
+
+def decode_name(segment):
+  """Undo `encode_name`."""
+  return urllib.parse.unquote(segment)
+
+def kind_label(kind, count=1):
+  """Return the English word for objects of `kind`, plural if `count > 1`."""
+  singular, plural = KIND_LABELS[kind]
+  return singular if count == 1 else plural
+
+def add_query_params(query, params):
+  """Prepend the `(key, value)` pairs in `params` to the query `query`."""
+  if not params:
+    return query
+  existing = urllib.parse.parse_qsl(query[1:], keep_blank_values=True) \
+    if query else []
+  return "?" + urllib.parse.urlencode(list(params) + existing)
+@
+
+Let's verify each kind of link, in the three attributes, with the
+worked example of the chapter introduction first.
+<<test functions>>=
+RCE_LINK = (
+  '<a href="https://canvas.kth.se/courses/59543/pages/grading-criteria" '
+  'data-api-endpoint="https://canvas.kth.se/api/v1/courses/59543/pages/'
+  'grading-criteria" data-api-returntype="Page" '
+  'title="Grading criteria">grading criteria</a>')
+
+def test_symbolize_the_worked_example():
+  out, problems = symbolize_links(RCE_LINK, fake_course(), SERVER)
+  assert out == (
+    '<a href="$WIKI_REFERENCE$/pages/grading-criteria" '
+    'data-api-endpoint="$WIKI_REFERENCE$/pages/grading-criteria" '
+    'data-api-returntype="Page" title="Grading criteria">grading criteria</a>')
+  assert problems == []
+
+def symbolize(url, course=None):
+  course = course or fake_course()
+  out, problems = symbolize_links(f'<a href="{url}">t</a>', course, SERVER)
+  return out[len('<a href="'):-len('">t</a>')], problems
+
+@pytest.mark.parametrize("url, symbol", [
+  ("/courses/59543/assignments/123456",
+   "$CANVAS_COURSE_REFERENCE$/assignments/HAC%20Ch%206%3A%20Stream%20ciphers"),
+  ("/courses/59543/quizzes/34", "$CANVAS_COURSE_REFERENCE$/quizzes/INL1Quiz"),
+  ("/courses/59543/discussion_topics/56",
+   "$CANVAS_COURSE_REFERENCE$/discussion_topics/General%20discussion"),
+  ("/courses/59543/discussion_topics/57",
+   "$CANVAS_COURSE_REFERENCE$/discussion_topics/Welcome"),
+  ("/courses/59543/modules/12", "$CANVAS_COURSE_REFERENCE$/modules/Week%201"),
+  ("/courses/59543/modules/items/345",
+   "$CANVAS_COURSE_REFERENCE$/modules/items/Week%201/Lecture%3A%20Intro"),
+  ("/courses/59543/files/789", "$IMS-CC-FILEBASE$/slides/intro%20a.pdf"),
+  ("/courses/59543/files/789/download?wrap=1",
+   "$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_download=1&amp;wrap=1"),
+  ("/courses/59543/files/789/preview",
+   "$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_preview=1"),
+  ("/courses/59543/assignments", "$CANVAS_COURSE_REFERENCE$/assignments"),
+  ("/courses/59543/assignments/syllabus",
+   "$CANVAS_COURSE_REFERENCE$/assignments/syllabus"),
+  ("/courses/59543/files/folder/slides",
+   "$CANVAS_COURSE_REFERENCE$/files/folder/slides"),
+  ("/courses/59543/announcements", "$CANVAS_COURSE_REFERENCE$/announcements"),
+  ("/courses/59543", "$CANVAS_COURSE_REFERENCE$/"),
+  ("/courses/59543/pages/setup?module_item_id=345#h2",
+   "$WIKI_REFERENCE$/pages/setup#h2"),
+  ("/courses/59543/files/789/download?verifier=abc&amp;wrap=1",
+   "$IMS-CC-FILEBASE$/slides/intro%20a.pdf?canvas_download=1&amp;wrap=1"),
+])
+def test_symbolize_each_kind_of_link(url, symbol):
+  assert symbolize(url) == (symbol, [])
+
+def test_symbolize_leaves_other_links_alone():
+  for url in ["/courses/99999/pages/setup",
+              "https://other.example.com/courses/59543/pages/setup",
+              "https://www.youtube.com/watch?v=1",
+              "$WIKI_REFERENCE$/pages/setup",
+              "mailto:dbosk@kth.se", "#top"]:
+    assert symbolize(url) == (url, [])
+
+def test_symbolize_keeps_a_body_without_course_links_identical():
+  body = '<p>Hi &amp; <a href="/x?a=1&amp;b=2">there</a><img src="/y.png"></p>'
+  assert symbolize_links(body, fake_course(), SERVER) == (body, [])
+
+def test_symbolize_is_idempotent():
+  once, _ = symbolize_links(RCE_LINK, fake_course(), SERVER)
+  twice, _ = symbolize_links(once, fake_course(), SERVER)
+  assert once == twice
+@
+
+\subsection{Objects we cannot name}
+
+A link to an id that names nothing---an assignment deleted after the
+link was made---keeps the number under an [[id:]] prefix and is
+reported; and a name shared by two objects is reported while still
+being used.
+<<test functions>>=
+def test_symbolize_reports_a_missing_target_and_keeps_its_id():
+  symbol, problems = symbolize("/courses/59543/assignments/999")
+  assert symbol == "$CANVAS_COURSE_REFERENCE$/assignments/id:999"
+  assert [(p.kind, p.url) for p in problems] == \
+    [("missing", "/assignments/999")]
+  symbol, problems = symbolize("/courses/59543/files/1/download")
+  assert symbol == "$CANVAS_COURSE_REFERENCE$/files/id:1?canvas_download=1"
+  assert problems[0].kind == "missing"
+  symbol, problems = symbolize("/courses/59543/modules/items/1")
+  assert symbol == "$CANVAS_COURSE_REFERENCE$/modules/items/id:1"
+  assert problems[0].kind == "missing"
+
+def test_symbolize_reports_an_ambiguous_name_but_uses_it():
+  symbol, problems = symbolize("/courses/59543/assignments/7")
+  assert symbol == "$CANVAS_COURSE_REFERENCE$/assignments/Lab%201"
+  assert [p.kind for p in problems] == ["ambiguous"]
+  assert "'Lab 1'" in problems[0].reason
+@
