@@ -23,7 +23,6 @@ import logging
 import re
 import sys
 
-import pypandoc
 import rich.console
 import rich.markdown
 import rich.syntax
@@ -33,6 +32,7 @@ from datetime import datetime
 import canvaslms.cli
 import canvaslms.cli.content
 import canvaslms.cli.courses
+import canvaslms.cli.links
 import canvaslms.cli.modules
 import canvaslms.cli.utils
 
@@ -175,6 +175,9 @@ When [[--html]] is specified:
 
 This enables a round-trip workflow where HTML pages can be viewed, edited, and
 pushed back without losing any formatting.
+Links into the course are written in their symbolic form
+(\cref{sec:course-links}) so that the file can be pushed into another
+course; [[--no-link-translation]] keeps Canvas's numeric links instead.
 <<add pages view subcommand>>=
 view_parser = pages_subp.add_parser("view",
     help="View page content",
@@ -191,6 +194,7 @@ add_page_options(view_parser)
 view_parser.add_argument("--html",
     action="store_true",
     help="Output raw HTML instead of converting to Markdown")
+canvaslms.cli.links.add_link_options(view_parser)
 @
 
 <<functions>>=
@@ -206,7 +210,9 @@ def pages_view_command(config, canvas, args):
       if args.html:
         <<output page html in tty>>
       else:
-        output = format_page(full_page)
+        output = format_page(
+            full_page,
+            canvaslms.cli.content.translation_course(full_page.course, args))
         with console.pager(styles=False, links=True):
           console.print(rich.markdown.Markdown(output, code_theme="manni"))
     else:
@@ -255,7 +261,8 @@ output = canvaslms.cli.content.render_to_markdown(
     full_page,
     canvaslms.cli.content.PAGE_SCHEMA,
     content_attr='body',
-    extra_attributes={'modules': page_modules, 'regex': page_regex})
+    extra_attributes={'modules': page_modules, 'regex': page_regex},
+    course=canvaslms.cli.content.translation_course(full_page.course, args))
 print(output)
 @
 
@@ -302,7 +309,10 @@ header += "\n## Content (HTML)\n\n"
 with console.pager(styles=True):
   console.print(rich.markdown.Markdown(header))
   if full_page.body:
-    syntax = rich.syntax.Syntax(full_page.body, "html", theme="monokai",
+    body = canvaslms.cli.content.symbolize_body(
+        full_page.body,
+        canvaslms.cli.content.translation_course(full_page.course, args))
+    syntax = rich.syntax.Syntax(body, "html", theme="monokai",
                                 word_wrap=True)
     console.print(syntax)
   else:
@@ -320,7 +330,8 @@ output = canvaslms.cli.content.render_to_html(
     full_page,
     canvaslms.cli.content.PAGE_SCHEMA,
     content_attr='body',
-    extra_attributes={'modules': page_modules, 'regex': page_regex})
+    extra_attributes={'modules': page_modules, 'regex': page_regex},
+    course=canvaslms.cli.content.translation_course(full_page.course, args))
 print(output)
 @
 
@@ -334,7 +345,7 @@ full_page = get_full_page(page.course, page.url)
 @
 
 <<functions>>=
-def format_page(page):
+def format_page(page, course=None):
   """Format a wiki page for terminal display."""
   text = f"# {page.title}\n\n"
   text += f"## Metadata\n\n"
@@ -352,7 +363,8 @@ def format_page(page):
 
   if page.body:
     try:
-      markdown_content = canvaslms.cli.content.html_to_markdown(page.body)
+      markdown_content = canvaslms.cli.content.html_to_markdown(
+        page.body, course)
       text += markdown_content
     except Exception:
       text += page.body
@@ -375,6 +387,13 @@ The [[edit]] subcommand updates page content. It supports two modes:
   export page content with [[view]] (piped to a file), edit locally, and push
   changes back with [[edit -f]].
 \end{description}
+
+Symbolic links in the body are resolved against the course before the
+page is written (\cref{sec:course-links}).
+An unresolved link stops the push, since a symbol stored in Canvas is a
+broken link to students; [[--allow-unresolved-links]] turns that into a
+warning for the user who is pushing a course in several passes, and
+[[--no-link-translation]] turns the translation off.
 <<add pages edit subcommand>>=
 edit_parser = pages_subp.add_parser("edit",
     help="Edit page content interactively or from a file",
@@ -404,6 +423,7 @@ edit_parser.add_argument("--html",
     action="store_true",
     help="Read file as HTML instead of converting from Markdown. "
          "In interactive mode, edit HTML directly.")
+canvaslms.cli.links.add_link_options(edit_parser, push=True)
 @
 
 <<functions>>=
@@ -460,17 +480,11 @@ We convert the content to HTML for Canvas (unless [[--html]] is specified, in
 which case the content is already HTML) and build the update dictionary. The
 Canvas API expects page updates with a [[wiki_page]] wrapper.
 
-The conversion is the one step here that depends on [[pandoc]], which is an
-optional system dependency: when it is missing or broken, [[pypandoc]] raises
-[[OSError]] or [[RuntimeError]] instead of returning a string. The interactive
-path below guards against this, as do the equivalent conversions in
-[[syllabus.nw]], [[discussions.nw]] and [[content.nw]]; the file-based path
-was the one that forgot, so a user without [[pandoc]] got a raw traceback
-instead of the CLI's usual diagnostics. We therefore degrade the same way the
-interactive path does: warn, and send the Markdown to Canvas unconverted.
-Storing unconverted Markdown is imperfect, but it is recoverable---the user
-can install [[pandoc]] and re-run the very same command---whereas a traceback
-in the middle of a scripted update is not.
+The conversion is the one step here that depends on [[pandoc]], an
+optional system dependency. The shared [[markdown_to_html]]
+(\cref{sec:markdown-to-html}) warns and sends the Markdown unconverted
+when [[pandoc]] is missing, so this path and the interactive one below
+degrade the same way.
 
 The matching strategy prioritizes reliability and safety:
 \begin{enumerate}
@@ -485,13 +499,9 @@ The matching strategy prioritizes reliability and safety:
 
 <<update pages with new content>>=
 if args.html:
-  html_content = body_content  # Already HTML, no conversion needed
+  html_content = body_content
 else:
-  try:
-    html_content = pypandoc.convert_text(body_content, 'html', format='md')
-  except Exception as e:
-    logger.warning(f"Failed to convert markdown to HTML: {e}")
-    html_content = body_content
+  html_content = canvaslms.cli.content.markdown_to_html(body_content)
 
 if 'regex' in attributes and attributes['regex']:
   <<update or create page by regex>>
@@ -551,11 +561,16 @@ except canvaslms.cli.EmptyListError:
 
 When updating an existing page, we build the update dictionary and call the
 Canvas API.
+The symbolic links are resolved here, against the page's own course,
+rather than where the body was converted: the conversion happens once
+per file, the resolution once per course written to
+(\cref{sec:content-links}).
 <<update existing page>>=
 update_data = {
   'wiki_page': {
     'title': attributes.get('title', full_page.title),
-    'body': html_content,
+    'body': canvaslms.cli.content.resolve_body_for(
+        html_content, full_page.course, args),
   }
 }
 
@@ -592,7 +607,7 @@ When [[--create]] is specified and the page doesn't exist, we create a new one.
 <<create new page>>=
 create_params = {
   'title': attributes.get('title', 'Untitled Page'),
-  'body': html_content,
+  'body': canvaslms.cli.content.resolve_body_for(html_content, course, args),
 }
 if 'published' in attributes:
   create_params['published'] = attributes['published']
@@ -879,18 +894,15 @@ knows nothing about module specs.
 <<update single page from interactive edit>>=
 <<reject invalid module specs before editing page>>
 if args.html:
-  html_content = final_content  # Already HTML, no conversion needed
+  html_content = final_content
 else:
-  try:
-    html_content = pypandoc.convert_text(final_content, 'html', format='md')
-  except Exception as e:
-    logger.warning(f"Failed to convert markdown to HTML: {e}")
-    html_content = final_content
+  html_content = canvaslms.cli.content.markdown_to_html(final_content)
 
 update_data = {
   'wiki_page': {
     'title': final_attrs.get('title', full_page.title),
-    'body': html_content,
+    'body': canvaslms.cli.content.resolve_body_for(
+        html_content, full_page.course, args),
   }
 }
 

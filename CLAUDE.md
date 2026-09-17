@@ -664,6 +664,7 @@ src/canvaslms/
 │   ├── discussions.nw # Discussion boards
 │   ├── quizzes.nw    # Quiz/survey analysis
 │   ├── fbf.nw        # Feedback functionality
+│   ├── links.nw      # Course link translation (symbolic <-> numeric)
 │   └── utils.nw      # Shared utilities
 ├── grades/           # Grading algorithms (.nw sources)
 ├── hacks/            # Canvas API extensions
