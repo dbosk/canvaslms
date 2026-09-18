@@ -80,6 +80,15 @@ llm keys set openai  # or another provider
 
 ### Managing Quiz Content
 
+Upload a generated Classic quiz (replace `12345` with your course ID), then
+replace its questions after regenerating the ZIP. Updating preserves quiz
+settings and requires an unpublished quiz without student attempts.
+
+```bash
+quiz_id=$(canvaslms quizzes import -c '^12345$' -f quiz.qti.zip --id-only)
+canvaslms quizzes import -c '^12345$' -f quiz.qti.zip --quiz-id "$quiz_id" --replace-items
+```
+
 View and edit quiz content directly from the command line:
 
 ```bash
