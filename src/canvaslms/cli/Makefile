@@ -18,6 +18,7 @@ MODULES+=	links.py links.tex
 MODULES+=	content.py content.tex
 MODULES+=	pages.py pages.tex
 MODULES+=	syllabus.py syllabus.tex
+MODULES+=	tutorial.py tutorial.tex
 
 .PHONY: all
 all: ${MODULES}
