@@ -20,13 +20,17 @@ properly configured before a course begins.
 \section*{Chapter overview}
 
 This chapter serves two purposes:
-First, it provides the [[modules]] subcommand with seven sub-commands:
+First, it provides the [[modules]] subcommand with nine sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
 \item [[modules view]] --- displays module contents including all items and
   their completion requirements
 \item [[modules move]] --- moves an item to a given position within a module
+\item [[modules add-item]] --- adds a text header, an external URL or an
+  existing page, assignment or quiz to a module
+\item [[modules remove-item]] --- removes an item from a module, keeping the
+  content it pointed at
 \item [[modules require]] --- sets what students must do with an item
 \item [[modules create]] --- creates a module
 \item [[modules edit]] --- changes a module's name, position, unlock date,
@@ -86,6 +90,23 @@ def add_command(subp):
                 "module; Canvas renumbers the other items.")
   move_parser.set_defaults(func=modules_move_command)
   <<add move arguments>>
+
+  # Add 'add-item' subcommand
+  add_item_parser = modules_subp.add_parser("add-item",
+    help="Adds an item to a module",
+    description="Adds a text header, an external URL or an existing page, "
+                "assignment or quiz to each matching module, unless the "
+                "module already has it.")
+  add_item_parser.set_defaults(func=modules_add_item_command)
+  <<add add-item arguments>>
+
+  # Add 'remove-item' subcommand
+  remove_item_parser = modules_subp.add_parser("remove-item",
+    help="Removes an item from a module",
+    description="Removes one item from each matching module. The page, "
+                "assignment or quiz behind the item stays in the course.")
+  remove_item_parser.set_defaults(func=modules_remove_item_command)
+  <<add remove-item arguments>>
 
   # Add 'create' subcommand
   create_parser = modules_subp.add_parser("create",
@@ -165,8 +186,8 @@ commands without defaults: [[pages]], [[discussions]], [[calendar]],
 
 All sub-commands but [[create]] accept a regular expression for selecting
 modules by name or Canvas ID; the ones that change something ([[move]],
-[[require]], [[edit]], [[delete]]) require it, [[create]] takes a module
-name instead (\cref{sec:modules-create}).
+[[add-item]], [[remove-item]], [[require]], [[edit]], [[delete]]) require
+it, [[create]] takes a module name instead (\cref{sec:modules-create}).
 This allows users to work with specific modules or groups of related modules.
 Additionally, the [[view]] subcommand supports two optional flags that add
 columns: [[--show-id]] includes Canvas item IDs and [[--show-position]]
@@ -193,7 +214,7 @@ view_parser.add_argument("--show-position", action="store_true",
 @
 
 The arguments of the other sub-commands are explained with their commands
-(\cref{sec:modules-move,sec:modules-require,sec:modules-create,sec:modules-edit,sec:modules-delete}).
+(\cref{sec:modules-move,sec:modules-add-item,sec:modules-remove-item,sec:modules-require,sec:modules-create,sec:modules-edit,sec:modules-delete}).
 <<add move arguments>>=
 move_parser.add_argument("regex",
   help="Regex for selecting modules (required: the move applies to each "
@@ -584,6 +605,489 @@ def test_move_refuses_ambiguous_match():
 def test_move_rejects_position_below_one():
   with pytest.raises(SystemExit):
     run_modules_move([make_module_item(1, title="Lab 1")], "^Lab", 0)
+@
+
+
+\section{Adding an item to a module, [[modules_add_item_command]]}
+\label{sec:modules-add-item}
+
+The front-matter route (\cref{sec:module-positions}) puts a page, an
+assignment or a quiz into a module when that item's own file is pushed.
+Two kinds of module item have no file, and so no route at all: a text
+header ([[SubHeader]] in Canvas's terms), which is how a course marks a
+slot that its real item will fill later, and an external URL.
+And an existing page or assignment that only needs \emph{placing} should
+not require its whole file to be pushed again.
+[[modules add-item]] is the module-centric complement to [[modules move]]
+for all of these:
+\begin{minted}{bash}
+canvaslms modules add-item -c prgi26 "^Vecka 3$" -t subheader \
+  --title "Föreläsningsanteckningar kommer" -p 3
+canvaslms modules add-item -c prgi26 "^Vecka 3$" -t url \
+  --title "Zoom" --url https://kth-se.zoom.us/j/123
+canvaslms modules add-item -c prgi26 "^Vecka 3$" -t page \
+  --content "^Övning: vecka 3$" -p 5
+\end{minted}
+
+A command like this belongs in a recipe that applies a module's declared
+shape, and a recipe is re-run.
+The command is therefore idempotent by default, the convention
+[[modules create]] set (\cref{sec:modules-create}): an item the module
+already has is not added again, and [[--allow-duplicate]] says otherwise.
+What \enquote{already has} means differs by kind.
+A page, assignment or quiz item points at its content, so it is the same
+item when it points at the same content, whatever it is titled; a text
+header or a URL has no content behind it, and its title is the only
+identity Canvas gives it.
+When the item is already there and a position was asked for, the item is
+moved to it, exactly as a pushed file with a position moves the item
+(\cref{sec:updating-membership}), so that a recipe converges on the shape
+it declares instead of leaving early items where they were.
+
+New items are unpublished unless [[--publish]] says otherwise, for the
+same reason new modules are: the author reads it before the students do.
+<<constants>>=
+ITEM_KINDS = ('subheader', 'url', 'page', 'assignment', 'quiz')
+CONTENT_KINDS = ('page', 'assignment', 'quiz')
+<<functions>>=
+def modules_add_item_command(config, canvas, args):
+  """Add an item to each matching module, unless the module has it."""
+  <<check that the options fit the kind of item>>
+  course_list = courses.process_course_option(canvas, args)
+  added = []
+  moved = []
+  for course in course_list:
+    spec, title = resolve_item_spec(course, args)
+    for module in filter_modules(course, args.regex):
+      <<add or move the item in [[module]]>>
+  print_module_changes(added, [], moved)
+@
+
+Which options a kind needs is checked before any course is touched, so
+that a recipe fails on its first line rather than half-way through the
+modules.
+<<check that the options fit the kind of item>>=
+if args.position is not None and args.position < 1:
+  canvaslms.cli.err(1, "Position must be 1 or greater")
+if args.type in ('subheader', 'url') and not args.title:
+  canvaslms.cli.err(1, f"-t {args.type} needs --title")
+if args.type == 'url' and not args.url:
+  canvaslms.cli.err(1, "-t url needs --url")
+if args.type in CONTENT_KINDS and not args.content:
+  canvaslms.cli.err(1, f"-t {args.type} needs --content REGEX")
+@
+
+The item is described by the attributes Canvas's create call takes,
+resolved once per course because the content behind a page, assignment
+or quiz item is a per-course object.
+A text header and a URL are described entirely by the options.
+A content item is described by the content it points at, found by regex
+in the same way the [[pages]], [[assignments]] and [[quizzes]] commands
+find their objects, and a quiz is placed the way those commands place it:
+a Classic Quiz is a [[Quiz]] item, a New Quiz is an [[Assignment]] item
+(\cref{sec:module-membership}).
+The title the user gives for a content item overrides the content's own
+title on the item, which Canvas allows; without one, Canvas uses the
+content's title, which is also what we report.
+<<functions>>=
+def resolve_item_spec(course, args):
+  """Return (module item attributes, title) for the item to add.
+
+  The attributes are what `create_module_item` takes, without position
+  and indentation; the title is the content's title unless --title
+  overrides it.
+  """
+  if args.type == 'subheader':
+    return {'type': 'SubHeader', 'title': args.title}, args.title
+  if args.type == 'url':
+    return {'type': 'ExternalUrl', 'title': args.title,
+            'external_url': args.url, 'new_tab': True}, args.title
+  content = find_unique_content(course, args.type, args.content)
+  <<describe the content item>>
+  if args.title:
+    spec['title'] = args.title
+    title = args.title
+  return spec, title
+@
+
+<<describe the content item>>=
+if args.type == 'page':
+  spec = {'type': 'Page', 'page_url': content.url}
+  title = content.title
+elif args.type == 'assignment':
+  spec = {'type': 'Assignment', 'content_id': content.id}
+  title = content.name
+else:
+  import canvaslms.cli.quizzes
+  item_type, item_id = canvaslms.cli.quizzes.quiz_module_item(content)
+  spec = {'type': item_type, 'content_id': item_id}
+  title = content.title
+@
+
+The lookup borrows the filters of the three content commands.
+Those modules import this one when they load, for the membership helpers
+above, so importing them at the top of this module would make a cycle
+that Python resolves only by accident of import order; importing them
+inside the function, when the command actually runs, keeps the dependency
+one-way at load time.
+The match must be unique: an item points at one thing, and a regex that
+matches several pages says nothing about which one was meant.
+<<functions>>=
+def find_unique_content(course, kind, regex):
+  """Return the one page, assignment or quiz of `course` matching `regex`.
+
+  No match and several matches both exit with an error naming them.
+  """
+  import canvaslms.cli.assignments
+  import canvaslms.cli.pages
+  import canvaslms.cli.quizzes
+  if kind == 'page':
+    matches = canvaslms.cli.pages.filter_pages(course, regex)
+    names = [page.title for page in matches]
+  elif kind == 'assignment':
+    matches = list(
+        canvaslms.cli.assignments.filter_assignments([course], regex))
+    names = [assignment.name for assignment in matches]
+  else:
+    matches = list(canvaslms.cli.quizzes.filter_quizzes([course], regex))
+    names = [quiz.title for quiz in matches]
+  if not matches:
+    canvaslms.cli.err(1, f"No {kind} matching '{regex}' in "
+                         f"{course.course_code}")
+  if len(matches) > 1:
+    canvaslms.cli.err(1, f"Several {kind}s match '{regex}' in "
+                         f"{course.course_code}: "
+                         + ", ".join(repr(name) for name in names))
+  return matches[0]
+@
+
+Recognising an item the module already has is the search
+[[update_item_modules]] does for content items
+(\cref{sec:updating-membership}), including the page slug resolution that
+keeps a renamed page from being added twice, plus the title comparison
+for the kinds that have nothing else.
+<<functions>>=
+def find_existing_item(course, module, spec, title):
+  """Return the item of `module` that already is `spec`, or None."""
+  canonical_url = None
+  if spec['type'] == 'Page':
+    canonical_url = resolve_page_url(course, spec['page_url'])
+  for item in list_module_items(module):
+    if item.type != spec['type']:
+      continue
+    if 'content_id' in spec:
+      if item.content_id == spec['content_id']:
+        return item
+    elif spec['type'] == 'Page':
+      if page_item_matches(course, item, spec['page_url'], canonical_url):
+        return item
+    elif (item.title or '') == title:
+      return item
+  return None
+@
+
+With the item described and the duplicate question settled, adding is one
+create call, with the position and indentation when given.
+Canvas accepts [[published]] only on update, as for modules, hence the
+second request for [[--publish]].
+Every mutation invalidates the module's cached items
+(\cref{sec:module-membership}); a failure is reported per module and the
+command goes on, so that one module's problem does not stop the recipe
+for the others.
+<<add or move the item in [[module]]>>=
+existing = None
+if not args.allow_duplicate:
+  existing = find_existing_item(course, module, spec, title)
+if existing is not None:
+  if args.position is not None and existing.position != args.position:
+    try:
+      move_module_item(module, existing, args.position)
+      moved.append(module.name)
+    except Exception as e:
+      canvaslms.cli.warn(f"Could not move '{title}' in {module.name}: {e}")
+  continue
+new_item = dict(spec)
+if args.position is not None:
+  new_item['position'] = args.position
+if args.indent is not None:
+  new_item['indent'] = args.indent
+try:
+  item = module.create_module_item(new_item)
+  if args.publish:
+    item.edit(module_item={'published': True})
+  invalidate_module_items(module)
+  added.append(module.name)
+except Exception as e:
+  canvaslms.cli.warn(f"Could not add '{title}' to {module.name}: {e}")
+@
+
+<<add add-item arguments>>=
+add_item_parser.add_argument("regex",
+  help="Regex for selecting modules (name or Canvas ID); the item is "
+       "added to each matching module")
+courses.add_course_option(add_item_parser, required=True)
+add_item_parser.add_argument("-t", "--type", required=True,
+  choices=ITEM_KINDS,
+  help="Kind of item: a text header, an external URL, or an existing "
+       "page, assignment or quiz of the course")
+add_item_parser.add_argument("--title",
+  help="Title of the item; required for subheader and url, and overrides "
+       "the content's own title for the other kinds")
+add_item_parser.add_argument("--url",
+  help="Address of a url item")
+add_item_parser.add_argument("--content", metavar="REGEX",
+  help="Regex matching exactly one page, assignment or quiz of the "
+       "course, by title, URL slug or Canvas ID")
+add_item_parser.add_argument("-p", "--position", type=int,
+  help="1-based position within the module (default: last); an item "
+       "already in the module is moved there")
+add_item_parser.add_argument("--indent", type=int, choices=range(6),
+  metavar="N", help="Indentation level of the item, 0 to 5")
+add_item_parser.add_argument("--publish", action="store_true",
+  help="Publish the item right away (default: unpublished)")
+add_item_parser.add_argument("--allow-duplicate", action="store_true",
+  help="Add the item even if the module already has it")
+@
+
+Let's verify each kind of item: a text header is created from the
+options at the asked position and published on request, an existing
+header is not added again but is moved when a position says so, and
+[[--allow-duplicate]] adds it anyway.
+<<test functions>>=
+def run_modules_add_item(items, **options):
+  """Run modules add-item on one module; return (module, stderr)."""
+  module = make_cached_module("Week 1", 11, items)
+  module.create_module_item.return_value = MagicMock()
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", type="subheader", title=None,
+                            url=None, content=None, position=None,
+                            indent=None, publish=False,
+                            allow_duplicate=False)
+  for key, value in options.items():
+    setattr(args, key, value)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_add_item_command({}, MagicMock(), args)
+  return module
+
+def test_add_item_creates_subheader_at_position(capsys):
+  module = run_modules_add_item([], title="Notes soon", position=3,
+                                indent=1)
+  module.create_module_item.assert_called_once_with(
+      {'type': 'SubHeader', 'title': "Notes soon", 'position': 3,
+       'indent': 1})
+  module.create_module_item.return_value.edit.assert_not_called()
+  assert module.module_item_all_fetched is None
+  assert "Added to modules: Week 1" in capsys.readouterr().err
+
+def test_add_item_publishes_on_request():
+  module = run_modules_add_item([], title="Notes soon", publish=True)
+  module.create_module_item.return_value.edit.assert_called_once_with(
+      module_item={'published': True})
+
+def test_add_item_is_idempotent_for_subheaders(capsys):
+  header = make_module_item(3, title="Notes soon", item_type="SubHeader")
+  module = run_modules_add_item([header], title="Notes soon", position=3)
+  module.create_module_item.assert_not_called()
+  header.edit.assert_not_called()
+  assert capsys.readouterr().err == ""
+
+def test_add_item_moves_an_existing_item_to_the_position(capsys):
+  header = make_module_item(5, title="Notes soon", item_type="SubHeader")
+  module = run_modules_add_item([header], title="Notes soon", position=3)
+  module.create_module_item.assert_not_called()
+  header.edit.assert_called_once_with(module_item={'position': 3})
+  assert "Moved within modules: Week 1" in capsys.readouterr().err
+
+def test_add_item_allow_duplicate_adds_again():
+  header = make_module_item(3, title="Notes soon", item_type="SubHeader")
+  module = run_modules_add_item([header], title="Notes soon",
+                                allow_duplicate=True)
+  module.create_module_item.assert_called_once()
+
+def test_add_item_url_carries_address_and_new_tab():
+  module = run_modules_add_item([], type="url", title="Zoom",
+                                url="https://example.org/zoom")
+  module.create_module_item.assert_called_once_with(
+      {'type': 'ExternalUrl', 'title': "Zoom",
+       'external_url': "https://example.org/zoom", 'new_tab': True})
+
+def test_add_item_checks_the_options_for_the_kind():
+  with pytest.raises(SystemExit):
+    run_modules_add_item([], type="subheader")
+  with pytest.raises(SystemExit):
+    run_modules_add_item([], type="url", title="Zoom")
+  with pytest.raises(SystemExit):
+    run_modules_add_item([], type="page")
+  with pytest.raises(SystemExit):
+    run_modules_add_item([], title="Notes soon", position=0)
+@
+
+Content items are found through the other commands' filters, so the
+tests stand in for those and check that the item points at the content,
+that the content's title is what identifies an existing item, and that
+zero or several matches stop the command.
+<<test functions>>=
+def make_page(url, title):
+  """Create a page mock with the attributes add-item reads."""
+  page = MagicMock()
+  page.url = url
+  page.title = title
+  return page
+
+def test_add_item_page_points_at_the_page_and_is_idempotent():
+  page = make_page("week-1-notes", "Week 1 notes")
+  with patch("canvaslms.cli.pages.filter_pages", return_value=[page]):
+    module = run_modules_add_item([], type="page", content="^Week 1")
+    module.create_module_item.assert_called_once_with(
+        {'type': 'Page', 'page_url': "week-1-notes"})
+    present = make_page_item("week-1-notes", position=1)
+    module = run_modules_add_item([present], type="page", content="^Week 1")
+    module.create_module_item.assert_not_called()
+
+def test_add_item_title_overrides_the_content_title():
+  page = make_page("week-1-notes", "Week 1 notes")
+  with patch("canvaslms.cli.pages.filter_pages", return_value=[page]):
+    module = run_modules_add_item([], type="page", content="^Week 1",
+                                  title="Read this first")
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Page', 'page_url': "week-1-notes",
+       'title': "Read this first"})
+
+def test_add_item_assignment_points_at_the_assignment():
+  assignment = MagicMock()
+  assignment.id = 42
+  assignment.name = "Lab 1"
+  with patch("canvaslms.cli.assignments.filter_assignments",
+             return_value=iter([assignment])):
+    module = run_modules_add_item([], type="assignment", content="^Lab 1$")
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Assignment', 'content_id': 42})
+
+def test_add_item_quiz_uses_the_quiz_item_type():
+  quiz = MagicMock()
+  quiz.title = "Quiz 1"
+  with patch("canvaslms.cli.quizzes.filter_quizzes",
+             return_value=iter([quiz])), \
+       patch("canvaslms.cli.quizzes.quiz_module_item",
+             return_value=("Quiz", 7)):
+    module = run_modules_add_item([], type="quiz", content="^Quiz 1$")
+  module.create_module_item.assert_called_once_with(
+      {'type': 'Quiz', 'content_id': 7})
+
+def test_add_item_refuses_zero_or_several_matches():
+  pages = [make_page("a", "Week 1 a"), make_page("b", "Week 1 b")]
+  with patch("canvaslms.cli.pages.filter_pages", return_value=pages):
+    with pytest.raises(SystemExit):
+      run_modules_add_item([], type="page", content="^Week 1")
+  with patch("canvaslms.cli.pages.filter_pages", return_value=[]):
+    with pytest.raises(SystemExit):
+      run_modules_add_item([], type="page", content="^Week 9")
+@
+
+
+\section{Removing an item from a module, [[modules_remove_item_command]]}
+\label{sec:modules-remove-item}
+
+An item leaves a module today by one of two routes, and neither reaches
+every item.
+Pushing the content's file with an empty [[modules]] list detaches a page
+or an assignment (\cref{sec:updating-membership}), which requires the
+file; [[modules delete]] (\cref{sec:modules-delete}) removes a whole
+module.
+A text header that a real item has replaced, or an imported assignment
+that should leave a module while staying in the course, has no route at
+all.
+[[modules remove-item]] removes one item from each matching module:
+\begin{minted}{bash}
+canvaslms modules remove-item -c prgi26 "^Vecka 3$" \
+  -i "^Föreläsningsanteckningar kommer$"
+\end{minted}
+
+The item is found as [[modules move]] and [[modules require]] find
+theirs (\cref{sec:modules-move}): by title or Canvas ID, uniquely within
+each module, with an ambiguous pattern an error and a module without a
+match a warning.
+Removing a module item is a delete of the \emph{item}: Canvas keeps the
+page, assignment or quiz it pointed at, and this is the whole point of
+the command, so its description says so and no confirmation is asked,
+unlike for [[modules delete]], whose regex can take thirty items with it.
+What the command does can be undone with [[modules add-item]].
+One thing Canvas does not do on removal is close the gap: the remaining
+items keep the positions they had, so a module that lost its second item
+still numbers the third one~3.
+Their order is unaffected, and a later [[add-item]] or [[move]] with a
+position still lands where it says, so the gap is cosmetic; it only
+matters to a script that compares positions before and after.
+<<functions>>=
+def modules_remove_item_command(config, canvas, args):
+  """Remove one item from each matching module; its content stays."""
+  item_regex = re.compile(args.item)
+  course_list = courses.process_course_option(canvas, args)
+  removed = []
+  for course in course_list:
+    for module in filter_modules(course, args.regex):
+      item = find_unique_item(module, item_regex, args.item)
+      if item is None:
+        continue
+      try:
+        item.delete()
+        invalidate_module_items(module)
+        removed.append(module.name)
+      except Exception as e:
+        canvaslms.cli.warn(f"Could not remove '{item.title}' from "
+                           f"{module.name}: {e}")
+  print_module_changes([], removed)
+@
+
+<<add remove-item arguments>>=
+remove_item_parser.add_argument("regex",
+  help="Regex for selecting modules (name or Canvas ID); the item is "
+       "removed from each matching module")
+courses.add_course_option(remove_item_parser, required=True)
+remove_item_parser.add_argument("-i", "--item", required=True,
+  help="Regex matching the title or Canvas ID of the item to remove")
+@
+
+Let's verify that the unique match is deleted and the cache forgotten,
+that nothing else is touched, and that ambiguity stops the command.
+<<test functions>>=
+def run_modules_remove_item(items, item_regex):
+  """Run modules remove-item on one module; return the module."""
+  module = make_cached_module("Week 1", 11, items)
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", item=item_regex)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_remove_item_command({}, MagicMock(), args)
+  return module
+
+def test_remove_item_deletes_the_unique_match(capsys):
+  header = make_module_item(3, title="Notes soon", item_type="SubHeader")
+  lab = make_module_item(4, title="Lab 1", item_type="Assignment")
+  module = run_modules_remove_item([header, lab], "^Notes")
+  header.delete.assert_called_once()
+  lab.delete.assert_not_called()
+  assert module.module_item_all_fetched is None
+  assert "Removed from modules: Week 1" in capsys.readouterr().err
+
+def test_remove_item_skips_module_without_match(capsys):
+  lab = make_module_item(4, title="Lab 1", item_type="Assignment")
+  run_modules_remove_item([lab], "^Notes")
+  lab.delete.assert_not_called()
+  assert "Removed" not in capsys.readouterr().err
+
+def test_remove_item_refuses_ambiguous_match():
+  items = [make_module_item(1, title="Lab 1"),
+           make_module_item(2, title="Lab 2")]
+  with pytest.raises(SystemExit):
+    run_modules_remove_item(items, "^Lab")
+  for item in items:
+    item.delete.assert_not_called()
 @
 
 
