@@ -67,6 +67,7 @@ convention to ours.
 <<[[tutorial.py]]>>=
 """Interactive tutorials for canvaslms, powered by pytorial."""
 
+import argparse
 import pathlib
 import sys
 
@@ -314,6 +315,7 @@ def add_tutorial_command(subp, *, state_root=None, tutorial_paths=None):
     state_root=state_root,
     tutorial_paths=tuple(tutorial_paths))
   tutorial_parser.set_defaults(func=tutorial_command)
+  <<attach completers for tutorial identifiers>>
   return tutorial_parser
 @
 
@@ -329,6 +331,12 @@ def build_parser(**kwargs):
                              required=True)
   tutorial.add_tutorial_command(subp, **kwargs)
   return argp
+
+def tutorial_group(argp):
+  """Returns the tutorial command's parser from a tree built above"""
+  for action in argp._actions:
+    if isinstance(action, argparse._SubParsersAction):
+      return action.choices["tutorial"]
 @
 
 Each verb must parse and carry pytorial's handler, the verb must be
@@ -351,6 +359,99 @@ def test_the_verb_is_required():
   """canvaslms tutorial without a verb is rejected by argparse"""
   with pytest.raises(SystemExit):
     build_parser().parse_args(["tutorial"])
+@
+
+\section{Completing tutorial identifiers}
+
+The verbs complete on their own, since [[argcomplete]] reads the live
+parser (\cref{command-line-interface}), but the identifier a user types
+after [[run]] or [[review]] does not: pytorial attaches completers to its
+Typer front end only.
+The identifier is the one thing a new user does not know yet, so we
+attach completers ourselves, to the same two arguments, using the
+helpers pytorial already has.
+What [[run]] can complete is whatever the catalog offers, and what
+[[review]] can complete is whatever has a saved run, so the two
+completers read different sources but the same state and paths the
+command itself uses.
+Both are closures over those settings; a completer is called with the
+prefix typed so far and the arguments parsed up to that point, and the
+[[run]] completer also honours a [[--tutorial-path]] given earlier on
+the line, as the verb itself would.
+
+<<functions>>=
+def run_id_completer(tutorial_paths):
+  """Returns an argcomplete completer for the identifiers run accepts"""
+  offered = pytorial.cli.embedded_tutorial_paths(tuple(tutorial_paths))
+
+  def complete(prefix, parsed_args, **kwargs):
+    extra = tuple(getattr(parsed_args, "tutorial_path", None) or ())
+    return pytorial.cli.suggest_run_tutorial_ids(offered, extra, prefix)
+
+  return complete
+
+def review_id_completer(state_root):
+  """Returns an argcomplete completer for the identifiers review accepts"""
+  def complete(prefix, parsed_args, **kwargs):
+    return pytorial.cli.suggest_review_tutorial_ids(
+      namespace="canvaslms", state_root=state_root, incomplete=prefix)
+
+  return complete
+@
+
+Argparse keeps a parser's subparsers in one action, and each positional
+argument in an action of its own, so attaching a completer means finding
+the verb's parser among the choices and then the action whose
+destination is [[tutorial_id]].
+
+<<functions>>=
+def tutorial_id_action(tutorial_parser, verb):
+  """Returns the tutorial_id action of the given verb's subparser"""
+  for action in tutorial_parser._actions:
+    if isinstance(action, argparse._SubParsersAction):
+      verb_parser = action.choices[verb]
+      break
+  for action in verb_parser._actions:
+    if action.dest == "tutorial_id":
+      return action
+  raise KeyError(f"tutorial {verb} has no tutorial_id argument")
+@
+
+<<attach completers for tutorial identifiers>>=
+tutorial_id_action(tutorial_parser, "run").completer = \
+  run_id_completer(tutorial_paths)
+tutorial_id_action(tutorial_parser, "review").completer = \
+  review_id_completer(state_root)
+@
+
+Completing [[run]] must offer the bundled tutorials and pytorial's
+universal one; completing [[review]] must offer only tutorials with a
+saved run, which we fake by dropping a run file where pytorial's state
+store keeps them.
+
+<<test functions>>=
+def test_run_completes_offered_tutorial_ids(tmp_path):
+  """run completes the ids in the offered catalog"""
+  argp = build_parser(state_root=tmp_path)
+  action = tutorial.tutorial_id_action(tutorial_group(argp), "run")
+  parsed = argparse.Namespace(tutorial_path=[])
+
+  assert "getting-started" in action.completer("get", parsed)
+  assert "using-tutorials" in action.completer("", parsed)
+  assert action.completer("nothing-like-this", parsed) == []
+
+def test_review_completes_only_saved_runs(tmp_path):
+  """review completes only tutorials that have a saved run"""
+  argp = build_parser(state_root=tmp_path)
+  action = tutorial.tutorial_id_action(tutorial_group(argp), "review")
+
+  assert action.completer("", argparse.Namespace()) == []
+
+  runs = tmp_path / "runs"
+  runs.mkdir()
+  (runs / "getting-started.json").write_text("{}")
+
+  assert action.completer("get", argparse.Namespace()) == ["getting-started"]
 @
 
 \section{Running the selected verb}
