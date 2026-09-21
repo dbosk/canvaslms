@@ -665,9 +665,11 @@ src/canvaslms/
 │   ├── quizzes.nw    # Quiz/survey analysis
 │   ├── fbf.nw        # Feedback functionality
 │   ├── links.nw      # Course link translation (symbolic <-> numeric)
+│   ├── tutorial.nw   # `tutorial` command (embeds pytorial)
 │   └── utils.nw      # Shared utilities
 ├── grades/           # Grading algorithms (.nw sources)
 ├── hacks/            # Canvas API extensions
+├── tutorials/        # Bundled tutorials (.nw -> .md loaded by pytorial)
 └── __init__.py       # Generated from canvaslms.nw
 ```
 
@@ -779,6 +781,12 @@ Add to `src/canvaslms/cli/Makefile`:
 MODULES+= newcommand.py newcommand.tex
 ```
 
+If the command bundles data files (as `tutorial` does with
+`src/canvaslms/tutorials/*.md`), also add a `[tool.poetry] include` entry
+for them in `pyproject.toml` and a targeted rule in `src/.gitignore` when
+they are generated. Generated `.md` is not covered by the existing
+`**/*.py` / `**/*.tex` rules.
+
 ### 6. Register the command
 
 Import and register in `cli.nw`:
@@ -807,6 +815,48 @@ Before considering the task complete, verify:
 - [ ] Design decisions are documented
 - [ ] Examples are provided
 - [ ] Edge cases are discussed
+
+## Adding a Tutorial
+
+The `tutorial` command (`src/canvaslms/cli/tutorial.nw`) embeds
+[pytorial](https://github.com/dbosk/pytorial). Each bundled tutorial is a
+literate file `src/canvaslms/tutorials/<id>.nw` that tangles to `<id>.md`
+(the file pytorial loads) and weaves to `<id>.tex` (a manual chapter).
+Read an existing one first; `getting-started.nw` is the template.
+
+Rules the tests enforce (`<<test [[tutorial.py]]>>` and the command lint in
+`cli.nw`):
+- The file name is the tutorial `id`; the `.md` must parse with
+  `pytorial.catalog.load_tutorial_file`.
+- Every shell step has `required_patterns`; every question step has
+  `answers` (and `options` for select kinds).
+- No `pre_command`, `check_command` or `post_command`: bundled tutorials
+  must run under `--no-allow-shell`.
+- Every backticked `canvaslms ...` command in the tutorial text must name
+  real verbs and options of the current parser tree.
+
+Conventions:
+- Match the typed command with anchored regexes such as
+  `(?:^|\s)canvaslms\s+courses\b`; match output only when it is
+  deterministic (help text). Regex mode has no `re.MULTILINE`, so use
+  `[^\n]*` rather than `^` for per-line matching.
+- Never require `canvaslms login` (it overwrites the stored token) or any
+  command that writes to Canvas; teach those with `-h` and question steps.
+- No noweb-hostile text in tutorial bodies: no `<<...>>`, no heredocs, no
+  line starting with `@`. `noroots` exits 0, so an unused chunk silently
+  disappears from the `.md`; the parse test is the backstop.
+- Design prose (what varies between steps, why a pattern is shaped as it
+  is) goes in the woven body, not in `\ltnote`.
+
+Registration checklist:
+1. `MODULES+= <id>.md <id>.tex` and `<id>.md: <id>.nw` in
+   `src/canvaslms/tutorials/Makefile`.
+2. `\input{../src/canvaslms/tutorials/<id>.tex}` under
+   `\part{The bundled tutorials}` in `doc/canvaslms.tex`, and a
+   `canvaslms.pdf: ${SRC_DIR}/tutorials/<id>.tex` line in `doc/Makefile`.
+3. `make -C src/canvaslms all && make -C tests all && poetry run pytest`.
+4. Editing a bundled tutorial changes its digest, so users' in-progress runs
+   of it must be restarted with `--restart`; mention it in release notes.
 
 ## Configuration and Authentication
 
@@ -871,6 +921,7 @@ When in doubt, bump. Do not write lazy migration shims for old cache layouts.
 - `pypandoc>=1.11` - Document conversion
 - `arrow>=1.2.3` - Date/time handling
 - `keyring>=24.2,<26.0` - Credential storage
+- `pytorial>=0.10.0,<1.0` - Interactive tutorials (the `tutorial` command)
 
 ### Optional
 - `canvaslms[llm]` - AI summaries for quiz analysis (Python 3.10+)

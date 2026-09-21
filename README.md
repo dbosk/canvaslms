@@ -14,6 +14,20 @@ pipx install canvaslms
 canvaslms login
 ```
 
+Then let the built-in tutorials walk you through the commands against your
+own courses. Each step opens a shell, tells you what to type, and checks what
+you did; progress is saved between runs.
+
+```bash
+canvaslms tutorial list
+canvaslms tutorial run getting-started
+```
+
+The first tutorial covers logging in and listing courses and users. Later
+ones cover assignments and grading, course content, and letting a coding
+agent such as Claude Code run `canvaslms` for you through the skills in
+[dbosk/claude-skills](https://github.com/dbosk/claude-skills).
+
 You can also use the package directly from Python.
 This lets scripts and other CLI tools import `canvaslms` and reuse the same
 authentication, configuration, and encrypted cache as the `canvaslms`

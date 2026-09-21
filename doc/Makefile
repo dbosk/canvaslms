@@ -51,6 +51,11 @@ canvaslms.pdf: ${SRC_DIR}/cli/calendar.tex
 canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cache.tex
+canvaslms.pdf: ${SRC_DIR}/cli/tutorial.tex
+canvaslms.pdf: ${SRC_DIR}/tutorials/getting-started.tex
+canvaslms.pdf: ${SRC_DIR}/tutorials/assignments-and-grading.tex
+canvaslms.pdf: ${SRC_DIR}/tutorials/course-content.tex
+canvaslms.pdf: ${SRC_DIR}/tutorials/agent-skills.tex
 canvaslms.pdf: ${TEST_DIR}/conftest.tex
 canvaslms.pdf: lint.tex
 

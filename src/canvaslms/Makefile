@@ -3,6 +3,7 @@ NOTANGLEFLAGS.py=
 SUBDIR+=	cli
 SUBDIR+=	grades
 SUBDIR+=	hacks
+SUBDIR+=	tutorials
 
 MODULES+=	__init__.py canvaslms.tex
 
