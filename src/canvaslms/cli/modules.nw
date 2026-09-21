@@ -20,7 +20,7 @@ properly configured before a course begins.
 \section*{Chapter overview}
 
 This chapter serves two purposes:
-First, it provides the [[modules]] subcommand with eight sub-commands:
+First, it provides the [[modules]] subcommand with nine sub-commands:
 \begin{itemize}
 \item [[modules list]] --- lists modules with their metadata (unlock dates,
   progress requirements, item counts)
@@ -29,6 +29,8 @@ First, it provides the [[modules]] subcommand with eight sub-commands:
 \item [[modules move]] --- moves an item to a given position within a module
 \item [[modules add-item]] --- adds a text header, an external URL or an
   existing page, assignment or quiz to a module
+\item [[modules remove-item]] --- removes an item from a module, keeping the
+  content it pointed at
 \item [[modules require]] --- sets what students must do with an item
 \item [[modules create]] --- creates a module
 \item [[modules edit]] --- changes a module's name, position, unlock date,
@@ -97,6 +99,14 @@ def add_command(subp):
                 "module already has it.")
   add_item_parser.set_defaults(func=modules_add_item_command)
   <<add add-item arguments>>
+
+  # Add 'remove-item' subcommand
+  remove_item_parser = modules_subp.add_parser("remove-item",
+    help="Removes an item from a module",
+    description="Removes one item from each matching module. The page, "
+                "assignment or quiz behind the item stays in the course.")
+  remove_item_parser.set_defaults(func=modules_remove_item_command)
+  <<add remove-item arguments>>
 
   # Add 'create' subcommand
   create_parser = modules_subp.add_parser("create",
@@ -176,7 +186,7 @@ commands without defaults: [[pages]], [[discussions]], [[calendar]],
 
 All sub-commands but [[create]] accept a regular expression for selecting
 modules by name or Canvas ID; the ones that change something ([[move]],
-[[add-item]], [[require]], [[edit]], [[delete]]) require
+[[add-item]], [[remove-item]], [[require]], [[edit]], [[delete]]) require
 it, [[create]] takes a module name instead (\cref{sec:modules-create}).
 This allows users to work with specific modules or groups of related modules.
 Additionally, the [[view]] subcommand supports two optional flags that add
@@ -204,7 +214,7 @@ view_parser.add_argument("--show-position", action="store_true",
 @
 
 The arguments of the other sub-commands are explained with their commands
-(\cref{sec:modules-move,sec:modules-add-item,sec:modules-require,sec:modules-create,sec:modules-edit,sec:modules-delete}).
+(\cref{sec:modules-move,sec:modules-add-item,sec:modules-remove-item,sec:modules-require,sec:modules-create,sec:modules-edit,sec:modules-delete}).
 <<add move arguments>>=
 move_parser.add_argument("regex",
   help="Regex for selecting modules (required: the move applies to each "
@@ -975,6 +985,109 @@ def test_add_item_refuses_zero_or_several_matches():
   with patch("canvaslms.cli.pages.filter_pages", return_value=[]):
     with pytest.raises(SystemExit):
       run_modules_add_item([], type="page", content="^Week 9")
+@
+
+
+\section{Removing an item from a module, [[modules_remove_item_command]]}
+\label{sec:modules-remove-item}
+
+An item leaves a module today by one of two routes, and neither reaches
+every item.
+Pushing the content's file with an empty [[modules]] list detaches a page
+or an assignment (\cref{sec:updating-membership}), which requires the
+file; [[modules delete]] (\cref{sec:modules-delete}) removes a whole
+module.
+A text header that a real item has replaced, or an imported assignment
+that should leave a module while staying in the course, has no route at
+all.
+[[modules remove-item]] removes one item from each matching module:
+\begin{minted}{bash}
+canvaslms modules remove-item -c prgi26 "^Vecka 3$" \
+  -i "^Föreläsningsanteckningar kommer$"
+\end{minted}
+
+The item is found as [[modules move]] and [[modules require]] find
+theirs (\cref{sec:modules-move}): by title or Canvas ID, uniquely within
+each module, with an ambiguous pattern an error and a module without a
+match a warning.
+Removing a module item is a delete of the \emph{item}: Canvas keeps the
+page, assignment or quiz it pointed at, and this is the whole point of
+the command, so its description says so and no confirmation is asked,
+unlike for [[modules delete]], whose regex can take thirty items with it.
+What the command does can be undone with [[modules add-item]].
+One thing Canvas does not do on removal is close the gap: the remaining
+items keep the positions they had, so a module that lost its second item
+still numbers the third one~3.
+Their order is unaffected, and a later [[add-item]] or [[move]] with a
+position still lands where it says, so the gap is cosmetic; it only
+matters to a script that compares positions before and after.
+<<functions>>=
+def modules_remove_item_command(config, canvas, args):
+  """Remove one item from each matching module; its content stays."""
+  item_regex = re.compile(args.item)
+  course_list = courses.process_course_option(canvas, args)
+  removed = []
+  for course in course_list:
+    for module in filter_modules(course, args.regex):
+      item = find_unique_item(module, item_regex, args.item)
+      if item is None:
+        continue
+      try:
+        item.delete()
+        invalidate_module_items(module)
+        removed.append(module.name)
+      except Exception as e:
+        canvaslms.cli.warn(f"Could not remove '{item.title}' from "
+                           f"{module.name}: {e}")
+  print_module_changes([], removed)
+@
+
+<<add remove-item arguments>>=
+remove_item_parser.add_argument("regex",
+  help="Regex for selecting modules (name or Canvas ID); the item is "
+       "removed from each matching module")
+courses.add_course_option(remove_item_parser, required=True)
+remove_item_parser.add_argument("-i", "--item", required=True,
+  help="Regex matching the title or Canvas ID of the item to remove")
+@
+
+Let's verify that the unique match is deleted and the cache forgotten,
+that nothing else is touched, and that ambiguity stops the command.
+<<test functions>>=
+def run_modules_remove_item(items, item_regex):
+  """Run modules remove-item on one module; return the module."""
+  module = make_cached_module("Week 1", 11, items)
+  course = MagicMock()
+  course.course_code = "CODE"
+  course.get_modules.return_value = [module]
+  args = argparse.Namespace(regex="^Week 1$", item=item_regex)
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]):
+    modules_remove_item_command({}, MagicMock(), args)
+  return module
+
+def test_remove_item_deletes_the_unique_match(capsys):
+  header = make_module_item(3, title="Notes soon", item_type="SubHeader")
+  lab = make_module_item(4, title="Lab 1", item_type="Assignment")
+  module = run_modules_remove_item([header, lab], "^Notes")
+  header.delete.assert_called_once()
+  lab.delete.assert_not_called()
+  assert module.module_item_all_fetched is None
+  assert "Removed from modules: Week 1" in capsys.readouterr().err
+
+def test_remove_item_skips_module_without_match(capsys):
+  lab = make_module_item(4, title="Lab 1", item_type="Assignment")
+  run_modules_remove_item([lab], "^Notes")
+  lab.delete.assert_not_called()
+  assert "Removed" not in capsys.readouterr().err
+
+def test_remove_item_refuses_ambiguous_match():
+  items = [make_module_item(1, title="Lab 1"),
+           make_module_item(2, title="Lab 2")]
+  with pytest.raises(SystemExit):
+    run_modules_remove_item(items, "^Lab")
+  for item in items:
+    item.delete.assert_not_called()
 @
 
 
