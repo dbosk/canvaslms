@@ -921,7 +921,7 @@ When in doubt, bump. Do not write lazy migration shims for old cache layouts.
 - `pypandoc>=1.11` - Document conversion
 - `arrow>=1.2.3` - Date/time handling
 - `keyring>=24.2,<26.0` - Credential storage
-- `pytorial>=0.9.0,<1.0` - Interactive tutorials (the `tutorial` command)
+- `pytorial>=0.10.0,<1.0` - Interactive tutorials (the `tutorial` command)
 
 ### Optional
 - `canvaslms[llm]` - AI summaries for quiz analysis (Python 3.10+)
