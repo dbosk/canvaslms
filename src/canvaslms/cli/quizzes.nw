@@ -14,6 +14,8 @@ Classic Quizzes (the original Canvas quiz system) and New Quizzes (Quizzes.Next)
 The [[quizzes]] command has the following subcommands:
 \begin{description}
 \item[[[list]]] Lists all quizzes in a course (Classic, New Quizzes, and surveys)
+\item[[[import]]] Imports a QTI package or replaces a Classic quiz's questions
+\item[[[import-status]]] Checks completion of a QTI import
 \item[[[view]]] Displays full quiz content including questions and answers
 \item[[[analyse]]] Summarizes quiz/survey evaluation data with statistics and AI
 \item[[[create]]] Creates a new quiz from JSON (settings and optionally questions)
@@ -341,6 +343,7 @@ subcommands:
 \begin{description}
 \item[ [[add_command()]] ] Registers the parent [[quizzes]] command
 \item[ [[add_list_command()]] ] Registers the [[quizzes list]] subcommand
+\item[ [[add_qti_commands()]] ] Registers [[import]] and [[import-status]]
 \item[ [[add_analyse_command()]] ] Registers the [[quizzes analyse]] subcommand
 \item[ [[add_create_command()]] ] Registers the [[quizzes create]] subcommand
 \item[ [[add_edit_command()]] ] Registers the [[quizzes edit]] subcommand
@@ -354,16 +357,28 @@ subcommands:
 import argparse
 import csv
 import difflib
+import hashlib
+import io
 import json
+import math
 import os
 import re
 import statistics
 import sys
 import time
+import uuid
+import zipfile
 import yaml
 from collections import defaultdict, Counter
+from html.parser import HTMLParser
+from pathlib import Path
+from xml.etree import ElementTree
 
 import pypandoc
+import arrow
+from canvasapi.exceptions import CanvasException
+from canvasapi.util import combine_kwargs
+from canvaslms import dirs
 
 import canvaslms.cli
 import canvaslms.cli.courses as courses
@@ -441,6 +456,7 @@ quizzes_subp = quizzes_parser.add_subparsers(
     required=True)
 
 add_list_command(quizzes_subp)
+add_qti_commands(quizzes_subp)
 add_analyse_command(quizzes_subp)
 add_view_command(quizzes_subp)
 add_create_command(quizzes_subp)
@@ -449,6 +465,665 @@ add_delete_command(quizzes_subp)
 add_export_command(quizzes_subp)
 add_items_command(quizzes_subp)
 add_banks_command(quizzes_subp)
+@
+
+\section{Importing QTI packages}
+\label{sec:quiz-qti-import}
+
+[[quizzes import]] uploads one flat QTI 1.2 assessment as a Classic Quiz by
+default. [[--type new]] asks Canvas to convert the package to a New Quiz;
+it supports fresh imports, not replacement of an existing New Quiz.
+Question groups and bank references are unsupported, including in fresh imports.
+The command
+waits for Canvas to finish and prints the resulting quiz ID, title and URL.
+[[--id-only]] prints just the ID, with progress and errors on standard error.
+[[--no-wait]] instead reports a migration ID, which [[quizzes import-status]]
+can subsequently resolve using a local import receipt. Receipts are scoped by
+server and course and contain no authentication tokens.
+
+\begin{minted}{bash}
+canvaslms quizzes list -c '^123$'
+quiz_id=$(canvaslms quizzes import -c '^123$' -f quiz.qti.zip --id-only)
+canvaslms quizzes import -c '^123$' -f revised.qti.zip \
+  --quiz-id "$quiz_id" --replace-items
+canvaslms quizzes import -c '^123$' -f quiz.qti.zip --no-wait
+canvaslms quizzes import-status -c '^123$' MIGRATION_ID --wait --id-only
+canvaslms quizzes import -c '^123$' -f quiz.qti.zip --type new --id-only
+\end{minted}
+
+An import timeout exits with status 2 and leaves the remote import running;
+an import failure exits with status 1 and includes Canvas's migration issues.
+A nonblocking import's successful submission does not mean its quiz is ready.
+
+\subsection{Choosing creation or question replacement}
+
+Replacement requires both [[--quiz-id]] and [[--replace-items]]. Native QTI
+overwrite can merge old and new questions, so the package is imported into an
+empty staging quiz with a known ID. Canvas's [[quiz_id_to_update]] migration
+setting supplies that correlation; this setting is an undocumented Canvas
+extension. The destination is untouched until staging completes and its content
+has been read. The importer never targets the destination quiz directly.
+
+Replacement accepts unpublished quizzes without student attempts and flat
+multiple-choice, true/false and essay questions. Groups and bank-linked pools
+are unsupported. Question IDs change; the destination quiz ID is retained.
+Question creation and deletion are not transactional. A failure retains the
+staging quiz and a private local backup rather than reporting partial work as
+success or automatically replaying destructive operations.
+
+Quiz settings are preserved by default. [[--update-metadata FILE]] explicitly
+applies a JSON object containing only the settings named in that file, for
+example [[{"time_limit": 60, "shuffle_answers": true}]]. Quiz type,
+publication, assignment identity and third-party integration flags cannot be
+changed through this option. Date strings include an explicit UTC offset.
+Canvas's required finalizing save can normalize
+inconsistent stored values or synchronize linked assignment fields; the command
+checks the exposed quiz settings and reports unexpected changes. Settings not
+exposed by the API, external proctoring configuration and independently edited
+assignment settings cannot be verified by this comparison.
+
+<<functions>>=
+def add_qti_commands(subp):
+  parser = subp.add_parser("import", help="Import a Classic or New QTI quiz")
+  courses.add_course_option(parser, required=True)
+  parser.add_argument("-f", "--file", required=True, type=Path,
+                      help="QTI 1.2 ZIP containing one flat assessment")
+  parser.add_argument("--type", choices=("classic", "new"), default="classic",
+                      help="Quiz engine (new supports fresh imports only)")
+  parser.add_argument("--quiz-id", type=int,
+                      help="Existing unpublished Classic quiz to update")
+  parser.add_argument("--replace-items", action="store_true",
+                      help="Replace all questions, preserving quiz settings")
+  parser.add_argument("--update-metadata", type=Path, metavar="FILE",
+                      help="Explicit JSON settings patch for replacement")
+  parser.add_argument("--no-wait", action="store_true",
+                      help="Submit a fresh import and print its migration ID")
+  parser.add_argument("--id-only", action="store_true")
+  parser.add_argument("--timeout", type=float, default=300,
+                      help="Seconds to wait for migration completion (300)")
+  parser.set_defaults(func=qti_import_command)
+
+  parser = subp.add_parser("import-status", help="Check a QTI import receipt")
+  courses.add_course_option(parser, required=True)
+  parser.add_argument("migration_id", type=int)
+  parser.add_argument("--wait", action="store_true")
+  parser.add_argument("--id-only", action="store_true")
+  parser.add_argument("--timeout", type=float, default=300)
+  parser.set_defaults(func=qti_status_command)
+
+class QtiImportError(RuntimeError):
+  pass
+@
+
+\subsection{Package identity and explicit settings}
+
+The archive is read once so the inspected bytes are the uploaded bytes. Local
+ZIP/XML errors and packages containing multiple assessments fail before any
+Canvas writes. The expected item count is recorded for checking the completed
+import. Published packages are rejected because the staging quiz must stay
+unpublished. Package metadata is used only by the fresh staging import, never
+copied wholesale onto an existing destination.
+
+<<constants>>=
+QTI_QUESTION_FIELDS = (
+  'question_name', 'question_text', 'question_type', 'points_possible',
+  'correct_comments', 'incorrect_comments', 'neutral_comments',
+  'correct_comments_html', 'incorrect_comments_html', 'neutral_comments_html',
+  'answers',
+)
+QTI_SETTINGS = (
+  'title', 'description', 'time_limit', 'allowed_attempts', 'scoring_policy',
+  'shuffle_answers', 'one_question_at_a_time', 'cant_go_back',
+  'show_correct_answers', 'show_correct_answers_last_attempt',
+  'show_correct_answers_at', 'hide_correct_answers_at', 'hide_results',
+  'one_time_results', 'ip_filter', 'access_code', 'due_at', 'unlock_at',
+  'lock_at', 'only_visible_to_overrides',
+)
+QTI_DATES = {
+  'due_at', 'unlock_at', 'lock_at', 'show_correct_answers_at',
+  'hide_correct_answers_at',
+}
+QTI_VOLATILE_FIELDS = {
+  'question_count', 'points_possible', 'question_types', 'version_number',
+  'updated_at', 'all_dates', 'locked_for_user', 'lock_info', 'lock_explanation',
+  'has_access_code', 'visible_to_everyone',
+  'mobile_url', 'preview_url', 'speedgrader_url', 'speed_grader_url',
+  'quiz_reports_url', 'quiz_statistics_url', 'quiz_submission_versions_html_url',
+  'message_students_url',
+}
+QTI_QUESTION_TYPES = {
+  'multiple_choice_question', 'true_false_question', 'essay_question',
+}
+@
+
+<<functions>>=
+def read_qti_package(data):
+  assessments = []
+  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    for name in archive.namelist():
+      if name.startswith('__MACOSX/') or Path(name).name.startswith('._') or \
+          not name.lower().endswith('.xml'):
+        continue
+      root = ElementTree.fromstring(archive.read(name))
+      for node in root.iter():
+        tag = node.tag.rsplit('}', 1)[-1]
+        if tag == 'assessment':
+          assessments.append(node)
+        if tag in ('published', 'available') and \
+            (node.text or '').strip().lower() in ('true', '1'):
+          raise QtiImportError("Published QTI packages are unsupported")
+  if len(assessments) != 1:
+    raise QtiImportError("Expected exactly one QTI 1.2 assessment")
+  assessment = assessments[0]
+  count = sum(node.tag.rsplit('}', 1)[-1] == 'item'
+              for node in assessment.iter())
+  if not count:
+    raise QtiImportError("The QTI assessment contains no questions")
+  return assessment.get('title') or 'Imported quiz', count
+
+def qti_course(canvas, args):
+  course_list = courses.process_course_option(canvas, args)
+  if len(course_list) != 1:
+    raise QtiImportError("Select exactly one course with -c")
+  return course_list[0]
+
+def qti_pages(course, endpoint, key=None, api=None):
+  response = course._requester.request('GET', endpoint, _url=api, per_page=100)
+  result = []
+  while True:
+    data = response.json()
+    result.extend(data[key] if key else data)
+    next_url = response.links.get('next', {}).get('url')
+    if not next_url:
+      return result
+    response = course._requester.request('GET', _url=next_url)
+
+def qti_snapshot(course, quiz_id):
+  endpoint = f'courses/{course.id}/quizzes/{quiz_id}'
+  quiz = course._requester.request('GET', endpoint).json()
+  questions = qti_pages(course, endpoint + '/questions')
+  return quiz, questions
+
+def qti_check_target(course, quiz_id):
+  quiz, questions = qti_snapshot(course, quiz_id)
+  if quiz['published'] or not quiz.get('unpublishable'):
+    raise QtiImportError("Replacement requires an unpublished quiz without attempts")
+  submissions = qti_pages(course,
+      f'courses/{course.id}/quizzes/{quiz_id}/submissions', 'quiz_submissions')
+  if any(s.get('user_id') is not None and
+         s.get('workflow_state') != 'settings_only' for s in submissions):
+    raise QtiImportError("Replacement refuses a quiz with student attempts")
+  if any(q.get('quiz_group_id') for q in questions) or \
+      len(questions) != quiz['question_count']:
+    raise QtiImportError("Replacement does not support question groups or pools")
+  return quiz, questions
+@
+
+\subsection{Tracking completion without guessing IDs}
+
+A receipt records the pre-created quiz and migration IDs. Its private backup
+can include answer keys and access restrictions, so both files use owner-only
+permissions. A server/course-specific path prevents a migration on one Canvas
+instance from being confused with the same numeric ID elsewhere. Status reads
+never resume an interrupted replacement automatically.
+
+<<functions>>=
+def qti_receipt_path(course, migration_id):
+  server = hashlib.sha256(course._requester.base_url.encode()).hexdigest()[:16]
+  return Path(dirs.user_data_dir) / 'qti-imports' / server / \
+      f'{course.id}-{migration_id}.json'
+
+def qti_write_record(path, record):
+  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  temporary = path.with_name(path.name + '.' + uuid.uuid4().hex)
+  with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600), 'w') as stream:
+    json.dump(record, stream, indent=2)
+  os.replace(temporary, path)
+
+def qti_wait(course, migration_id, wait, timeout):
+  deadline = time.monotonic() + timeout
+  previous = None
+  while True:
+    migration = course.get_content_migration(migration_id)
+    state = migration.workflow_state
+    if state != previous:
+      print(f"Migration {migration_id}: {state}", file=sys.stderr)
+      previous = state
+    if state in ('completed', 'failed', 'pre_process_error'):
+      issues = list(migration.get_migration_issues())
+      for issue in issues:
+        print(f"{issue.issue_type}: {issue.description}", file=sys.stderr)
+      if state != 'completed' or any(i.issue_type == 'error' for i in issues):
+        raise QtiImportError(f"Canvas import {migration_id} failed")
+      return True
+    if state not in ('pre_processing', 'pre_processed', 'running', 'queued',
+                      'created'):
+      raise QtiImportError(f"Import {migration_id} needs attention: {state}")
+    if not wait:
+      return False
+    if time.monotonic() >= deadline:
+      raise TimeoutError(f"Import {migration_id} is still {state}; "
+                         "check quizzes import-status before retrying")
+    time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+def qti_ready(course, receipt, timeout=60):
+  if receipt.get('quiz_type') == 'new':
+    return qti_new_ready(course, receipt, timeout)
+  for attempt in range(30):
+    quiz, questions = qti_snapshot(course, receipt['quiz_id'])
+    if quiz['published']:
+      raise QtiImportError("Canvas published the imported quiz unexpectedly")
+    if len(questions) == receipt['question_count'] and \
+        quiz['question_count'] == len(questions) and \
+        qti_points_ready(quiz, questions):
+      return quiz, questions
+    time.sleep(2)
+  raise QtiImportError("Imported questions, counts or points do not match "
+                       "the QTI package; inspect the retained import quiz. "
+                       "Question groups and bank references are unsupported")
+
+def qti_points_ready(quiz, questions):
+  points = [q.get('points_possible') for q in questions]
+  return quiz.get('points_possible') is not None and None not in points and \
+      math.isclose(quiz['points_possible'], sum(points),
+                   rel_tol=1e-9, abs_tol=1e-9)
+
+def qti_output(args, course, receipt, quiz=None):
+  if args.id_only:
+    if quiz is None:
+      raise TimeoutError("The import is not complete; no quiz ID is ready")
+    print(quiz['id'])
+    return
+  writer = csv.writer(sys.stdout, delimiter=args.delimiter)
+  writer.writerow(['Course ID', 'Migration ID', 'Status', 'Quiz ID',
+                   'Quiz Title', 'Quiz Type', 'URL'])
+  writer.writerow([course.id, receipt['migration_id'], receipt['phase'],
+                   quiz['id'] if quiz else '',
+                   quiz['title'] if quiz else '',
+                   ('new_quiz' if receipt.get('quiz_type') == 'new'
+                    else quiz['quiz_type']) if quiz else '',
+                   quiz['html_url'] if quiz else ''])
+@
+
+\subsection{Resolving a New Quiz import}
+
+Canvas performs the QTI conversion when [[import_quizzes_next]] is true.
+Its migration audit data records [[imported_assets.lti_assignment_quiz_set]]
+as assignment/Classic-quiz ID pairs. Reading that mapping identifies the
+destination without matching titles or guessing which concurrent import
+created an assignment. The [[audit_info]] include and this mapping are Canvas
+extensions, not part of the documented content migration response schema.
+Missing mappings fail explicitly; the command never substitutes another quiz.
+
+The content migration can finish before the New Quizzes service finishes
+building the items. We poll that service until the expected number of ordinary
+questions is readable. Assignment points are independent of question points in
+New Quizzes and must not be compared with their sum. The receipt keeps the
+assignment ID as soon as it is known, including when readiness times out.
+
+<<functions>>=
+def qti_new_ready(course, receipt, timeout):
+  from canvasapi.exceptions import ResourceDoesNotExist
+
+  deadline = time.monotonic() + timeout
+  if receipt['quiz_id'] is None:
+    migration = course.get_content_migration(receipt['migration_id'],
+                                             include=['audit_info'])
+    audit = getattr(migration, 'audit_info', {})
+    pairs = audit.get('migration_settings', {}).get('imported_assets', {}).get(
+        'lti_assignment_quiz_set', [])
+    if len(pairs) != 1:
+      raise QtiImportError("Canvas did not identify exactly one New Quiz in "
+          "the migration audit data; check New Quizzes migration availability "
+          "and inspect the retained import")
+    receipt['quiz_id'] = pairs[0][0]
+    qti_write_record(qti_receipt_path(course, receipt['migration_id']), receipt)
+    print(f"Imported New Quiz assignment {receipt['quiz_id']}; "
+          "waiting for its questions", file=sys.stderr)
+
+  endpoint = f"courses/{course.id}/quizzes/{receipt['quiz_id']}"
+  while True:
+    try:
+      quiz = course._requester.request('GET', endpoint,
+                                       _url='new_quizzes').json()
+      if quiz['published']:
+        raise QtiImportError("Canvas published the imported New Quiz unexpectedly")
+      items = qti_pages(course, endpoint + '/items', api='new_quizzes')
+      if any(item['entry_type'] != 'Item' for item in items):
+        raise QtiImportError("New Quiz import does not support stimuli or banks")
+      if len(items) == receipt['question_count'] and all(
+          item.get('entry', {}).get('item_body') is not None and
+          item.get('points_possible') is not None for item in items):
+        receipt['quiz_id'] = quiz['id']
+        quiz['html_url'] = (course._requester.base_url.split('/api/')[0] +
+                           f"/courses/{course.id}/assignments/{quiz['id']}")
+        return quiz, items
+    except ResourceDoesNotExist:
+      pass
+    if time.monotonic() >= deadline:
+      raise TimeoutError(f"New Quiz {receipt['quiz_id']} is not ready with "
+          f"{receipt['question_count']} questions; check quizzes import-status "
+          "before retrying the import")
+    time.sleep(min(2, max(0, deadline - time.monotonic())))
+@
+
+\subsection{Comparing and replacing supported questions}
+
+Canvas regenerates question and answer IDs and can normalize empty feedback or
+HTML attribute ordering. The comparison ignores these representational changes
+while retaining answer order, weights, question text and feedback. The
+destination's order is set through the quiz reorder endpoint and checked against
+the ordered question listing. The listing's individual [[position]] fields can
+be null even when Canvas has stored the ordering.
+
+<<functions>>=
+class QtiHTML(HTMLParser):
+  def __init__(self):
+    super().__init__(convert_charrefs=True)
+    self.parts = []
+
+  def handle_starttag(self, tag, attrs):
+    self.parts.append(('start', tag, sorted(attrs)))
+
+  def handle_startendtag(self, tag, attrs):
+    self.handle_starttag(tag, attrs)
+
+  def handle_endtag(self, tag):
+    if tag not in ('img', 'br', 'hr', 'input', 'meta', 'link'):
+      self.parts.append(('end', tag))
+
+  def handle_data(self, data):
+    self.parts.append(('data', data))
+
+def qti_normalize(value):
+  if value is None:
+    return ''
+  if isinstance(value, dict):
+    return {k: qti_normalize(v) for k, v in value.items()
+            if k not in ('id', 'migration_id') and v is not None and v != ''}
+  if isinstance(value, list):
+    return [qti_normalize(v) for v in value]
+  if isinstance(value, str) and '<' in value:
+    parser = QtiHTML()
+    parser.feed(value)
+    return parser.parts
+  return value
+
+def qti_setting_matches(key, expected, actual):
+  if key in QTI_DATES and expected and actual:
+    return arrow.get(expected) == arrow.get(actual)
+  return qti_normalize(expected) == qti_normalize(actual)
+
+def qti_replace(course, receipt, path, metadata):
+  <<read staged questions>>
+  <<back up destination quiz>>
+  <<replace destination questions>>
+  <<verify replacement>>
+  <<clean up staging quiz>>
+  return after
+@
+
+Only supported staged questions can enter the replacement, so the destination
+is still untouched when this check fails.
+
+<<read staged questions>>=
+staged, questions = qti_ready(course, receipt)
+if any(q.get('quiz_group_id') or q['question_type'] not in
+       QTI_QUESTION_TYPES for q in questions):
+  raise QtiImportError("Replacement supports flat multiple-choice, "
+                       "true/false and essay questions only")
+course._requester.request('PUT',
+    f"courses/{course.id}/quizzes/{receipt['quiz_id']}",
+    _kwargs=combine_kwargs(quiz={
+      'title': f"canvaslms staging for quiz {receipt['target_id']}"}))
+@
+
+The destination is checked again immediately before mutation. The backup and
+receipt phase are written before deleting its first question.
+
+<<back up destination quiz>>=
+before, old_questions = qti_check_target(course, receipt['target_id'])
+backup = path.with_suffix('.backup.json')
+qti_write_record(backup, {'quiz': before, 'questions': old_questions})
+print(f"Backup: {backup}; staging quiz: {staged['id']}", file=sys.stderr)
+receipt['phase'] = 'replacing'
+qti_write_record(path, receipt)
+@
+
+Questions are recreated in source order, then explicitly reordered. The final
+quiz save refreshes counts and applies only the requested settings patch.
+
+<<replace destination questions>>=
+endpoint = f"courses/{course.id}/quizzes/{receipt['target_id']}"
+requester = course._requester
+for question in old_questions:
+  requester.request('DELETE', endpoint + f"/questions/{question['id']}")
+order = []
+for position, question in enumerate(questions, 1):
+  payload = {k: question[k] for k in QTI_QUESTION_FIELDS
+             if question.get(k) is not None}
+  payload['position'] = position
+  payload['answers'] = [
+    {k: v for k, v in answer.items()
+     if k not in ('id', 'migration_id') and v is not None}
+    for answer in payload.get('answers', [])]
+  created = requester.request('POST', endpoint + '/questions',
+      _kwargs=combine_kwargs(question=payload)).json()
+  order.append({'id': created['id'], 'type': 'question'})
+requester.request('POST', endpoint + '/reorder',
+                  _kwargs=combine_kwargs(order=order))
+patch = {k: '' if v is None else v for k, v in metadata.items()}
+requester.request('PUT', endpoint,
+                  _kwargs=combine_kwargs(quiz={**patch, 'published': False}))
+@
+
+Success requires the requested content and order, removal of all old question
+IDs, accurate totals, and unchanged exposed settings outside the explicit patch.
+
+<<verify replacement>>=
+for attempt in range(30):
+  after, landed = qti_snapshot(course, receipt['target_id'])
+  if after['question_count'] == len(questions) and \
+      qti_points_ready(after, questions):
+    break
+  time.sleep(2)
+qti_write_record(path.with_suffix('.after.json'),
+                 {'quiz': after, 'questions': landed})
+changed = sorted(k for k in set(before) | set(after)
+                 if k not in metadata and k not in QTI_VOLATILE_FIELDS
+                 and before.get(k) != after.get(k))
+unapplied = [k for k, v in metadata.items()
+             if not qti_setting_matches(k, v, after.get(k))]
+content_matches = len(landed) == len(questions) and all(
+  all(qti_normalize(source.get(k)) == qti_normalize(dest.get(k))
+      for k in QTI_QUESTION_FIELDS)
+  for source, dest in zip(questions, landed))
+old_ids = {q['id'] for q in old_questions}
+checks = {
+  'question content': content_matches,
+  'old question removal': not any(q['id'] in old_ids for q in landed),
+  'question order': [q['id'] for q in landed] == [item['id'] for item in order],
+  'question count': after['question_count'] == len(questions),
+  'total points': qti_points_ready(after, questions),
+}
+failed = [name for name, passed in checks.items() if not passed]
+if changed:
+  failed.append('changed settings: ' + ', '.join(changed))
+if unapplied:
+  failed.append('unapplied metadata: ' + ', '.join(unapplied))
+if failed:
+  raise QtiImportError('Replacement verification failed: ' + '; '.join(failed)
+                       + f'; inspect {backup}')
+@
+
+A verified replacement no longer needs its staging quiz. Cleanup failure is
+reported separately because the destination has already been verified.
+
+<<clean up staging quiz>>=
+receipt['phase'] = 'completed'
+qti_write_record(path, receipt)
+try:
+  requester.request('DELETE',
+      f"courses/{course.id}/quizzes/{receipt['quiz_id']}")
+except (CanvasException, OSError) as exc:
+  print(f"Replacement completed; could not delete staging quiz "
+        f"{receipt['quiz_id']}: {exc}", file=sys.stderr)
+@
+
+\subsection{Running the import and reporting its outcome}
+
+The command boundary converts expected file, API and workflow failures into
+nonzero exit codes. Once Canvas has created an artifact, its ID is printed on
+standard error so it remains discoverable even if upload or verification fails.
+Listing caches are invalidated on success and failure alike.
+
+<<functions>>=
+def qti_import_command(config, canvas, args):
+  course = None
+  path = None
+  try:
+    <<read QTI import options>>
+    <<submit staging import>>
+    <<upload QTI package>>
+    if args.no_wait:
+      qti_output(args, course, receipt)
+      return
+    qti_wait(course, migration.id, True, args.timeout)
+    if args.replace_items:
+      result = qti_replace(course, receipt, path, metadata)
+    else:
+      result, questions = qti_ready(course, receipt, args.timeout)
+    receipt['phase'] = 'completed'
+    qti_write_record(path, receipt)
+    qti_output(args, course, receipt, result)
+  except TimeoutError as exc:
+    canvaslms.cli.err(2, str(exc))
+  except (QtiImportError, CanvasException, OSError,
+          ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+    if path:
+      print(f"Import incomplete; retained artifacts are recorded in {path}",
+            file=sys.stderr)
+    canvaslms.cli.err(1, str(exc))
+  finally:
+    if course is not None:
+      invalidate_quiz_listing_cache(course)
+      if hasattr(course, 'assignment_cache'):
+        course.assignment_cache.clear()
+        course.assignment_all_fetched = None
+@
+
+Option combinations and package identity are resolved before creating anything
+on Canvas. An explicit settings file is used only for replacement.
+
+<<read QTI import options>>=
+if args.type == 'new' and (args.quiz_id is not None or args.replace_items):
+  raise QtiImportError("--type new supports fresh imports only")
+if (args.quiz_id is not None) != args.replace_items:
+  raise QtiImportError("Use --quiz-id and --replace-items together")
+if args.update_metadata and not args.replace_items:
+  raise QtiImportError("--update-metadata requires --replace-items")
+if args.no_wait and (args.id_only or args.replace_items):
+  raise QtiImportError("--no-wait cannot be combined with --id-only "
+                       "or --replace-items")
+if args.timeout < 0:
+  raise QtiImportError("--timeout cannot be negative")
+data = args.file.read_bytes()
+title, count = read_qti_package(data)
+metadata = json.loads(args.update_metadata.read_text()) \
+    if args.update_metadata else {}
+if not isinstance(metadata, dict) or set(metadata) - set(QTI_SETTINGS):
+  raise QtiImportError("Metadata must be a JSON object of supported quiz "
+                       "settings; type, publication and identity are fixed")
+@
+
+A known empty Classic quiz gives its migration a definite destination. New
+Quizzes use Canvas's native conversion and resolve the assignment ID from the
+migration audit data. Both paths record a receipt before uploading.
+
+<<submit staging import>>=
+course = qti_course(canvas, args)
+if args.replace_items:
+  qti_check_target(course, args.quiz_id)
+settings = {'overwrite_quizzes': False, 'import_quizzes_next': args.type == 'new'}
+quiz_id = None
+if args.type == 'classic':
+  quiz = course.create_quiz({'title': 'canvaslms import: ' + title,
+                             'quiz_type': 'practice_quiz',
+                             'published': False})
+  quiz_id = quiz.id
+  settings['quiz_id_to_update'] = quiz_id
+  print(f"Created import quiz {quiz_id}", file=sys.stderr)
+migration = course.create_content_migration('qti_converter',
+    settings=settings,
+    pre_attachment={'name': args.file.name, 'size': len(data),
+                    'content_type': 'application/zip'})
+receipt = {'course_id': course.id, 'migration_id': migration.id,
+           'quiz_id': quiz_id, 'target_id': args.quiz_id, 'quiz_type': args.type,
+           'question_count': count, 'phase': 'submitted'}
+path = qti_receipt_path(course, migration.id)
+qti_write_record(path, receipt)
+print(f"Receipt: {path}", file=sys.stderr)
+@
+
+Canvas supplies the multipart endpoint and fields. The upload carries no Canvas
+bearer token, and both the upload instructions and response must indicate success.
+
+<<upload QTI package>>=
+attachment = migration.pre_attachment
+if attachment.get('error') or not attachment.get('upload_url') or \
+    'upload_params' not in attachment:
+  raise QtiImportError("Canvas rejected the upload: "
+                       + str(attachment.get('message', 'missing upload instructions')))
+response = course._requester.request('POST', use_auth=False,
+    _url=attachment['upload_url'],
+    file={'file': (args.file.name, io.BytesIO(data), 'application/zip')},
+    _kwargs=combine_kwargs(**attachment['upload_params']))
+uploaded = json.loads(response.text.lstrip().removeprefix('while(1);'))
+if uploaded.get('error') or not (uploaded.get('id') or uploaded.get('url')):
+  raise QtiImportError("Canvas did not accept the uploaded file: "
+                       + str(uploaded.get('message', 'no file ID or URL')))
+@
+
+Status resolves receipts but never replays question replacement.
+
+<<functions>>=
+def qti_status_command(config, canvas, args):
+  course = None
+  try:
+    course = qti_course(canvas, args)
+    complete = qti_wait(course, args.migration_id, args.wait, args.timeout)
+    path = qti_receipt_path(course, args.migration_id)
+    receipt = json.loads(path.read_text())
+    if receipt['target_id'] and receipt['phase'] == 'completed':
+      quiz, questions = qti_snapshot(course, receipt['target_id'])
+      qti_output(args, course, receipt, quiz)
+      return
+    quiz = None
+    if complete:
+      if receipt['target_id']:
+        if receipt['phase'] == 'submitted':
+          raise QtiImportError("Staging import completed; the destination "
+              "was not modified. Re-run import to replace its questions")
+        raise QtiImportError("Staging import completed, but replacement did "
+                             "not finish. Inspect its receipt and backup; "
+                             "status does not retry destructive operations")
+      quiz, questions = qti_ready(course, receipt,
+                                  args.timeout if args.wait else 0)
+      receipt['phase'] = 'completed'
+      qti_write_record(path, receipt)
+    qti_output(args, course, receipt, quiz)
+  except TimeoutError as exc:
+    canvaslms.cli.err(2, str(exc))
+  except (QtiImportError, CanvasException, OSError,
+          ValueError) as exc:
+    canvaslms.cli.err(1, str(exc))
+  finally:
+    if course is not None:
+      invalidate_quiz_listing_cache(course)
+      if hasattr(course, 'assignment_cache'):
+        course.assignment_cache.clear()
+        course.assignment_all_fetched = None
 @
 
 
@@ -636,20 +1311,24 @@ def list_command(config, canvas, args):
 
 \subsection{Listing all quizzes}
 
-We output the quiz list in CSV format with course code, title, type, published
+We output the quiz list in CSV format with course code, ID, title, type, published
 status, and due date. The [[filter_quizzes()]] function already attached the
 course to each quiz, so we can access it via [[quiz.course]].
+For Classic Quizzes the ID is the quiz ID; for New Quizzes it is the assignment
+ID accepted by the New Quizzes API. Deduplication includes the course and quiz
+engine because the two engines have independent identifier spaces.
 <<list all quizzes>>=
 # Keep track of quiz IDs we've already listed to avoid duplicates
 listed_quiz_ids = set()
 
 # Output using csv module
 writer = csv.writer(sys.stdout, delimiter=args.delimiter)
-writer.writerow(["Course Code", "Quiz Title", "Quiz Type",
+writer.writerow(["Course Code", "Quiz ID", "Quiz Title", "Quiz Type",
                  "Published", "Due Date"])
 
 for quiz in quiz_list:
-  if quiz.id in listed_quiz_ids:
+  identity = (quiz.course.id, is_new_quiz(quiz), str(quiz.id))
+  if identity in listed_quiz_ids:
     continue
 
   # Determine quiz type
@@ -662,9 +1341,9 @@ for quiz in quiz_list:
   due_date = canvaslms.cli.utils.format_local_time(quiz.due_at)
 
   # Use the course attached by filter_quizzes()
-  writer.writerow([quiz.course.course_code, quiz.title or '', quiz_type,
+  writer.writerow([quiz.course.course_code, quiz.id, quiz.title or '', quiz_type,
                    published, due_date])
-  listed_quiz_ids.add(quiz.id)
+  listed_quiz_ids.add(identity)
 @
 
 To fetch the quizzes we need to call both [[get_quizzes()]] and
