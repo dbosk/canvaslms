@@ -12,8 +12,8 @@ The [[submissions view]] subcommand displays detailed information about
 individual submissions, including attachments, comments, and submission history.
 
 The [[submissions grade]] subcommand allows grading of submissions, either 
-by setting grades and comments programmatically or by opening the Canvas 
-SpeedGrader interface.
+by setting grades, comments and rubric assessments programmatically or by
+opening the Canvas SpeedGrader interface.
 
 We outline the module:
 <<[[submissions.py]]>>=
@@ -48,6 +48,7 @@ import tempfile
 import textwrap
 import urllib.request
 import webbrowser
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ We define the test file structure early, but the actual test implementations app
 
 <<test [[submissions.py]]>>=
 """Tests for patiencediff integration and helpers in submissions."""
+import argparse
 import pytest
 from unittest.mock import Mock
 
@@ -95,7 +97,14 @@ from canvaslms.cli.submissions import (
     list_submissions,
     list_ungraded_submissions,
     match_renamed_files,
+    match_rubric_item,
+    merge_rubric_assessment,
+    parse_rubric_value,
+    resolve_rubric_specs,
+    rubric_specs_from_args,
+    rubric_specs_from_data,
     speedgrader,
+    submissions_grade_command,
 )
 
 <<test functions>>
@@ -1110,9 +1119,9 @@ def add_submission_options(parser, required=False, suppress_help=False):
 \subsection{Options for setting a grade}
 
 The [[submissions grade]] subcommand and the standalone [[grade]] command set
-a grade, a comment, or both; when neither is given they fall back to opening
-SpeedGrader.
-Both commands take the pair from here, so that adding an option for one of
+a grade, a comment, a rubric assessment, or any combination of them; when none
+is given they fall back to opening SpeedGrader.
+Both commands take the options from here, so that adding an option for one of
 them cannot leave the other behind.
 What the options mean for the grading itself we postpone to where grading is
 implemented.
@@ -1126,12 +1135,23 @@ def add_grading_options(parser):
     parser: The argparse parser to add options to
   """
   grade_options = parser.add_argument_group(
-    "arguments to set the grade and/or comment, "
+    "arguments to set the grade, comment and/or rubric assessment, "
     "if none given, opens SpeedGrader")
   grade_options.add_argument("-g", "--grade",
     help="The grade to set for the submissions")
   grade_options.add_argument("-m", "--message",
     help="A comment to the student")
+  grade_options.add_argument("-R", "--rubric", action="append", nargs="+",
+    metavar=("CRITERION VALUE", "COMMENT"),
+    help="Assess a rubric criterion: CRITERION matches the criterion's "
+         "description (or ID), VALUE is points or a regex matching a "
+         "rating, an empty VALUE keeps the rating; any further words "
+         "form a comment on the criterion. Can be repeated; criteria "
+         "not mentioned keep their current assessment.")
+  grade_options.add_argument("--rubric-file", metavar="FILE",
+    help="Read rubric assessments from a YAML or JSON file ('-' for "
+         "stdin), shaped like the rubric_assessment of "
+         "'submissions view --json'. Applied before any -R.")
 @
 
 \subsection{Options for viewing a submission}
@@ -4398,8 +4418,14 @@ This can be almost anything: Canvas accepts points, percentages or letter
 grades and will convert accordingly.
 \item [[-m]] or [[--message]], which sets a comment.
 \end{itemize}
-Both are optional.
-If neither is given, the SpeedGrader page of each submission is opened in the 
+Assignments graded with a rubric need more than that, so there are also
+[[-R]]/[[--rubric]] and [[--rubric-file]], which set the rubric assessment one
+criterion at a time.
+They bring enough design questions of their own to get a subsection
+(\cref{sec:rubric-set}); here we only need to know that they, too, count as
+grading.
+All options are optional.
+If none is given, the SpeedGrader page of each submission is opened in the
 web browser.
 The grading options are added via the [[add_grading_options]] function,
 which is shared between [[submissions grade]] and the standalone [[grade]]
@@ -4418,12 +4444,13 @@ if args.grade:
   results["submission"] = {"posted_grade": args.grade}
 if args.message:
   results["comment"] = {"text_comment": args.message}
+<<resolve the rubric options for every assignment>>
 @
 
-Now we can process the submissions: either update the submission, if the grade 
-or message options were given, or open the submission in SpeedGrader.
+Now we can process the submissions: either update the submission, if any
+grading option was given, or open the submission in SpeedGrader.
 <<grade the submissions>>=
-if not args.grade and not args.message:
+if not results and not rubric_updates:
   for submission in submission_list:
     <<open [[submission]] in SpeedGrader>>
 else:
@@ -4481,6 +4508,10 @@ if args.grade:
   logger.info(f"  Setting grade to: {args.grade}")
 if args.message:
   logger.info(f"  Adding comment: {args.message}")
+for criterion_id, update in rubric_updates.get(
+    submission.assignment.id, {}).items():
+  criterion = get_criterion(criterion_id, submission.assignment.rubric)
+  logger.info(f"  Assessing {criterion['description']}: {update}")
 @
 
 \subsection{Error handling for grading operations}
@@ -4490,9 +4521,14 @@ Common issues include unauthorized access when assignments are not published,
 or when the user doesn't have permission to grade the assignment.
 This error handling ensures that users get helpful feedback instead of raw
 API exceptions.
+It wraps both of the requests a submission may need---the rubric assessment
+first, then the grade and comment---for reasons we give in
+\cref{sec:rubric-grade-order}.
 <<grade submission with error handling>>=
 try:
-  submission.edit(**results)
+  <<set the rubric assessment of [[submission]]>>
+  if results:
+    submission.edit(**results)
 except canvasapi.exceptions.Forbidden as err:
   canvaslms.cli.err(1,
     f"Permission denied when grading {submission.assignment.name} "
@@ -4511,4 +4547,708 @@ except canvasapi.exceptions.CanvasException as err:
     f"Canvas API error when grading {submission.assignment.name} "
     f"for {submission.user}. "
     f"Canvas error: {err}")
+@
+
+
+\subsection{Setting rubric assessments}\label{sec:rubric-set}
+
+Many assignments are graded with a rubric: a list of criteria, each offering a
+few ratings worth some points.
+[[-g]] sets only the resulting grade, so the rubric itself used to require
+SpeedGrader.
+We want the command line to fill it in, using the vocabulary that
+[[submissions view]] already uses when it prints an assessment
+(\cref{FormattingRubrics}):
+\begin{minted}{text}
+canvaslms grade -c DD1310 -a Lab1 -u alice \
+  -R Correctness Pass \
+  -R 'Code style' 2 Long functions, split them \
+  -m 'Good work overall'
+\end{minted}
+[[Correctness]] and [[Code style]] name criteria by their descriptions,
+[[Pass]] names a rating of the first, [[2]] gives points for the second, and
+the remaining words become a comment on that criterion.
+The same assessment can come from a file, in exactly the shape that
+[[submissions view --json]] prints under [[rubric_assessment]]:
+\begin{minted}{yaml}
+Correctness: {rating: Pass}
+Code style: {points: 2, comments: "Long functions, split them"}
+\end{minted}
+That symmetry is the point of [[--rubric-file]]: an assessment can be
+exported, edited and fed back, or generated by a grading script, without
+learning a second format.
+
+What the user writes \emph{names} things; what Canvas wants is IDs:
+\begin{minted}{python}
+{'_7957': {'rating_id': '_6397', 'points': 1.0, 'comments': 'Well done'}}
+\end{minted}
+Getting from the one to the other takes four steps, each in its own part
+below:
+\begin{enumerate}
+\item collect the specifications from [[--rubric-file]] and [[-R]]
+  (\cref{sec:rubric-specs});
+\item find the criterion and the rating that each specification names
+  (\cref{sec:rubric-names});
+\item translate them into Canvas's fields, for every assignment, before
+  anything is written (\cref{sec:rubric-resolve});
+\item merge the result into each submission's current assessment and write
+  it, ahead of the grade (\cref{sec:rubric-merge,sec:rubric-grade-order}).
+\end{enumerate}
+Three of these steps are shaped by how Canvas treats a written assessment,
+which we established by experiment in a sandbox course; each experiment is
+reported where its consequence is implemented.
+
+
+\subsubsection{Collecting the specifications}\label{sec:rubric-specs}
+
+The two sources describe the same thing: a criterion and some of a rating,
+points and a comment.
+We normalise both into a list of pairs [[(pattern, spec)]], where [[pattern]]
+names the criterion and [[spec]] is a dictionary with any of the keys
+[[rating]], [[points]] and [[comments]]---the keys of the JSON output.
+It is a list rather than a dictionary keyed by pattern because two different
+patterns may name the same criterion.
+Which one wins can only be decided once the patterns are resolved, and it is
+the order that decides: the file first, then the [[-R]] options in
+command-line order, so that [[-R]] can adjust a prepared file.
+
+On the command line, a value is only a string.
+We read a number as points and anything else as a pattern for a rating,
+because that is how a grader thinks of it: \enquote{two points} or
+\enquote{Pass}.
+An empty value sets neither, which is how one comments on a criterion without
+touching its rating: [[-R Style '' Nice names]].
+<<functions>>=
+def parse_rubric_value(value):
+  """Turn a command-line rubric VALUE into a specification.
+
+  A number sets the points, an empty string sets nothing and anything else
+  is a pattern for the rating.
+  """
+  if value == "":
+    return {}
+  try:
+    return {"points": float(value)}
+  except ValueError:
+    return {"rating": value}
+@
+
+The file is a mapping from criterion to assessment.
+We accept the assessment as a mapping, like the JSON output, but also as a
+bare value with the meaning it has on the command line, so that a
+hand-written file can say [[Correctness: Pass]].
+Two details keep the round trip through [[submissions view --json]] working.
+The JSON output writes [[null]] for a rating it could not find, so we treat
+[[null]] as \enquote{not given} rather than as a rating called
+\enquote{None}.
+And we reject keys we do not know: a misspelt [[comment:]] would otherwise
+silently drop the comment, which a grader would only notice when a student
+asks where it went.
+<<constants>>=
+RUBRIC_SPEC_KEYS = ("rating", "points", "comments")
+<<functions>>=
+def rubric_specs_from_data(data):
+  """Return the `(pattern, spec)` pairs of a loaded rubric file.
+
+  `data` maps criteria to either a value, read like a command-line VALUE,
+  or a mapping with any of the keys `rating`, `points` and `comments`.
+  Raises `ValueError` for anything else.
+  """
+  if not isinstance(data, dict):
+    raise ValueError("a rubric file must map criteria to assessments")
+
+  specs = []
+  for pattern, assessment in data.items():
+    if assessment is None:
+      spec = {}
+    elif isinstance(assessment, dict):
+      <<check and copy the fields of [[assessment]] into [[spec]]>>
+    else:
+      spec = parse_rubric_value(str(assessment))
+    specs.append((str(pattern), spec))
+  return specs
+@
+
+Of the fields, only the points need converting: YAML reads [[2]] as an
+integer and JSON may carry it as a string, whereas the rating and the comment
+are text either way.
+<<check and copy the fields of [[assessment]] into [[spec]]>>=
+unknown = set(assessment) - set(RUBRIC_SPEC_KEYS)
+if unknown:
+  raise ValueError(f"unknown keys for criterion '{pattern}': "
+                   f"{', '.join(sorted(map(str, unknown)))}; "
+                   f"expected {', '.join(RUBRIC_SPEC_KEYS)}")
+spec = {key: assessment[key] for key in RUBRIC_SPEC_KEYS
+        if assessment.get(key) is not None}
+if "points" in spec:
+  spec["points"] = float(spec["points"])
+if "rating" in spec:
+  spec["rating"] = str(spec["rating"])
+if "comments" in spec:
+  spec["comments"] = str(spec["comments"])
+@
+
+Reading the file is kept apart from interpreting it, so that the
+interpretation can be tested on plain data.
+[[yaml.safe_load]] serves both formats, since JSON is (for our purposes) a
+subset of YAML.
+On the command line, the words after the value are joined into the comment.
+The usage line, \texttt{CRITERION VALUE [COMMENT ...]}, promises exactly
+that, and it saves quoting a comment that is a sentence.
+<<functions>>=
+def rubric_specs_from_file(path):
+  """Return the `(pattern, spec)` pairs of the rubric file at `path`.
+
+  The path `-` reads standard input.
+  """
+  if path == "-":
+    return rubric_specs_from_data(yaml.safe_load(sys.stdin))
+  with open(path) as file:
+    return rubric_specs_from_data(yaml.safe_load(file))
+
+def rubric_specs_from_args(args):
+  """Return the `(pattern, spec)` pairs of `--rubric-file` and `-R`, in order.
+
+  Raises `ValueError` for malformed input.
+  """
+  specs = []
+  if args.rubric_file:
+    specs += rubric_specs_from_file(args.rubric_file)
+  for words in args.rubric or []:
+    if len(words) < 2:
+      raise ValueError(f"-R needs a CRITERION and a VALUE, "
+                       f"got only '{words[0]}'")
+    pattern, value, *comment = words
+    spec = parse_rubric_value(value)
+    if comment:
+      spec["comments"] = " ".join(comment)
+    specs.append((pattern, spec))
+  return specs
+@
+
+Let us verify both sources, and that they come out in the order that lets
+[[-R]] override the file.
+
+<<test functions>>=
+class TestRubricSpecs:
+    """Rubric specifications from the command line and from files"""
+
+    def test_value_is_points_rating_or_nothing(self):
+        """Numbers are points, other text a rating, empty text nothing"""
+        assert parse_rubric_value("2") == {"points": 2.0}
+        assert parse_rubric_value("0.5") == {"points": 0.5}
+        assert parse_rubric_value("Pass") == {"rating": "Pass"}
+        assert parse_rubric_value("") == {}
+
+    def test_json_output_shape_is_accepted(self):
+        """The rubric_assessment of `view --json` reads back unchanged"""
+        data = {"Correctness": {"rating": "OK", "points": 1.0,
+                                "comments": "Well done"},
+                "Style": {"rating": None, "points": None,
+                          "comments": ""}}
+        assert rubric_specs_from_data(data) == [
+            ("Correctness", {"rating": "OK", "points": 1.0,
+                             "comments": "Well done"}),
+            ("Style", {"comments": ""}),
+        ]
+
+    def test_bare_values_read_like_the_command_line(self):
+        """`Criterion: 2` and `Criterion: Pass` need no mapping"""
+        assert rubric_specs_from_data({"A": 2, "B": "Pass", "C": None}) == [
+            ("A", {"points": 2.0}), ("B", {"rating": "Pass"}), ("C", {})]
+
+    def test_unknown_keys_are_rejected(self):
+        """A misspelt key must not silently drop data"""
+        with pytest.raises(ValueError, match="comment"):
+            rubric_specs_from_data({"A": {"comment": "typo"}})
+
+    def test_file_must_be_a_mapping(self):
+        """A list is not a rubric assessment"""
+        with pytest.raises(ValueError):
+            rubric_specs_from_data(["A", "B"])
+
+    def test_file_comes_before_command_line(self, tmp_path):
+        """-R options follow the file, so they override it"""
+        rubric_file = tmp_path / "assessment.yml"
+        rubric_file.write_text("Correctness: {rating: Fail}\n")
+        args = argparse.Namespace(
+            rubric_file=str(rubric_file),
+            rubric=[["Correctness", "Pass"],
+                    ["Style", "", "Long", "functions"]])
+
+        assert rubric_specs_from_args(args) == [
+            ("Correctness", {"rating": "Fail"}),
+            ("Correctness", {"rating": "Pass"}),
+            ("Style", {"comments": "Long functions"}),
+        ]
+
+    def test_value_is_required(self):
+        """-R with only a criterion is an error, not an empty assessment"""
+        args = argparse.Namespace(rubric_file=None, rubric=[["Correctness"]])
+        with pytest.raises(ValueError, match="VALUE"):
+            rubric_specs_from_args(args)
+@
+
+
+\subsubsection{Naming criteria and ratings}\label{sec:rubric-names}
+
+Everywhere else in [[canvaslms]], things are named by regular expressions, and
+we want criteria and ratings to be no exception: [[-R Corr Pass]] should be
+enough.
+Rubrics, however, make plain regular expressions awkward in two ways.
+Descriptions often extend one another, so the regex [[Code]] cannot select
+[[Code]] when [[Code style]] exists; and descriptions contain regex
+metacharacters, so the description [[Parametrar/returvärden (funktioner)]]
+copied from the JSON output would not match itself.
+We therefore try exact matches first and fall back on the regex only when
+there is none: first the Canvas ID, which lets scripts be precise, then the
+description as it stands, and last the regex.
+
+The other difference from the assignment option is that a pattern must name
+\emph{exactly one} item.
+[[-a]] may match several assignments on purpose, but assessing two criteria
+with the same value is never what one meant---the command's help warns of
+dragons for good reason.
+When a pattern matches nothing or too much we raise the [[EmptyListError]] or
+[[MultipleMatchesError]] that the main program already reports for its other
+lookups, listing the candidates so that the pattern is easy to fix.
+Ratings are matched within their criterion, so the same helper serves both:
+criteria and ratings alike carry an [[id]] and a [[description]].
+Only the error messages tell them apart, and they need the plural too, which
+English does not form regularly for \enquote{criterion}.
+<<constants>>=
+RUBRIC_ITEM_PLURALS = {"criterion": "criteria", "rating": "ratings"}
+<<functions>>=
+def match_rubric_item(pattern, items, kind):
+  """Return the one criterion or rating in `items` that `pattern` names.
+
+  `pattern` names an item by its ID, its exact description or, failing
+  those, a regex matching the description of that item only. `kind` names
+  the items in error messages.
+  """
+  def description(item):
+    return (item.get("description") or "").strip()
+
+  exact_ways = (lambda item: item["id"] == pattern,
+                lambda item: description(item) == pattern.strip())
+  for is_named in exact_ways:
+    matches = [item for item in items if is_named(item)]
+    if matches:
+      break
+  else:
+    <<match [[pattern]] as a regex against the descriptions>>
+
+  <<make sure [[matches]] contains a single item>>
+  return matches[0]
+@
+
+A pattern that is not a valid regex can still be a valid description (think
+of an unbalanced parenthesis), so an invalid regex simply matches nothing.
+<<match [[pattern]] as a regex against the descriptions>>=
+try:
+  regex = re.compile(pattern)
+except re.error:
+  matches = []
+else:
+  matches = [item for item in items if regex.search(description(item))]
+@
+
+<<make sure [[matches]] contains a single item>>=
+kinds = RUBRIC_ITEM_PLURALS[kind]
+candidates = ", ".join(f"'{description(item)}'" for item in items)
+if not matches:
+  raise canvaslms.cli.EmptyListError(
+    f"no {kind} matches '{pattern}', "
+    f"expected one of: {candidates or f'(no {kinds})'}")
+if len(matches) > 1:
+  raise canvaslms.cli.MultipleMatchesError(
+    f"'{pattern}' matches several {kinds}: "
+    + ", ".join(f"'{description(item)}'" for item in matches))
+@
+
+Let us check the three ways of naming and the two ways of failing.
+
+<<test functions>>=
+class TestMatchRubricItem:
+    """Naming criteria by ID, description or regex"""
+
+    CRITERIA = [
+        {"id": "_1", "description": "Code"},
+        {"id": "_2", "description": "Code style"},
+        {"id": "_3", "description": "Parameters (functions)"},
+    ]
+
+    def test_id_names_the_criterion(self):
+        assert match_rubric_item("_2", self.CRITERIA, "criterion")["id"] == "_2"
+
+    def test_exact_description_beats_longer_matches(self):
+        """`Code` selects Code although the regex also hits Code style"""
+        assert match_rubric_item("Code", self.CRITERIA,
+                                 "criterion")["id"] == "_1"
+
+    def test_description_with_metacharacters(self):
+        """A description that is not a valid regex still names itself"""
+        assert match_rubric_item("Parameters (functions)", self.CRITERIA,
+                                 "criterion")["id"] == "_3"
+
+    def test_regex_names_a_unique_criterion(self):
+        assert match_rubric_item("sty", self.CRITERIA,
+                                 "criterion")["id"] == "_2"
+
+    def test_ambiguous_regex_is_an_error(self):
+        from canvaslms.cli import MultipleMatchesError
+        with pytest.raises(MultipleMatchesError,
+                           match="several criteria.*Code style"):
+            match_rubric_item("^Co", self.CRITERIA, "criterion")
+
+    def test_no_match_lists_the_candidates(self):
+        from canvaslms.cli import EmptyListError
+        with pytest.raises(EmptyListError, match="'Code style'"):
+            match_rubric_item("Correctness", self.CRITERIA, "criterion")
+
+    def test_invalid_regex_matches_nothing(self):
+        from canvaslms.cli import EmptyListError
+        with pytest.raises(EmptyListError):
+            match_rubric_item("(", self.CRITERIA, "criterion")
+@
+
+
+\subsubsection{Translating specifications into Canvas's fields}
+\label{sec:rubric-resolve}
+
+With the names resolved, each specification becomes the fields Canvas stores
+for a criterion: [[rating_id]], [[points]] and [[comments]].
+The first experiment decides how.
+Sending a [[rating_id]] alone left the criterion without points, and the
+submission without a score; sending [[points]] alone made Canvas select the
+rating with those points by itself.
+So the points are what count, and a rating must always bring its points
+along.
+We take them from the rating unless the specification gives points of its
+own.
+That exception is not academic: when a rubric's points are edited after
+grading, old assessments keep their old points under the new ratings, and a
+round trip through the JSON output must not rewrite them.
+
+Given only points, we still look for the one rating with exactly those points,
+so that the log and our own copy of the assessment show the rating that
+Canvas will pick.
+If there is no such rating---a free-form criterion, points between ratings, or
+two ratings with equal points---we set [[rating_id]] to [[None]], which the
+merge (\cref{sec:rubric-merge}) turns into \enquote{remove}.
+Merely leaving it out would keep the rating of the previous assessment, now
+paired with points that contradict it.
+<<functions>>=
+def rating_with_points(points, criterion):
+  """Return the ID of the only rating of `criterion` worth `points`, or None"""
+  matches = [rating["id"] for rating in criterion.get("ratings") or []
+             if rating["points"] == points]
+  return matches[0] if len(matches) == 1 else None
+@
+
+Later specifications for the same criterion update the fields of earlier
+ones, rather than replacing them.
+A file may thus set the rating and the comment, and a later [[-R]] adjust the
+points only.
+<<functions>>=
+def resolve_rubric_specs(specs, rubric):
+  """Translate `(pattern, spec)` pairs into assessment fields for `rubric`.
+
+  Returns a dictionary mapping criterion IDs to the fields (`rating_id`,
+  `points`, `comments`) to set; a `rating_id` of None means to remove it.
+  """
+  if not rubric:
+    raise canvaslms.cli.EmptyListError("there is no rubric to assess")
+
+  updates = {}
+  for pattern, spec in specs:
+    criterion = match_rubric_item(pattern, rubric, "criterion")
+    update = updates.setdefault(criterion["id"], {})
+    <<translate [[spec]] for [[criterion]] into [[update]]>>
+  return updates
+@
+
+<<translate [[spec]] for [[criterion]] into [[update]]>>=
+if "rating" in spec:
+  rating = match_rubric_item(spec["rating"],
+                             criterion.get("ratings") or [], "rating")
+  update["rating_id"] = rating["id"]
+  update["points"] = spec.get("points", rating["points"])
+elif "points" in spec:
+  update["points"] = spec["points"]
+  update["rating_id"] = rating_with_points(spec["points"], criterion)
+if "comments" in spec:
+  update["comments"] = spec["comments"]
+@
+
+Let us verify the translation against a rubric whose two ratings have
+different points, plus a free-form criterion without ratings.
+
+<<test functions>>=
+class TestResolveRubricSpecs:
+    """From named specifications to Canvas's assessment fields"""
+
+    RUBRIC = [
+        {"id": "_c", "description": "Correctness", "points": 1.0,
+         "ratings": [{"id": "_ok", "points": 1.0, "description": "OK"},
+                     {"id": "_re", "points": 0.0, "description": "Remark"}]},
+        {"id": "_f", "description": "Free form", "points": 5.0,
+         "ratings": []},
+    ]
+
+    def test_rating_brings_its_points(self):
+        """Canvas needs the points, a rating_id alone scores nothing"""
+        assert resolve_rubric_specs(
+            [("Corr", {"rating": "OK"})], self.RUBRIC) == {
+            "_c": {"rating_id": "_ok", "points": 1.0}}
+
+    def test_explicit_points_win_over_the_ratings(self):
+        """A round trip keeps points that differ from the rating's"""
+        assert resolve_rubric_specs(
+            [("Corr", {"rating": "OK", "points": 0.5})], self.RUBRIC) == {
+            "_c": {"rating_id": "_ok", "points": 0.5}}
+
+    def test_points_select_the_matching_rating(self):
+        assert resolve_rubric_specs(
+            [("Corr", {"points": 0.0})], self.RUBRIC) == {
+            "_c": {"rating_id": "_re", "points": 0.0}}
+
+    def test_points_without_rating_remove_the_rating(self):
+        """No rating has 3 points, so the old rating must go"""
+        assert resolve_rubric_specs(
+            [("Free", {"points": 3.0, "comments": "Fine"})],
+            self.RUBRIC) == {
+            "_f": {"rating_id": None, "points": 3.0, "comments": "Fine"}}
+
+    def test_later_specifications_update_earlier_ones(self):
+        """The file sets rating and comment, -R adjusts the points"""
+        assert resolve_rubric_specs(
+            [("Correctness", {"rating": "Remark", "comments": "Hm"}),
+             ("_c", {"points": 1.0})], self.RUBRIC) == {
+            "_c": {"rating_id": "_ok", "points": 1.0, "comments": "Hm"}}
+
+    def test_rating_of_free_form_criterion_is_an_error(self):
+        from canvaslms.cli import EmptyListError
+        with pytest.raises(EmptyListError, match="no ratings"):
+            resolve_rubric_specs([("Free", {"rating": "OK"})], self.RUBRIC)
+
+    def test_assignment_without_rubric_is_an_error(self):
+        from canvaslms.cli import EmptyListError
+        with pytest.raises(EmptyListError, match="no rubric"):
+            resolve_rubric_specs([("Corr", {"rating": "OK"})], None)
+@
+
+In the command, the rubric belongs to the assignment, and a regex given to
+[[-a]] may select several assignments with different rubrics.
+We resolve the specifications once for every assignment among the
+submissions, and all of them before the first submission is written to.
+A pattern that fails for the third assignment must stop the command before the
+first one is touched; otherwise it would leave half a batch graded, and the
+grader would have to work out which half.
+Errors are prefixed with the assignment's name, since the same pattern may
+work for one assignment and not for the next.
+Reading the file can fail in its own ways---a missing file, invalid YAML, a
+malformed specification---which we report and stop at, too.
+<<resolve the rubric options for every assignment>>=
+try:
+  rubric_specs = rubric_specs_from_args(args)
+except (OSError, ValueError, yaml.YAMLError) as error:
+  canvaslms.cli.err(1, f"Invalid rubric assessment: {error}")
+
+rubric_updates = {}
+if rubric_specs:
+  for submission in submission_list:
+    assignment = submission.assignment
+    if assignment.id in rubric_updates:
+      continue
+    try:
+      rubric_updates[assignment.id] = resolve_rubric_specs(
+        rubric_specs, assignment.rubric)
+    except (canvaslms.cli.EmptyListError,
+            canvaslms.cli.MultipleMatchesError) as error:
+      raise type(error)(f"{assignment.name}: {error}") from error
+@
+
+
+\subsubsection{Merging into the current assessment}\label{sec:rubric-merge}
+
+The second experiment decides the write itself.
+We assessed two criteria of a submission and then wrote an assessment
+containing a third criterion only: afterwards the first two were gone and the
+score was that of the third alone.
+Canvas thus \emph{replaces} the whole assessment with what it is sent.
+Were we to send only the criteria the grader mentioned, [[-R Style 2]] would
+silently wipe every other criterion.
+We therefore start from the submission's current assessment and overlay the
+updates, field by field, so that a comment survives a change of rating.
+A field set to [[None]] is dropped in the process; that serves the
+\enquote{remove this rating} of the translation, and it also avoids echoing
+back the [[None]] comments Canvas reports, which would reach Canvas as the
+string \enquote{None}.
+<<functions>>=
+def merge_rubric_assessment(current, updates):
+  """Return the complete assessment to send: `current` with `updates` applied.
+
+  Both map criterion IDs to fields; fields that end up None are left out.
+  """
+  merged = {criterion_id: dict(fields)
+            for criterion_id, fields in (current or {}).items()}
+  for criterion_id, fields in updates.items():
+    merged.setdefault(criterion_id, {}).update(fields)
+
+  return {criterion_id: {key: value for key, value in fields.items()
+                         if value is not None}
+          for criterion_id, fields in merged.items()}
+@
+
+Let us verify that untouched criteria and untouched fields survive, and that a
+removed rating is really removed.
+
+<<test functions>>=
+class TestMergeRubricAssessment:
+    """Canvas replaces assessments, so we must send the whole of it"""
+
+    CURRENT = {
+        "_a": {"rating_id": "_ok", "points": 1.0, "comments": None},
+        "_b": {"rating_id": "_re", "points": 0.0, "comments": "Hm"},
+    }
+
+    def test_untouched_criteria_are_kept(self):
+        merged = merge_rubric_assessment(
+            self.CURRENT, {"_b": {"rating_id": "_ok", "points": 1.0}})
+        assert merged == {
+            "_a": {"rating_id": "_ok", "points": 1.0},
+            "_b": {"rating_id": "_ok", "points": 1.0, "comments": "Hm"},
+        }
+
+    def test_none_removes_a_field(self):
+        merged = merge_rubric_assessment(
+            self.CURRENT, {"_b": {"rating_id": None, "points": 0.5}})
+        assert merged["_b"] == {"points": 0.5, "comments": "Hm"}
+
+    def test_new_criteria_are_added(self):
+        assert merge_rubric_assessment(None, {"_c": {"points": 2.0}}) == {
+            "_c": {"points": 2.0}}
+@
+
+The merge is only as good as the assessment it starts from.
+The submission cache never refetches a submission with a final grade, so its
+copy of the assessment may be arbitrarily old: a colleague may have changed
+the rubric in SpeedGrader, or an earlier [[-R]] may have written it (the
+response to a write does not include the assessment).
+Merging into such a copy would revert those changes as surely as not merging
+at all.
+We therefore refresh the submission from Canvas right before merging, at the
+price of one extra request per submission.
+The cache's lazy wrapper offers a forced [[refresh]] for this purpose; a plain
+submission, fetched without the cache, is fresh already, so we recognise the
+wrapper by that method, just as [[ensure_submission_attrs]] recognises it by
+[[ensure_attrs]].
+<<make sure [[submission]] holds Canvas's current assessment>>=
+if hasattr(submission, "refresh"):
+  submission.refresh()
+@
+
+After the write, we store what we sent as the submission's assessment.
+That keeps the cached copy in step with Canvas for the commands that follow,
+without spending yet another request on reading it back.
+<<set the rubric assessment of [[submission]]>>=
+if rubric_updates:
+  <<make sure [[submission]] holds Canvas's current assessment>>
+  assessment = merge_rubric_assessment(
+    submission.rubric_assessment,
+    rubric_updates[submission.assignment.id])
+  submission.edit(rubric_assessment=assessment)
+  submission.rubric_assessment = assessment
+@
+
+
+\subsubsection{Rubric before grade}\label{sec:rubric-grade-order}
+
+The third experiment concerns rubrics that are used for grading, which is how
+Canvas usually sets them up.
+Sending [[posted_grade=P]] and a failing assessment in the same request gave
+the grade F: Canvas computes the grade from the rubric after applying the
+posted grade.
+Sending the grade in a separate request after the assessment, on the other
+hand, kept the assessment and set P.
+An explicit [[-g]] is the grader's final word---the counterpart of overriding
+the rubric's grade in SpeedGrader---so we write the assessment first and the
+grade and comment second, as [[<<grade submission with error handling>>]]
+does.
+The extra request is only made when both are given.
+Without [[-g]], a rubric used for grading sets the grade itself, which is what
+such an assignment is designed to do.
+
+Let us verify the whole path through the command: the submission is refreshed
+before the merge, the merged assessment is written before the grade, and
+SpeedGrader stays closed when the rubric is the only thing being set.
+
+<<test functions>>=
+class TestGradeWithRubric:
+    """submissions grade with -R, end to end with a stub submission"""
+
+    RUBRIC = TestResolveRubricSpecs.RUBRIC
+
+    def make_submission(self, current):
+        """A submission whose refresh reveals the `current` assessment"""
+        submission = Mock(spec=["assignment", "user", "edit", "refresh",
+                                "rubric_assessment"])
+        submission.assignment.id = 1
+        submission.assignment.name = "Lab 1"
+        submission.assignment.rubric = self.RUBRIC
+        submission.rubric_assessment = {"_c": {"points": 0.0}}
+
+        def refresh():
+            submission.rubric_assessment = current
+        submission.refresh.side_effect = refresh
+        return submission
+
+    def grade(self, monkeypatch, submission, **options):
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.process_submission_options",
+            lambda canvas, args: [submission])
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.webbrowser.open",
+            Mock(side_effect=AssertionError("SpeedGrader opened")))
+        args = argparse.Namespace(grade=None, message=None, rubric=None,
+                                  rubric_file=None)
+        for name, value in options.items():
+            setattr(args, name, value)
+        submissions_grade_command(None, None, args)
+
+    def test_rubric_is_merged_into_fresh_assessment(self, monkeypatch):
+        """The stale cached assessment is not what gets merged"""
+        submission = self.make_submission(
+            {"_f": {"points": 4.0, "comments": "Nice"}})
+
+        self.grade(monkeypatch, submission, rubric=[["Corr", "OK"]])
+
+        submission.edit.assert_called_once_with(rubric_assessment={
+            "_f": {"points": 4.0, "comments": "Nice"},
+            "_c": {"rating_id": "_ok", "points": 1.0},
+        })
+
+    def test_rubric_is_written_before_the_grade(self, monkeypatch):
+        """-g must come last, or the rubric overrides it"""
+        submission = self.make_submission({})
+
+        self.grade(monkeypatch, submission, grade="P",
+                   rubric=[["Corr", "Remark"]])
+
+        assert [call.kwargs for call in submission.edit.call_args_list] == [
+            {"rubric_assessment": {"_c": {"rating_id": "_re",
+                                          "points": 0.0}}},
+            {"submission": {"posted_grade": "P"}},
+        ]
+
+    def test_unresolvable_rubric_writes_nothing(self, monkeypatch):
+        """Resolution fails before the first write"""
+        from canvaslms.cli import EmptyListError
+        submission = self.make_submission({})
+
+        with pytest.raises(EmptyListError, match="Lab 1"):
+            self.grade(monkeypatch, submission, rubric=[["Nope", "OK"]])
+
+        submission.edit.assert_not_called()
 @
