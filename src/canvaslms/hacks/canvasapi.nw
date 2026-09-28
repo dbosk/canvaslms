@@ -4023,6 +4023,24 @@ a caller ever write a payload attribute such as [[grade]] through the wrapper,
 the value just fetched from Canvas is the truth and must win over the stale
 local write.
 
+The swap has a second casualty: the normalisation in the CLI's [[utils]]
+module (\enquote{Normalizing partial Canvas objects}), which gives every
+attribute the CLI reads a value, if only [[None]], so that it can read them
+without [[getattr]] fallbacks.
+Canvas leaves some fields out of its payload altogether---[[rubric_assessment]]
+of a submission never assessed is one---so after a swap such a name is simply
+gone, and a read that the listing helpers had guaranteed raises
+[[AttributeError]] (issue~\#495).
+The wrapper does not know the CLI's lists of attributes, but it does not need
+to: a refresh must never \emph{shrink} the set of attributes, whatever put them
+there.
+So every name the old submission had and the fresh payload lacks becomes
+[[None]] on the fresh submission.
+We carry the name, not the old value: a field Canvas no longer reports has no
+value any more, and the stale one would be a lie.
+Annotations are applied first, so they keep their values; this only catches
+what is left.
+
 \subsubsection{When the submission is gone}
 \label{sec:missing-submission}
 
@@ -4053,7 +4071,8 @@ def _refresh(self):
   """Refresh the wrapped submission from Canvas.
 
   Caller annotations (attributes set through the wrapper, e.g. `user`)
-  are carried over to the fresh submission unless Canvas sent that name.
+  are carried over to the fresh submission unless Canvas sent that name;
+  any other name the fresh payload lacks is kept as None.
 
   A submission Canvas no longer has (404) leaves the cached one in place;
   the wrapper still counts as refreshed, so the failing request is not
@@ -4080,6 +4099,9 @@ def _refresh(self):
     for name, value in annotations.items():
       if not hasattr(fresh_submission, name):
         setattr(fresh_submission, name, value)
+    for name in vars(submission):
+      if not hasattr(fresh_submission, name):
+        setattr(fresh_submission, name, None)
 
     object.__setattr__(self, '_submission', fresh_submission)
 
@@ -4090,8 +4112,9 @@ Let us verify the carry-over with the same set-up as the staleness tests: a
 stale wrapper whose next mutable read swaps in a fresh stand-in.  The [[user]]
 annotation must survive that swap; a name the fresh payload already carries
 must keep the fresh value; and the [[None]] fill-ins made by [[ensure_attrs]]
-(which bypasses the wrapper's [[__setattr__]], see below) must not be mistaken
-for annotations.
+(which bypasses the wrapper's [[__setattr__]], see below) must survive as
+[[None]] where Canvas leaves the field out, yet give way where it sends one.
+A real value that Canvas stops sending must become [[None]], not stay stale.
 
 <<test functions>>=
 class TestLazySubmissionAnnotationsSurviveRefresh:
@@ -4136,15 +4159,41 @@ class TestLazySubmissionAnnotationsSurviveRefresh:
 
         assert lazy.grade == "P"
 
-    def test_ensure_attrs_fill_ins_are_not_annotations(self):
-        """`None` fill-ins from ensure_attrs are not carried over."""
+    def test_normalised_attributes_survive_a_refresh(self):
+        """A field Canvas omits stays readable as None (issue #495)."""
         fresh = self.StandInSubmission()
         lazy = self.stale_wrapper(fresh)
         lazy.ensure_attrs(["rubric_assessment"])
 
         lazy.submission_history
 
-        assert not hasattr(fresh, "rubric_assessment")
+        assert lazy.rubric_assessment is None
+
+    def test_fresh_payload_wins_over_fill_in(self):
+        """A field Canvas does send replaces the None fill-in."""
+        fresh = self.StandInSubmission()
+        fresh.rubric_assessment = {"_1": {"points": 1.0}}
+        lazy = self.stale_wrapper(fresh)
+        lazy.ensure_attrs(["rubric_assessment"])
+
+        lazy.submission_history
+
+        assert lazy.rubric_assessment == {"_1": {"points": 1.0}}
+
+    def test_omitted_value_is_not_kept_stale(self):
+        """A value Canvas stops sending becomes None, not the old value."""
+        old = self.StandInSubmission()
+        old.rubric_assessment = {"_1": {"points": 1.0}}
+        lazy = LazySubmission(
+            old, MagicMock(), {"submission_history"},
+            MagicMock(return_value=self.StandInSubmission()))
+        object.__setattr__(
+            lazy, "_last_refresh",
+            datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
+
+        lazy.submission_history
+
+        assert lazy.rubric_assessment is None
 @
 
 The departed student deserves a test of its own, because what we want is an
@@ -4292,7 +4341,8 @@ enough, though: as explained under \enquote{Performing the refresh}, the
 wrapped object is replaced on refresh, so we also record every such write in
 [[_annotations]] for [[_refresh]] to re-apply.  Recording happens only on this
 path---[[ensure_attrs]] writes its [[None]] fill-ins directly to the wrapped
-submission and is thus, by design, not an annotation.
+submission and is thus, by design, not an annotation; a refresh keeps those
+names by other means, as [[None]] (\enquote{Performing the refresh}).
 
 <<LazySubmission methods>>=
 def __setattr__(self, name, value):
