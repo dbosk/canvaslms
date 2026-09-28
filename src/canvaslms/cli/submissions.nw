@@ -4924,11 +4924,38 @@ submission without a score; sending [[points]] alone made Canvas select the
 rating with those points by itself.
 So the points are what count, and a rating must always bring its points
 along.
-We take them from the rating unless the specification gives points of its
-own.
-That exception is not academic: when a rubric's points are edited after
-grading, old assessments keep their old points under the new ratings, and a
-round trip through the JSON output must not rewrite them.
+We take them from the rating.
+
+A specification may give points as well, and then we must decide what it
+means when they disagree with the rating.
+The file format makes that case common rather than exotic: the JSON output
+always carries both, so a grader who changes [[rating: OK]] to
+[[rating: Remark]] in an exported assessment leaves the old points behind.
+Letting the points win would store a Remark worth full points---a wrong score
+that nothing reports.
+Letting the rating win would silently discard points someone deliberately
+wrote.
+We therefore accept both only when they agree, and otherwise refuse, naming
+what the rating is worth, so that the grader drops one of the two.
+Agreement means equal points, except for criteria whose ratings are ranges:
+there a rating covers everything above the next lower rating up to its own
+points, and any points in between are what the range is for.
+The price is paid by assessments made before a rubric's points were edited,
+which keep their old points under the new ratings: they no longer round-trip
+unchanged, but must be given with only the rating or only the points.
+<<functions>>=
+def points_fit_rating(points, rating, criterion):
+  """Tell whether `points` can be scored with `rating` of `criterion`.
+
+  Without ranges a rating is worth exactly its points; with ranges it covers
+  everything above the next lower rating up to its own points.
+  """
+  if not criterion.get("criterion_use_range"):
+    return points == rating["points"]
+  lower = [other["points"] for other in criterion.get("ratings") or []
+           if other["points"] < rating["points"]]
+  return (max(lower) if lower else float("-inf")) < points <= rating["points"]
+@
 
 Given only points, we still look for the one rating with exactly those points,
 so that the log and our own copy of the assessment show the rating that
@@ -4972,8 +4999,14 @@ def resolve_rubric_specs(specs, rubric):
 if "rating" in spec:
   rating = match_rubric_item(spec["rating"],
                              criterion.get("ratings") or [], "rating")
+  points = spec.get("points", rating["points"])
+  if not points_fit_rating(points, rating, criterion):
+    raise ValueError(
+      f"rating '{rating['description']}' of '{criterion['description']}' "
+      f"is worth {rating['points']} points, not {points}; "
+      f"give only the rating or only the points")
   update["rating_id"] = rating["id"]
-  update["points"] = spec.get("points", rating["points"])
+  update["points"] = points
 elif "points" in spec:
   update["points"] = spec["points"]
   update["rating_id"] = rating_with_points(spec["points"], criterion)
@@ -5002,11 +5035,31 @@ class TestResolveRubricSpecs:
             [("Corr", {"rating": "OK"})], self.RUBRIC) == {
             "_c": {"rating_id": "_ok", "points": 1.0}}
 
-    def test_explicit_points_win_over_the_ratings(self):
-        """A round trip keeps points that differ from the rating's"""
+    def test_agreeing_points_are_accepted(self):
+        """The JSON output gives both; unchanged, they agree"""
         assert resolve_rubric_specs(
-            [("Corr", {"rating": "OK", "points": 0.5})], self.RUBRIC) == {
-            "_c": {"rating_id": "_ok", "points": 0.5}}
+            [("Corr", {"rating": "OK", "points": 1.0})], self.RUBRIC) == {
+            "_c": {"rating_id": "_ok", "points": 1.0}}
+
+    def test_disagreeing_points_are_an_error(self):
+        """A changed rating with stale points must not be stored"""
+        with pytest.raises(ValueError, match="worth 0.0 points, not 1.0"):
+            resolve_rubric_specs(
+                [("Corr", {"rating": "Remark", "points": 1.0})], self.RUBRIC)
+
+    def test_points_within_a_range_rating(self):
+        """A range rating covers the points above the next lower one"""
+        rubric = [{"id": "_r", "description": "Report", "points": 5.0,
+                   "criterion_use_range": True,
+                   "ratings": [
+                       {"id": "_good", "points": 5.0, "description": "Good"},
+                       {"id": "_weak", "points": 2.0, "description": "Weak"}]}]
+        assert resolve_rubric_specs(
+            [("Report", {"rating": "Good", "points": 3.5})], rubric) == {
+            "_r": {"rating_id": "_good", "points": 3.5}}
+        with pytest.raises(ValueError):
+            resolve_rubric_specs(
+                [("Report", {"rating": "Good", "points": 2.0})], rubric)
 
     def test_points_select_the_matching_rating(self):
         assert resolve_rubric_specs(
@@ -5047,6 +5100,9 @@ first one is touched; otherwise it would leave half a batch graded, and the
 grader would have to work out which half.
 Errors are prefixed with the assignment's name, since the same pattern may
 work for one assignment and not for the next.
+A lookup that finds nothing or too much raises the main program's own
+exceptions; a rating that disagrees with its points is no failed lookup but a
+contradiction in the input, so we report it the way we report malformed input.
 Reading the file can fail in its own ways---a missing file, invalid YAML, a
 malformed specification---which we report and stop at, too.
 <<resolve the rubric options for every assignment>>=
@@ -5067,6 +5123,8 @@ if rubric_specs:
     except (canvaslms.cli.EmptyListError,
             canvaslms.cli.MultipleMatchesError) as error:
       raise type(error)(f"{assignment.name}: {error}") from error
+    except ValueError as error:
+      canvaslms.cli.err(1, f"{assignment.name}: {error}")
 @
 
 
