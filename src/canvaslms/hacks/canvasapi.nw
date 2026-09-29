@@ -4041,6 +4041,36 @@ value any more, and the stale one would be a lie.
 Annotations are applied first, so they keep their values; this only catches
 what is left.
 
+This does not happen because we asked for too little.  The wrapper refetches
+with every [[include]] any caller has asked for so far (see below), and Canvas
+omits the assessment of a never-assessed submission even when
+[[include[]=rubric_assessment]] is given, from both the single-submission and
+the list endpoint---we checked against the sandbox course.
+
+Two code paths swap the wrapped submission: this lazy refresh, and the bulk
+refresh of a whole assignment (\cref{sec:bulk-refresh}).  Both must keep the
+annotations and the attribute names, so the swap is a method of its own rather
+than two copies that could drift apart.
+<<LazySubmission methods>>=
+def _replace_submission(self, fresh_submission):
+  """Swap in `fresh_submission`, keeping what the old one had beyond it.
+
+  Annotations are carried over unless Canvas sent that name; any other
+  name the fresh payload lacks is kept as None.
+  """
+  submission = object.__getattribute__(self, '_submission')
+  annotations = object.__getattribute__(self, '_annotations')
+  for name, value in annotations.items():
+    if not hasattr(fresh_submission, name):
+      setattr(fresh_submission, name, value)
+  for name in vars(submission):
+    if not hasattr(fresh_submission, name):
+      setattr(fresh_submission, name, None)
+  object.__setattr__(self, '_submission', fresh_submission)
+@
+
+The lazy refresh fetches the submission anew and hands it over.
+
 \subsubsection{When the submission is gone}
 \label{sec:missing-submission}
 
@@ -4096,14 +4126,7 @@ def _refresh(self):
                    f"{submission.user_id} on assignment {assignment} "
                    f"no longer exists, keeping the cached submission")
   else:
-    for name, value in annotations.items():
-      if not hasattr(fresh_submission, name):
-        setattr(fresh_submission, name, value)
-    for name in vars(submission):
-      if not hasattr(fresh_submission, name):
-        setattr(fresh_submission, name, None)
-
-    object.__setattr__(self, '_submission', fresh_submission)
+    self._replace_submission(fresh_submission)
 
   object.__setattr__(self, '_last_refresh', datetime.now())
 @
@@ -5146,7 +5169,10 @@ return list(self.__cache.values())
 @
 
 The bulk refresh pre-check logic counts how many submissions would need refresh
-and triggers a bulk fetch if the count exceeds the threshold.  The fetch is the
+and triggers a bulk fetch if the count exceeds the threshold.
+The fetched submissions replace the wrapped ones through
+[[_replace_submission]], so annotations and attribute names survive a bulk
+refresh exactly as they survive a lazy one.  The fetch is the
 one part that can fail, so it is the only part we wrap; what we do when it does
 is the subject of \cref{sec:bulk-refresh-failure} below.
 <<check staleness threshold and bulk refresh if needed>>=
@@ -5166,7 +5192,7 @@ try:
   for raw_submission in get_submissions(self, include=list(all_includes)):
     if raw_submission.user_id in self.__cache:
       lazy_submission = self.__cache[raw_submission.user_id]
-      object.__setattr__(lazy_submission, '_submission', raw_submission)
+      lazy_submission._replace_submission(raw_submission)
       object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
       object.__setattr__(lazy_submission, '_includes', all_includes)
     else:
@@ -5322,6 +5348,48 @@ class TestBulkRefreshFailureKeepsCache:
 
         requester.request.assert_called_once()
         refetch.assert_not_called()
+@
+
+A successful bulk refresh must keep what a lazy one keeps.  We give the
+stale cache a normalised name and a [[user]] annotation, and let Canvas answer
+with a payload that has neither, as it does for a submission never assessed.
+
+<<test functions>>=
+class TestBulkRefreshKeepsNames:
+    """A bulk refresh keeps annotations and normalised names."""
+
+    def test_bulk_refresh_keeps_annotations_and_names(self):
+        payloads = [{"id": user_id, "user_id": user_id, "grade": "F"}
+                    for user_id in range(BULK_REFRESH_MIN_COUNT)]
+        response = MagicMock()
+        response.json.return_value = [dict(each) for each in payloads]
+        response.links = {}
+        requester = MagicMock()
+        requester.request.return_value = response
+        requester.base_url = "https://canvas.example/api/v1/"
+        requester.new_quizzes_url = "https://canvas.example/api/quiz/v1/"
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+
+        user = object()
+        cache = getattr(assignment, "__cache")
+        for payload in payloads:
+            lazy = LazySubmission(Submission(requester, dict(payload)),
+                                  assignment, set(), MagicMock())
+            lazy.ensure_attrs(["rubric_assessment"])
+            lazy.user = user
+            object.__setattr__(
+                lazy, "_last_refresh",
+                datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
+            cache[payload["user_id"]] = lazy
+        old = object.__getattribute__(cache[0], "_submission")
+        setattr(assignment, "__all_fetched", datetime.now())
+
+        refreshed = assignment.get_submissions(check_bulk_refresh=True)[0]
+
+        requester.request.assert_called_once()
+        assert object.__getattribute__(refreshed, "_submission") is not old
+        assert refreshed.user is user
+        assert refreshed.rubric_assessment is None
 @
 
 Let's verify that the bulk-refresh pre-check stays optional and only flips to a
