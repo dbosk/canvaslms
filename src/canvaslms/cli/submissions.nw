@@ -23,6 +23,7 @@ import canvasapi.submission
 
 import canvaslms.cli
 import canvaslms.cli.assignments as assignments
+import canvaslms.cli.content as content
 import canvaslms.cli.users as users
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
@@ -96,11 +97,15 @@ from canvaslms.cli.submissions import (
     is_ungraded,
     list_submissions,
     list_ungraded_submissions,
+    ask_for_grading,
+    grading_template,
     match_renamed_files,
     match_rubric_item,
     merge_rubric_assessment,
+    parse_grading,
     parse_rubric_value,
     resolve_rubric_specs,
+    rubric_entry_keys,
     rubric_specs_from_args,
     rubric_specs_from_data,
     speedgrader,
@@ -824,6 +829,20 @@ they pipe the output or skip the output altogether.
 console = rich.console.Console()
 <<create [[tmpdir]]>>
 for submission in submission_list:
+  view_submission(submission, args, tmpdir, console)
+@
+
+Showing one submission is a function of its own, because it is not only done
+in a loop like this one: interactive grading (\cref{sec:grade-interactive})
+shows the submissions one at a time, each followed by its grading.
+It takes the same view options, so a grader sees a submission exactly as
+[[submissions view]] would show it.
+<<functions>>=
+def view_submission(submission, args, tmpdir, console):
+  """Show `submission` like `submissions view`, following the options in `args`.
+
+  Files are written below `tmpdir`, output goes through `console`.
+  """
   <<let [[subdir]] be the subdir for [[submission]]'s files>>
   output = format_submission(submission,
                              history=args.history,
@@ -1125,6 +1144,9 @@ Both commands take the options from here, so that adding an option for one of
 them cannot leave the other behind.
 What the options mean for the grading itself we postpone to where grading is
 implemented.
+Interactive grading shows each submission as [[submissions view]] does, so the
+grading commands also take the viewing options of \cref{sec:view-options}, in
+a group of their own since they only matter with [[-i]].
 <<functions>>=
 def add_grading_options(parser):
   """Adds grading options to argparse parser
@@ -1152,9 +1174,15 @@ def add_grading_options(parser):
     help="Read rubric assessments from a YAML or JSON file ('-' for "
          "stdin), shaped like the rubric_assessment of "
          "'submissions view --json'. Applied before any -R.")
+  grade_options.add_argument("-i", "--interactive", action="store_true",
+    help="Show each submission like 'submissions view', then edit its "
+         "grade, rubric assessment and a new comment in $EDITOR.")
+  add_view_options(parser.add_argument_group(
+    "arguments for showing submissions with --interactive"))
 @
 
 \subsection{Options for viewing a submission}
+\label{sec:view-options}
 
 [[submissions view]] and the standalone [[submission]] command share a much
 larger group of options: where the output goes ([[-o]], [[--open]],
@@ -1170,7 +1198,8 @@ which is why the function reads as a bare list of [[add_argument]] calls here.
 def add_view_options(parser):
   """Adds submission viewing options to argparse parser
 
-  These options are shared between 'submissions view' and 'submission' commands.
+  These options are shared between 'submissions view' and 'submission', and
+  used by 'submissions grade' and 'grade' with --interactive.
 
   Args:
     parser: The argparse parser to add options to
@@ -4450,13 +4479,32 @@ if args.message:
 Now we can process the submissions: either update the submission, if any
 grading option was given, or open the submission in SpeedGrader.
 <<grade the submissions>>=
-if not results and not rubric_updates:
+if args.interactive:
+  <<grade the submissions interactively>>
+elif not results and not rubric_updates:
   for submission in submission_list:
     <<open [[submission]] in SpeedGrader>>
 else:
   for submission in submission_list:
-    <<log the grading of [[submission]]>>
-    <<grade submission with error handling>>
+    grade_submission(submission, results,
+                     rubric_updates.get(submission.assignment.id))
+@
+
+The third way, [[-i]], is interactive grading (\cref{sec:grade-interactive}).
+It writes the submissions one at a time, each with values of its own, which is
+why writing a submission is a function rather than the body of the loop above.
+It takes the keyword arguments for [[Submission.edit]] that we just collected
+in [[results]], and the rubric fields to change for the submission's
+assignment, if any.
+<<functions>>=
+def grade_submission(submission, results, rubric_update=None):
+  """Write `rubric_update`, then `results`, to `submission` on Canvas.
+
+  `results` holds keyword arguments for `Submission.edit` (grade, comment);
+  `rubric_update` maps criterion IDs to the fields to change.
+  """
+  <<log the grading of [[submission]]>>
+  <<grade submission with error handling>>
 @
 
 Opening SpeedGrader means honouring [[speedgrader]]'s contract that there might
@@ -4501,15 +4549,18 @@ Dropping the local flag is what lets these messages out.
 The chunk is named for what it does---it logs---and not for a condition it
 tests, because it tests none: whether these lines reach the user is settled
 once, globally, by how many times [[-v]] was given.
+(The [[if]]s below test what there is to log, not whether to log.)
+It reads the values from [[results]] and [[rubric_update]] rather than from
+the options, since in interactive grading they come from the editor instead.
 <<log the grading of [[submission]]>>=
 logger.info(f"Grading {submission.assignment.course.course_code} "
              f"{submission.assignment.name} for {submission.user.name}")
-if args.grade:
-  logger.info(f"  Setting grade to: {args.grade}")
-if args.message:
-  logger.info(f"  Adding comment: {args.message}")
-for criterion_id, update in rubric_updates.get(
-    submission.assignment.id, {}).items():
+if "submission" in results:
+  logger.info(f"  Setting grade to: "
+              f"{results['submission']['posted_grade']}")
+if "comment" in results:
+  logger.info(f"  Adding comment: {results['comment']['text_comment']}")
+for criterion_id, update in (rubric_update or {}).items():
   criterion = get_criterion(criterion_id, submission.assignment.rubric)
   logger.info(f"  Assessing {criterion['description']}: {update}")
 @
@@ -5219,11 +5270,10 @@ After the write, we store what we sent as the submission's assessment.
 That keeps the cached copy in step with Canvas for the commands that follow,
 without spending yet another request on reading it back.
 <<set the rubric assessment of [[submission]]>>=
-if rubric_updates:
+if rubric_update:
   <<make sure [[submission]] holds Canvas's current assessment>>
   assessment = merge_rubric_assessment(
-    submission.rubric_assessment,
-    rubric_updates[submission.assignment.id])
+    submission.rubric_assessment, rubric_update)
   submission.edit(rubric_assessment=assessment)
   submission.rubric_assessment = assessment
 @
@@ -5278,7 +5328,7 @@ class TestGradeWithRubric:
             "canvaslms.cli.submissions.webbrowser.open",
             Mock(side_effect=AssertionError("SpeedGrader opened")))
         args = argparse.Namespace(grade=None, message=None, rubric=None,
-                                  rubric_file=None)
+                                  rubric_file=None, interactive=False)
         for name, value in options.items():
             setattr(args, name, value)
         submissions_grade_command(None, None, args)
@@ -5330,4 +5380,542 @@ class TestGradeWithRubric:
             self.grade(monkeypatch, submission, rubric=[["Nope", "OK"]])
 
         submission.edit.assert_not_called()
+@
+
+
+\subsection{Grading interactively}\label{sec:grade-interactive}
+
+The options above suit grading that is decided before the command runs: a
+list of students who passed, a script that tests submissions.
+Much grading is not like that.
+The grader must look at each submission, run it perhaps, and then decide on a
+grade, fill in the rubric and write a comment---what SpeedGrader offers in the
+browser.
+[[-i]] offers it in the terminal:
+\begin{minted}{text}
+canvaslms grade -c DD1310 -a Lab1 -U -i --open all
+\end{minted}
+For every selected submission, this does two things in turn.
+\begin{enumerate}
+\item It shows the submission exactly as [[submissions view]] would, with the
+  same options: here [[--open all]] opens the submitted files, while
+  [[--open shell]] or [[--open docker]] would let the grader run them, and
+  [[--diff]] would show what changed since the last attempt.
+  Peer reviews are part of that view, too.
+\item It opens the grader's editor on a grading file, and grades the
+  submission with what the grader saves.
+\end{enumerate}
+
+The grading file uses the format that the content commands use for pages and
+assignments: YAML front matter for the structured fields, followed by free
+text.
+Here the free text is a new comment to the student, so writing it feels like
+writing a message rather than filling in a form:
+\begin{minted}{yaml}
+---
+# Grading Lab 1 (DD1310) for Alice Anderson.
+# Save to grade: only what you change is sent to Canvas.
+# Text after the closing --- is sent as a new comment to the student.
+# Empty the file to skip this submission, press Ctrl-C to stop.
+# Grading type: pass_fail, 1.0 points possible.
+grade: null
+rubric:
+  # Correctness (1.0 points)
+  #   The program must pass all tests; ask the student to run them.
+  #   - OK (1.0)
+  #   - Remark (0.0)
+  #       Something fails; say what in the comment.
+  Correctness: {rating: null, points: null, comments: null}
+---
+Well done! Next time, split the long functions.
+\end{minted}
+The fields start out with what Canvas holds, so the grader edits rather than
+retypes, and the rubric appears in the shape [[--rubric-file]] reads.
+The comments under each criterion and rating are their long descriptions from
+the rubric.
+That is where Canvas lets the teacher put guidance for whoever grades---what
+to check, what to ask the student---so the grading file puts it in front of
+the grader at the moment it is needed.
+
+The rest of this subsection builds the pieces: the loop over the submissions,
+the grading file, reading it back, and the editing session in between.
+
+
+\subsubsection{The grading loop}
+
+Interactive grading replaces the option values with the editor, so combining
+it with them has no sensible meaning; we refuse rather than guess.
+<<grade the submissions interactively>>=
+if results or rubric_updates:
+  canvaslms.cli.err(1, "-i cannot be combined with -g, -m, -R or "
+                       "--rubric-file: the editor sets those")
+grade_interactively(submission_list, args)
+@
+
+The loop borrows from [[submissions view]] what makes the submissions
+viewable: the history that [[--diff]] needs, the filtering of null
+submissions (which a grader can undo with [[--include-null-submissions]], say
+to fail those who never submitted), and a directory for the files.
+Before showing a submission, we refresh it, for the same reason as before a
+rubric write (\cref{sec:rubric-merge}): the grading file starts from what the
+submission holds, and that should be what Canvas holds now, not what the cache
+kept from last week.
+The grader stops with Ctrl-C, which may come in the pager, the editor or
+anywhere in between; submissions already graded stay graded.
+<<functions>>=
+def grade_interactively(submission_list, args):
+  """Show each submission, then grade it with what the user writes."""
+  <<enable history when diff is requested>>
+  submission_list = filter_view_submissions(
+    submission_list,
+    include_null_submissions=args.include_null_submissions)
+  if not submission_list:
+    raise canvaslms.cli.EmptyListError(
+      "No submissions found matching the criteria")
+
+  console = rich.console.Console()
+  <<create [[tmpdir]]>>
+  try:
+    for submission in submission_list:
+      <<make sure [[submission]] holds Canvas's current assessment>>
+      view_submission(submission, args, tmpdir, console)
+      grading = ask_for_grading(submission)
+      if grading:
+        grade_submission(submission, *grading)
+      else:
+        logger.info(f"Leaving {submission.user.name} as it was")
+  except KeyboardInterrupt:
+    print("\nStopped grading.", file=sys.stderr)
+@
+
+
+\subsubsection{The grading file}
+
+The file names each criterion by its description, as the JSON output does.
+Two criteria may share a description, however, and a YAML mapping cannot hold
+the same key twice; for those we fall back on the criterion's ID, which
+[[match_rubric_item]] accepts just as well.
+<<functions>>=
+def rubric_entry_keys(rubric):
+  """Return the key that names each criterion of `rubric` in a grading file.
+
+  That is the description, unless another criterion shares it; then the ID.
+  """
+  descriptions = [(criterion.get("description") or "").strip()
+                  for criterion in rubric]
+  return [description
+          if description and descriptions.count(description) == 1
+          else criterion["id"]
+          for description, criterion in zip(descriptions, rubric)]
+@
+
+The current assessment is translated into the file's vocabulary: rating
+descriptions instead of rating IDs.
+Every criterion gets an entry, assessed or not, so that the grader sees the
+whole rubric and only has to fill in values.
+<<functions>>=
+def current_rubric_entries(submission):
+  """Return the rubric assessment of `submission` as a grading file shows it"""
+  rubric = submission.assignment.rubric or []
+  assessment = submission.rubric_assessment or {}
+  entries = {}
+  for key, criterion in zip(rubric_entry_keys(rubric), rubric):
+    fields = assessment.get(criterion["id"]) or {}
+    rating = get_rating(fields.get("rating_id"), criterion)
+    entries[key] = {
+      "rating": rating["description"].strip() if rating else None,
+      "points": fields.get("points"),
+      "comments": fields.get("comments") or None,
+    }
+  return entries
+@
+
+We write the file line by line rather than with [[yaml.safe_dump]], since
+the guidance must go into YAML comments, which PyYAML does not write.
+The values themselves, however, we let PyYAML render, one line each, so that
+quoting is always right: a description containing a colon, a grade such as
+[[70%]], a comment with a newline in it.
+<<functions>>=
+def yaml_inline(value):
+  """Return `value` as YAML on a single line"""
+  text = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True,
+                        sort_keys=False, width=10**6)
+  return text.strip().removesuffix("\n...").strip()
+
+def comment_lines(text, prefix):
+  """Return `text` wrapped into YAML comment lines starting with `prefix`"""
+  return [f"{prefix}{line}"
+          for paragraph in (text or "").strip().splitlines()
+          for line in textwrap.wrap(paragraph, 72) or [""]]
+@
+
+The template returns, besides the text, the values it started from.
+We need them to tell afterwards what the grader changed
+(\cref{sec:grading-file-read}).
+<<functions>>=
+def grading_template(submission):
+  """Return the grading file for `submission` and the values it starts with.
+
+  The values are a dictionary with the keys `grade` and `rubric`, in the
+  form the file uses.
+  """
+  assignment = submission.assignment
+  current = {"grade": submission.grade,
+             "rubric": current_rubric_entries(submission)}
+  lines = ["---"]
+  <<add the instructions to [[lines]]>>
+  lines.append(f"grade: {yaml_inline(current['grade'])}")
+  if assignment.rubric:
+    lines.append("rubric:")
+    keys = rubric_entry_keys(assignment.rubric)
+    for key, criterion in zip(keys, assignment.rubric):
+      <<add [[criterion]] with its guidance to [[lines]]>>
+  lines += ["---", ""]
+  return "\n".join(lines), current
+@
+
+The instructions state the two rules a grader could not guess: that untouched
+fields are not sent, and that the text below the front matter becomes a
+comment.
+The grading type and the points possible tell what a valid grade looks like.
+<<add the instructions to [[lines]]>>=
+lines += [
+  f"# Grading {assignment.name} ({assignment.course.course_code}) "
+  f"for {submission.user.name}.",
+  "# Save to grade: only what you change is sent to Canvas.",
+  "# Text after the closing --- is sent as a new comment to the student.",
+  "# Empty the file to skip this submission, press Ctrl-C to stop.",
+  f"# Grading type: {assignment.grading_type}, "
+  f"{assignment.points_possible} points possible.",
+]
+@
+
+<<add [[criterion]] with its guidance to [[lines]]>>=
+lines.append(f"  # {criterion['description']} "
+             f"({criterion['points']} points)")
+lines += comment_lines(criterion.get("long_description"), "  #   ")
+for rating in criterion.get("ratings") or []:
+  lines.append(f"  #   - {rating['description'].strip()} "
+               f"({rating['points']})")
+  lines += comment_lines(rating.get("long_description"), "  #       ")
+lines.append(f"  {yaml_inline(key)}: {yaml_inline(current['rubric'][key])}")
+@
+
+
+\subsubsection{Reading the grading file back}\label{sec:grading-file-read}
+
+The file holds every field, but the grader changes only a few, and we send
+only those.
+That is what \enquote{only what you change is sent} promises, and it matters
+for more than the number of requests.
+Consider a grader who changes a rating from [[OK]] to [[Remark]] and leaves
+the points alone.
+Sent as it stands, the entry would pair the new rating with the old rating's
+points, which the translation rejects (\cref{sec:rubric-resolve}).
+Sent as a change of rating only, it gets the new rating's points, which is
+what the grader meant.
+And since unchanged criteria are not sent at all, a criterion that a colleague
+assessed while this file was open keeps the colleague's assessment.
+
+We therefore compare the edited entries with the ones the file started with,
+field by field.
+An empty string and [[null]] count as equal, so that a grader who writes
+[[comments: '']] has not changed an absent comment.
+An entry the grader rewrote into another shape, say [[Correctness: OK]], is
+taken as changed as a whole.
+<<functions>>=
+def changed_rubric_entries(current, edited):
+  """Return what changed from `current` to `edited` rubric entries.
+
+  Entries that are mappings keep only their changed fields; other entries
+  count as changed as a whole. The result is shaped like a rubric file.
+  """
+  if not isinstance(edited, dict):
+    raise ValueError("rubric must map criteria to assessments")
+
+  def value(field):
+    return None if field == "" else field
+
+  changes = {}
+  for key, entry in edited.items():
+    before = current.get(key)
+    if isinstance(entry, dict) and isinstance(before, dict):
+      fields = {name: field for name, field in entry.items()
+                if value(field) != value(before.get(name))}
+      if fields:
+        changes[key] = fields
+    elif entry != before:
+      changes[key] = entry
+  return changes
+@
+
+Splitting the file uses the front-matter delimiter of the content commands,
+but not their parser.
+That parser is lenient by design: YAML it cannot read, it treats as body text
+with a warning.
+For a grading that would be the wrong kind of kindness---a stray colon would
+turn the whole file into a comment to the student---so we raise instead, and
+let the editing session offer to fix it.
+<<functions>>=
+def split_grading_file(text):
+  """Return the front matter (a dictionary) and the comment of a grading.
+
+  Raises `ValueError` or `yaml.YAMLError` for a file that is not a grading.
+  """
+  parts = content.FRONT_MATTER_DELIMITER.split(text, maxsplit=2)
+  if len(parts) < 3 or parts[0].strip():
+    raise ValueError("the grading must start with front matter between "
+                     "two --- lines")
+  data = yaml.safe_load(parts[1]) or {}
+  if not isinstance(data, dict):
+    raise ValueError("the front matter must set grade and rubric")
+  unknown = set(data) - {"grade", "rubric"}
+  if unknown:
+    raise ValueError(f"unknown keys {', '.join(sorted(map(str, unknown)))}; "
+                     f"expected grade and rubric")
+  return data, parts[2].strip()
+@
+
+With the file split, a grading becomes the two arguments of
+[[grade_submission]].
+An empty file is the documented way to skip a submission, and a file without
+changes is one too.
+<<functions>>=
+def parse_grading(text, submission, current):
+  """Return what a filled-in grading file asks to change, or None if nothing.
+
+  `current` are the values the file started with. The result is the pair
+  `(results, rubric_update)` that `grade_submission` takes.
+  """
+  if not text.strip():
+    return None
+  data, comment = split_grading_file(text)
+
+  results = {}
+  <<collect the changed grade and the comment into [[results]]>>
+  <<resolve the changed rubric entries into [[rubric_update]]>>
+
+  if not results and not rubric_update:
+    return None
+  return results, rubric_update
+@
+
+YAML reads a grade of [[7]] as an integer and [[P]] as a string, while Canvas
+reports grades as strings, so we compare them as strings.
+A grader who deletes the grade line has not asked for anything; one who sets
+the grade to [[null]] asks to remove it, which Canvas does for an empty grade.
+<<collect the changed grade and the comment into [[results]]>>=
+if "grade" in data:
+  grade = None if data["grade"] is None else str(data["grade"])
+  before = None if current["grade"] is None else str(current["grade"])
+  if grade != before:
+    results["submission"] = {"posted_grade": grade or ""}
+if comment:
+  results["comment"] = {"text_comment": comment}
+@
+
+The changed rubric entries have the shape of a rubric file, so the
+[[--rubric-file]] machinery takes over from here.
+<<resolve the changed rubric entries into [[rubric_update]]>>=
+rubric_update = None
+changes = changed_rubric_entries(current["rubric"], data.get("rubric") or {})
+if changes:
+  rubric_update = resolve_rubric_specs(rubric_specs_from_data(changes),
+                                       submission.assignment.rubric)
+@
+
+Let us verify the round trip first---a file saved unchanged asks for
+nothing---and then each kind of change.
+
+<<test functions>>=
+class TestGradingFile:
+    """Writing and reading the grading file of interactive grading"""
+
+    RUBRIC = [
+        {"id": "_c", "description": "Correctness", "points": 1.0,
+         "long_description": "Ask the student to run the tests.",
+         "ratings": [
+             {"id": "_ok", "points": 1.0, "description": "OK"},
+             {"id": "_re", "points": 0.0, "description": "Remark",
+              "long_description": "Say what fails in the comment."}]},
+        {"id": "_s", "description": "Style: naming", "points": 1.0,
+         "ratings": [
+             {"id": "_sok", "points": 1.0, "description": "OK"},
+             {"id": "_sre", "points": 0.0, "description": "Remark"}]},
+    ]
+
+    def make_submission(self, grade="F", assessment=None):
+        submission = Mock(spec=["assignment", "user", "grade",
+                                "rubric_assessment"])
+        submission.assignment.name = "Lab 1"
+        submission.assignment.course.course_code = "DD1310"
+        submission.assignment.grading_type = "pass_fail"
+        submission.assignment.points_possible = 2.0
+        submission.assignment.rubric = self.RUBRIC
+        submission.user.name = "Alice Anderson"
+        submission.grade = grade
+        submission.rubric_assessment = assessment or {
+            "_c": {"rating_id": "_ok", "points": 1.0, "comments": ""}}
+        return submission
+
+    def edit(self, text, old, new):
+        assert old in text
+        return text.replace(old, new)
+
+    def test_unchanged_file_asks_for_nothing(self):
+        submission = self.make_submission()
+        text, current = grading_template(submission)
+        assert parse_grading(text, submission, current) is None
+
+    def test_template_shows_guidance_and_current_values(self):
+        text, _ = grading_template(self.make_submission())
+        assert "#   Ask the student to run the tests." in text
+        assert "#       Say what fails in the comment." in text
+        assert "Correctness: {rating: OK, points: 1.0, comments: null}" \
+            in text
+        assert "'Style: naming': {rating: null" in text
+
+    def test_changed_rating_brings_its_own_points(self):
+        """Only the rating changed, so the points follow the rating"""
+        submission = self.make_submission()
+        text, current = grading_template(submission)
+        text = self.edit(text, "rating: OK, points: 1.0",
+                         "rating: Remark, points: 1.0")
+        assert parse_grading(text, submission, current) == (
+            {}, {"_c": {"rating_id": "_re", "points": 0.0}})
+
+    def test_grade_and_comment(self):
+        submission = self.make_submission()
+        text, current = grading_template(submission)
+        text = self.edit(text, "grade: F", "grade: P") + "Well done!\n"
+        assert parse_grading(text, submission, current) == (
+            {"submission": {"posted_grade": "P"},
+             "comment": {"text_comment": "Well done!"}}, None)
+
+    def test_numeric_grade_compares_as_text(self):
+        submission = self.make_submission(grade="7")
+        text, current = grading_template(submission)
+        assert parse_grading(self.edit(text, "grade: '7'", "grade: 7"),
+                             submission, current) is None
+
+    def test_deleted_grade_line_changes_nothing(self):
+        submission = self.make_submission()
+        text, current = grading_template(submission)
+        assert parse_grading(self.edit(text, "grade: F\n", ""),
+                             submission, current) is None
+
+    def test_empty_file_skips(self):
+        submission = self.make_submission()
+        _, current = grading_template(submission)
+        assert parse_grading("  \n", submission, current) is None
+
+    def test_malformed_files_are_errors(self):
+        submission = self.make_submission()
+        text, current = grading_template(submission)
+        with pytest.raises(ValueError, match="front matter"):
+            parse_grading("P\n", submission, current)
+        with pytest.raises(ValueError, match="unknown keys"):
+            parse_grading(self.edit(text, "grade:", "grde:"),
+                          submission, current)
+
+    def test_shared_descriptions_fall_back_on_ids(self):
+        rubric = [{"id": "_1", "description": "Task"},
+                  {"id": "_2", "description": "Task"},
+                  {"id": "_3", "description": "Report"}]
+        assert rubric_entry_keys(rubric) == ["_1", "_2", "Report"]
+@
+
+
+\subsubsection{The editing session}
+
+What remains is the conversation between the editor and the parser.
+A file that cannot be used should not be lost: the grader may have written a
+long comment before mistyping a rating.
+So on an error we say what is wrong and offer to reopen the editor on the
+grader's own text, or to skip the submission.
+<<functions>>=
+def ask_for_grading(submission):
+  """Let the user fill in the grading file of `submission` in an editor.
+
+  Returns what `parse_grading` makes of it, or None to skip the submission.
+  """
+  text, current = grading_template(submission)
+  while True:
+    <<let the user edit [[text]]>>
+    try:
+      return parse_grading(text, submission, current)
+    except (ValueError, yaml.YAMLError, canvaslms.cli.EmptyListError,
+            canvaslms.cli.MultipleMatchesError) as error:
+      <<ask whether to edit [[text]] again>>
+@
+
+An editor that fails---quits with an error, as [[vim]] does on [[:cq]]---is a
+conventional way to abort the edit, so we skip the submission.
+An editor that cannot be found, on the other hand, will not be found for the
+next submission either, so we stop.
+<<let the user edit [[text]]>>=
+try:
+  text = canvaslms.cli.utils.edit_text(text, suffix=".md")
+except subprocess.CalledProcessError as error:
+  canvaslms.cli.warn(f"The editor failed ({error}), "
+                     f"skipping {submission.user.name}")
+  return None
+except FileNotFoundError as error:
+  canvaslms.cli.err(1, f"Cannot start the editor: {error}; set $EDITOR")
+@
+
+Editing again is the default, since it is what the grader will want nearly
+every time.
+Without a terminal to answer from, there is nobody to fix the file, so we
+skip.
+<<ask whether to edit [[text]] again>>=
+print(f"Cannot grade with that: {error}", file=sys.stderr)
+try:
+  answer = input("Edit again or skip this submission? [E/s] ")
+except EOFError:
+  return None
+if answer.strip().lower().startswith("s"):
+  return None
+@
+
+Let us verify the session with a stand-in for the editor: a mistyped rating
+is reported, and the grader's second attempt, made on the first one's text,
+is what counts.
+
+<<test functions>>=
+class TestAskForGrading:
+    """The editing session of interactive grading"""
+
+    def test_error_reopens_the_editor_on_the_same_text(self, monkeypatch):
+        submission = TestGradingFile().make_submission()
+        edits = []
+
+        def editor(text, suffix):
+            edits.append(text)
+            if len(edits) == 1:
+                return text.replace("rating: OK", "rating: Nope")
+            return text.replace("rating: Nope", "rating: Remark")
+
+        monkeypatch.setattr("canvaslms.cli.utils.edit_text", editor)
+        monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+        assert ask_for_grading(submission) == (
+            {}, {"_c": {"rating_id": "_re", "points": 0.0}})
+        assert "rating: Nope" in edits[1]
+
+    def test_grader_may_skip_after_an_error(self, monkeypatch):
+        submission = TestGradingFile().make_submission()
+        monkeypatch.setattr("canvaslms.cli.utils.edit_text",
+                            lambda text, suffix: "no front matter")
+        monkeypatch.setattr("builtins.input", lambda prompt: "s")
+        assert ask_for_grading(submission) is None
+
+    def test_interactive_refuses_option_values(self, monkeypatch):
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.process_submission_options",
+            lambda canvas, args: [])
+        args = argparse.Namespace(grade="P", message=None, rubric=None,
+                                  rubric_file=None, interactive=True)
+        with pytest.raises(SystemExit):
+            submissions_grade_command(None, None, args)
 @
