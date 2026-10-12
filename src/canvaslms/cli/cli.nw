@@ -71,6 +71,8 @@ import pytest
 import argparse
 import json
 import logging
+import re
+import shlex
 
 import canvaslms.cli
 
@@ -961,3 +963,138 @@ the cost of rewriting a cache it never reads.
 <<we don't need [[canvas]]>>=
 or func == canvaslms.cli.cache.clear_command
 or func == canvaslms.cli.cache.clear_attachments_command
+@
+
+
+\paragraph{The \texttt{tutorial} command}
+
+The \texttt{tutorial} command is located in [[canvaslms.cli.tutorial]]
+(\cref{sec:tutorial-command}).
+<<modules>>=
+import canvaslms.cli.tutorial
+<<add subcommands to subp>>=
+canvaslms.cli.tutorial.add_command(subp)
+@
+
+The tutorials are where a user learns to log in, so the command must work
+before there are credentials: creating the Canvas object here would abort the
+very lesson that explains how to get one
+(\cref{sec:tutorial-no-canvas}).
+<<we don't need [[canvas]]>>=
+or func == canvaslms.cli.tutorial.tutorial_command
+@
+
+The chunk above is a boolean expression, so we can evaluate it in a test the
+same way we reuse [[<<look up the command function as [[func]]>>]] above, with
+[[func]] bound to the tutorial command.
+The [[quizzes]] disjunct compares [[func]] before it reads [[args.csv]], so a
+namespace without [[csv]] is safe here.
+
+<<test functions>>=
+class TestCommandsThatNeedNoCanvasObject:
+    """Test which commands may run without credentials"""
+
+    def test_tutorial_needs_no_canvas(self):
+        """The tutorials teach logging in, so they must run before login"""
+        args = argparse.Namespace(command="tutorial")
+        func = canvaslms.cli.tutorial.tutorial_command
+
+        assert (<<we don't need [[canvas]]>>)
+
+    def test_courses_needs_canvas(self):
+        """An ordinary command still gets a Canvas object"""
+        args = argparse.Namespace(command="courses")
+        func = canvaslms.cli.courses.courses_command
+
+        assert not (<<we don't need [[canvas]]>>)
+@
+
+\subsubsection{The tutorials only name real commands}%
+\label{sec:tutorials-name-real-commands}
+
+The bundled tutorials (\cref{tutorial-getting-started} and onwards) tell
+the learner which commands to type, in backticks.
+Nothing but a reader keeps those in step with the interface as it changes:
+a renamed verb or a dropped option would leave a tutorial that fails on a
+command the learner typed exactly as told.
+The parser tree knows every verb and every option, and this is the one
+place where the whole tree is built, so we check the tutorials against it
+here.
+
+The check reads each tutorial, takes every backticked span that begins with
+[[canvaslms]], drops whatever follows a pipe or a redirection (that belongs
+to another program), and splits the rest like a shell would.
+It then walks the verbs down the subparser tree and requires every
+dash-prefixed token that remains to be an option of the parser it reached.
+The check knows nothing about meaning, only about names, and it does not
+look at option values or positional arguments; that is enough to catch the
+failures a rename causes.
+
+<<test functions>>=
+class TestTutorialsNameRealCommands:
+    """Verify that the bundled tutorials only use existing verbs and options"""
+
+    <<tutorial command lint helpers>>
+    <<tutorial command lint test>>
+@
+
+We reuse the parser builder from the shadowing test above, since both need
+the tree [[main]] builds.
+<<tutorial command lint helpers>>=
+build_parser = TestGlobalOptionsAreNotShadowed.build_parser
+
+def invocations(self, path):
+    """Yield the canvaslms command lines a tutorial file asks for."""
+    text = path.read_text()
+    for span in re.findall(r"`([^`]+)`", text):
+        line = " ".join(span.split())
+        if not line.startswith("canvaslms "):
+            continue
+        yield re.split(r"\s[|>]", line)[0]
+
+@
+
+A verb is any token that names a choice of the current subparser; the walk
+stops at the first token that is not one, which is where the options begin.
+<<tutorial command lint helpers>>=
+def subparser_choices(self, parser):
+    """Return the subcommand name to parser mapping of parser, if any."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices
+    return {}
+
+def resolve(self, argp, tokens):
+    """Return the parser the verbs lead to, and the remaining tokens."""
+    parser = argp
+    while tokens:
+        choices = self.subparser_choices(parser)
+        if tokens[0] not in choices:
+            break
+        parser = choices[tokens[0]]
+        tokens = tokens[1:]
+    return parser, tokens
+
+@
+
+<<tutorial command lint test>>=
+def test_tutorials_only_name_real_verbs_and_options(self):
+    """Every backticked canvaslms command in a tutorial parses by name"""
+    argp = self.build_parser()
+    tutorials = canvaslms.cli.tutorial.bundled_tutorial_dir().glob("*.md")
+    problems = []
+    for path in sorted(tutorials):
+        for line in self.invocations(path):
+            tokens = shlex.split(line)[1:]
+            parser, rest = self.resolve(argp, tokens)
+            if parser is argp and tokens:
+                problems.append(f"{path.name}: unknown verb in {line!r}")
+                continue
+            for token in rest:
+                if (token.startswith("-")
+                        and token not in parser._option_string_actions):
+                    problems.append(
+                        f"{path.name}: unknown option {token} in {line!r}")
+
+    assert not problems, "\n".join(problems)
+@
