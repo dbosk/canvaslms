@@ -11672,6 +11672,11 @@ The counts we return only cover individual questions (pool members count one
 each); this keeps the \enquote{Added N question(s), M failed} message of all
 callers meaningful whether or not groups are involved.
 
+Every question, grouped or not, passes through [[classic_question_for_create]]
+on its way to Canvas.  It renames the value fields of numerical answers,
+which Canvas reads under other names than it exports them
+(\cref{sec:classic-numerical-answers}).
+
 <<functions>>=
 def add_classic_questions(quiz, questions):
   """Adds questions to a Classic Quiz.
@@ -11700,7 +11705,7 @@ def add_classic_questions(quiz, questions):
       failed += group_failed
     else:
       try:
-        quiz.create_question(question=entry)
+        quiz.create_question(question=classic_question_for_create(entry))
         print(f"  Added: {entry.get('question_name', f'Question {i}')}")
         success += 1
       except Exception as e:
@@ -11799,7 +11804,8 @@ for i, question in enumerate(pool, 1):
 
   try:
     quiz.create_question(
-      question={**question, 'quiz_group_id': group.id})
+      question={**classic_question_for_create(question),
+                'quiz_group_id': group.id})
     print(f"  Added: {question.get('question_name', f'Question {i}')} "
           f"(in group {name})")
     success += 1
@@ -11910,6 +11916,92 @@ def test_add_classic_question_group_warns(caplog):
   assert (success, failed) == (0, 0)
   assert 'empty question pool' in caplog.text
 @
+
+\subsubsection{Numerical answers}
+\label{sec:classic-numerical-answers}
+
+Canvas exports a numerical question's answer with its value in [[exact]] and
+[[margin]], [[start]] and [[end]], or [[approximate]] and [[precision]],
+depending on the answer's [[numerical_answer_type]].  These are also the
+names that the [[quizzes create]] schema documents
+(\cref{sec:classic-question-types}).  But [[create_question]] does not read
+them.  It reads [[answer_exact]], [[answer_error_margin]],
+[[answer_range_start]], [[answer_range_end]], [[answer_approximate]] and
+[[answer_precision]], and when those are missing it creates the answer with
+every value zero, without an error.  A numerical question sent with the
+exported names therefore accepts 0, and only 0, as its correct answer.
+
+We found this on 2026-10-12, when the verification of a QTI replacement
+(\cref{sec:qti-replace}) failed for a numerical question.  A probe in the
+sandbox course then created one question under each set of names for each
+of the three answer types: the exported names gave zeros in all three, and
+the names above gave the values sent.  The other answer fields, such as
+[[text]], [[weight]] and the feedback, Canvas reads under their exported
+names.
+
+Where should the translation happen?  The exported names are the ones users
+see and edit: [[quizzes export]] writes them, with or without [[-I]],
+[[quizzes edit --replace-items]] puts them in the user's editor, and the
+[[quizzes create]] schema documents them.  Translating in the cleaner of
+[[export -I]] would have covered only the first of these paths, and given
+users two schemas for the same field.  So we keep the exported names as the
+one schema and translate where questions are handed to Canvas, which covers
+every path that creates questions.
+<<functions>>=
+def classic_question_for_create(question):
+  """Returns `question` with numerical answers named as Canvas reads them"""
+  if question.get('question_type') != 'numerical_question':
+    return question
+  return {**question,
+          'answers': [{CLASSIC_NUMERICAL_ANSWER_FIELDS.get(key, key): value
+                       for key, value in answer.items()}
+                      for answer in question.get('answers', [])]}
+<<constants>>=
+CLASSIC_NUMERICAL_ANSWER_FIELDS = {
+  'exact': 'answer_exact', 'margin': 'answer_error_margin',
+  'start': 'answer_range_start', 'end': 'answer_range_end',
+  'approximate': 'answer_approximate', 'precision': 'answer_precision',
+}
+@
+
+Let us verify that each kind of numerical answer reaches Canvas under the
+names it reads, with the other answer fields intact, whether the question is
+added on its own or into a group.
+
+<<test functions>>=
+def test_add_classic_questions_renames_numerical_answer_fields():
+  quiz = MagicMock()
+  quiz.create_question_group.return_value = MagicMock(id=77)
+  numerical = {'question_name': 'N', 'question_type': 'numerical_question',
+               'answers': [
+    {'weight': 100, 'numerical_answer_type': 'exact_answer',
+     'exact': 2.72, 'margin': 0.01},
+    {'weight': 100, 'numerical_answer_type': 'range_answer',
+     'start': 3.1, 'end': 3.2},
+    {'weight': 100, 'numerical_answer_type': 'precision_answer',
+     'approximate': 1234.5, 'precision': 3},
+  ]}
+  entries = [numerical,
+             {'group': {'name': 'pool', 'pick_count': 1},
+              'questions': [numerical]}]
+
+  assert quizzes.add_classic_questions(quiz, entries) == (2, 0)
+
+  for call in quiz.create_question.call_args_list:
+    assert call.kwargs['question']['answers'] == [
+      {'weight': 100, 'numerical_answer_type': 'exact_answer',
+       'answer_exact': 2.72, 'answer_error_margin': 0.01},
+      {'weight': 100, 'numerical_answer_type': 'range_answer',
+       'answer_range_start': 3.1, 'answer_range_end': 3.2},
+      {'weight': 100, 'numerical_answer_type': 'precision_answer',
+       'answer_approximate': 1234.5, 'answer_precision': 3},
+    ]
+  assert numerical['answers'][0]['exact'] == 2.72
+@
+
+The last assertion checks that the caller's question is left as it was: the
+QTI replacement compares the questions it sent with what Canvas stored, and
+must compare them under the exported names.
 
 
 \section{Editing quiz items}
