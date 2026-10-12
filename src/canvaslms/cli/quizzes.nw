@@ -7172,7 +7172,7 @@ def qti_course(canvas, args):
   return course_list[0]
 @
 
-Now to the central difficulty of a Classic import: which quiz did it create?
+Now to the central difficulty of an import: which quiz did it create?
 A migration reports the state of its job, not the quiz it produced, and
 matching by title is unreliable---titles repeat, and two imports may run at
 once.  We sidestep the question by creating the quiz \emph{first}.  Canvas's
@@ -7184,12 +7184,12 @@ Canvas's API documentation, so this rests on an undocumented Canvas
 extension; should Canvas drop it, the check of the result
 (\cref{sec:qti-classic-ready}) fails rather than reporting the wrong quiz.
 
-[[overwrite_quizzes]] is false so that the import can never overwrite some
+[[overwrite_quizzes]] is false so that the import does not overwrite some
 other quiz in the course that happens to carry the same QTI identifier,
-which is what the setting is for.  For New Quizzes we
-cannot pre-create anything; [[import_quizzes_next]] tells Canvas to convert
-the package into a New Quiz, and we find that quiz afterwards
-(\cref{sec:qti-new-quiz}).
+which is what the setting is for.  For a New Quiz, [[import_quizzes_next]]
+tells Canvas to convert the package into a New Quiz.  We pin that import to
+a pre-created quiz too, because, as \cref{sec:qti-new-quiz} shows, the
+setting alone does not protect existing quizzes there.
 
 A replacement selects and checks its destination before the staging quiz
 is created (\cref{sec:qti-replace}), so that a wrong pattern or a published
@@ -7198,30 +7198,31 @@ quiz costs nothing on Canvas.
 As soon as Canvas has accepted the migration, we write the receipt
 (\cref{sec:qti-receipts}) and print where it is, before the upload: from
 here on there is something on the server that the user may need to find.
+The receipt records the pre-created quiz as [[import_quiz_id]], and the
+quiz the user will get as [[quiz_id]]: for a Classic import the two are the
+same, for a New Quiz the latter is only known once the import is done.
 <<create the import quiz and submit the migration>>=
 course = qti_course(canvas, args)
 target_id = None
 if args.replace_items:
   target_id = qti_target_quiz(course, args.assignment)
   qti_check_target(course, target_id)
+quiz = course.create_quiz({'title': 'canvaslms import: ' + title,
+                           'quiz_type': 'practice_quiz',
+                           'published': False})
+print(f"Created import quiz {quiz.id}", file=sys.stderr)
 settings = {'overwrite_quizzes': False,
-            'import_quizzes_next': args.type == 'new'}
-quiz_id = None
-if args.type == 'classic':
-  quiz = course.create_quiz({'title': 'canvaslms import: ' + title,
-                             'quiz_type': 'practice_quiz',
-                             'published': False})
-  quiz_id = quiz.id
-  settings['quiz_id_to_update'] = quiz_id
-  print(f"Created import quiz {quiz_id}", file=sys.stderr)
+            'import_quizzes_next': args.type == 'new',
+            'quiz_id_to_update': quiz.id}
 migration = course.create_content_migration('qti_converter',
     settings=settings,
     pre_attachment={'name': args.file.name, 'size': len(data),
                     'content_type': 'application/zip'})
 receipt = {'course_id': course.id, 'migration_id': migration.id,
-           'quiz_id': quiz_id, 'target_id': target_id,
-           'quiz_type': args.type, 'question_count': count,
-           'phase': 'submitted'}
+           'import_quiz_id': quiz.id,
+           'quiz_id': quiz.id if args.type == 'classic' else None,
+           'target_id': target_id, 'quiz_type': args.type,
+           'question_count': count, 'phase': 'submitted'}
 path = qti_receipt_path(course, migration.id)
 qti_write_record(path, receipt)
 print(f"Receipt: {path}", file=sys.stderr)
@@ -7586,34 +7587,89 @@ def qti_output(args, course, receipt, quiz=None):
 \label{sec:qti-new-quiz}
 
 With [[import_quizzes_next]] set, Canvas converts the package into a New
-Quiz.  Here we cannot use the pre-created quiz: a New Quiz is an assignment
-backed by a separate service, and the migration creates it itself.  So the
-question of which quiz the import created returns.  Canvas answers it in the
-migration's audit data: its [[migration_settings]] record, under
-[[imported_assets.lti_assignment_quiz_set]], the pairs of assignment and
-Classic quiz IDs that the migration turned into New Quizzes.  The assignment
-ID is the New Quiz's ID.  Like [[quiz_id_to_update]], the [[audit_info]]
-include and this mapping are not part of Canvas's documented API.
+Quiz.  It does so in two steps: it imports the package as a Classic quiz,
+as for any QTI import, and then converts that Classic quiz into a New Quiz,
+an assignment backed by a separate service, removing the Classic quiz
+afterwards.
 
-Finding the quiz this way, rather than by title or by the newest
-assignment, means a concurrent import cannot mislead us.  If the mapping
-does not hold exactly one pair, we fail rather than guess.  The ID goes into
-the receipt as soon as we know it, so that [[import-status]] can continue
-even if waiting for the items times out.
+That first step is where an unpinned import goes wrong.  When the course
+already holds a Classic quiz imported from the same package---the
+same QTI identifier---Canvas imports into \emph{that} quiz, whatever
+[[overwrite_quizzes]] says, and the second step then converts it and removes
+it.  We observed this against KTH's Canvas in October 2026: a [[--type new]]
+import of a package that had earlier been imported as a Classic quiz
+consumed that Classic quiz, edited settings and all.  Pinning the import with
+[[quiz_id_to_update]], as for a Classic import, makes the first step land in
+our empty pre-created quiz instead, and leaves the earlier quiz alone.
+
+Which New Quiz did the import create?  Canvas records it in the migration's
+audit data: its [[migration_settings]] hold, under
+[[imported_assets.lti_assignment_quiz_set]], the pairs of assignment and
+Classic quiz IDs that the migration converted.  The assignment ID is the New
+Quiz's ID.  Like [[quiz_id_to_update]], the [[audit_info]] include and this
+mapping are not part of Canvas's documented API.
+
+Finding the quiz this way, rather than by title or by the newest assignment,
+means a concurrent import cannot mislead us, and the pinning makes it
+checkable: the Classic half of the pair must be the quiz we created.  A pair
+naming any other Classic quiz means Canvas converted a quiz we did not
+create, which we report rather than present as a successful import.
+
+The IDs in the pairs are Canvas's \emph{global} IDs, which prefix the local
+ID with the database shard: on KTH's Canvas, assignment 400103 appears as
+87790000000400103, that is $8779 \cdot 10^{13} + 400103$.  We reduce them
+to the local IDs that every other API call and every Canvas URL uses.
+<<functions>>=
+def qti_new_quiz_from_audit(pairs, import_quiz_id):
+  """Returns the New Quiz ID that converted our import quiz.
+
+  `pairs` are the (assignment, Classic quiz) global ID pairs of the
+  migration's audit data.  Raises `QtiImportError` unless there is exactly
+  one pair, and its Classic quiz is `import_quiz_id`.
+  """
+  if len(pairs) != 1:
+    raise QtiImportError("Canvas did not identify exactly one New Quiz in "
+        "the migration audit data; check New Quizzes migration availability "
+        "and inspect the retained import")
+  assignment_id, classic_id = (int(i) % QTI_IDS_PER_SHARD for i in pairs[0])
+  if classic_id != import_quiz_id:
+    raise QtiImportError(f"Canvas converted Classic quiz {classic_id} "
+        f"instead of import quiz {import_quiz_id} into New Quiz "
+        f"{assignment_id}; check both in Canvas")
+  return assignment_id
+<<constants>>=
+QTI_IDS_PER_SHARD = 10**13
+@
+
+Let us verify that our own conversion is accepted with its local ID, and
+that a conversion of some other quiz is reported.
+
+<<test functions>>=
+def test_qti_new_quiz_from_audit_reduces_global_ids():
+  pairs = [[87790000000400122, 87790000000077632]]
+  assert quizzes.qti_new_quiz_from_audit(pairs, 77632) == 400122
+
+@pytest.mark.parametrize("pairs, message", [
+  ([], "exactly one New Quiz"),
+  ([[87790000000400103, 87790000000077627]], "converted Classic quiz 77627"),
+])
+def test_qti_new_quiz_from_audit_refuses(pairs, message):
+  with pytest.raises(quizzes.QtiImportError, match=message):
+    quizzes.qti_new_quiz_from_audit(pairs, 77632)
+@
+
+The ID goes into the receipt as soon as we know it, so that
+[[import-status]] can continue even if waiting for the items times out.
 <<find the New Quiz in the migration audit data>>=
 migration = course.get_content_migration(receipt['migration_id'],
                                          include=['audit_info'])
 audit = getattr(migration, 'audit_info', {})
 pairs = audit.get('migration_settings', {}).get('imported_assets', {}).get(
     'lti_assignment_quiz_set', [])
-if len(pairs) != 1:
-  raise QtiImportError("Canvas did not identify exactly one New Quiz in "
-      "the migration audit data; check New Quizzes migration availability "
-      "and inspect the retained import")
-receipt['quiz_id'] = pairs[0][0]
+receipt['quiz_id'] = qti_new_quiz_from_audit(pairs, receipt['import_quiz_id'])
 qti_write_record(qti_receipt_path(course, receipt['migration_id']), receipt)
-print(f"Imported New Quiz assignment {receipt['quiz_id']}; "
-      "waiting for its questions", file=sys.stderr)
+print(f"Imported New Quiz {receipt['quiz_id']}; waiting for its questions",
+      file=sys.stderr)
 @
 
 The migration can finish before the New Quizzes service has built the
