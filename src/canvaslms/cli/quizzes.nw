@@ -6963,6 +6963,12 @@ stops ([[--no-wait]]) or waits for Canvas and finishes the import or the
 replacement.  The receipt is updated to [[completed]] only at the very end,
 after everything has been checked.
 
+[[--timeout]] bounds the whole wait, not each phase of it.  Waiting for the
+migration and waiting for the quiz to be ready are two loops, and if each
+had its own [[--timeout]], a user asking for five minutes could wait ten.
+So we fix one deadline before the first loop and give the second only what
+remains of it.
+
 The [[except]] clauses define the exit statuses.  A timeout exits with
 status 2 and every other anticipated failure with status 1.  The
 distinction matters to a script: after a timeout the import is still
@@ -6982,11 +6988,13 @@ def qti_import_command(config, canvas, args):
     if args.no_wait:
       qti_output(args, course, receipt)
       return
+    deadline = time.monotonic() + args.timeout
     qti_wait(course, migration.id, True, args.timeout)
+    remaining = max(0, deadline - time.monotonic())
     if args.replace_items:
-      result = qti_replace(course, receipt, path, metadata)
+      result = qti_replace(course, receipt, path, metadata, remaining)
     else:
-      result, questions = qti_ready(course, receipt, args.timeout)
+      result, questions = qti_ready(course, receipt, remaining)
     receipt['phase'] = 'completed'
     qti_write_record(path, receipt)
     qti_output(args, course, receipt, result)
@@ -7068,7 +7076,10 @@ def read_qti_package(data):
           assessments.append(node)
         if tag in ('published', 'available') and \
             (node.text or '').strip().lower() in ('true', '1'):
-          raise QtiImportError("Published QTI packages are unsupported")
+          raise QtiImportError(
+              f"{name} marks the quiz as published (<{tag}>); quizzes "
+              "import only creates unpublished quizzes, so set it to false "
+              "and publish the quiz in Canvas once you have checked it")
   if len(assessments) != 1:
     raise QtiImportError("Expected exactly one QTI 1.2 assessment")
   assessment = assessments[0]
@@ -7119,12 +7130,24 @@ def test_read_qti_package_skips_macos_resource_forks():
 @pytest.mark.parametrize("files", [
   {"a.xml": qti_assessment(), "b.xml": qti_assessment()},
   {"a.xml": qti_assessment(items=0)},
-  {"a.xml": qti_assessment(extra="<published>true</published>")},
   {"manifest.xml": "<manifest/>"},
 ])
 def test_read_qti_package_refuses_unsupported_packages(files):
   with pytest.raises(quizzes.QtiImportError):
     quizzes.read_qti_package(qti_zip(files))
+@
+
+A refused published package must say which file and element to change, since
+the user has to edit the package or its generator's settings:
+
+<<test functions>>=
+def test_read_qti_package_names_the_published_element():
+  data = qti_zip({"quiz/assessment_meta.xml": "<quiz><available>true"
+                  "</available></quiz>",
+                  "quiz/assessment.xml": qti_assessment()})
+  with pytest.raises(quizzes.QtiImportError,
+                     match=r"assessment_meta\.xml.*<available>"):
+    quizzes.read_qti_package(data)
 @
 
 \subsection{Submitting the migration}
@@ -7398,17 +7421,26 @@ our check that nothing was lost in conversion; the other two say that
 Canvas has caught up.  A quiz that turned up published contradicts the
 unpublished quiz we created, and we stop.
 
+From outside, a quiz that Canvas has not caught up with yet and a quiz
+that lost questions in conversion look the same: the counts disagree.  Only
+time tells them apart.  We therefore poll until [[timeout]] runs out and
+then report a timeout, exit status 2, rather than a failure: the quiz may
+still become ready, and [[import-status]] can be asked again.  The message
+says what to inspect if it never does.  With a [[timeout]] of zero, as
+[[import-status]] without [[--wait]] uses, we look exactly once.
+
 New Quizzes are checked differently, and [[qti_ready]] hands them on
 (\cref{sec:qti-new-quiz}).
 <<functions>>=
-def qti_ready(course, receipt, timeout=QTI_READY_TIMEOUT):
+def qti_ready(course, receipt, timeout):
   """Waits until the imported quiz of `receipt` matches the package.
 
   Returns the quiz and its questions as Canvas JSON.
   """
   if receipt.get('quiz_type') == 'new':
     return qti_new_ready(course, receipt, timeout)
-  for attempt in range(int(QTI_READY_TIMEOUT / QTI_POLL_INTERVAL)):
+  deadline = time.monotonic() + timeout
+  while True:
     quiz, questions = qti_snapshot(course, receipt['quiz_id'])
     if quiz['published']:
       raise QtiImportError("Canvas published the imported quiz unexpectedly")
@@ -7416,12 +7448,40 @@ def qti_ready(course, receipt, timeout=QTI_READY_TIMEOUT):
         quiz['question_count'] == len(questions) and \
         qti_points_ready(quiz, questions):
       return quiz, questions
-    time.sleep(QTI_POLL_INTERVAL)
-  raise QtiImportError("Imported questions, counts or points do not match "
-                       "the QTI package; inspect the retained import quiz. "
-                       "Question groups and bank references are unsupported")
-<<constants>>=
-QTI_READY_TIMEOUT = 60
+    if time.monotonic() >= deadline:
+      raise TimeoutError(
+          f"Quiz {receipt['quiz_id']} does not match the QTI package yet "
+          f"({len(questions)} of {receipt['question_count']} questions); "
+          "check quizzes import-status, and if it never matches, inspect "
+          "the quiz: question groups and bank references are unsupported")
+    time.sleep(min(QTI_POLL_INTERVAL, max(0, deadline - time.monotonic())))
+@
+
+Let us verify both ends: a quiz whose totals catch up on the second look is
+returned, and a single look at a quiz that is not ready reports a timeout.
+
+<<test functions>>=
+def classic_snapshots(monkeypatch, snapshots):
+  """Make `qti_snapshot` return `snapshots` in turn, without sleeping"""
+  calls = iter(snapshots)
+  monkeypatch.setattr(quizzes, "qti_snapshot",
+                      lambda course, quiz_id: next(calls))
+  monkeypatch.setattr(quizzes.time, "sleep", lambda seconds: None)
+
+def test_qti_ready_waits_for_canvas_to_catch_up(monkeypatch):
+  questions = [{'points_possible': 1}, {'points_possible': 2}]
+  stale = {'published': False, 'question_count': 0, 'points_possible': 0}
+  ready = {'published': False, 'question_count': 2, 'points_possible': 3}
+  classic_snapshots(monkeypatch, [(stale, questions), (ready, questions)])
+  receipt = {'quiz_id': 5, 'question_count': 2}
+  assert quizzes.qti_ready(MagicMock(), receipt, 60) == (ready, questions)
+
+def test_qti_ready_with_no_time_left_looks_once(monkeypatch):
+  quiz = {'published': False, 'question_count': 1, 'points_possible': 1}
+  classic_snapshots(monkeypatch, [(quiz, [{'points_possible': 1}])])
+  receipt = {'quiz_id': 5, 'question_count': 2}
+  with pytest.raises(TimeoutError, match="1 of 2 questions"):
+    quizzes.qti_ready(MagicMock(), receipt, 0)
 @
 
 Points are floating-point numbers, and the quiz total is computed by Canvas
@@ -7658,9 +7718,10 @@ QTI_SETTINGS = (
 
 The whole replacement has five steps, each explained below.
 <<functions>>=
-def qti_replace(course, receipt, path, metadata):
+def qti_replace(course, receipt, path, metadata, timeout):
   """Replaces the destination quiz's questions with the staged ones.
 
+  Waits at most `timeout` seconds for the staging quiz to be ready.
   Returns the destination quiz as Canvas JSON after verifying it.
   """
   <<read staged questions>>
@@ -7706,7 +7767,7 @@ check that it holds only supported questions; failing here still leaves the
 destination untouched.  We then rename the staging quiz so that, should it
 be left behind, its title says what it is for.
 <<read staged questions>>=
-staged, questions = qti_ready(course, receipt)
+staged, questions = qti_ready(course, receipt, timeout)
 if any(q.get('quiz_group_id') or q['question_type'] not in
        QTI_QUESTION_TYPES for q in questions):
   raise QtiImportError("Replacement supports flat multiple-choice, "
@@ -7790,8 +7851,14 @@ what would reveal that.  It can only cover what the API exposes, though:
 external proctoring configuration and independently edited assignment
 settings are beyond it.  The state after the replacement is saved beside the
 backup, so that a failed verification can be inspected.
+
+The wait for the totals is not bounded by [[--timeout]].  By now the
+destination has been changed, and giving up early would leave the user with
+neither a verified quiz nor a diagnosis; so we give Canvas a fixed minute
+to settle, which is far more than it has been observed to need, and verify
+whatever we find then.
 <<verify replacement>>=
-for attempt in range(int(QTI_READY_TIMEOUT / QTI_POLL_INTERVAL)):
+for attempt in range(int(QTI_SETTLE_TIMEOUT / QTI_POLL_INTERVAL)):
   after, landed = qti_snapshot(course, receipt['target_id'])
   if after['question_count'] == len(questions) and \
       qti_points_ready(after, questions):
@@ -7824,6 +7891,8 @@ if unapplied:
 if failed:
   raise QtiImportError('Replacement verification failed: '
                        + '; '.join(failed) + f'; inspect {backup}')
+<<constants>>=
+QTI_SETTLE_TIMEOUT = 60
 @
 
 Some quiz fields change whenever the questions do, and so cannot count as
@@ -7998,15 +8067,22 @@ known and stop: either the destination was never touched, and running
 person looking at the backup can decide what to do.  [[import-status]]
 never performs a replacement step itself; a status command that could
 delete questions would be a surprising thing to run in a loop.
+
+The receipt is read first, before asking Canvas anything, since without it
+there is nothing to report on: the receipt says which quiz the migration
+was for.  As in [[import]], one deadline bounds both the wait for the
+migration and the wait for the quiz.
 <<functions>>=
 def qti_status_command(config, canvas, args):
   """Reports the state of a QTI import from its receipt"""
   course = None
   try:
     course = qti_course(canvas, args)
-    complete = qti_wait(course, args.migration_id, args.wait, args.timeout)
     path = qti_receipt_path(course, args.migration_id)
-    receipt = json.loads(path.read_text())
+    receipt = read_qti_receipt(path, args.migration_id)
+    timeout = args.timeout if args.wait else 0
+    deadline = time.monotonic() + timeout
+    complete = qti_wait(course, args.migration_id, args.wait, timeout)
     if receipt['target_id'] and receipt['phase'] == 'completed':
       quiz, questions = qti_snapshot(course, receipt['target_id'])
       qti_output(args, course, receipt, quiz)
@@ -8016,7 +8092,7 @@ def qti_status_command(config, canvas, args):
       if receipt['target_id']:
         <<explain the unfinished replacement>>
       quiz, questions = qti_ready(course, receipt,
-                                  args.timeout if args.wait else 0)
+                                  max(0, deadline - time.monotonic()))
       receipt['phase'] = 'completed'
       qti_write_record(path, receipt)
     qti_output(args, course, receipt, quiz)
@@ -8028,6 +8104,32 @@ def qti_status_command(config, canvas, args):
   finally:
     if course is not None:
       forget_qti_import_listings(course)
+@
+
+A receipt is missing when the import was started on another computer, by
+another user account, or with [[-c]] matching another course, and it is
+unreadable only if someone edited it.  The bare [[FileNotFoundError]] would
+name a hashed path and leave the user guessing, so we say what a receipt is
+and where they might have one.
+<<functions>>=
+def read_qti_receipt(path, migration_id):
+  """Returns the receipt at `path`, or raises `QtiImportError`"""
+  try:
+    return json.loads(path.read_text())
+  except FileNotFoundError:
+    raise QtiImportError(
+        f"No import receipt for migration {migration_id} in this course: "
+        "import-status needs the receipt written by quizzes import, on the "
+        f"same computer and user account and for the same course ({path})")
+  except ValueError as exc:
+    raise QtiImportError(f"Cannot read import receipt {path}: {exc}")
+@
+
+<<test functions>>=
+def test_read_qti_receipt_explains_a_missing_receipt(tmp_path):
+  with pytest.raises(quizzes.QtiImportError, match="No import receipt for "
+                                                   "migration 42"):
+    quizzes.read_qti_receipt(tmp_path / "1-42.json", 42)
 @
 
 The two messages for an unfinished replacement separate the safe case from
