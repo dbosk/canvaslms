@@ -1154,7 +1154,8 @@ This command lists all quizzes (both Classic Quizzes and New Quizzes) in a cours
 list_parser = subp.add_parser("list",
     help="List all quizzes in a course",
     description="""Lists all quizzes (including Classic Quizzes, New Quizzes, and surveys)
-in a course. Output in CSV format with quiz ID, title, type, and whether it's published.""")
+in a course. Output in CSV format with title, type, whether it's published
+and due date; -i adds the Canvas ID.""")
 
 list_parser.set_defaults(func=list_command)
 
@@ -1162,6 +1163,19 @@ try:
   courses.add_course_option(list_parser, required=True)
 except argparse.ArgumentError:
   pass
+@
+
+The Canvas ID of a quiz is what scripts need to address it unambiguously:
+titles are not unique and a regex over titles can match more than intended.
+[[quizzes import --id-only]] (\cref{sec:quiz-qti-import}) prints exactly this
+ID.  We nonetheless make the ID column opt-in, following [[courses -i]],
+because inserting a column into the default output would silently shift the
+fields that existing pipelines such as [[cut -f2]] rely on.
+<<add quizzes list command to subp>>=
+list_parser.add_argument("-i", "--id",
+  action="store_true", default=False,
+  help="Include the Canvas ID of the quiz after the course code. For "
+       "New Quizzes this is the assignment ID.")
 @
 
 We need options for:
@@ -1311,24 +1325,30 @@ def list_command(config, canvas, args):
 
 \subsection{Listing all quizzes}
 
-We output the quiz list in CSV format with course code, ID, title, type, published
-status, and due date. The [[filter_quizzes()]] function already attached the
+We output the quiz list in CSV format with course code, title, type, published
+status, and due date, and with [[--id]] also the quiz's Canvas ID right after
+the course code. The [[filter_quizzes()]] function already attached the
 course to each quiz, so we can access it via [[quiz.course]].
 For Classic Quizzes the ID is the quiz ID; for New Quizzes it is the assignment
-ID accepted by the New Quizzes API. Deduplication includes the course and quiz
-engine because the two engines have independent identifier spaces.
-<<list all quizzes>>=
-# Keep track of quiz IDs we've already listed to avoid duplicates
-listed_quiz_ids = set()
+ID accepted by the New Quizzes API.
 
-# Output using csv module
+A quiz can reach the list twice, so we skip those we have already printed.
+The key for that must be the triple of course, quiz engine and ID, not the
+ID alone: the Classic and New Quizzes engines number their quizzes
+independently, so a Classic quiz and a New Quiz can share an ID, and so can
+quizzes in two different courses.  Keyed by the ID alone, the second of
+those quizzes would silently vanish from the listing.
+<<list all quizzes>>=
+listed_quizzes = set()
+
 writer = csv.writer(sys.stdout, delimiter=args.delimiter)
-writer.writerow(["Course Code", "Quiz ID", "Quiz Title", "Quiz Type",
-                 "Published", "Due Date"])
+id_header = ["Quiz ID"] if args.id else []
+writer.writerow(["Course Code"] + id_header +
+                ["Quiz Title", "Quiz Type", "Published", "Due Date"])
 
 for quiz in quiz_list:
   identity = (quiz.course.id, is_new_quiz(quiz), str(quiz.id))
-  if identity in listed_quiz_ids:
+  if identity in listed_quizzes:
     continue
 
   # Determine quiz type
@@ -1341,9 +1361,43 @@ for quiz in quiz_list:
   due_date = canvaslms.cli.utils.format_local_time(quiz.due_at)
 
   # Use the course attached by filter_quizzes()
-  writer.writerow([quiz.course.course_code, quiz.id, quiz.title or '', quiz_type,
-                   published, due_date])
-  listed_quiz_ids.add(identity)
+  id_column = [quiz.id] if args.id else []
+  writer.writerow([quiz.course.course_code] + id_column +
+                  [quiz.title or '', quiz_type, published, due_date])
+  listed_quizzes.add(identity)
+@
+
+Let us verify both properties: the default output keeps its columns, [[-i]]
+adds the ID after the course code, and a Classic quiz and a New Quiz that
+share an ID are both listed.
+
+<<test functions>>=
+def list_two_quizzes_with_one_id(monkeypatch, capsys, show_id):
+  """Run `list_command` over a Classic quiz and a New Quiz, both ID 7"""
+  course = MagicMock(id=1, course_code="DD1310")
+  classic = MagicMock(id=7, title="Classic", quiz_type="assignment",
+                      published=True, due_at=None, course=course)
+  new = MagicMock(id="7", title="New", published=False, due_at=None,
+                  course=course)
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  monkeypatch.setattr(quizzes, "filter_quizzes",
+                      lambda course_list, regex: iter([classic, new]))
+  monkeypatch.setattr(quizzes, "is_new_quiz", lambda quiz: quiz is new)
+  args = argparse.Namespace(delimiter="\t", id=show_id)
+  quizzes.list_command({}, MagicMock(), args)
+  return [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+
+def test_list_default_output_has_no_id_column(monkeypatch, capsys):
+  rows = list_two_quizzes_with_one_id(monkeypatch, capsys, show_id=False)
+  assert rows[0] == ["Course Code", "Quiz Title", "Quiz Type",
+                     "Published", "Due Date"]
+  assert [row[1] for row in rows[1:]] == ["Classic", "New"]
+
+def test_list_id_option_adds_id_after_course_code(monkeypatch, capsys):
+  rows = list_two_quizzes_with_one_id(monkeypatch, capsys, show_id=True)
+  assert rows[0][:3] == ["Course Code", "Quiz ID", "Quiz Title"]
+  assert [row[1:3] for row in rows[1:]] == [["7", "Classic"], ["7", "New"]]
 @
 
 To fetch the quizzes we need to call both [[get_quizzes()]] and
