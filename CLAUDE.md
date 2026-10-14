@@ -782,8 +782,9 @@ MODULES+= newcommand.py newcommand.tex
 ```
 
 If the command bundles data files (as `tutorial` does with
-`src/canvaslms/tutorials/*.md`), also add a `[tool.poetry] include` entry
-for them in `pyproject.toml` and a targeted rule in `src/.gitignore` when
+`src/canvaslms/tutorials/<id>.md`), also add `[tool.poetry] include`
+entries for them in `pyproject.toml` (by name, not a glob that would also
+catch stray files) and a targeted rule in `src/.gitignore` when
 they are generated. Generated `.md` is not covered by the existing
 `**/*.py` / `**/*.tex` rules.
 
@@ -851,11 +852,15 @@ Conventions:
 Registration checklist:
 1. `MODULES+= <id>.md <id>.tex` and `<id>.md: <id>.nw` in
    `src/canvaslms/tutorials/Makefile`.
-2. `\input{../src/canvaslms/tutorials/<id>.tex}` under
+2. `<id>` in `BUNDLED_TUTORIALS` in `src/canvaslms/cli/tutorial.nw` (its
+   position is the catalog order), and an include entry for
+   `src/canvaslms/tutorials/<id>.md` in `pyproject.toml`. The catalog and
+   the wheel take only registered tutorials, never a directory glob.
+3. `\input{../src/canvaslms/tutorials/<id>.tex}` under
    `\part{The bundled tutorials}` in `doc/canvaslms.tex`, and a
    `canvaslms.pdf: ${SRC_DIR}/tutorials/<id>.tex` line in `doc/Makefile`.
-3. `make -C src/canvaslms all && make -C tests all && poetry run pytest`.
-4. Editing a bundled tutorial changes its digest, so users' in-progress runs
+4. `make -C src/canvaslms all && make -C tests all && poetry run pytest`.
+5. Editing a bundled tutorial changes its digest, so users' in-progress runs
    of it must be restarted with `--restart`; mention it in release notes.
 
 ## Configuration and Authentication

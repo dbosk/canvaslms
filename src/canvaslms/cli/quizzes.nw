@@ -385,6 +385,8 @@ from canvasapi.exceptions import CanvasException, ResourceDoesNotExist
 from canvasapi.util import combine_kwargs
 from canvaslms import dirs
 
+import canvasapi.exceptions
+
 import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
@@ -9939,11 +9941,7 @@ def items_list_command(config, canvas, args):
 
   quiz = quiz_list[0]
 
-  # Get items based on quiz type
-  if is_new_quiz(quiz):
-    items = list_new_quiz_items(quiz.course, quiz.id, canvas._Canvas__requester)
-  else:
-    items = list_classic_questions(quiz)
+  items = list_quiz_items_or_exit(quiz, canvas._Canvas__requester)
 
   if not items:
     print("No questions found in this quiz.")
@@ -9969,7 +9967,97 @@ def items_list_command(config, canvas, args):
 For New Quizzes, we call the items endpoint and normalize the response into a
 consistent format with [[position]], [[id]], [[type]], [[title]], and [[points]]
 fields.
+Three commands rely on this list: [[items list]] prints it, and
+[[items edit]] and [[items delete]] search it for the item at a given
+[[--position]].
+All three need the list to be both \emph{complete} and \emph{honest}, and a
+single request that turns every error into an empty list is neither.
 
+\paragraph{Complete: following every page.}
+Canvas does not return a long list in one response.
+It returns one page and names the next one in the [[Link]] header of the
+response, under the relation [[next]].
+A reader that stops after the first response silently truncates a long
+quiz: [[items list]] shows only its first questions, and [[items edit]]
+reports \enquote{No question found at position 25} for a question that
+exists.
+
+We follow the [[next]] URL exactly as Canvas gives it rather than
+counting pages ourselves.
+The URL already carries every query parameter of the first request, so the
+follow-up requests pass none, and we never depend on how Canvas numbers its
+pages.
+We ask for pages of [[NEW_QUIZZES_PAGE_SIZE]] elements, which keeps a
+typical quiz to a single request.
+Canvas may cap the page size below what we ask for, but that costs only
+extra round trips, never items, because the loop stops only when no
+[[next]] page is named.
+
+Nothing in this loop is specific to quiz items, so it is a helper of its own
+that takes any list endpoint of the New Quizzes API.
+<<functions>>=
+def get_new_quizzes_list(requester, endpoint):
+  """Returns every element of the paginated New Quizzes list at `endpoint`.
+
+  Follows the `next` relation of the `Link` header until Canvas names no
+  further page.  Errors from Canvas propagate as `CanvasException`.
+  """
+  response = requester.request(
+    method='GET',
+    endpoint=endpoint,
+    _url="new_quizzes",
+    per_page=NEW_QUIZZES_PAGE_SIZE
+  )
+  elements = []
+  while True:
+    elements.extend(response.json())
+    next_url = response.links.get('next', {}).get('url')
+    if not next_url:
+      return elements
+    response = requester.request(method='GET', _url=next_url)
+<<constants>>=
+NEW_QUIZZES_PAGE_SIZE = 100
+@
+
+Let's verify that the helper reads a two-page list in order, and that it
+fetches the second page from the URL Canvas named.
+A [[requests]] response exposes the parsed [[Link]] header as
+[[response.links]], so each mocked page sets that attribute.
+<<test functions>>=
+def new_quizzes_page(elements, next_url=None):
+  """Return a mocked response holding one page of a New Quizzes list"""
+  page = MagicMock()
+  page.json.return_value = elements
+  page.links = {'next': {'url': next_url}} if next_url else {}
+  return page
+
+def test_get_new_quizzes_list_follows_next_links():
+  next_url = "https://canvas.example/api/quiz/v1/items?page=2"
+  requester = MagicMock()
+  requester.request.side_effect = [
+    new_quizzes_page([{'id': 1}, {'id': 2}], next_url),
+    new_quizzes_page([{'id': 3}]),
+  ]
+
+  elements = quizzes.get_new_quizzes_list(requester, "courses/1/items")
+
+  assert elements == [{'id': 1}, {'id': 2}, {'id': 3}]
+  first, second = requester.request.call_args_list
+  assert first.kwargs['per_page'] == quizzes.NEW_QUIZZES_PAGE_SIZE
+  assert second.kwargs['_url'] == next_url
+@
+
+\paragraph{Honest: letting errors through.}
+The earlier version caught every exception, printed a warning and returned
+[[[]]].
+Its callers then could not tell \enquote{the quiz has no items} from
+\enquote{we could not ask Canvas}: [[items list]] printed \enquote{No
+questions found in this quiz} after an expired token, and [[items edit]]
+and [[items delete]] claimed that no question sat at the requested
+position.
+We therefore let [[canvasapi]]'s exceptions propagate.
+Only a command knows how to report a failure to its user, so that is where
+they are handled (\cref{sec:list-quiz-items-or-exit}).
 <<functions>>=
 def list_new_quiz_items(course, assignment_id, requester):
   """Lists items in a New Quiz
@@ -9980,32 +10068,57 @@ def list_new_quiz_items(course, assignment_id, requester):
     requester: Canvas API requester
 
   Returns:
-    List of item dictionaries with normalized fields
+    List of item dictionaries with normalized fields, from every page.
+
+  Raises:
+    CanvasException: if Canvas could not be asked for the items.
   """
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}/items"
 
-  try:
-    response = requester.request(
-      method='GET',
-      endpoint=endpoint,
-      _url="new_quizzes"
-    )
-    data = response.json()
+  items = []
+  for item in get_new_quizzes_list(requester, endpoint):
+    entry = item.get('entry', {})
+    items.append({
+      'position': item.get('position'),
+      'id': item.get('id'),
+      'type': entry.get('interaction_type_slug', 'unknown'),
+      'title': entry.get('title', ''),
+      'points': item.get('points_possible')
+    })
+  return items
+@
 
-    items = []
-    for item in data:
-      entry = item.get('entry', {})
-      items.append({
-        'position': item.get('position'),
-        'id': item.get('id'),
-        'type': entry.get('interaction_type_slug', 'unknown'),
-        'title': entry.get('title', ''),
-        'points': item.get('points_possible')
-      })
-    return items
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to list New Quiz items: {e}")
-    return []
+Let's prove both properties for the normalized list: a quiz spread over
+two pages is listed in full and in order, and a failing request reaches
+the caller instead of turning into an empty quiz.
+<<test functions>>=
+def new_quiz_item(position):
+  """Return a raw New Quizzes item at `position`"""
+  return {'id': 100 + position, 'position': position, 'points_possible': 1,
+          'entry': {'title': f"Q{position}",
+                    'interaction_type_slug': 'choice'}}
+
+def test_list_new_quiz_items_reads_every_page():
+  requester = MagicMock()
+  requester.request.side_effect = [
+    new_quizzes_page([new_quiz_item(1), new_quiz_item(2)],
+                     "https://canvas.example/next"),
+    new_quizzes_page([new_quiz_item(3)]),
+  ]
+
+  items = quizzes.list_new_quiz_items(MagicMock(id=1), 42, requester)
+
+  assert [item['position'] for item in items] == [1, 2, 3]
+  assert items[2]['title'] == "Q3"
+
+def test_list_new_quiz_items_propagates_api_errors():
+  from canvasapi.exceptions import Unauthorized
+
+  requester = MagicMock()
+  requester.request.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(Unauthorized):
+    quizzes.list_new_quiz_items(MagicMock(id=1), 42, requester)
 @
 
 
@@ -10039,6 +10152,77 @@ def list_classic_questions(quiz):
   except Exception as e:
     canvaslms.cli.warn(f"Failed to list Classic Quiz questions: {e}")
     return []
+@
+
+
+\subsection{Reporting a failed listing}
+\label{sec:list-quiz-items-or-exit}
+
+The three commands that list items---[[items list]], [[items edit]] and
+[[items delete]]---all pick the listing function by quiz type, and all must
+react the same way when Canvas cannot be asked: stop with an error that
+names the cause, rather than carry on as if the quiz were empty.
+Writing that once, as a function, keeps the three commands from drifting
+apart.
+We catch [[CanvasException]], the base class of every error [[canvasapi]]
+raises for a failed request, so that the user sees Canvas's own
+explanation (an expired token, a missing quiz) instead of a traceback.
+
+The Classic Quiz path is unchanged: [[list_classic_questions]] still warns
+and returns an empty list on failure, so this function can only report the
+errors of New Quizzes.
+<<functions>>=
+def list_quiz_items_or_exit(quiz, requester):
+  """Lists the items of `quiz`, a New Quiz or a Classic Quiz.
+
+  Exits with an error message if Canvas could not be asked for the items,
+  so that an empty result always means that the quiz has no items.
+  """
+  if not is_new_quiz(quiz):
+    return list_classic_questions(quiz)
+  try:
+    return list_new_quiz_items(quiz.course, quiz.id, requester)
+  except canvasapi.exceptions.CanvasException as e:
+    quiz_name = quiz.title or quiz.id
+    canvaslms.cli.err(1, f"Could not list the questions of {quiz_name}: {e}")
+@
+
+Let's verify, through [[items list]], that a failed request is reported as an
+error and not printed as an empty quiz.
+The quiz must be an instance of a class named [[NewQuiz]], since that is how
+[[is_new_quiz]] recognizes one.
+<<test functions>>=
+def new_quiz_whose_items_fail(monkeypatch, canvas):
+  """Make the commands find one New Quiz whose item listing fails"""
+  from canvasapi.exceptions import Unauthorized
+
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.course = MagicMock(id=1)
+
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [quiz.course])
+  monkeypatch.setattr(quizzes, "filter_quizzes",
+                      lambda course_list, regex: iter([quiz]))
+  canvas._Canvas__requester.request.side_effect = \
+    Unauthorized("Invalid access token")
+
+def test_items_list_reports_api_errors(monkeypatch, capsys, caplog):
+  canvas = MagicMock()
+  new_quiz_whose_items_fail(monkeypatch, canvas)
+  args = argparse.Namespace(course=["c"], assignment="Midterm",
+                            delimiter="\t")
+
+  with pytest.raises(SystemExit) as exit_info:
+    quizzes.items_list_command({}, canvas, args)
+
+  assert exit_info.value.code == 1
+  assert "Invalid access token" in caplog.text
+  assert "No questions found" not in capsys.readouterr().out
 @
 
 
@@ -11945,10 +12129,7 @@ def items_edit_command(config, canvas, args):
   # Find the item ID if position was given
   item_id = args.id
   if args.position and not item_id:
-    if is_new_quiz(quiz):
-      items = list_new_quiz_items(quiz.course, quiz.id, canvas._Canvas__requester)
-    else:
-      items = list_classic_questions(quiz)
+    items = list_quiz_items_or_exit(quiz, canvas._Canvas__requester)
 
     for item in items:
       if item.get('position') == args.position:
@@ -12071,10 +12252,7 @@ def items_delete_command(config, canvas, args):
   item_id = args.id
   item_title = None
   if args.position and not item_id:
-    if is_new_quiz(quiz):
-      items = list_new_quiz_items(quiz.course, quiz.id, canvas._Canvas__requester)
-    else:
-      items = list_classic_questions(quiz)
+    items = list_quiz_items_or_exit(quiz, canvas._Canvas__requester)
 
     for item in items:
       if item.get('position') == args.position:
@@ -12109,6 +12287,26 @@ def items_delete_command(config, canvas, args):
     print(f"Deleted question {item_id}")
   else:
     canvaslms.cli.err(1, "Failed to delete question")
+@
+
+A question given by [[--position]] is found by listing the quiz.
+If Canvas cannot be asked for that list, the command must say so rather
+than claim that no question sits at that position, which would send the
+user looking for a mistake in their position number.
+Let's verify that the listing error, not a missing position, is reported:
+<<test functions>>=
+def test_items_delete_reports_api_errors_not_missing_position(
+    monkeypatch, caplog):
+  canvas = MagicMock()
+  new_quiz_whose_items_fail(monkeypatch, canvas)
+  args = argparse.Namespace(course=["c"], assignment="Midterm",
+                            position=3, id=None, force=True)
+
+  with pytest.raises(SystemExit):
+    quizzes.items_delete_command({}, canvas, args)
+
+  assert "Invalid access token" in caplog.text
+  assert "No question found at position" not in caplog.text
 @
 
 
