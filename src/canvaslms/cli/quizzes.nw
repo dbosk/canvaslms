@@ -4997,6 +4997,11 @@ The workflow is:
 \item Apply the changes (settings only, unless [[--replace-items]])
 \end{enumerate}
 
+With [[--replace-items]], the export is all the user sees of the quiz's
+questions, and whatever they save replaces them.  If Canvas cannot be read,
+we must therefore stop before the editor opens, rather than show an export
+without questions (\cref{sec:export-or-exit}).
+
 <<update quiz module membership interactively>>=
 if 'modules' in final_attrs:
   update_quiz_module_membership(quiz, final_attrs['modules'])
@@ -5020,10 +5025,12 @@ def edit_quiz_interactive_json(quiz, requester, html_mode=False,
 
   # Export current quiz state to JSON
   if is_new_quiz(quiz):
-    original_data = export_full_new_quiz(quiz, requester, include_banks=True,
-                                         importable=not replace_items)
+    original_data = export_quiz_or_exit(
+      export_full_new_quiz, quiz, requester, include_banks=True,
+      importable=not replace_items)
   else:
-    original_data = export_full_classic_quiz(quiz, importable=not replace_items)
+    original_data = export_quiz_or_exit(
+      export_full_classic_quiz, quiz, importable=not replace_items)
 
   # If not replacing items, remove items from the export to simplify editing
   if not replace_items:
@@ -6485,7 +6492,9 @@ export_parser.add_argument("--no-banks",
 
 The export command finds the quiz, extracts its settings, and exports all
 questions.  We reuse the existing [[export_new_quiz_items]] and
-[[export_classic_questions]] functions for question export.
+[[export_classic_questions]] functions for question export.  When Canvas
+cannot be read, we stop with an error instead of printing an export that
+lacks questions (\cref{sec:export-or-exit}).
 
 If the quiz appears in modules, we also export a [[modules]] list of module
 specs: anchored, regex-escaped module names (e.g., [[^FBF$]]) paired with the
@@ -6514,9 +6523,10 @@ def export_command(config, canvas, args):
 
   # Build the export structure
   if is_new_quiz(quiz):
-    export = export_full_new_quiz(quiz, requester, include_banks, importable)
+    export = export_quiz_or_exit(export_full_new_quiz, quiz, requester,
+                                 include_banks, importable)
   else:
-    export = export_full_classic_quiz(quiz, importable)
+    export = export_quiz_or_exit(export_full_classic_quiz, quiz, importable)
 
   # Preserve the user's selection expression for round-trip syncing.
   export.setdefault('settings', {})['regex'] = args.assignment
@@ -7955,10 +7965,14 @@ def test_qti_check_target_refuses(monkeypatch, data, attempts, message):
 \paragraph{Reading the staged questions.}
 We wait for the staging quiz to be ready, exactly as for a fresh import, and
 export its questions in the form [[add_classic_questions]] takes.
-[[export_classic_questions]] warns and returns no questions when Canvas
-cannot be read, so we compare the count with the package once more.  Then
-we check that the questions are supported; failing here still leaves the
-destination untouched.  Finally we rename the staging quiz so that, should
+When Canvas cannot be read, [[export_classic_questions]] raises
+[[CanvasException]] (\cref{sec:export-new-quiz-items}), which
+[[qti_import_command]] reports like any other failure; the destination is
+still untouched then.  The export is a second reading of the staging quiz,
+after the one [[qti_ready]] checked, so we compare the count with the
+package once more.  Then we check that the questions are supported;
+failing here still leaves the destination untouched.  Finally we rename the
+staging quiz so that, should
 it be left behind, its title says what it is for.
 <<read staged questions>>=
 qti_ready(course, receipt, timeout)
@@ -7991,6 +8005,12 @@ destination may be half-replaced and the backup holds what it was, in the
 format that [[quizzes edit -f]] restores.  We also note the IDs of the old
 questions, which the verification needs and the importable backup, by
 design, does not contain.
+
+A backup is only worth taking if it is complete.  When Canvas cannot be
+read, [[export_full_classic_quiz]] raises rather than return a quiz without
+questions (\cref{sec:export-new-quiz-items}), and since the backup is the
+first thing written here, the exception leaves before the receipt says
+[[replacing]] and before anything is deleted.
 <<back up destination quiz>>=
 quiz, before = qti_check_target(course, receipt['target_id'])
 old_ids = {q['id'] for q in qti_snapshot(course, receipt['target_id'])[1]}
@@ -8313,6 +8333,58 @@ def test_qti_replace_refuses_unverified_types_untouched(monkeypatch, tmp_path,
   delete.assert_not_called()
 @
 
+The backup must hold up in the same way.  When the destination's questions
+cannot be read, the replacement stops before the receipt says
+[[replacing]], with no backup written and no question deleted, and the
+exception is one that [[qti_import_command]] reports.  The backup is taken
+by the real export functions here, while the staged questions still come
+from the mock.  The destination therefore needs settings that would export,
+so that only its questions can stop the backup.
+
+<<test functions>>=
+def classic_quiz_with_unreadable_questions():
+  """Return a Classic quiz whose settings export but questions fail"""
+  from canvasapi.exceptions import Unauthorized
+
+  quiz = MagicMock(id=20, title='Week 1', description='',
+                   quiz_type='assignment', time_limit=None,
+                   allowed_attempts=1, points_possible=1, due_at=None,
+                   unlock_at=None, lock_at=None, show_correct_answers=True,
+                   access_code=None)
+  quiz.get_questions.side_effect = Unauthorized("Invalid access token")
+  return quiz
+
+def test_qti_replace_stops_when_the_backup_cannot_be_read(monkeypatch,
+                                                         tmp_path):
+  from canvasapi.exceptions import CanvasException
+
+  export_full_classic_quiz = quizzes.export_full_classic_quiz
+  export_classic_questions = quizzes.export_classic_questions
+  course, receipt, after = mock_qti_replacement(monkeypatch)
+  export_staged_questions = quizzes.export_classic_questions
+  destination = classic_quiz_with_unreadable_questions()
+  delete = MagicMock(return_value=True)
+
+  for name, replacement in {
+      'qti_check_target': lambda course, quiz_id: (destination, {}),
+      'export_full_classic_quiz': export_full_classic_quiz,
+      'export_classic_questions':
+          lambda quiz: export_classic_questions(quiz)
+                       if quiz is destination
+                       else export_staged_questions(quiz),
+      'delete_all_classic_quiz_questions': delete}.items():
+    monkeypatch.setattr(quizzes, name, replacement)
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  path = tmp_path / "1-42.json"
+
+  with pytest.raises(CanvasException):
+    quizzes.qti_replace(course, receipt, path, {}, 60)
+  assert not path.with_suffix('.backup.json').exists()
+  assert receipt['phase'] == 'submitted'
+  delete.assert_not_called()
+@
+
 \subsection{Forgetting the listings an import changes}
 \label{sec:qti-listing-cache}
 
@@ -8575,6 +8647,12 @@ New Quizzes store their content differently from Classic Quizzes. We use the
 [[export_new_quiz_items]] function to fetch the full item data, then format
 each item according to its type.
 
+When Canvas cannot be read, [[export_new_quiz_items]] raises
+(\cref{sec:export-new-quiz-items}).  Unlike the commands that export
+(\cref{sec:export-or-exit}), [[quizzes view]] changes nothing and can show
+the rest of the quiz, so it does not stop; it says in place of the questions
+that they could not be fetched.  The same holds for Classic Quizzes below.
+
 <<functions>>=
 def format_new_quiz_as_markdown(quiz, course, requester, link_course=None):
   """Format a New Quiz as markdown
@@ -8698,6 +8776,8 @@ We can walk the whole path too, from Canvas's settings to the line a reader
 sees: a quiz whose own [[time_limit]] is null, and settings that say
 [[1800]], must be viewed as a half-hour quiz rather than as nothing or as
 thirty hours.
+The view asks Canvas twice, first for the settings and then for the items,
+which we answer with an empty page.
 
 <<test functions>>=
 def test_view_reports_a_new_quiz_time_limit_in_minutes():
@@ -8710,10 +8790,12 @@ def test_view_reports_a_new_quiz_time_limit_in_minutes():
   quiz.time_limit = None
   quiz.course = MagicMock(id=1)
 
-  requester = MagicMock()
-  requester.request.return_value.json.return_value = {
+  settings = MagicMock()
+  settings.json.return_value = {
     'quiz_settings': {'has_time_limit': True,
                       'session_time_limit_in_seconds': 1800}}
+  requester = MagicMock()
+  requester.request.side_effect = [settings, new_quizzes_page([])]
 
   markdown = quizzes.format_new_quiz_as_markdown(quiz, quiz.course, requester)
 
@@ -12622,6 +12704,9 @@ they occur (\cref{sec:cleaning-export}).
 
 \subsection{The export command}
 
+The command exports with the helpers below, and stops with an error naming
+the quiz if Canvas cannot be read (\cref{sec:export-or-exit}).
+
 <<functions>>=
 def items_export_command(config, canvas, args):
   """Exports all questions from a quiz to JSON"""
@@ -12638,12 +12723,12 @@ def items_export_command(config, canvas, args):
 
   # Export based on quiz type
   if is_new_quiz(quiz):
-    export = export_new_quiz_items(quiz, requester,
-                                    include_banks=include_banks)
+    export = export_quiz_or_exit(export_new_quiz_items, quiz, requester,
+                                 include_banks=include_banks)
     if getattr(args, 'importable', False):
       export = clean_for_import(export, quiz_type='new_quiz')
   else:
-    export = export_classic_questions(quiz)
+    export = export_quiz_or_exit(export_classic_questions, quiz)
     if getattr(args, 'importable', False):
       export = clean_for_import(export, quiz_type='classic')
   export = content.symbolize_tree(
@@ -13223,6 +13308,33 @@ The function first checks the cache for previously fetched items
 (\cref{quiz-items-cache} covers the caching details).
 If the cache has fresh data, we return it immediately, avoiding the API call.
 
+\paragraph{An export must fail loudly.}
+An export is more than something to read.
+It is the input of [[quizzes edit --replace-items]], which deletes a quiz's
+questions and creates the exported ones instead, and it is the backup taken
+before a replacement (\cref{sec:qti-replace}).
+An earlier version read only the first page of items, and caught every error
+of the request, warned and carried on with no items.
+Either way the result looked like a successful export, of a shorter quiz or
+of an empty one, and that is what an export must never look like by
+mistake.
+Fed back into a replacement, a truncated export replaces a quiz's questions
+with only some of them.
+Opened in the editor of [[edit --full-json --replace-items]], an empty
+export invites the user to write questions into what looks like an empty
+quiz, and saving them deletes the questions nobody saw.
+Kept as a backup, it restores nothing.
+Worse, the empty result went into the cache, so for the next few minutes
+(\cref{quiz-items-cache}) every command saw an empty quiz, without even a
+warning.
+
+We therefore read the items with [[get_new_quizzes_list]]
+(\cref{sec:list-new-quiz-items}), which follows every page of the list and
+lets [[canvasapi]]'s [[CanvasException]] propagate.
+Since the exception leaves the function before the end, a failed fetch
+never reaches [[cache_quiz_items]].
+The commands decide how to report it (\cref{sec:export-or-exit}).
+
 <<functions>>=
 def export_new_quiz_items(quiz, requester, include_banks=True):
   """Exports items from a New Quiz
@@ -13233,7 +13345,10 @@ def export_new_quiz_items(quiz, requester, include_banks=True):
     include_banks: If True, expand Bank/BankEntry items to include bank questions
 
   Returns:
-    Dictionary with quiz metadata and items
+    Dictionary with quiz metadata and items, from every page.
+
+  Raises:
+    CanvasException: if Canvas could not be asked for the items.
   """
   # Check cache first (only for include_banks=True, the common case)
   if include_banks:
@@ -13246,17 +13361,7 @@ def export_new_quiz_items(quiz, requester, include_banks=True):
   course = quiz.course
   assignment_id = quiz.id
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}/items"
-
-  try:
-    response = requester.request(
-      method='GET',
-      endpoint=endpoint,
-      _url="new_quizzes"
-    )
-    raw_items = response.json()
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to fetch New Quiz items: {e}")
-    raw_items = []
+  raw_items = get_new_quizzes_list(requester, endpoint)
 
   items = []
   banks = {}  # bank_id -> bank data (to avoid duplicate fetches)
@@ -13340,6 +13445,53 @@ def export_new_quiz_items(quiz, requester, include_banks=True):
   return export_data
 @
 
+Let's verify both properties on a quiz of three items spread over two pages:
+the export holds all three, in order, and a request that fails raises
+instead of exporting, with nothing left in the cache.
+The quiz is a plain object rather than a [[MagicMock]], which would claim to
+have an [[_items_cache]] attribute and so pass for a cached quiz.
+<<test functions>>=
+def exportable_new_quiz():
+  """Return a New Quiz object with nothing cached"""
+  class NewQuiz:
+    pass
+
+  quiz = NewQuiz()
+  quiz.id = 42
+  quiz.title = 'Midterm'
+  quiz.course = MagicMock(id=1)
+  return quiz
+
+def new_quiz_item(item_id):
+  """Return a question item as the New Quizzes items API lists it"""
+  return {'id': item_id, 'position': item_id, 'entry_type': 'Item',
+          'points_possible': 1, 'entry': {'title': f'Q{item_id}'}}
+
+def test_export_new_quiz_items_reads_every_page():
+  next_url = "https://canvas.example/api/quiz/v1/items?page=2"
+  requester = MagicMock()
+  requester.request.side_effect = [
+    new_quizzes_page([new_quiz_item(1), new_quiz_item(2)], next_url),
+    new_quizzes_page([new_quiz_item(3)]),
+  ]
+
+  export = quizzes.export_new_quiz_items(exportable_new_quiz(), requester)
+
+  assert [item['id'] for item in export['items']] == [1, 2, 3]
+  assert export['item_count'] == 3
+
+def test_export_new_quiz_items_raises_and_caches_nothing():
+  from canvasapi.exceptions import CanvasException, Unauthorized
+
+  quiz = exportable_new_quiz()
+  requester = MagicMock()
+  requester.request.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(CanvasException):
+    quizzes.export_new_quiz_items(quiz, requester)
+  assert quizzes.get_cached_quiz_items(quiz) is None
+@
+
 
 \subsection{Extracting bank information from Bank/BankEntry items}
 
@@ -13406,6 +13558,12 @@ questions instead of a random draw---a particularly insidious loss because
 the export still imports without error.  We first convert every question to
 a dictionary, then fold grouped questions into group entries.
 
+Reading the questions can fail like reading New Quiz items, and for the same
+reasons as there (\cref{sec:export-new-quiz-items}) we let the
+[[CanvasException]] of [[quiz.get_questions]] propagate rather than export
+no questions.  [[canvasapi]] reads the pages of the list as we iterate over
+it, so an error on any page, not only the first, reaches the caller.
+
 <<functions>>=
 def export_classic_questions(quiz):
   """Exports questions from a Classic Quiz.
@@ -13419,15 +13577,13 @@ def export_classic_questions(quiz):
 
   Returns:
     Dictionary with quiz metadata and questions
+
+  Raises:
+    CanvasException: if Canvas could not be asked for the questions.
   """
   import datetime
 
-  try:
-    questions = list(quiz.get_questions())
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to fetch Classic Quiz questions: {e}")
-    questions = []
-
+  questions = list(quiz.get_questions())
   items = [classic_question_to_dict(q) for q in questions]
   entries = group_classic_questions(quiz, items)
 
@@ -13636,6 +13792,108 @@ def test_group_classic_questions_fetch_failure():
   assert [q['question_name'] for q in entries[1]['questions']] == ['Pooled']
 @
 
+Apart from the folding, let's verify that a Classic export, like a New
+Quiz one, raises when the questions cannot be read, instead of exporting
+none.
+
+<<test functions>>=
+def test_export_classic_questions_raises():
+  from canvasapi.exceptions import CanvasException, Unauthorized
+
+  quiz = MagicMock()
+  quiz.get_questions.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(CanvasException):
+    quizzes.export_classic_questions(quiz)
+@
+
+
+\subsection{Reporting a failed export}
+\label{sec:export-or-exit}
+
+Since the export functions raise when Canvas cannot be read, every command
+that exports must decide what to do instead.
+For [[quizzes export]], [[quizzes items export]] and
+[[quizzes edit --full-json]], the answer is the same: there is nothing
+useful to do without the export.
+Printing what we have would be the silent failure we just removed, and the
+editor of [[edit --full-json --replace-items]] must not open on a quiz
+without its questions, since what the user saves replaces them.
+So the three commands stop with an error that names the quiz and gives
+Canvas's own explanation, as [[list_quiz_items_or_exit]] does for listings
+(\cref{sec:list-quiz-items-or-exit}).
+
+The commands call four different export functions, the full export or the
+questions alone, of a New or a Classic Quiz.
+Rather than wrap each call in its own [[try]] block, we write the reaction
+once, as a function that runs the export it is given.
+Stopping happens before any output and before any change, so a failed
+export leaves both the terminal and the quiz as they were.
+
+Two commands handle the exception themselves.
+[[quizzes view]] changes nothing and shows the rest of the quiz with a note
+in place of the questions (\cref{quiz-view}).
+[[quizzes import --replace-items]] reports [[CanvasException]] among its own
+failures, which also points to its receipt (\cref{sec:qti-replace}).
+<<functions>>=
+def export_quiz_or_exit(export, quiz, *args, **kwargs):
+  """Returns `export(quiz, *args, **kwargs)`, an export of `quiz`.
+
+  Exits with an error message naming the quiz if Canvas could not be
+  read, so that no command continues with an export lacking questions.
+  """
+  try:
+    return export(quiz, *args, **kwargs)
+  except CanvasException as e:
+    quiz_name = quiz.title or quiz.id
+    canvaslms.cli.err(1, f"Could not export {quiz_name}: {e}")
+@
+
+Let's verify, through [[items export]], that a quiz whose items cannot be
+read is reported as an error and that nothing is printed.
+We reuse the New Quiz whose requests fail from the listing tests.
+
+<<test functions>>=
+def test_items_export_reports_api_errors(monkeypatch, capsys, caplog):
+  canvas = MagicMock()
+  new_quiz_whose_items_fail(monkeypatch, canvas)
+  args = argparse.Namespace(course=["c"], assignment="Midterm",
+                            include_banks=True, no_banks=False,
+                            importable=False)
+
+  with pytest.raises(SystemExit) as exit_info:
+    quizzes.items_export_command({}, canvas, args)
+
+  assert exit_info.value.code == 1
+  assert "Could not export Midterm: Invalid access token" in caplog.text
+  assert capsys.readouterr().out == ""
+@
+
+The case that matters most is the replacement.
+When [[edit --full-json --replace-items]] cannot read the questions of a
+Classic quiz, it must stop before the editor opens, and so before any
+question can be deleted.  We reuse the quiz from the test of the QTI
+replacement's backup (\cref{sec:qti-replace}); should the editor open after
+all, the mock cancels it.
+
+<<test functions>>=
+def test_edit_full_json_stops_when_questions_cannot_be_read(monkeypatch):
+  quiz = classic_quiz_with_unreadable_questions()
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  editor = MagicMock(return_value=None)
+  delete = MagicMock(return_value=True)
+  monkeypatch.setattr(quizzes, "open_in_editor", editor)
+  monkeypatch.setattr(quizzes, "delete_all_classic_quiz_questions", delete)
+
+  with pytest.raises(SystemExit) as exit_info:
+    quizzes.edit_quiz_interactive_json(quiz, MagicMock(), replace_items=True)
+
+  assert exit_info.value.code == 1
+  editor.assert_not_called()
+  delete.assert_not_called()
+@
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \chapter{Item Bank Commands}
@@ -13737,33 +13995,70 @@ def banks_export_command(config, canvas, args):
 
 \subsection{Fetching bank items}
 
-We fetch items from an item bank using the [[item_banks]] API endpoint.  This
-endpoint may not be accessible in all Canvas configurations, so we handle
-failures gracefully. Note that many Canvas installations don't expose the
-Item Banks API, so failures are common and expected---we silently return an
-empty list rather than warning the user.
+We fetch items from an item bank using the [[item_banks]] API endpoint.  It
+is a paginated list like a quiz's items, so we read every page of it with
+[[get_new_quizzes_list]] (\cref{sec:list-new-quiz-items}).
+
+Here, unlike for a quiz's own items (\cref{sec:export-new-quiz-items}), a
+failure does not stop the export.  Many Canvas installations do not open the
+Item Banks API to their users, so a failure is common and expected, and
+refusing to export every quiz that draws from a bank would make
+[[quizzes export]] useless there.  The bank's questions are an addition to
+the export: the quiz keeps its reference to the bank whether or not we can
+expand it.  What we must not do is to leave the questions out silently, as
+an earlier version did, since then nothing tells an inaccessible bank from
+an empty one.  So we warn, naming the bank, and return an empty list.  We
+catch only [[CanvasException]], the errors of a request that Canvas refused
+or that never reached it; anything else is a bug and should show as one.
+
+[[banks export]] above exports nothing but the bank, so for it an empty list
+is an error either way; the warning then gives the reason that its error
+message can only guess at.
 
 <<functions>>=
 def get_bank_items(requester, bank_id):
-  """Fetches items from an item bank
+  """Fetches the items of an item bank, from every page
 
   Args:
     requester: Canvas API requester
     bank_id: Item bank ID
 
   Returns:
-    List of item dictionaries, or empty list if bank is inaccessible
+    List of item dictionaries, or an empty list, after a warning, if the
+    bank is inaccessible
   """
   endpoint = f"item_banks/{bank_id}/items"
 
   try:
-    response = requester.request(
-      method='GET',
-      endpoint=endpoint,
-      _url="new_quizzes"
-    )
-    return response.json()
-  except Exception:
-    # Item Banks API often isn't accessible - this is expected
+    return get_new_quizzes_list(requester, endpoint)
+  except CanvasException as e:
+    canvaslms.cli.warn(f"Could not read item bank {bank_id}, "
+                       f"leaving its questions out: {e}")
     return []
+@
+
+Let's verify both halves: a bank spread over two pages is read whole, and an
+inaccessible bank yields an empty list together with a warning that names
+it.
+
+<<test functions>>=
+def test_get_bank_items_reads_every_page():
+  next_url = "https://canvas.example/api/quiz/v1/item_banks/77/items?page=2"
+  requester = MagicMock()
+  requester.request.side_effect = [
+    new_quizzes_page([{'id': 1}], next_url),
+    new_quizzes_page([{'id': 2}]),
+  ]
+
+  assert quizzes.get_bank_items(requester, 77) == [{'id': 1}, {'id': 2}]
+
+def test_get_bank_items_warns_about_an_inaccessible_bank(caplog):
+  from canvasapi.exceptions import Forbidden
+
+  requester = MagicMock()
+  requester.request.side_effect = Forbidden("Item banks are not available")
+
+  assert quizzes.get_bank_items(requester, 77) == []
+  assert "item bank 77" in caplog.text
+  assert "Item banks are not available" in caplog.text
 @
