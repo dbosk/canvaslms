@@ -7784,11 +7784,27 @@ groups, since the deletion removes the groups and the backup records them.
 The \emph{package}, on the other hand, must be flat: we check the staging
 quiz against the item count of the package, which a question group would
 make meaningless (\cref{sec:qti-classic-ready}).  We also restrict the
-staged questions to multiple-choice, true/false and essay questions, the
-types whose round trip through a QTI import, the export and the creation of
-questions has been verified against Canvas; other types may well work, but
-a failure would only be discovered after the destination's questions have
-been deleted.  The new questions get new IDs; the quiz keeps its own.
+staged questions to the types whose round trip through a QTI import, the
+export and the creation of questions has been verified against Canvas,
+because a type that does not survive it is only discovered after the
+destination's questions have been deleted.
+
+That set is the seven types text2qti produces: multiple-choice,
+true/false, multiple-answers, numerical, short-answer, essay and
+file-upload questions.  We verified it in the sandbox course on 2026-10-12.
+We imported a text2qti package with one question of each type, some with
+correct, incorrect or general feedback, and then replaced its questions
+from a revised package.  The revision changed every question's text and
+answers, a numerical tolerance, and the number of short-answer
+alternatives, and it added a numerical question with a range answer.  The
+verification passed for all seven types, but only after one fix: a
+numerical answer first arrived with value and margin zero, because Canvas
+reads numerical answers under other names than it exports them
+(\cref{sec:classic-numerical-answers}).  Canvas's other Classic types,
+matching, fill-in-multiple-blanks, multiple-dropdowns, calculated and
+text-only questions, remain unsupported.  text2qti cannot produce them, so
+we have no package that would verify them.  The new questions get new IDs;
+the quiz keeps its own.
 
 Since Canvas offers no transaction, a failure between deleting the old
 questions and verifying the new ones cannot be rolled back automatically.
@@ -7954,13 +7970,17 @@ if len(questions) != receipt['question_count']:
                        f"{staged.id}")
 if any('group' in q or q.get('question_type') not in QTI_QUESTION_TYPES
        for q in questions):
-  raise QtiImportError("Replacement supports flat multiple-choice, "
-                       "true/false and essay questions only")
+  raise QtiImportError("Replacement supports flat quizzes of "
+                       "multiple-choice, true/false, multiple-answers, "
+                       "numerical, short-answer, essay and file-upload "
+                       "questions only")
 staged.edit(quiz={
     'title': f"canvaslms staging for quiz {receipt['target_id']}"})
 <<constants>>=
 QTI_QUESTION_TYPES = {
-  'multiple_choice_question', 'true_false_question', 'essay_question',
+  'multiple_choice_question', 'true_false_question',
+  'multiple_answers_question', 'numerical_question', 'short_answer_question',
+  'essay_question', 'file_upload_question',
 }
 @
 
@@ -8195,10 +8215,11 @@ keeps standard output clean; a failed creation and a changed setting are
 both reported with the command that restores the backup.
 
 <<test functions>>=
-def mock_qti_replacement(monkeypatch, create_failures=0, after_changes={}):
+def mock_qti_replacement(monkeypatch, create_failures=0, after_changes={},
+                         question_type='essay_question'):
   """Mock Canvas for `qti_replace` of staging quiz 10 into quiz 20"""
   staged, destination = MagicMock(id=10), MagicMock(id=20)
-  question = {'question_name': 'Q1', 'question_type': 'essay_question',
+  question = {'question_name': 'Q1', 'question_type': question_type,
               'points_possible': 2, 'answers': []}
   before = {'id': 20, 'published': False, 'unpublishable': True,
             'time_limit': 30, 'question_count': 1, 'points_possible': 1}
@@ -8252,6 +8273,44 @@ def test_qti_replace_reports_changed_settings(monkeypatch, tmp_path):
   with pytest.raises(quizzes.QtiImportError,
                      match=r"time_limit \(30 -> 60\)"):
     quizzes.qti_replace(course, receipt, tmp_path / "1-42.json", {}, 60)
+@
+
+The restriction to the verified question types must hold in both
+directions.  Each of the seven verified types is replaced like the essay
+above.  A staged question of any other type is refused while the
+destination is still untouched: no backup has been written, the receipt is
+still [[submitted]], and no question has been deleted.
+
+<<test functions>>=
+@pytest.mark.parametrize("question_type", [
+  'multiple_choice_question', 'true_false_question',
+  'multiple_answers_question', 'numerical_question', 'short_answer_question',
+  'essay_question', 'file_upload_question',
+])
+def test_qti_replace_accepts_verified_types(monkeypatch, tmp_path,
+                                            question_type):
+  course, receipt, after = mock_qti_replacement(
+    monkeypatch, question_type=question_type)
+  assert quizzes.qti_replace(course, receipt, tmp_path / "1-42.json",
+                             {}, 60) == after
+
+@pytest.mark.parametrize("question_type", [
+  'matching_question', 'fill_in_multiple_blanks_question',
+  'multiple_dropdowns_question', 'calculated_question', 'text_only_question',
+])
+def test_qti_replace_refuses_unverified_types_untouched(monkeypatch, tmp_path,
+                                                        question_type):
+  course, receipt, after = mock_qti_replacement(
+    monkeypatch, question_type=question_type)
+  delete = MagicMock(return_value=True)
+  monkeypatch.setattr(quizzes, "delete_all_classic_quiz_questions", delete)
+  path = tmp_path / "1-42.json"
+
+  with pytest.raises(quizzes.QtiImportError, match="questions only"):
+    quizzes.qti_replace(course, receipt, path, {}, 60)
+  assert not path.with_suffix('.backup.json').exists()
+  assert receipt['phase'] == 'submitted'
+  delete.assert_not_called()
 @
 
 \subsection{Forgetting the listings an import changes}
@@ -11856,6 +11915,11 @@ The counts we return only cover individual questions (pool members count one
 each); this keeps the \enquote{Added N question(s), M failed} message of all
 callers meaningful whether or not groups are involved.
 
+Every question, grouped or not, passes through [[classic_question_for_create]]
+on its way to Canvas.  It renames the value fields of numerical answers,
+which Canvas reads under other names than it exports them
+(\cref{sec:classic-numerical-answers}).
+
 <<functions>>=
 def add_classic_questions(quiz, questions):
   """Adds questions to a Classic Quiz.
@@ -11884,7 +11948,7 @@ def add_classic_questions(quiz, questions):
       failed += group_failed
     else:
       try:
-        quiz.create_question(question=entry)
+        quiz.create_question(question=classic_question_for_create(entry))
         print(f"  Added: {entry.get('question_name', f'Question {i}')}")
         success += 1
       except Exception as e:
@@ -11983,7 +12047,8 @@ for i, question in enumerate(pool, 1):
 
   try:
     quiz.create_question(
-      question={**question, 'quiz_group_id': group.id})
+      question={**classic_question_for_create(question),
+                'quiz_group_id': group.id})
     print(f"  Added: {question.get('question_name', f'Question {i}')} "
           f"(in group {name})")
     success += 1
@@ -12094,6 +12159,92 @@ def test_add_classic_question_group_warns(caplog):
   assert (success, failed) == (0, 0)
   assert 'empty question pool' in caplog.text
 @
+
+\subsubsection{Numerical answers}
+\label{sec:classic-numerical-answers}
+
+Canvas exports a numerical question's answer with its value in [[exact]] and
+[[margin]], [[start]] and [[end]], or [[approximate]] and [[precision]],
+depending on the answer's [[numerical_answer_type]].  These are also the
+names that the [[quizzes create]] schema documents
+(\cref{sec:classic-question-types}).  But [[create_question]] does not read
+them.  It reads [[answer_exact]], [[answer_error_margin]],
+[[answer_range_start]], [[answer_range_end]], [[answer_approximate]] and
+[[answer_precision]], and when those are missing it creates the answer with
+every value zero, without an error.  A numerical question sent with the
+exported names therefore accepts 0, and only 0, as its correct answer.
+
+We found this on 2026-10-12, when the verification of a QTI replacement
+(\cref{sec:qti-replace}) failed for a numerical question.  A probe in the
+sandbox course then created one question under each set of names for each
+of the three answer types: the exported names gave zeros in all three, and
+the names above gave the values sent.  The other answer fields, such as
+[[text]], [[weight]] and the feedback, Canvas reads under their exported
+names.
+
+Where should the translation happen?  The exported names are the ones users
+see and edit: [[quizzes export]] writes them, with or without [[-I]],
+[[quizzes edit --replace-items]] puts them in the user's editor, and the
+[[quizzes create]] schema documents them.  Translating in the cleaner of
+[[export -I]] would have covered only the first of these paths, and given
+users two schemas for the same field.  So we keep the exported names as the
+one schema and translate where questions are handed to Canvas, which covers
+every path that creates questions.
+<<functions>>=
+def classic_question_for_create(question):
+  """Returns `question` with numerical answers named as Canvas reads them"""
+  if question.get('question_type') != 'numerical_question':
+    return question
+  return {**question,
+          'answers': [{CLASSIC_NUMERICAL_ANSWER_FIELDS.get(key, key): value
+                       for key, value in answer.items()}
+                      for answer in question.get('answers', [])]}
+<<constants>>=
+CLASSIC_NUMERICAL_ANSWER_FIELDS = {
+  'exact': 'answer_exact', 'margin': 'answer_error_margin',
+  'start': 'answer_range_start', 'end': 'answer_range_end',
+  'approximate': 'answer_approximate', 'precision': 'answer_precision',
+}
+@
+
+Let us verify that each kind of numerical answer reaches Canvas under the
+names it reads, with the other answer fields intact, whether the question is
+added on its own or into a group.
+
+<<test functions>>=
+def test_add_classic_questions_renames_numerical_answer_fields():
+  quiz = MagicMock()
+  quiz.create_question_group.return_value = MagicMock(id=77)
+  numerical = {'question_name': 'N', 'question_type': 'numerical_question',
+               'answers': [
+    {'weight': 100, 'numerical_answer_type': 'exact_answer',
+     'exact': 2.72, 'margin': 0.01},
+    {'weight': 100, 'numerical_answer_type': 'range_answer',
+     'start': 3.1, 'end': 3.2},
+    {'weight': 100, 'numerical_answer_type': 'precision_answer',
+     'approximate': 1234.5, 'precision': 3},
+  ]}
+  entries = [numerical,
+             {'group': {'name': 'pool', 'pick_count': 1},
+              'questions': [numerical]}]
+
+  assert quizzes.add_classic_questions(quiz, entries) == (2, 0)
+
+  for call in quiz.create_question.call_args_list:
+    assert call.kwargs['question']['answers'] == [
+      {'weight': 100, 'numerical_answer_type': 'exact_answer',
+       'answer_exact': 2.72, 'answer_error_margin': 0.01},
+      {'weight': 100, 'numerical_answer_type': 'range_answer',
+       'answer_range_start': 3.1, 'answer_range_end': 3.2},
+      {'weight': 100, 'numerical_answer_type': 'precision_answer',
+       'answer_approximate': 1234.5, 'answer_precision': 3},
+    ]
+  assert numerical['answers'][0]['exact'] == 2.72
+@
+
+The last assertion checks that the caller's question is left as it was: the
+QTI replacement compares the questions it sent with what Canvas stored, and
+must compare them under the exported names.
 
 
 \section{Editing quiz items}
