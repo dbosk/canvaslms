@@ -94,6 +94,22 @@ llm keys set openai  # or another provider
 
 ### Managing Quiz Content
 
+Quizzes written elsewhere, for example with `text2qti`, can be imported as
+QTI 1.2 packages. First list your courses and their IDs, then replace `12345`
+below with your course ID to upload a generated Classic quiz. Run the last
+command after regenerating the ZIP to replace its questions. Replacing keeps
+the quiz's ID and settings, requires an unpublished quiz without student
+attempts, and writes a backup that `quizzes edit -f` can restore.
+
+```bash
+canvaslms courses --all --id
+quiz_id=$(canvaslms quizzes import -c '^12345$' -f quiz.qti.zip --id-only)
+canvaslms quizzes import -c '^12345$' -f quiz.qti.zip -a "^$quiz_id$" --replace-items
+```
+
+Add `--type new` to import as a New Quiz instead (fresh imports only), and
+`canvaslms quizzes list -c '^12345$' -i` to list quizzes with their IDs.
+
 View and edit quiz content directly from the command line:
 
 ```bash
