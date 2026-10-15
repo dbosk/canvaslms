@@ -54,6 +54,9 @@ The main test file structure is defined here, then individual test chunks appear
 \begin{description}
 \item[Equality and hashability tests] Appear after [[make_classes_comparable()]] (\cref{ComparableObjects})
 \item[User string representation tests] Appear after [[make_useful_user_dunder_str()]]
+\item[Submission edit tests] Appear after
+  [[make_submission_edit_keep_attachment_files()]]
+  (\cref{SubmissionEditAttachments})
 \item[Caching tests] Will appear after caching infrastructure (future sections)
 \end{description}
 
@@ -104,6 +107,7 @@ from datetime import datetime, timedelta
 # These are the actual Canvas classes we patch.
 # We import them explicitly so we can call their patched dunder methods.
 from canvasapi.assignment import Assignment, AssignmentGroup
+from canvasapi.file import File
 from canvasapi.submission import Submission
 from canvasapi.user import User
 
@@ -439,6 +443,144 @@ class TestUserStringRepresentation:
 
 This improved string representation makes debugging much easier.
 When you print a list of users or log user actions, you see meaningful names instead of numeric IDs.
+
+
+\section{Keep an edited submission's attachments as [[File]] objects}
+\label{SubmissionEditAttachments}
+
+[[canvasapi]] gives a submission two ways of receiving Canvas's JSON, and they
+do not agree on the shape of [[attachments]].
+The constructor turns each attachment into a [[canvasapi.file.File]], which is
+what the rest of canvaslms relies on: [[submissions view]] reads its
+[[filename]], looks it up in the attachment cache by [[id]] and calls
+[[download]].
+[[Submission.edit]], which [[submissions grade]] uses to set grades, comments
+and rubric assessments, instead merges the response into the object it was
+called on through the generic [[set_attributes]].
+That bypasses the constructor, so after an edit [[attachments]] holds the bare
+dictionaries from the response:
+\begin{minted}{python}
+fetched.attachments  # [File(...), ...]
+edited.attachments   # [{"id": ..., "filename": ..., ...}, ...]
+\end{minted}
+
+In a run that ends right after the edit nobody reads the attachments again, so
+the difference was invisible until the submission cache made the edited object
+outlive the run.
+The cache's lazy wrapper hands [[edit]] straight to the submission it wraps
+(\enquote{Writes that Canvas answers} in \cref{sec:lazy-submission-class}),
+so the edit rewrites the very object the cache saves on exit.
+A submission just graded with a final grade such as P is then never refetched
+(the [[NOREFRESH_GRADES]] policy), and every later [[submissions view]] of it
+crashed on [[attachment.filename]] (issue~\#503), while [[--no-cache]] and
+submissions graded in SpeedGrader worked.
+
+We repair the shape where it is lost: we wrap [[Submission.edit]] so that, once
+Canvas's response has been merged, any attachment still in dictionary form is
+built into a [[File]] the way the constructor would have built it, with the
+submission's own requester.
+The check on the type makes this safe whatever Canvas sent: a response without
+[[attachments]] leaves the existing [[File]] objects alone, and wrapping twice
+changes nothing.
+Two alternatives were rejected.
+Teaching the readers to accept dictionaries would mean doing it in every one of
+them---the formatting for Markdown and JSON, the diff text extraction, the
+attachment cache---to restore an invariant that one place can keep.
+Invalidating the cache entry after a write (dropping it, or refetching the
+submission) would cost an extra request for every submission graded, would need
+a way for the CLI to reach into the cache that it does not have, and would
+still leave the edited object malformed for the rest of the run, which matters
+to interactive grading and to runs without the cache.
+Patching the class fixes the cached and the uncached path alike.
+
+The disagreement is a bug in [[canvasapi]] itself, not a convention we must
+live with: the constructor's conversion was added without updating the
+methods that refresh the object.
+We reported it upstream
+(\url{https://github.com/ucfopen/canvasapi/issues/721}) and proposed a fix
+(\url{https://github.com/ucfopen/canvasapi/pull/722}) that moves the
+conversion into [[Submission.set_attributes]], which the constructor already
+calls, and lets [[edit]] refresh through it, so that creation and every
+refresh share one conversion.
+Our patch stays until the minimum [[canvasapi]] version in [[pyproject.toml]]
+contains that fix.
+It is harmless on a fixed [[canvasapi]]: the attachments then arrive as
+[[File]] objects, the type check finds no dictionaries, and the patch changes
+nothing.
+So raising the minimum version is the only step needed before this section
+and its tests can be removed.
+<<functions>>=
+def make_submission_edit_keep_attachment_files():
+  """Make `Submission.edit` keep `attachments` as `File` objects"""
+  import canvasapi.file
+  import canvasapi.submission
+
+  original_edit = canvasapi.submission.Submission.edit
+
+  @functools.wraps(original_edit)
+  def edit(self, **kwargs):
+    result = original_edit(self, **kwargs)
+    <<turn dictionaries in [[self.attachments]] into [[File]] objects>>
+    return result
+
+  canvasapi.submission.Submission.edit = edit
+@
+
+The conversion mirrors the one in the [[Submission]] constructor.
+<<turn dictionaries in [[self.attachments]] into [[File]] objects>>=
+self.attachments = [
+  canvasapi.file.File(self._requester, attachment)
+  if isinstance(attachment, dict) else attachment
+  for attachment in self.attachments
+]
+@
+
+\subsection{Verifying that edits keep [[File]] attachments}
+
+Let us verify the patch on a real [[Submission]] built from a dictionary, with
+a stand-in requester that answers the edit with the same attachment in JSON
+form, as Canvas does.
+Afterwards the attachment must still be a [[File]] carrying the name.
+A response without [[attachments]] must leave the existing [[File]] alone.
+<<test functions>>=
+class TestSubmissionEditKeepsAttachmentFiles:
+    """Submission.edit leaves attachments as File objects (issue #503)."""
+
+    ATTACHMENT = {"id": 7, "filename": "report.pdf",
+                  "display_name": "report.pdf",
+                  "content-type": "application/pdf"}
+
+    def make_submission(self, response):
+        """A submission with one attachment whose edit answers `response`."""
+        requester = MagicMock()
+        requester.request.return_value.json.return_value = response
+        return Submission(requester, {
+            "id": 3, "assignment_id": 2, "user_id": 1, "course_id": 4,
+            "grade": None, "attachments": [dict(self.ATTACHMENT)]})
+
+    def test_edit_rebuilds_attachment_files(self):
+        """The attachments in the edit response become File objects."""
+        submission = self.make_submission({
+            "id": 3, "assignment_id": 2, "user_id": 1, "grade": "P",
+            "attachments": [dict(self.ATTACHMENT)]})
+
+        assert submission.edit(submission={"posted_grade": "P"}) is submission
+
+        [attachment] = submission.attachments
+        assert isinstance(attachment, File)
+        assert attachment.filename == "report.pdf"
+
+    def test_response_without_attachments_keeps_files(self):
+        """A response that omits attachments leaves the File objects."""
+        submission = self.make_submission({
+            "id": 3, "assignment_id": 2, "user_id": 1, "grade": "P"})
+        [before] = submission.attachments
+
+        submission.edit(submission={"posted_grade": "P"})
+
+        assert submission.attachments == [before]
+        assert isinstance(before, File)
+@
 
 
 \section{Cacheable Canvas objects}
@@ -3783,6 +3925,7 @@ Key design decisions:
 \end{description}
 
 \subsubsection{Implementation: LazySubmission class}
+\label{sec:lazy-submission-class}
 
 We give the whole picture first, then fill in each method.  The wrapper holds
 the fetched submission together with everything needed to re-fetch it---the
@@ -4439,6 +4582,51 @@ def __setattr__(self, name, value):
     object.__getattribute__(self, '_annotations')[name] = value
     submission = object.__getattribute__(self, '_submission')
     setattr(submission, name, value)
+@
+
+\paragraph{Writes that Canvas answers}
+
+Not every write passes through [[__setattr__]].
+[[submission.edit(...)]], with which [[submissions grade]] sets a grade, is a
+method lookup: [[edit]] is not one of the wrapper's own members, so
+[[__getattribute__]] delegates it, and the bound method merges Canvas's response
+straight into the wrapped submission.
+That is what we want.
+The cached copy learns the new grade without a refetch, and since the merge
+bypasses [[__setattr__]], it records no annotation that could later override a
+fresh payload.
+It also means that whatever [[edit]] leaves behind is what the cache saves
+and---for a final grade, which is never refetched---what every later command
+reads.
+\Cref{SubmissionEditAttachments} makes [[edit]] leave proper [[File]]
+attachments behind.
+Let us verify that grading through the wrapper, as [[submissions grade]] does
+on a cached submission, leaves [[File]] objects for a later
+[[submissions view]] to read.
+<<test functions>>=
+class TestLazySubmissionEditKeepsAttachmentFiles:
+    """Grading a cached submission keeps its File attachments (#503)."""
+
+    def test_graded_cached_submission_keeps_files(self):
+        """After edit through the wrapper, attachments are still Files."""
+        attachment = {"id": 7, "filename": "report.pdf",
+                      "display_name": "report.pdf"}
+        requester = MagicMock()
+        requester.request.return_value.json.return_value = {
+            "id": 3, "assignment_id": 2, "user_id": 1, "grade": "P",
+            "attachments": [dict(attachment)]}
+        submission = Submission(requester, {
+            "id": 3, "assignment_id": 2, "user_id": 1, "course_id": 4,
+            "grade": None, "attachments": [dict(attachment)]})
+        refetch = MagicMock()
+        lazy = LazySubmission(submission, MagicMock(), set(), refetch)
+
+        lazy.edit(submission={"posted_grade": "P"})
+
+        [cached] = lazy.attachments
+        assert isinstance(cached, File)
+        assert cached.filename == "report.pdf"
+        refetch.assert_not_called()
 @
 
 \paragraph{Serving [[assignment]] from [[_assignment]] when nobody set it}
