@@ -2221,9 +2221,10 @@ else:
   if json_format:
     attachments = {}
   for attachment in submission_attachments:
+    filename = attachment.filename
     <<let [[tmpdir]] be a fresh temporary directory>>
     <<let [[contents]] be the converted [[attachment]]>>
-    formatted_attachment = format_section(attachment.filename, contents,
+    formatted_attachment = format_section(filename, contents,
                                           json_format=json_format,
                                           md_title_level=md_title_level+"#")
 
@@ -2487,9 +2488,68 @@ missing, so we name the error and also warn on standard error.
 try:
   contents = convert_to_md(attachment, tmpdir)
 except Exception as err:
-  canvaslms.cli.warn(
-    f"could not convert attachment {attachment.filename}: {err}")
+  canvaslms.cli.warn(f"could not convert attachment {filename}: {err}")
   contents = f"[Could not convert attachment: {err}]"
+@
+
+The handler itself must not fail, or it buries the error it exists to report.
+It used to name the file by reading [[attachment.filename]] inside the
+[[except]] clause.
+When that read was the very thing that had failed---as with the dictionaries a
+graded, cached submission once held instead of [[File]] objects
+(\cref{SubmissionEditAttachments}, issue~\#503)---the handler raised the same
+[[AttributeError]] again, so the traceback ended on the handler's error
+instead of the one that actually stopped the conversion.
+So the loop above reads the name once, before converting, into [[filename]],
+which the handler and the section title then share.
+An attachment without a name fails right there, once, with its own error---the
+propagation that [[TestAttachmentErrorsAreNotSwallowed]] demands of a broken
+object---and the handler only ever sees conversion errors, naming the file by
+a value already in hand.
+A [[getattr]] fallback in the handler would have been the obvious alternative,
+but it only moves the problem: the section title needs the name too, so the
+loop would warn about an unnamed file and then crash on the same read anyway,
+unless we invented a title for a file we cannot identify.
+
+Let us verify that a nameless attachment now raises a single error of its own.
+The stand-in converter fails the way [[convert_to_md]] did on a dictionary, by
+reading [[filename]]; before the fix the error that escaped was the handler's,
+carrying the original as its [[__context__]].
+<<test functions>>=
+class TestConversionHandlerDoesNotRaiseAgain:
+    """A nameless attachment fails once, not again in the handler (#503)."""
+
+    def make_submission(self):
+        """Build a submission whose one attachment is a bare dictionary."""
+        submission = Mock()
+        submission.ensure_attrs.return_value = submission
+        submission.id = 1
+        submission.user_id = 2
+        submission.grader_id = None
+        submission.grade = "P"
+        submission.submitted_at = None
+        submission.graded_at = None
+        submission.body = None
+        submission.submission_data = None
+        submission.rubric_assessment = None
+        submission.submission_comments = None
+        submission.attachments = [{"id": 7, "filename": "report.pdf"}]
+        submission.preview_url = None
+        submission.assignment.name = "A1"
+        submission.assignment.course.course_code = "C1"
+        return submission
+
+    def test_nameless_attachment_raises_its_own_error(self, monkeypatch,
+                                                      tmp_path):
+        """The escaping error is the original one, not a second one."""
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: str(tmpdir / attachment.filename))
+
+        with pytest.raises(AttributeError, match="filename") as excinfo:
+            format_submission(self.make_submission(), tmpdir=tmp_path)
+
+        assert excinfo.value.__context__ is None
 @
 
 Let's verify that a failing attachment costs us only itself.
