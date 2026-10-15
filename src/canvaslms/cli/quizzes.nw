@@ -13793,10 +13793,18 @@ group entry at its \emph{first} member's slot; any later members---adjacent
 in every quiz we have seen, but nothing forces them to be---are folded into
 that same entry.
 
-If fetching a group fails, we still emit the group entry with only its
-[[id]]: flattening the pool into ordinary questions would silently change
-what students see, whereas an entry without [[pick_count]] fails loudly on
-re-import.
+Fetching a group can fail, and we let the [[CanvasException]] propagate,
+for the same reason as when reading the questions fails.  The alternatives
+both lose information silently.  Flattening the pool into ordinary questions
+would show every student the whole pool instead of a random draw.  Emitting
+the entry with only its [[id]] is no better, although one might expect it to
+fail on re-import: [[clean_classic_quiz_for_import]] keeps only the attributes
+that are present, so [[add_classic_question_group]] would create the group
+from an empty specification, without the [[pick_count]] and
+[[question_points]] that define the draw, and Canvas would supply its own
+defaults.  The group would import without a complaint, but with different
+draw rules.  The export therefore fails, and its callers report the quiz
+that could not be exported (\cref{sec:export-or-exit}).
 
 <<functions>>=
 def group_classic_questions(quiz, items):
@@ -13834,16 +13842,16 @@ entry.
 
 <<functions>>=
 def fetch_question_group_info(quiz, group_id):
-  """Fetches a question group's defining attributes, keeping its id."""
-  group_info = {'id': group_id}
-  try:
-    group = quiz.get_quiz_group(group_id)
-    group_info['name'] = getattr(group, 'name', None)
-    group_info['pick_count'] = getattr(group, 'pick_count', None)
-    group_info['question_points'] = getattr(group, 'question_points', None)
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to fetch question group {group_id}: {e}")
-  return group_info
+  """Fetches a question group's defining attributes.
+
+  Raises:
+    CanvasException: if Canvas could not be asked for the group.
+  """
+  group = quiz.get_quiz_group(group_id)
+  return {'id': group_id,
+          'name': getattr(group, 'name', None),
+          'pick_count': getattr(group, 'pick_count', None),
+          'question_points': getattr(group, 'question_points', None)}
 @
 
 Within a pool we do sort by [[position]] when Canvas provides one (the
@@ -13907,26 +13915,35 @@ def test_group_classic_questions_folds_nonadjacent():
       assert 'quiz_group_id' not in question
 @
 
-When the group cannot be fetched, the entry must keep the pool grouped
-(with only the group [[id]]) rather than silently flattening it into
-ordinary questions.
+When the group cannot be fetched, the exception must reach the caller
+rather than yield an entry lacking the draw rules.  We check it both at the
+folding step and through the export, which is what the commands call.
 
 <<test functions>>=
 def test_group_classic_questions_fetch_failure():
+  from canvasapi.exceptions import CanvasException, Unauthorized
+
   quiz = MagicMock()
-  quiz.get_quiz_group.side_effect = Exception("API error")
+  quiz.get_quiz_group.side_effect = Unauthorized("Invalid access token")
 
   items = [
     {'id': 1, 'position': 1, 'quiz_group_id': None, 'question_name': 'Q1'},
     {'id': 2, 'position': 1, 'quiz_group_id': 9, 'question_name': 'Pooled'},
   ]
 
-  entries = quizzes.group_classic_questions(quiz, items)
+  with pytest.raises(CanvasException):
+    quizzes.group_classic_questions(quiz, items)
 
-  assert len(entries) == 2
-  assert entries[0]['question_name'] == 'Q1'
-  assert entries[1]['group'] == {'id': 9}
-  assert [q['question_name'] for q in entries[1]['questions']] == ['Pooled']
+def test_export_classic_questions_group_failure_raises():
+  from canvasapi.exceptions import CanvasException, Unauthorized
+
+  question = MagicMock(id=2, quiz_group_id=9, position=None)
+  quiz = MagicMock()
+  quiz.get_questions.return_value = [question]
+  quiz.get_quiz_group.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(CanvasException):
+    quizzes.export_classic_questions(quiz)
 @
 
 Apart from the folding, let's verify that a Classic export, like a New
