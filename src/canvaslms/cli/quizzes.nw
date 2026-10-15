@@ -10185,6 +10185,9 @@ def test_list_new_quiz_items_propagates_api_errors():
 
 For Classic Quizzes, we use the [[get_questions()]] method from the canvasapi
 library and normalize the response to match the same format as New Quiz items.
+As for New Quizzes, a failed request is not caught here: it propagates as a
+[[CanvasException]] to the caller, which alone can tell the user
+(\cref{sec:list-quiz-items-or-exit}).
 
 <<functions>>=
 def list_classic_questions(quiz):
@@ -10195,22 +10198,35 @@ def list_classic_questions(quiz):
 
   Returns:
     List of question dictionaries with normalized fields
+
+  Raises:
+    CanvasException: if Canvas could not be asked for the questions.
   """
-  try:
-    questions = quiz.get_questions()
-    items = []
-    for q in questions:
-      items.append({
-        'position': getattr(q, 'position', None),
-        'id': q.id,
-        'type': getattr(q, 'question_type', 'unknown'),
-        'title': getattr(q, 'question_name', ''),
-        'points': getattr(q, 'points_possible', None)
-      })
-    return items
-  except Exception as e:
-    canvaslms.cli.warn(f"Failed to list Classic Quiz questions: {e}")
-    return []
+  items = []
+  for q in quiz.get_questions():
+    items.append({
+      'position': getattr(q, 'position', None),
+      'id': q.id,
+      'type': getattr(q, 'question_type', 'unknown'),
+      'title': getattr(q, 'question_name', ''),
+      'points': getattr(q, 'points_possible', None)
+    })
+  return items
+@
+
+Let's verify that a failing request reaches the caller instead of turning
+into an empty quiz.
+The question list is fetched lazily, so the error may surface while we
+iterate, and the test makes [[get_questions]] itself fail.
+<<test functions>>=
+def test_list_classic_questions_propagates_api_errors():
+  from canvasapi.exceptions import Unauthorized
+
+  quiz = MagicMock()
+  quiz.get_questions.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(Unauthorized):
+    quizzes.list_classic_questions(quiz)
 @
 
 
@@ -10227,9 +10243,8 @@ We catch [[CanvasException]], the base class of every error [[canvasapi]]
 raises for a failed request, so that the user sees Canvas's own
 explanation (an expired token, a missing quiz) instead of a traceback.
 
-The Classic Quiz path is unchanged: [[list_classic_questions]] still warns
-and returns an empty list on failure, so this function can only report the
-errors of New Quizzes.
+Both listing functions let the exception through, so this one function
+reports the failure for either quiz type.
 <<functions>>=
 def list_quiz_items_or_exit(quiz, requester):
   """Lists the items of `quiz`, a New Quiz or a Classic Quiz.
@@ -10237,9 +10252,9 @@ def list_quiz_items_or_exit(quiz, requester):
   Exits with an error message if Canvas could not be asked for the items,
   so that an empty result always means that the quiz has no items.
   """
-  if not is_new_quiz(quiz):
-    return list_classic_questions(quiz)
   try:
+    if not is_new_quiz(quiz):
+      return list_classic_questions(quiz)
     return list_new_quiz_items(quiz.course, quiz.id, requester)
   except canvasapi.exceptions.CanvasException as e:
     quiz_name = quiz.title or quiz.id
@@ -10282,6 +10297,19 @@ def test_items_list_reports_api_errors(monkeypatch, capsys, caplog):
   assert exit_info.value.code == 1
   assert "Invalid access token" in caplog.text
   assert "No questions found" not in capsys.readouterr().out
+
+def test_list_quiz_items_or_exit_reports_classic_errors(caplog):
+  from canvasapi.exceptions import Unauthorized
+
+  quiz = MagicMock()
+  quiz.title = 'Midterm'
+  quiz.get_questions.side_effect = Unauthorized("Invalid access token")
+
+  with pytest.raises(SystemExit) as exit_info:
+    quizzes.list_quiz_items_or_exit(quiz, MagicMock())
+
+  assert exit_info.value.code == 1
+  assert "Invalid access token" in caplog.text
 @
 
 
