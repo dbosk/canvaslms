@@ -12218,10 +12218,24 @@ see and edit: [[quizzes export]] writes them, with or without [[-I]],
 users two schemas for the same field.  So we keep the exported names as the
 one schema and translate where questions are handed to Canvas, which covers
 every path that creates questions.
+
+Editing a question hands it to Canvas too, and Canvas's update reads the
+answer fields under the same names as its create
+(\cref{sec:update-classic-question}).  But an edit need not repeat the
+question's type: the user may send only the [[answers]].  So the type can
+also be passed as [[question_type]], and a question without [[answers]] is
+returned as it is, so that a translation never adds an empty answer list
+that the user did not send.
 <<functions>>=
-def classic_question_for_create(question):
-  """Returns `question` with numerical answers named as Canvas reads them"""
-  if question.get('question_type') != 'numerical_question':
+def classic_question_for_create(question, question_type=None):
+  """Returns `question` with numerical answers named as Canvas reads them
+
+  The question type is read from `question` unless `question_type` is
+  given, which an edit needs when it leaves out the type.
+  """
+  if question_type is None:
+    question_type = question.get('question_type')
+  if question_type != 'numerical_question' or 'answers' not in question:
     return question
   return {**question,
           'answers': [{CLASSIC_NUMERICAL_ANSWER_FIELDS.get(key, key): value
@@ -12382,9 +12396,21 @@ def update_new_quiz_item(course, assignment_id, item_id, requester, update_data)
 
 
 \subsection{Updating a Classic Quiz question}
+\label{sec:update-classic-question}
 
 Classic Quizzes use the canvasapi library's [[edit()]] method, which handles
 the API call internally.
+
+The question we send must be translated like one we create: Canvas reads the
+value fields of numerical answers under other names than it exports them
+(\cref{sec:classic-numerical-answers}).  Without the translation, editing a
+numerical question from its exported JSON stores 0 as its only correct
+answer.  We confirmed this in the sandbox course on 2026-10-14 for all three
+kinds of numerical answer, both with the full exported question and with a
+file holding only the [[answers]].  The second case is why the type comes
+from the stored question when the file leaves it out.  A
+[[question_type]] in the file still takes precedence, since it is the type
+that the question will have after the edit.
 
 <<functions>>=
 def update_classic_question(quiz, question_id, update_data):
@@ -12400,11 +12426,61 @@ def update_classic_question(quiz, question_id, update_data):
   """
   try:
     question = quiz.get_question(question_id)
-    question.edit(question=update_data)
+    question_type = update_data.get('question_type', question.question_type)
+    question.edit(question=classic_question_for_create(update_data,
+                                                       question_type))
     return True
   except Exception as e:
     canvaslms.cli.warn(f"Failed to update Classic Quiz question: {e}")
     return False
+@
+
+Let us verify that an edit sends the names Canvas reads, both when the file
+holds the full exported question and when it holds only the answers of a
+question whose type Canvas has stored.
+
+<<test functions>>=
+@pytest.mark.parametrize('update_data', [
+  {'question_name': 'E', 'question_type': 'numerical_question',
+   'answers': [{'weight': 100, 'numerical_answer_type': 'exact_answer',
+                'exact': 2.72, 'margin': 0.01}]},
+  {'answers': [{'weight': 100, 'numerical_answer_type': 'exact_answer',
+                'exact': 2.72, 'margin': 0.01}]},
+], ids=['full question', 'answers only'])
+def test_update_classic_question_renames_numerical_answer_fields(
+    update_data):
+  quiz = MagicMock()
+  question = quiz.get_question.return_value
+  question.question_type = 'numerical_question'
+
+  assert quizzes.update_classic_question(quiz, 1, update_data)
+
+  sent = question.edit.call_args.kwargs['question']
+  assert sent['answers'] == [
+    {'weight': 100, 'numerical_answer_type': 'exact_answer',
+     'answer_exact': 2.72, 'answer_error_margin': 0.01}]
+  assert sent.keys() == update_data.keys()
+@
+
+The other kinds of numerical answer share this translation with
+[[add_classic_questions]], whose test covers them.  What must not happen is
+a translation of a question that will not be numerical after the edit, or
+the addition of answers to an edit that leaves them out.  The edit that turns
+the question into a short-answer question carries an [[exact]] key only so
+that a translation applied by mistake would show.
+
+<<test functions>>=
+def test_update_classic_question_leaves_other_edits_unchanged():
+  quiz = MagicMock()
+  question = quiz.get_question.return_value
+  question.question_type = 'numerical_question'
+
+  to_text = {'question_type': 'short_answer_question',
+             'answers': [{'text': 'exact', 'weight': 100, 'exact': 1}]}
+  rename_only = {'question_name': 'Renamed'}
+  for update_data in [to_text, rename_only]:
+    assert quizzes.update_classic_question(quiz, 1, update_data)
+    assert question.edit.call_args.kwargs['question'] == update_data
 @
 
 
