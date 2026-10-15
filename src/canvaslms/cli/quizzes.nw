@@ -5403,11 +5403,40 @@ def replace_quiz_items(quiz, items, requester):
 @
 
 \paragraph{Deleting New Quiz items.}
-We first fetch all existing items, then delete each one.
+We first list all existing items, then delete each one.
+The order matters, and so does the completeness of the list
+(\cref{sec:list-new-quiz-items}).
+Canvas returns a long list one page at a time, so a deletion that read only
+the first response would delete the items on that page and then report
+success.
+Nothing would signal the failure: the replacement items are added after the
+old ones, and the quiz ends up holding a mixture of both.
+With the default page of 50 items, replacing a 60-item quiz by two items
+leaves the last ten old items in the quiz alongside the two new ones.
+We therefore use [[get_new_quizzes_list]], which follows every page.
+
+We also read the \emph{whole} list before deleting the first item, and never
+page and delete in alternation.
+Deleting an item shifts the later ones towards the front, so a next-page
+link followed after a few deletions would skip items.
+
+If Canvas refuses a request, we stop and return [[False]] with a warning that
+names the cause, which [[replace_quiz_items]] turns into a failed
+replacement before it creates anything.
+The deletions are not transactional, though: a failure after the first
+deletion leaves the quiz partly emptied.
+[[quizzes edit --replace-items]] writes no backup of its own, so to be able to
+restore the quiz, run [[quizzes export -I]] on it first and keep the file; it
+can be fed back to [[quizzes edit --replace-items]].
+Listing before deleting at least means that a failure to \emph{list} deletes
+nothing.
 
 <<functions>>=
 def delete_all_new_quiz_items(quiz, requester):
   """Delete all items from a New Quiz
+
+  Lists every page of items before deleting any of them.  A failure
+  partway through leaves the quiz partly deleted.
 
   Args:
     quiz: Quiz object
@@ -5417,33 +5446,58 @@ def delete_all_new_quiz_items(quiz, requester):
     True on success, False on failure
   """
   try:
-    # Fetch existing items
     endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}/items"
-    response = requester.request(
-      method='GET',
-      endpoint=endpoint,
-      _url="new_quizzes"
-    )
-    items = response.json()
+    items = get_new_quizzes_list(requester, endpoint)
 
-    if not items:
-      return True  # Nothing to delete
-
-    # Delete each item
     for item in items:
       item_id = item.get('id')
       if item_id:
-        delete_endpoint = f"courses/{quiz.course.id}/quizzes/{quiz.id}/items/{item_id}"
         requester.request(
           method='DELETE',
-          endpoint=delete_endpoint,
+          endpoint=f"{endpoint}/{item_id}",
           _url="new_quizzes"
         )
 
     return True
-  except Exception as e:
+  except CanvasException as e:
     canvaslms.cli.warn(f"Failed to delete New Quiz items: {e}")
     return False
+@
+
+Let's verify that every item of a two-page quiz is deleted, and that when
+the listing fails, nothing is deleted.
+<<test functions>>=
+def test_delete_all_new_quiz_items_deletes_every_page():
+  next_url = "https://canvas.example/api/quiz/v1/items?page=2"
+  quiz = MagicMock()
+  quiz.course.id = 7
+  quiz.id = 9
+  requester = MagicMock()
+  requester.request.side_effect = [
+    new_quizzes_page([{'id': 1}, {'id': 2}], next_url),
+    new_quizzes_page([{'id': 3}]),
+    MagicMock(), MagicMock(), MagicMock(),
+  ]
+
+  assert quizzes.delete_all_new_quiz_items(quiz, requester)
+
+  deleted = [call.kwargs['endpoint']
+             for call in requester.request.call_args_list
+             if call.kwargs.get('method') == 'DELETE']
+  assert deleted == [f"courses/7/quizzes/9/items/{i}" for i in (1, 2, 3)]
+
+def test_delete_all_new_quiz_items_listing_error_deletes_nothing():
+  quiz = MagicMock()
+  quiz.course.id = 7
+  quiz.id = 9
+  requester = MagicMock()
+  requester.request.side_effect = quizzes.CanvasException("boom")
+
+  assert not quizzes.delete_all_new_quiz_items(quiz, requester)
+
+  methods = [call.kwargs.get('method')
+             for call in requester.request.call_args_list]
+  assert 'DELETE' not in methods
 @
 
 \paragraph{Deleting Classic Quiz questions.}
