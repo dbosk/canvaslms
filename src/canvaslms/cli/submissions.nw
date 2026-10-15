@@ -87,6 +87,7 @@ from unittest.mock import Mock
 
 from canvaslms.cli.submissions import (
     convert_to_md,
+    extract_submission_text,
     filter_view_submissions,
     format_rubric,
     format_submission,
@@ -2188,7 +2189,7 @@ else:
         md_title_level=md_title_level)
 @
 
-\subsection{Attachments}
+\subsection{Attachments}\label{SubmissionAttachments}
 
 For the attachment, we want to add it to the output.
 In the case of Python code we want to have it as a Markdown code block.
@@ -3433,20 +3434,30 @@ except AttributeError:
   pass
 @
 
-File attachments require special handling to convert various formats to text.
+File attachments must be converted to text before they can be compared.
+A submission without files may lack the [[attachments]] attribute entirely,
+which is the only thing the [[except AttributeError]] is for.
+So it guards the lookup and nothing else, exactly as in the attachment block
+of [[format_submission]] (\cref{SubmissionAttachments}).
+It used to wrap the whole block, conversion loop included, and then any
+[[AttributeError]] in the loop---such as a file whose name cannot be
+read---silently removed \emph{all} the version's files from the comparison:
+the diff then reported them as deleted, or the version as unchanged, instead
+of failing.
 <<extract attachment text>>=
 try:
-  if submission.attachments:
-    tmpdir = pathlib.Path(tmpdir)
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    attachment_texts = {}
-    
-    <<process each attachment>>
-    
-    if attachment_texts:
-      content['attachments'] = attachment_texts
+  submission_attachments = submission.attachments
 except AttributeError:
-  pass
+  submission_attachments = None
+if submission_attachments:
+  tmpdir = pathlib.Path(tmpdir)
+  tmpdir.mkdir(parents=True, exist_ok=True)
+  attachment_texts = {}
+
+  <<process each attachment>>
+
+  if attachment_texts:
+    content['attachments'] = attachment_texts
 @
 
 Each attachment is processed to extract its text content, with error handling
@@ -3457,19 +3468,95 @@ However, for diff comparison, we want the raw content without these markers,
 since the diff itself will be wrapped in a code block later.
 Removing the markers prevents nested code blocks and ensures clean line-by-line
 comparison.
+
+The file name is the key of the result, and the handler needs it too, so we
+read it once, before converting, as [[format_submission]] does.
+The handler then only ever sees conversion errors, which cost one file a
+placeholder text.
+An attachment whose name cannot be read fails at that read, with its own
+error: the handler used to read the name a second time and raise again,
+hiding the original error (issue~\#524).
 <<process each attachment>>=
-for attachment in submission.attachments:
+for attachment in submission_attachments:
+  filename = attachment.filename
   try:
     attachment_content = convert_to_md(attachment, tmpdir)
-    # Remove markdown code block markers for cleaner diff
     lines = attachment_content.split('\n')
     if len(lines) > 2  and lines[0].startswith('```') \
                        and lines[-1].endswith('```'):
       attachment_content = '\n'.join(lines[1:-1])
-    attachment_texts[attachment.filename] = attachment_content
+    attachment_texts[filename] = attachment_content
   except Exception:
-    attachment_texts[attachment.filename] = \
-                                    "[Could not convert attachment to text]"
+    attachment_texts[filename] = "[Could not convert attachment to text]"
+@
+
+Let us verify the three cases.
+A file whose name cannot be read raises its own error, once.
+A file that cannot be converted costs only itself.
+A submission without the [[attachments]] attribute is still compared on its
+other content.
+<<test functions>>=
+class TestDiffAttachmentErrorsAreNotSwallowed:
+    """The diff text extraction reports broken attachments (#524)."""
+
+    def make_submission(self, attachments):
+        """Build a submission with no body or quiz answers."""
+        submission = Mock()
+        submission.body = None
+        submission.submission_data = None
+        submission.attachments = attachments
+        return submission
+
+    def test_broken_attachment_raises_its_own_error(self, monkeypatch,
+                                                    tmp_path):
+        """A nameless file fails once, not again in the handler."""
+        monkeypatch.setattr(
+            "canvaslms.cli.submissions.convert_to_md",
+            lambda attachment, tmpdir: "contents")
+
+        class BrokenAttachment:
+            """An attachment whose file name cannot be read."""
+
+            @property
+            def filename(self):
+                raise AttributeError("filename")
+
+        submission = self.make_submission([BrokenAttachment()])
+
+        with pytest.raises(AttributeError, match="filename") as excinfo:
+            extract_submission_text(submission, tmp_path)
+
+        assert excinfo.value.__context__ is None
+
+    def test_failed_conversion_costs_one_file(self, monkeypatch, tmp_path):
+        """An unconvertible file gets a placeholder; the others remain."""
+        def convert(attachment, tmpdir):
+            if attachment.filename == "broken.pdf":
+                raise RuntimeError("pandoc failed")
+            return "print(1)"
+
+        monkeypatch.setattr("canvaslms.cli.submissions.convert_to_md",
+                            convert)
+        broken, fine = Mock(), Mock()
+        broken.filename = "broken.pdf"
+        fine.filename = "fine.py"
+
+        content = extract_submission_text(
+            self.make_submission([broken, fine]), tmp_path)
+
+        assert content == {"attachments": {
+            "broken.pdf": "[Could not convert attachment to text]",
+            "fine.py": "print(1)"}}
+
+    def test_missing_attachments_attribute_is_tolerated(self, tmp_path):
+        """A submission without the attribute keeps its other content."""
+        submission = self.make_submission([])
+        submission.body = "my answer"
+        del submission.attachments
+
+        content = extract_submission_text(submission, tmp_path)
+
+        assert content == {"body": "my answer"}
 @
 
 \subsection{Generating unified diffs}
