@@ -772,33 +772,55 @@ the [[assignment_group_id]] Canvas gives us.
 
 Unlike [[modules]], where a regex may legitimately place an item in several
 modules, an assignment is in exactly one group.
-A spec that matches no group, or several, is an error, and we report it
-before anything is written.
-We keep [[match_item_by_regex]]'s exceptions for that, but re-raise them as
-[[ValueError]]: the callers already turn [[ValueError]] into a message for an
-unparseable date, and an [[EmptyListError]] escaping into the file-edit code
-would be mistaken for \enquote{no assignment matches} and trigger
-[[--create]].
-A YAML file may give an ID as a number, so the spec is turned into a string
-before it is compiled.
+A spec that matches no group, or several, is therefore an error, reported
+before anything is written---with one exception.
+Group names need not be unique, and courses built by importing others often
+have two groups called \enquote{Assignments}.
+The exported spec [[^Assignments$]] then matches both, and refusing it would
+make every unchanged round trip of such an item fail, the interactive editor
+included, since it shows the spec too.
+So the caller may say which group the item is in now: when the spec matches
+several groups and the current one is among them, the item stays where it
+is, which is all an unchanged file can mean.
+A new item has no current group, so for it the ambiguity remains an error.
+
+We raise [[ValueError]] for every failure, not the [[EmptyListError]] and
+[[MultipleMatchesError]] that [[match_item_by_regex]] raises for items: the
+callers already turn [[ValueError]] into a message for an unparseable date,
+and an [[EmptyListError]] escaping into the file-edit code would be mistaken
+for \enquote{no assignment matches} and trigger [[--create]].
+A YAML file may give an ID as a bare number; we anchor it, because the regex
+[[3]] would also match group 13.
 <<functions>>=
-def resolve_assignment_group(course, spec):
+def resolve_assignment_group(course, spec, current=None):
   """Return the ID of the one assignment group of `course` matching `spec`.
 
-  `spec` is a regex (or an ID) matched against group names and IDs.
+  `spec` is a regex matched against group names and IDs, or an integer
+  ID. `current` is the ID of the item's present group, if any; it is kept
+  when `spec` matches several groups including it.
   Raises ValueError when no group or several groups match, or when the
   regex is invalid.
   """
-  groups = [canvaslms.cli.utils.ensure_assignment_group_attrs(group)
-            for group in course.get_assignment_groups()]
+  if isinstance(spec, int):
+    spec = f"^{spec}$"
   try:
-    group = canvaslms.cli.content.match_item_by_regex(
-        groups, str(spec), [lambda g: g.name or '', lambda g: str(g.id)],
-        item_type="assignment group", name_func=lambda g: g.name or '')
-  except (canvaslms.cli.EmptyListError,
-          canvaslms.cli.MultipleMatchesError, re.error) as e:
-    raise ValueError(f"assignment_group: {e}")
-  return group.id
+    pattern = re.compile(str(spec))
+  except re.error as e:
+    raise ValueError(f"assignment_group: invalid regex '{spec}': {e}")
+  matches = [group for group in course.get_assignment_groups()
+             if pattern.search(group.name or '')
+             or pattern.search(str(group.id))]
+  for group in matches:
+    if current is not None and str(group.id) == str(current):
+      return group.id
+  if len(matches) == 1:
+    return matches[0].id
+  if not matches:
+    raise ValueError(f"assignment_group: no assignment group matches "
+                     f"'{spec}'")
+  names = ", ".join(f"'{group.name}'" for group in matches)
+  raise ValueError(f"assignment_group: '{spec}' matches {len(matches)} "
+                   f"assignment groups ({names}); make it more specific")
 @
 
 The export goes the other way: from the [[assignment_group_id]] of an
@@ -819,7 +841,7 @@ def assignment_group_spec(course, group_id):
     return None
   for group in course.get_assignment_groups():
     if str(group.id) == str(group_id):
-      return '^' + re.escape(group.name) + '$'
+      return '^' + re.escape(group.name or '') + '$'
   return None
 @
 
@@ -847,13 +869,24 @@ class TestAssignmentGroupSpec:
 
   def test_no_match_is_an_error(self):
     course = course_with_groups((31, "Labs"))
-    with pytest.raises(ValueError, match="No assignment groups match"):
+    with pytest.raises(ValueError, match="no assignment group matches"):
       resolve_assignment_group(course, "^Exams$")
 
   def test_several_matches_are_an_error(self):
     course = course_with_groups((31, "Labs 1"), (32, "Labs 2"))
     with pytest.raises(ValueError, match="matches 2 assignment groups"):
       resolve_assignment_group(course, "^Labs")
+
+  def test_numeric_id_is_matched_exactly(self):
+    course = course_with_groups((3, "Labs"), (13, "Surveys"))
+    assert resolve_assignment_group(course, 3) == 3
+
+  def test_duplicate_names_keep_the_current_group(self):
+    course = course_with_groups((31, "Assignments"), (32, "Assignments"))
+    spec = assignment_group_spec(course, 32)
+    assert resolve_assignment_group(course, spec, current="32") == 32
+    with pytest.raises(ValueError, match="matches 2 assignment groups"):
+      resolve_assignment_group(course, spec)
 
   def test_exported_spec_resolves_back_to_the_same_group(self):
     course = course_with_groups((31, "Labs (INL1)"), (32, "Labs (INL1) extra"))
@@ -2015,8 +2048,9 @@ anyway.
 is present.
 An [[assignment_group]] spec (\cref{sec:assignment-group-spec}) is resolved
 against the course to the [[assignment_group_id]] Canvas expects, which is
-why the function takes the course; an empty spec leaves the group alone,
-since an assignment cannot be in no group.
+why the function takes the course, and the assignment's present group for
+the ambiguous case; an empty spec, [[null]] or [['']], leaves the group
+alone, since an assignment cannot be in no group.
 A spec that names no group, or several, raises [[ValueError]], as an
 unparseable date does, and each caller turns that into a message before it
 writes anything.
@@ -2036,14 +2070,15 @@ happened to parse.
 ASSIGNMENT_DATE_ATTRIBUTES = ('due_at', 'unlock_at', 'lock_at')
 <<functions>>=
 def assignment_attributes_to_params(attributes, course=None,
-                                    creating=False):
+                                    creating=False, current_group=None):
   """Return the optional `assignment` API fields that `attributes` set.
 
   An absent attribute is left out, so Canvas keeps its value. A date
   that is present but null or empty is sent as '', which clears it in
   Canvas; with `creating` it is left out instead, since a new
   assignment has no date to clear. An `assignment_group` spec is
-  resolved against `course` to an `assignment_group_id`.
+  resolved against `course` to an `assignment_group_id`; `current_group`
+  is the assignment's present group, kept when the spec is ambiguous.
   Raises ValueError for a date or group spec Canvas cannot be given.
   """
   params = {}
@@ -2060,9 +2095,9 @@ def assignment_attributes_to_params(attributes, course=None,
     params['points_possible'] = attributes['points_possible']
   if 'published' in attributes:
     params['published'] = attributes['published']
-  if attributes.get('assignment_group') is not None:
+  if attributes.get('assignment_group') not in (None, ''):
     params['assignment_group_id'] = resolve_assignment_group(
-        course, attributes['assignment_group'])
+        course, attributes['assignment_group'], current_group)
   return params
 @
 
@@ -2070,8 +2105,9 @@ The update path merges these fields into the parameters it has already
 built from the name and the description.
 <<add optional assignment attributes to update>>=
 try:
-  update_data['assignment'].update(
-      assignment_attributes_to_params(attributes, assignment.course))
+  update_data['assignment'].update(assignment_attributes_to_params(
+      attributes, assignment.course,
+      current_group=getattr(assignment, 'assignment_group_id', None)))
 except ValueError as e:
   canvaslms.cli.err(1, f"Cannot update assignment '{assignment.name}': {e}")
 @
@@ -2360,8 +2396,9 @@ update_data = {
   }
 }
 try:
-  update_data['assignment'].update(
-      assignment_attributes_to_params(final_attrs, assignment.course))
+  update_data['assignment'].update(assignment_attributes_to_params(
+      final_attrs, assignment.course,
+      current_group=getattr(assignment, 'assignment_group_id', None)))
 except ValueError as e:
   print(f"Cannot update assignment '{assignment.name}': {e}",
         file=sys.stderr)
