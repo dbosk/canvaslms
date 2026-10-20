@@ -48,6 +48,7 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -77,6 +78,7 @@ the helpers they verify.
 
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
+import argparse
 import requests
 from unittest.mock import MagicMock, Mock, patch
 
@@ -1728,25 +1730,17 @@ except Exception as e:
 
 When [[--create]] is specified and the assignment doesn't exist, we create a
 new one. We use the Canvas API's [[create_assignment]] method.
+The optional attributes come from [[assignment_attributes_to_params]]
+(\cref{sec:assignment-attributes-to-params}), told that it is creating, so
+that an empty date is left out rather than sent as a removal.
 <<create new assignment>>=
 create_params = {
   'name': attributes.get('name', 'Untitled Assignment'),
   'description': canvaslms.cli.content.resolve_body_for(
       html_content, course, args),
 }
-if 'due_at' in attributes and attributes['due_at'] is not None:
-  create_params['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
-if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
-  create_params['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
-if 'lock_at' in attributes and attributes['lock_at'] is not None:
-  create_params['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
-if 'points_possible' in attributes and attributes['points_possible'] is not None:
-  create_params['points_possible'] = attributes['points_possible']
-if 'published' in attributes:
-  create_params['published'] = attributes['published']
+create_params.update(
+    assignment_attributes_to_params(attributes, creating=True))
 
 try:
   new_assignment = course.create_assignment(assignment=create_params)
@@ -1828,9 +1822,58 @@ except canvaslms.cli.EmptyListError:
       f"Use --create to create a new assignment.")
 @
 
-We add optional attributes only if they are present in the YAML front matter.
-This allows users to update just the description without changing dates, or to
-update dates along with content.
+\subsubsection{From front matter to assignment parameters}
+\label{sec:assignment-attributes-to-params}
+
+Three paths write front matter to Canvas: updating an existing assignment
+from a file, creating one with [[--create]], and accepting an interactive
+edit.
+They used to carry three copies of the same block of [[if]]s, and a defect
+in that block was therefore three defects.
+They now share one function,
+[[assignment_attributes_to_params]], which turns the optional attributes into
+the fields of the [[assignment]] parameter; each path adds only the
+[[name]] and [[description]], which it derives in its own way.
+
+The function distinguishes three states of an attribute in the front matter,
+because the user means three different things by them.
+\begin{description}
+\item[Absent] The file says nothing about the attribute, so we send nothing
+  and Canvas keeps its value.
+  This lets a file update the description alone.
+\item[Present with a value] We send the value, converted for Canvas.
+\item[Present but empty] For a date, [[due_at: null]] (which is also how
+  [[assignments view]] exports an assignment without that date) or
+  [[due_at: '']] asks for the date to be removed.
+\end{description}
+The third state is where the old block failed (issue~\#527): it tested
+[[is not None]] and so treated an emptied date like an absent one.
+A snapshot restored from a file therefore kept whatever date the assignment
+had acquired since, the command still reported success, and a due date moved
+before a stale [[unlock_at]] could not be fixed from the file at all, since
+Canvas refuses a due date outside the availability window.
+
+We send a removal as the empty string, the wire encoding of \enquote{no
+date} that \cref{clearing-a-date} explains: a [[None]] would be dropped by
+[[requests]] before it reached Canvas.
+Reading an empty date as a removal is safe for the files we produce
+ourselves, because [[assignments view]] and the interactive editor fill in
+every date the assignment has.
+A [[null]] that nobody touched therefore stands for a date that is already
+absent, and removing it again changes nothing.
+
+Creating is the exception.
+A new assignment has no date to remove, so the [[creating]] flag makes the
+function leave empty dates out, which keeps the creation request to what the
+file actually sets.
+
+The other two optional attributes keep their old reading.
+An empty [[points_possible]] is left out, for the reason that empty quiz
+settings are (\cref{sec:quiz-null-attributes}): we know of no Canvas
+spelling that would clear it, and a [[null]] sent as [[None]] would vanish
+anyway.
+[[published]] has no empty state worth the name, so it is sent whenever it
+is present.
 
 Date attributes require special handling: what YAML's [[safe_load]] yields
 depends on how complete the timestamp is.
@@ -1843,20 +1886,113 @@ ending with~``Z''.
 We use [[format_canvas_time]] to perform this conversion; it
 handles all three input types, so users need not know which form YAML
 happened to parse.
+<<constants>>=
+ASSIGNMENT_DATE_ATTRIBUTES = ('due_at', 'unlock_at', 'lock_at')
+<<functions>>=
+def assignment_attributes_to_params(attributes, creating=False):
+  """Return the optional `assignment` API fields that `attributes` set.
+
+  An absent attribute is left out, so Canvas keeps its value. A date
+  that is present but null or empty is sent as '', which clears it in
+  Canvas; with `creating` it is left out instead, since a new
+  assignment has no date to clear.
+  """
+  params = {}
+  for key in ASSIGNMENT_DATE_ATTRIBUTES:
+    if key not in attributes:
+      continue
+    value = attributes[key]
+    if value is None or value == '':
+      if not creating:
+        params[key] = ''
+    else:
+      params[key] = canvaslms.cli.utils.format_canvas_time(value)
+  if attributes.get('points_possible') is not None:
+    params['points_possible'] = attributes['points_possible']
+  if 'published' in attributes:
+    params['published'] = attributes['published']
+  return params
+@
+
+The update path merges these fields into the parameters it has already
+built from the name and the description.
 <<add optional assignment attributes to update>>=
-if 'due_at' in attributes and attributes['due_at'] is not None:
-  update_data['assignment']['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
-if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
-  update_data['assignment']['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
-if 'lock_at' in attributes and attributes['lock_at'] is not None:
-  update_data['assignment']['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
-if 'points_possible' in attributes and attributes['points_possible'] is not None:
-  update_data['assignment']['points_possible'] = attributes['points_possible']
-if 'published' in attributes:
-  update_data['assignment']['published'] = attributes['published']
+update_data['assignment'].update(assignment_attributes_to_params(attributes))
+@
+
+Let's verify the three states of a date, and that creating leaves empty
+dates out:
+<<test functions>>=
+def test_absent_date_is_left_out():
+  assert assignment_attributes_to_params({'name': 'Lab'}) == {}
+
+def test_null_and_empty_dates_clear():
+  params = assignment_attributes_to_params(
+      {'due_at': None, 'unlock_at': ''})
+  assert params == {'due_at': '', 'unlock_at': ''}
+
+def test_present_date_is_converted_for_canvas():
+  import datetime as dt
+  params = assignment_attributes_to_params(
+      {'due_at': dt.datetime(2026, 12, 1, 10, 0, tzinfo=dt.timezone.utc)})
+  assert params == {'due_at': '2026-12-01T10:00:00Z'}
+
+def test_creating_leaves_empty_dates_out():
+  params = assignment_attributes_to_params(
+      {'due_at': None, 'lock_at': '', 'published': False}, creating=True)
+  assert params == {'published': False}
+
+def test_empty_points_possible_is_left_out():
+  assert assignment_attributes_to_params({'points_possible': None}) == {}
+@
+
+The test that matters to a user drives the whole file path: a file is read,
+matched to an assignment and written, and we look at the form fields that
+reach the requester---the last point we own before the request leaves.
+The requester is a [[MagicMock]] because a live write cannot run offline;
+listing the course's assignments is patched to hand over one real
+[[Assignment]], which spares us faking the paginated listing.
+<<test functions>>=
+def edit_assignment_from_file(tmp_path, front_matter):
+  """Run `assignments edit -f` on a file; return the form fields sent."""
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  course = Course(requester, {"id": 1, "course_code": "CODE"})
+  assignment = Assignment(requester, {
+      "id": 7, "course_id": 1, "name": "Lab", "description": "",
+      "due_at": "2026-11-20T22:59:00Z",
+      "unlock_at": "2026-11-09T07:00:00Z",
+      "lock_at": "2026-11-27T22:59:00Z"})
+  assignment.course = course
+  path = tmp_path / "lab.md"
+  path.write_text(f"---\n{front_matter}---\n\nBody\n")
+
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(
+      ["assignments", "edit", "-c", "CODE", "-f", str(path)])
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]), \
+       patch("canvaslms.cli.assignments.list_assignments",
+             return_value=[assignment]):
+    assignments_edit_command({}, MagicMock(), args)
+
+  return dict(requester.request.call_args.kwargs["_kwargs"])
+
+def test_file_with_null_and_empty_dates_clears_them(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\nunlock_at: null\nlock_at: ''\n")
+
+  assert sent["assignment[unlock_at]"] == ""
+  assert sent["assignment[lock_at]"] == ""
+  assert "assignment[due_at]" not in sent
+
+def test_file_date_is_sent_in_canvas_format(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\ndue_at: 2026-12-01T10:00:00Z\n")
+
+  assert sent["assignment[due_at]"] == "2026-12-01T10:00:00Z"
+  assert "assignment[unlock_at]" not in sent
 @
 
 \subsection{Processing module membership}
@@ -2028,7 +2164,11 @@ When the user accepts, we convert the Markdown to HTML and update the assignment
 If the user is working in HTML mode, we skip the conversion since the content
 is already HTML.
 As in the file-based path, a malformed [[modules]] list is reported and the
-assignment skipped before anything is written.
+assignment skipped before anything is written, and the optional attributes
+go through [[assignment_attributes_to_params]]
+(\cref{sec:assignment-attributes-to-params}).
+The editor shows every date the assignment has, so a date the user empties
+is removed and one left untouched is sent back unchanged.
 <<update single assignment from interactive edit>>=
 <<reject invalid module specs before editing assignment>>
 if args.html:
@@ -2043,21 +2183,8 @@ update_data = {
         html_content, assignment.course, args),
   }
 }
-
-# Add optional attributes (format dates for Canvas API)
-if 'due_at' in final_attrs and final_attrs['due_at'] is not None:
-  update_data['assignment']['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['due_at'])
-if 'unlock_at' in final_attrs and final_attrs['unlock_at'] is not None:
-  update_data['assignment']['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['unlock_at'])
-if 'lock_at' in final_attrs and final_attrs['lock_at'] is not None:
-  update_data['assignment']['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['lock_at'])
-if 'points_possible' in final_attrs and final_attrs['points_possible'] is not None:
-  update_data['assignment']['points_possible'] = final_attrs['points_possible']
-if 'published' in final_attrs:
-  update_data['assignment']['published'] = final_attrs['published']
+update_data['assignment'].update(
+    assignment_attributes_to_params(final_attrs))
 
 try:
   assignment.edit(**update_data)
