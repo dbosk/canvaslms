@@ -1089,35 +1089,65 @@ In fifteen KTH courses that listing held no scheme from the account, so we
 cannot tell whether Canvas would list one there.
 A scheme the listing does not show behaves like a deleted assignment group:
 the export writes no spec, and a push leaves the scheme alone.
+
+Unlike the assignment groups, which every caller lists anyway, the schemes
+are a listing of their own, which Canvas may refuse a role or fail to
+deliver.
+The two directions treat that failure as they treat a scheme that is not
+there.
+A write turns it into the [[ValueError]] its callers already report before
+writing anything, rather than letting a [[CanvasException]] end the command
+halfway through a list of files.
+An export warns and writes no spec, so that a view or a quiz export still
+shows the rest of the item; pushing that file back then leaves the scheme
+alone.
 <<functions>>=
+def course_grading_standards(course):
+  """Return the grading standards of `course` as a list.
+
+  Raises ValueError when Canvas does not list them.
+  """
+  try:
+    return list(course.get_grading_standards())
+  except canvasapi.exceptions.CanvasException as e:
+    raise ValueError(f"grading_standard: cannot list the course's grading "
+                     f"standards: {e}")
+
 def resolve_grading_standard(course, spec, current=None):
   """Return the ID of the one grading standard of `course` matching `spec`.
 
   `spec` is a regex matched against the standards' titles and IDs, or an
   integer ID. `current` is the ID of the standard in use now, kept when
   `spec` matches several standards including it.
-  Raises ValueError when no standard or several standards match.
+  Raises ValueError when no standard or several standards match, when the
+  regex is invalid, or when the standards cannot be listed.
   """
-  return resolve_named_item(course.get_grading_standards(), spec,
+  return resolve_named_item(course_grading_standards(course), spec,
                             'grading_standard', 'grading standard', current,
                             name_attr='title')
 
 def grading_standard_spec(course, standard_id):
   """Return an anchored regex naming grading standard `standard_id`.
 
-  Returns None when `standard_id` is None or names no standard of `course`.
+  Returns None when `standard_id` is None or names no standard of `course`,
+  and, after a warning, when the standards cannot be listed.
   """
   if standard_id is None:
     return None
-  return named_item_spec(course.get_grading_standards(), standard_id,
-                         name_attr='title')
+  try:
+    standards = course_grading_standards(course)
+  except ValueError as e:
+    canvaslms.cli.warn(str(e))
+    return None
+  return named_item_spec(standards, standard_id, name_attr='title')
 @
 
 Let's verify both directions on real [[GradingStandard]] objects, through a
 title with the slashes and parentheses that scheme titles tend to have.
 The course is a [[MagicMock]], as for the groups, only to hand them over.
-The last test makes sure that an assignment without a scheme, which is most
-of them, costs no request.
+One test makes sure that an assignment without a scheme, which is most
+of them, costs no request; the last that a refused listing fails a write
+before it starts but only costs an export its spec.
 <<test functions>>=
 def course_with_standards(*standards):
   """A course whose grading standards are `standards`, (id, title) pairs."""
@@ -1162,6 +1192,15 @@ class TestGradingStandardSpec:
     course.get_grading_standards.reset_mock()
     assert grading_standard_spec(course, None) is None
     course.get_grading_standards.assert_not_called()
+
+  def test_refused_listing_fails_a_write_and_warns_an_export(self, caplog):
+    from canvasapi.exceptions import Unauthorized
+    course = MagicMock()
+    course.get_grading_standards.side_effect = Unauthorized("no access")
+    with pytest.raises(ValueError, match="cannot list"):
+      resolve_grading_standard(course, "^P/F$")
+    assert grading_standard_spec(course, 101) is None
+    assert "cannot list" in caplog.text
 @
 
 
@@ -2396,6 +2435,13 @@ def test_creating_leaves_empty_dates_out():
 def test_empty_points_possible_is_left_out():
   assert assignment_attributes_to_params({'points_possible': None}) == {}
 
+def test_empty_grading_standard_leaves_the_scheme_alone():
+  course = course_with_standards((101, "P/F"))
+  assert assignment_attributes_to_params(
+      {'grading_standard': ''}, course) == {}
+  assert assignment_attributes_to_params(
+      {'grading_standard': None}, course) == {}
+
 def test_grading_settings_are_sent_as_the_api_names_them():
   params = assignment_attributes_to_params(
       {'grading_type': 'pass_fail', 'omit_from_final_grade': True,
@@ -2732,6 +2778,54 @@ if 'modules' in final_attrs:
             file=sys.stderr)
     skipped_count += 1
     continue
+@
+
+Let's verify that the editor round trip keeps the assignment's grading
+scheme when the course has two schemes of the same title.
+The editor must be shown the scheme's spec, and the write must know the
+present scheme, or the spec it shows comes back ambiguous.
+We stand in for the user with stubs: the editor returns what it was shown,
+which is what saving it unchanged does, and the prompts are answered yes.
+The stub leaves out the module membership, so that the edit stops at the
+assignment; module updates have tests of their own.
+The requester is a [[MagicMock]] because a live write cannot run offline.
+<<test functions>>=
+def test_editor_round_trip_keeps_an_equally_named_scheme():
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  course = Course(requester, {"id": 1, "course_code": "CODE"})
+  course.get_assignment_groups = lambda: []
+  course.get_grading_standards = lambda: [
+      GradingStandard(requester, {"id": 101, "title": "P/F"}),
+      GradingStandard(requester, {"id": 102, "title": "P/F"})]
+  assignment = Assignment(requester, {
+      "id": 7, "course_id": 1, "name": "Lab", "description": "",
+      "grading_type": "letter_grade", "grading_standard_id": 102})
+  assignment.course = course
+
+  def save_unchanged(schema, attrs, content_attr, extra_attributes,
+                     html_mode):
+    shown = {**attrs, **extra_attributes}
+    del shown['modules']
+    return shown, ''
+
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "CODE"])
+  with patch("canvaslms.cli.assignments.process_assignment_option",
+             return_value=[assignment]), \
+       patch("canvaslms.cli.assignments.modules.export_module_specs",
+             return_value=[]), \
+       patch("builtins.input", return_value="y"), \
+       patch("canvaslms.cli.content.get_content_from_editor",
+             side_effect=save_unchanged), \
+       patch("canvaslms.cli.content.interactive_confirm_and_edit",
+             side_effect=lambda title, body, attrs, *rest, **kw:
+               (attrs, body)):
+    assignments_edit_command({}, MagicMock(), args)
+
+  sent = dict(requester.request.call_args.kwargs["_kwargs"])
+  assert sent["assignment[grading_standard_id]"] == 102
 @
 
 Finally, we report a summary of what was done.
