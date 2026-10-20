@@ -75,11 +75,9 @@ For example:
 \begin{verbatim}
 @pytest.fixture
 def mock_course():
-    """Returns a fake Canvas Course object"""
-    course = MagicMock()
-    course.id = 12345
-    course.name = "Introduction to Testing"
-    return course
+    """Returns a Canvas Course object built offline"""
+    return Course(MagicMock(), {"id": 12345,
+                                "name": "Introduction to Testing"})
 
 def test_course_filtering(mock_course):
     # pytest automatically calls mock_course() and passes result
@@ -112,16 +110,19 @@ Tests can customize these attributes as needed.
 \section{Implementation: the conftest.py fixture file}
 
 Pytest automatically loads fixtures from [[conftest.py]] files.
-We'll create fixtures for each major Canvas API object type, using Python's
-[[unittest.mock.MagicMock]] to create flexible mock objects.
+We'll create fixtures for each major Canvas API object type.
+They are real [[canvasapi]] objects, built from the JSON fields Canvas sends
+on a [[MagicMock]] requester, so that no request ever leaves the test.
+\Cref{real-objects-not-mocks} explains why they are not plain [[MagicMock]]s.
 
 <<[[conftest.py]]>>=
 """
 Shared pytest fixtures for testing canvaslms.
 
-This file provides mock Canvas API objects that tests can use
-instead of making real API calls. Each fixture returns a MagicMock
-configured to behave like the corresponding Canvas API object.
+This file provides Canvas API objects that tests can use instead of
+making real API calls. Each fixture is a real canvasapi object built
+offline (or, for the Canvas client itself, an autospecced mock), so it
+has only the attributes and methods the real object has.
 """
 import pytest
 from unittest.mock import MagicMock, Mock
@@ -143,16 +144,30 @@ Every command receives a [[canvas]] parameter---an instance of the Canvas API
 client.
 We mock this as the root of our API object hierarchy.
 
+Unlike the objects below, the client cannot be a real [[Canvas]] object: every
+one of its methods is a request, and the tests need to decide what each call
+returns ([[mock_canvas.get_courses.return_value = ...]]).
+So we stay with a mock, but an \emph{autospecced} one.
+[[create_autospec(Canvas, instance=True)]] has exactly the methods of
+[[canvasapi.Canvas]], with their signatures: a misspelled method raises
+[[AttributeError]] and a call with arguments the real method does not take
+raises [[TypeError]], where a plain [[MagicMock]] would accept both.
+The values these methods return are plain [[MagicMock]]s unless a test sets
+them.
 <<mock canvas api fixture>>=
+from unittest.mock import create_autospec
+from canvasapi import Canvas
+
+
 @pytest.fixture
 def mock_canvas():
     """
-    Mock Canvas API instance.
+    Autospecced Canvas API instance.
 
-    Provides get_courses() method that returns a list of mock courses.
+    Provides get_courses() method that returns a list of courses.
     Tests can customize the return value to simulate different scenarios.
     """
-    canvas = MagicMock()
+    canvas = create_autospec(Canvas, instance=True)
     canvas.get_courses.return_value = []
     return canvas
 @
@@ -163,102 +178,136 @@ Courses are central to Canvas---almost every operation starts by selecting a
 course.
 We provide both single-course and multi-course fixtures.
 
-\subsubsection{Design decision: realistic vs. minimal mocks}
+\subsubsection{Design decision: real objects, not mocks}
+\label{real-objects-not-mocks}
 
-We face a choice: should our mock courses have every attribute a real Canvas
-course has (100+ attributes), or just the ones our code uses?
+We face a choice: should a test course be a [[MagicMock]] with the attributes
+we set on it, or a real [[canvasapi.course.Course]]?
 
-We choose \emph{minimal but realistic} mocks:
+The two differ in what happens when the code reads an attribute that the
+fixture does not set.
+A [[MagicMock]] invents it: [[course.term]] is then another [[MagicMock]],
+which is truthy, compares unequal to everything and formats as a long
+[[<MagicMock ...>]] string.
+A test can therefore stay green while the code reads an attribute Canvas never
+sends, or one that Canvas renamed.
+A real [[Course]] has exactly the attributes in the JSON it was built from, so
+the same read raises [[AttributeError]] and the test fails where the user's
+run would.
+
+So each fixture builds the real [[canvasapi]] class from the fields Canvas
+sends, on a [[MagicMock]] requester.
+The requester is only used when a method makes a request, so building and
+reading the object stays offline.
 \begin{itemize}
-\item Include attributes our code actually accesses ([[id]], [[name]],
-[[course_code]])
-\item Provide methods our code calls ([[get_assignments()]], [[get_users()]])
-\item Omit rarely-used attributes to keep tests readable
-\item Allow tests to add custom attributes when needed (MagicMock permits this)
+\item We include the fields our code reads that Canvas sends for the request
+our code makes.
+[[canvas.get_courses()]] without [[include]] sends [[id]], [[name]],
+[[course_code]], [[start_at]] and [[end_at]] (the dates are [[null]] when
+unset), but not [[term]]: Canvas adds that only for [[include[]=term]], which
+we never ask for.
+Earlier versions of these fixtures set a [[term]], which no code reads; it is
+gone, since its only effect was to make the fake look richer than the real
+thing.
+\item We omit the many fields our code never reads, to keep tests readable.
+\item Tests can still add attributes when they need them, since
+[[canvasapi]] objects accept new attributes as any Python object does.
 \end{itemize}
 
-This gives us the best of both worlds: tests are clear about what they're
-testing, but flexible enough for edge cases.
-
+The methods our code calls, such as [[get_assignments()]] and [[get_users()]],
+would make requests.
+We replace them on the instance with stubs that return an empty list.
+The stubs are autospecced from the real bound method, so a call with
+arguments the real method does not accept still fails.
+Tests override them by assigning a new stub to the attribute, for example
+[[mock_course.get_users = Mock(return_value=[student])]]; a plain [[Mock]]
+like that one gives up the signature check, while setting the
+[[return_value]] of the fixture's stub keeps it.
 <<mock course fixtures>>=
+from canvasapi.course import Course
+
+
+def stub_canvas_method(canvas_object, name, return_value):
+    """Replace a request-making method by a stub with its signature."""
+    stub = create_autospec(getattr(canvas_object, name),
+                           return_value=return_value)
+    setattr(canvas_object, name, stub)
+    return stub
+
+
+def make_course(attributes):
+    """Build a real Course from Canvas JSON, with its list methods stubbed."""
+    course = Course(MagicMock(),
+                    {"start_at": None, "end_at": None, **attributes})
+    stub_canvas_method(course, "get_assignments", [])
+    stub_canvas_method(course, "get_users", [])
+    return course
+
+
 @pytest.fixture
 def mock_course():
     """
-    Mock Canvas Course object with realistic attributes.
+    Canvas Course object with realistic attributes.
 
     Attributes:
         id: Course ID (12345)
         name: Course name ("Test Course")
         course_code: Short code ("TEST101")
-        term: Dict with term info
+        start_at, end_at: None, as for a course without dates
 
     Methods:
         get_assignments(): Returns empty list (override in tests)
         get_users(): Returns empty list (override in tests)
     """
-    course = MagicMock()
-    course.id = 12345
-    course.name = "Test Course"
-    course.course_code = "TEST101"
-    course.term = {"name": "Fall 2023"}
-
-    # Mock methods that return lists
-    course.get_assignments.return_value = []
-    course.get_users.return_value = []
-
-    return course
+    return make_course({
+        "id": 12345,
+        "name": "Test Course",
+        "course_code": "TEST101",
+    })
 
 
 @pytest.fixture
 def mock_courses():
     """
-    Returns a list of three mock courses with different names.
+    Returns a list of three courses with different names.
 
     Useful for testing filtering and selection logic.
     Uses variation theory: three courses with same structure,
     different data (names, codes, IDs).
     """
-    course1 = MagicMock()
-    course1.id = 1001
-    course1.name = "Introduction to Programming"
-    course1.course_code = "CS101"
-    course1.term = {"name": "Fall 2023"}
-    course1.get_assignments.return_value = []
-    course1.get_users.return_value = []
-
-    course2 = MagicMock()
-    course2.id = 1002
-    course2.name = "Advanced Algorithms"
-    course2.course_code = "CS201"
-    course2.term = {"name": "Fall 2023"}
-    course2.get_assignments.return_value = []
-    course2.get_users.return_value = []
-
-    course3 = MagicMock()
-    course3.id = 1003
-    course3.name = "Data Structures"
-    course3.course_code = "CS102"
-    course3.term = {"name": "Spring 2024"}
-    course3.get_assignments.return_value = []
-    course3.get_users.return_value = []
-
-    return [course1, course2, course3]
+    return [
+        make_course({"id": 1001, "name": "Introduction to Programming",
+                     "course_code": "CS101"}),
+        make_course({"id": 1002, "name": "Advanced Algorithms",
+                     "course_code": "CS201"}),
+        make_course({"id": 1003, "name": "Data Structures",
+                     "course_code": "CS102"}),
+    ]
 @
 
 \subsection{Mock assignment objects}
 
 Assignments represent tasks that students submit.
-Our mock assignments include common attributes like due dates, point values,
+Our assignments include common attributes like due dates, point values,
 and submission types.
-
+Both objects also carry a [[course_id]], which [[canvasapi]] uses to build the
+URLs of their methods: Canvas sends it with every assignment, and
+[[Course.get_assignment_groups]] adds it to each group, whose JSON lacks it.
+We use the id of [[mock_course]].
+[[Assignment]] parses [[due_at]] into [[due_at_date]] when it is built, as it
+does for objects fetched from Canvas.
 <<mock assignment fixtures>>=
+from canvasapi.assignment import Assignment, AssignmentGroup
+
+
 @pytest.fixture
 def mock_assignment():
     """
-    Mock Canvas Assignment object.
+    Canvas Assignment object.
 
     Attributes:
         id: Assignment ID
+        course_id: ID of the course (that of mock_course)
         name: Assignment name
         due_at: ISO 8601 due date string (or None)
         points_possible: Maximum points
@@ -269,15 +318,17 @@ def mock_assignment():
     Methods:
         get_submissions(): Returns empty list (override in tests)
     """
-    assignment = MagicMock()
-    assignment.id = 5001
-    assignment.name = "Homework 1"
-    assignment.due_at = "2023-12-15T23:59:00Z"
-    assignment.points_possible = 100.0
-    assignment.published = True
-    assignment.assignment_group_id = 2001
-    assignment.submission_types = ["online_text_entry", "online_upload"]
-    assignment.get_submissions.return_value = []
+    assignment = Assignment(MagicMock(), {
+        "id": 5001,
+        "course_id": 12345,
+        "name": "Homework 1",
+        "due_at": "2023-12-15T23:59:00Z",
+        "points_possible": 100.0,
+        "published": True,
+        "assignment_group_id": 2001,
+        "submission_types": ["online_text_entry", "online_upload"],
+    })
+    stub_canvas_method(assignment, "get_submissions", [])
 
     return assignment
 
@@ -285,35 +336,41 @@ def mock_assignment():
 @pytest.fixture
 def mock_assignment_group():
     """
-    Mock Canvas AssignmentGroup object.
+    Canvas AssignmentGroup object.
 
     Assignment groups categorize assignments (e.g., "Homeworks", "Exams").
 
     Attributes:
         id: Group ID
+        course_id: ID of the course (that of mock_course)
         name: Group name
         position: Sort order
         group_weight: Percentage of final grade
     """
-    group = MagicMock()
-    group.id = 2001
-    group.name = "Homeworks"
-    group.position = 1
-    group.group_weight = 40.0
-
-    return group
+    return AssignmentGroup(MagicMock(), {
+        "id": 2001,
+        "course_id": 12345,
+        "name": "Homeworks",
+        "position": 1,
+        "group_weight": 40.0,
+    })
 @
 
 \subsection{Mock user and group objects}
 
 Users are students, teachers, and TAs.
 Groups are collections of students for group assignments.
-
+The user is the one a teacher sees: Canvas sends [[login_id]] only to users
+with permission to see it, and [[email]] only for [[include[]=email]].
 <<mock user and group fixtures>>=
+from canvasapi.group import Group
+from canvasapi.user import User
+
+
 @pytest.fixture
 def mock_user():
     """
-    Mock Canvas User object.
+    Canvas User object.
 
     Attributes:
         id: User ID
@@ -322,20 +379,19 @@ def mock_user():
         login_id: Username
         email: Email address (may be None due to privacy settings)
     """
-    user = MagicMock()
-    user.id = 3001
-    user.name = "Alice Anderson"
-    user.sortable_name = "Anderson, Alice"
-    user.login_id = "alice"
-    user.email = "alice@example.edu"
-
-    return user
+    return User(MagicMock(), {
+        "id": 3001,
+        "name": "Alice Anderson",
+        "sortable_name": "Anderson, Alice",
+        "login_id": "alice",
+        "email": "alice@example.edu",
+    })
 
 
 @pytest.fixture
 def mock_group():
     """
-    Mock Canvas Group object.
+    Canvas Group object.
 
     Groups are collections of users for collaborative assignments.
 
@@ -345,13 +401,14 @@ def mock_group():
         members_count: Number of members
 
     Methods:
-        get_users(): Returns list of mock users
+        get_users(): Returns empty list (override in tests)
     """
-    group = MagicMock()
-    group.id = 4001
-    group.name = "Project Team Alpha"
-    group.members_count = 3
-    group.get_users.return_value = []
+    group = Group(MagicMock(), {
+        "id": 4001,
+        "name": "Project Team Alpha",
+        "members_count": 3,
+    })
+    stub_canvas_method(group, "get_users", [])
 
     return group
 @
@@ -361,12 +418,16 @@ def mock_group():
 Submissions represent student work on assignments.
 They have workflow states (submitted, graded, etc.) and may include scores,
 comments, and file attachments.
-
+As with assignments, [[Submission]] parses the timestamps into
+[[submitted_at_date]] and [[graded_at_date]] when it is built.
 <<mock submission fixtures>>=
+from canvasapi.submission import Submission
+
+
 @pytest.fixture
 def mock_submission():
     """
-    Mock Canvas Submission object.
+    Canvas Submission object.
 
     Submissions represent student work. They have states (submitted, graded,
     unsubmitted) and may include scores, comments, and timestamps.
@@ -384,20 +445,19 @@ def mock_submission():
         missing: Whether submission is missing
         excused: Whether student is excused
     """
-    submission = MagicMock()
-    submission.id = 6001
-    submission.user_id = 3001
-    submission.assignment_id = 5001
-    submission.workflow_state = "submitted"
-    submission.grade = "A"
-    submission.score = 95.0
-    submission.submitted_at = "2023-12-14T18:30:00Z"
-    submission.graded_at = "2023-12-16T10:00:00Z"
-    submission.late = False
-    submission.missing = False
-    submission.excused = False
-
-    return submission
+    return Submission(MagicMock(), {
+        "id": 6001,
+        "user_id": 3001,
+        "assignment_id": 5001,
+        "workflow_state": "submitted",
+        "grade": "A",
+        "score": 95.0,
+        "submitted_at": "2023-12-14T18:30:00Z",
+        "graded_at": "2023-12-16T10:00:00Z",
+        "late": False,
+        "missing": False,
+        "excused": False,
+    })
 @
 
 \subsection{Mock configuration}
@@ -430,8 +490,10 @@ def mock_config():
 \section{Real Canvas objects for the grade summary modules}
 \label{grading-objects}
 
-The fixtures above are [[MagicMock]]s: any attribute exists, so a test keeps
-passing when the code reads an attribute Canvas never sends.
+The fixtures above are single objects with fixed values, built from real
+[[canvasapi]] classes for the reason given in \cref{real-objects-not-mocks}:
+with a [[MagicMock]] any attribute exists, so a test keeps passing when the
+code reads an attribute Canvas never sends.
 The grade summary modules of \cref{summary-modules} decide students' results
 from a handful of attributes---[[grade]], [[submitted_at]], [[graded_at]],
 [[quiz_id]], [[submission_types]], a quiz's [[quiz_type]]---so their tests use
