@@ -45,6 +45,7 @@ import pytest
 import requests
 from unittest.mock import MagicMock
 
+from canvasapi.assignment import AssignmentGroup
 from canvasapi.util import combine_kwargs
 
 import canvaslms.cli.quizzes as quizzes
@@ -3149,6 +3150,7 @@ def create_command(config, canvas, args):
     quiz_params['title'] = args.title
 
   <<take canvaslms-only keys out of the quiz settings>>
+  <<resolve the quiz's assignment group>>
   <<put the body under the key the target quiz system reads>>
 
   if quiz_type == "new":
@@ -3263,6 +3265,74 @@ def test_strip_canvaslms_settings_without_modules():
   assert params == {'title': 'Quiz'}
 @
 
+A quiz is an assignment too, and its assignment group decides which grade it
+counts towards, so a quiz file names its group exactly as an assignment file
+does: an [[assignment_group]] key holding a regex on the group's name or ID
+(\cref{sec:assignment-group-spec}).
+Without it, [[quizzes create]] leaves the choice to Canvas, which puts the
+quiz in the course's first group---a course evaluation survey meant for a
+participation group then counts towards whatever group happens to come first
+(issue~\#528).
+
+The key is ours, not Canvas's, so it must not travel to Canvas under its own
+name; we replace it by the [[assignment_group_id]] it resolves to.
+A [[null]] value, as the editor template has for a quiz whose group we did
+not export, leaves the group alone.
+We return a new dictionary rather than editing the settings in place, for the
+reason given for [[convert_front_matter_units]]: the settings may be the
+caller's file contents.
+<<functions>>=
+def settings_with_assignment_group_id(settings, course):
+  """Return `settings` with its `assignment_group` spec resolved.
+
+  The spec is replaced by the `assignment_group_id` of the one group of
+  `course` it matches; a null spec is dropped. Raises ValueError when no
+  group or several groups match.
+  """
+  if 'assignment_group' not in settings:
+    return settings
+  settings = dict(settings)
+  spec = settings.pop('assignment_group')
+  if spec is not None:
+    settings['assignment_group_id'] = assignments.resolve_assignment_group(
+        course, spec)
+  return settings
+@
+
+On the create path the group is resolved before the quiz exists, so a spec
+that matches no group stops the command with nothing created.
+<<resolve the quiz's assignment group>>=
+try:
+  quiz_params = settings_with_assignment_group_id(quiz_params, course)
+except ValueError as e:
+  canvaslms.cli.err(1, f"Invalid quiz file {args.file}: {e}")
+@
+
+Let's verify that a created quiz of either kind reaches Canvas with the group
+ID and without our key, and that a spec naming no group creates nothing:
+
+<<test functions>>=
+@pytest.mark.parametrize("quiz_type", ["classic", "new"])
+def test_created_quiz_goes_to_the_named_group(monkeypatch, tmp_path,
+                                              quiz_type):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'survey.json',
+    '{"quiz_type": "%s", "settings": {"title": "Survey", '
+    '"assignment_group": "^Participation INL1$"}}' % quiz_type,
+    groups=[(31, "prgX"), (32, "Participation INL1")])
+
+  assert sent['assignment_group_id'] == 32
+  assert 'assignment_group' not in sent
+
+def test_quiz_naming_no_group_is_not_created(monkeypatch, tmp_path):
+  with pytest.raises(SystemExit):
+    create_quiz_from_file(
+      monkeypatch, tmp_path, 'survey.json',
+      '{"quiz_type": "classic", "settings": {"title": "Survey", '
+      '"assignment_group": "^Participation$"}}',
+      groups=[(31, "prgX")])
+@
+
 \paragraph{The body goes where the target quiz system reads it.}
 One more key in the settings needs attention before they become API
 parameters, and it needs the opposite treatment.  The keys just removed were
@@ -3321,11 +3391,16 @@ creation functions are replaced.
 
 <<test functions>>=
 def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
-                          quiz_type=None):
-  """Run quizzes create on a file, return the params it would send Canvas"""
+                          quiz_type=None, groups=()):
+  """Run quizzes create on a file, return the params it would send Canvas
+
+  `groups` are the course's assignment groups as (id, name) pairs.
+  """
   path = tmp_path / name
   path.write_text(contents, encoding='utf-8')
   course = cached_course()
+  course.get_assignment_groups.return_value = [
+    AssignmentGroup(MagicMock(), {"id": i, "name": n}) for i, n in groups]
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   sent = {}
@@ -3855,6 +3930,10 @@ We include fields that instructors commonly need to adjust:
 \item[Timing] [[time_limit]], [[due_at]], [[unlock_at]], [[lock_at]]---the most
   frequently edited settings when reusing quizzes across semesters.
 \item[Scoring] [[points_possible]], [[allowed_attempts]]---controls grading behavior.
+\item[Grading group] [[assignment_group]]---which assignment group, and so
+  which grade, the quiz counts towards.  It holds a regex on the group's name
+  rather than Canvas's [[assignment_group_id]], because IDs change when a
+  course is copied (\cref{sec:assignment-group-spec}).
 \item[Presentation] [[shuffle_questions]], [[shuffle_answers]],
   [[one_question_at_a_time]], [[cant_go_back]]---anti-cheating and UX options.
 \item[Feedback] [[show_correct_answers]], [[hide_results]]---controls what
@@ -3862,9 +3941,13 @@ We include fields that instructors commonly need to adjust:
 \item[Access control] [[access_code]], [[published]]---security and visibility.
 \item[Quiz type] [[quiz_type]]---distinguishes graded quizzes from surveys.
 \end{description}
-We deliberately exclude fields like [[ip_filter]] (rarely used),
-[[scoring_policy]] (complex interactions with other settings), and
-[[assignment_group_id]] (better managed through the assignments command).
+We deliberately exclude fields like [[ip_filter]] (rarely used) and
+[[scoring_policy]] (complex interactions with other settings).
+The assignment group used to be on that list, as better managed through the
+assignments command, but a quiz is created by [[quizzes create]], not by the
+assignments command, and Canvas puts a quiz created without a group in the
+course's first group; a file that cannot name the group cannot put a quiz
+where its grade belongs (issue~\#528).
 
 <<constants>>=
 QUIZ_SCHEMA = {
@@ -3958,6 +4041,12 @@ QUIZ_SCHEMA = {
         'required': False,
         'canvas_attr': 'access_code',
         'description': 'Password required to take the quiz'
+    },
+    'assignment_group': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'assignment_group_id',
+        'description': 'Regex naming the assignment group (name or ID)'
     },
     'quiz_type': {
         'default': 'assignment',
@@ -5707,6 +5796,9 @@ def extract_quiz_attributes(quiz, requester=None):
       value = time_limit_for_front_matter(
         new_quiz_time_limit(quiz, quiz_settings))
 
+    if key == 'assignment_group' and value is not None:
+      value = assignments.assignment_group_spec(quiz.course, value)
+
     if value is not None:
       attrs[key] = value
 
@@ -5975,6 +6067,12 @@ the common sink for all three edit paths---front matter, JSON/YAML files, and
 produced.  Only the front-matter callers convert; here [[time_limit]] is
 already in Canvas's units and travels through unchanged.
 
+Being the common sink also makes this the one place to resolve an
+[[assignment_group]] spec (\cref{sec:assignment-group-spec}) for all three
+edit paths.  A spec that matches no group, or several, fails the edit of
+that quiz before anything is sent, the way any other failed update does: the
+caller warns and moves on.
+
 <<functions>>=
 def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
                     args=None):
@@ -6001,6 +6099,12 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
   if args is not None and html_body:
     html_body = content.resolve_body_for(html_body, quiz.course, args)
 
+  try:
+    attributes = settings_with_assignment_group_id(attributes, quiz.course)
+  except ValueError as e:
+    canvaslms.cli.warn(f"{quiz.title}: {e}")
+    return False
+
   # Build API parameters
   quiz_params = quiz_attributes_to_api_params(
     attributes, is_new_quiz(quiz), html_body
@@ -6011,6 +6115,42 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
     return update_new_quiz(quiz.course, quiz.id, requester, quiz_params)
   else:
     return update_classic_quiz(quiz, quiz_params)
+@
+
+Let's verify the group on a real Classic [[Quiz]], looking at the form
+fields that reach the requester.  The requester is a [[MagicMock]] because a
+live write cannot run offline; the course only hands over its groups.
+
+<<test functions>>=
+def classic_quiz_in_course(groups):
+  """A real Classic Quiz on a mock requester, in a course with `groups`."""
+  from canvasapi.quiz import Quiz
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  quiz = Quiz(requester, {"id": 5, "course_id": 1, "title": "Survey"})
+  quiz.course = MagicMock()
+  quiz.course.get_assignment_groups.return_value = [
+    AssignmentGroup(requester, {"id": i, "name": n}) for i, n in groups]
+  return quiz, requester
+
+def test_edited_quiz_moves_to_the_named_group():
+  quiz, requester = classic_quiz_in_course(
+    [(31, "prgX"), (32, "Participation INL1")])
+
+  assert quizzes.apply_quiz_edit(
+    quiz, {'title': 'Survey', 'assignment_group': '^Participation INL1$'},
+    '', requester)
+
+  sent = dict(requester.request.call_args.kwargs['_kwargs'])
+  assert sent['quiz[assignment_group_id]'] == 32
+  assert 'quiz[assignment_group]' not in sent
+
+def test_edit_naming_no_group_sends_nothing():
+  quiz, requester = classic_quiz_in_course([(31, "prgX")])
+
+  assert not quizzes.apply_quiz_edit(
+    quiz, {'title': 'Survey', 'assignment_group': '^Exams$'}, '', requester)
+  requester.request.assert_not_called()
 @
 
 \paragraph{From attributes to API parameters.}
@@ -6714,6 +6854,8 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'instructions': quiz.instructions or '',
     'time_limit': new_quiz_time_limit(quiz, quiz_settings),
     'points_possible': getattr(quiz, 'points_possible', None),
+    'assignment_group': assignments.assignment_group_spec(
+        quiz.course, getattr(quiz, 'assignment_group_id', None)),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
@@ -6771,8 +6913,11 @@ fetch we control; everything else about the export is scenery here.
 
 <<test functions>>=
 def export_new_quiz_settings(monkeypatch, quiz_settings,
-                             object_time_limit=None):
-  """Return the settings exported for a quiz whose fetch gave quiz_settings"""
+                             object_time_limit=None, group=None):
+  """Return the settings exported for a quiz whose fetch gave quiz_settings
+
+  `group` is the (id, name) of the quiz's assignment group, if any.
+  """
   class NewQuiz:
     pass
 
@@ -6782,6 +6927,10 @@ def export_new_quiz_settings(monkeypatch, quiz_settings,
   quiz.instructions = ''
   quiz.time_limit = object_time_limit
   quiz.course = MagicMock(id=1)
+  if group:
+    quiz.assignment_group_id = group[0]
+    quiz.course.get_assignment_groups.return_value = [
+      AssignmentGroup(MagicMock(), {"id": group[0], "name": group[1]})]
 
   monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
   monkeypatch.setattr(quizzes, "fetch_new_quiz_settings",
@@ -6843,6 +6992,26 @@ def test_exported_new_quiz_time_limit_reaches_canvas():
   assert params['quiz[quiz_settings][has_time_limit]'] is True
 @
 
+The assignment group makes the same round trip: the export names the group by
+an anchored regex on its name, and feeding that file back resolves it to the
+group it came from, so recreating a survey from its export puts it where its
+grade belongs.
+
+<<test functions>>=
+def test_exported_assignment_group_resolves_back(monkeypatch):
+  settings = export_new_quiz_settings(
+    monkeypatch, {}, group=(32, "Participation INL1"))
+  assert settings['assignment_group'] == r"^Participation\ INL1$"
+
+  course = MagicMock()
+  course.get_assignment_groups.return_value = [
+    AssignmentGroup(MagicMock(), {"id": 31, "name": "Participation"}),
+    AssignmentGroup(MagicMock(), {"id": 32, "name": "Participation INL1"})]
+  resolved = quizzes.settings_with_assignment_group_id(settings, course)
+
+  assert resolved['assignment_group_id'] == 32
+@
+
 
 \subsection{Exporting a complete Classic Quiz}
 
@@ -6873,6 +7042,8 @@ def export_full_classic_quiz(quiz, importable=False):
     'shuffle_questions': bool(quiz.shuffle_questions),
     'shuffle_answers': bool(quiz.shuffle_answers),
     'points_possible': getattr(quiz, 'points_possible', None),
+    'assignment_group': assignments.assignment_group_spec(
+        quiz.course, getattr(quiz, 'assignment_group_id', None)),
     'published': bool(quiz.published),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
