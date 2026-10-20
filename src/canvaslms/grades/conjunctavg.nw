@@ -20,11 +20,17 @@ Conjunctive average means:
      those grades. For instance; an A and a C will result in a B; an A and a B 
      will result in an A, but an A with two Bs will become a B (standard 
      rounding).
+
+  3) Surveys (classic Canvas quizzes of survey type) must be completed, but
+     their scores are ignored: a completed survey counts as P, an uncompleted
+     one as F. See `canvaslms.grades.surveys`.
 """
 
 import datetime as dt
 from canvaslms.cli import results
 from canvaslms.grades.gradealiases import normalize_grade
+from canvaslms.grades.surveys import (is_survey, survey_completed,
+                                      split_surveys, missing_surveys)
 from canvasapi.exceptions import ResourceDoesNotExist
 
 <<helper functions>>
@@ -67,6 +73,8 @@ We can then check for Fs among the P/F grades (as seen above), if we find an F
 the summarized grade will be an F.
 If we find no Fs, then we can compute the average over all A--E grades and use 
 that as the final grade.
+Surveys are the exception to reading grades: we never look at a survey's
+grade, only at whether the student completed it (\cref{conjunctavg-surveys}).
 Canvas spells those grades in more ways than we want to reason about here:
 completes and [[P+]] are passes, incompletes and the label [[must fix]] are
 failures, and a missing grade on a mandatory assignment is a failure too.
@@ -79,9 +87,9 @@ A--E grades and requiring a pass everywhere else.
 
 The import is at module level rather than inside the functions, which makes
 [[conjunctavg.normalize_grade]] a re-export.
-That is deliberate: [[conjunctavgsurvey]] imports the name from here, and so
-may a teacher's own summary module, so the name has to keep working where it
-has always been.
+That is deliberate: [[conjunctavgsurvey]] re-exports everything from here,
+and a teacher's own summary module may import the name from here too, so the
+name has to keep working where it has always been.
 
 <<helper functions>>=
 def summarize(user, assignments_list):
@@ -106,7 +114,10 @@ def summarize(user, assignments_list):
     submission.assignment = assignment
 
     <<add graders to [[graders]] list>>
-    <<add grade to the correct grades list>>
+    if is_survey(assignment):
+      <<add survey completion to [[pf_grades]]>>
+    else:
+      <<add grade to the correct grades list>>
     <<add date to [[dates]] list>>
 
   if all(map(lambda x: x == "P", pf_grades)):
@@ -170,6 +181,89 @@ For who graded, we simply extract the list of graders from the submissions.
 graders += results.all_graders(submission)
 @
 
+\subsection{Surveys count by completion}\label{conjunctavg-surveys}
+
+A survey is the one kind of assignment whose grade we must not read.
+Canvas gives a completed classic graded survey its full points whatever the
+answers, so the grade carries no information about the student, and a
+teacher who lowers the survey's points turns every one of those grades into
+a number that is no passing grade at all (\cref{surveys}).
+What the survey can tell us is whether the student completed it, so a survey
+adds a [[P]] or an [[F]] to the P/F list and nothing to the A--E list: it can
+fail the group, but it can never move the average.
+A survey without any submission never gets this far; the missing-submission
+branch above has already added its [[F]].
+<<add survey completion to [[pf_grades]]>>=
+pf_grades.append("P" if survey_completed(submission) else "F")
+@
+
+This used to be a separate module, [[conjunctavgsurvey]], which recognized
+surveys by their grading scale.
+That module is now an alias of this one (\cref{conjunctavgsurvey}), so every
+group summarized by conjunctive average gets the survey rule, and the
+recognition is the one in [[surveys]].
+
+Let's verify the rule on a group like the one that motivated it: an exam
+graded A next to a classic graded survey.
+A completed survey passes whatever its grade looks like---full points, the
+lowered points of a survey whose maximum was changed, a format like
+[[85.5%]] that no grade parser expects, or no grade at all---and leaves the
+exam's A as the group's grade.
+<<test functions>>=
+class TestSurveys:
+    """Test that surveys count by completion, never by grade."""
+
+    <<survey test methods>>
+<<survey test methods>>=
+def exam(self, grading_objects):
+    return grading_objects.graded(grading_objects.submission(
+        "A", submitted_at="2026-01-10T10:00:00Z"), name="Exam")
+
+def test_completed_survey_passes_whatever_its_grade(self, grading_objects):
+    """The grade of a completed survey never matters."""
+    user = grading_objects.user()
+
+    for survey_grade in ["100", "50", "85.5%", None]:
+        survey = grading_objects.survey(grading_objects.submission(
+            survey_grade, submitted_at="2026-01-11T10:00:00Z"))
+
+        grade, grade_date, _ = summarize(
+            user, [self.exam(grading_objects), survey])
+
+        assert grade == "A"
+        assert grade_date.isoformat() == "2026-01-11"
+@
+
+An uncompleted survey fails the group despite the A, whether the student has
+a submission without any date or no submission at all.
+<<survey test methods>>=
+def test_uncompleted_survey_fails_group(self, grading_objects):
+    """Completion is mandatory, so a missing survey fails the group."""
+    user = grading_objects.user()
+    dateless = grading_objects.survey(grading_objects.submission(None))
+    absent = grading_objects.survey(None)
+
+    for survey in [dateless, absent]:
+        grade, _, _ = summarize(user, [self.exam(grading_objects), survey])
+
+        assert grade == "F"
+@
+
+A group of several students costs one quiz lookup per survey, not one per
+student.
+<<survey test methods>>=
+def test_survey_quiz_fetched_once_per_group(self, grading_objects):
+    """The survey's quiz type is looked up once for the whole group."""
+    survey = grading_objects.survey(grading_objects.submission(
+        "100", submitted_at="2026-01-11T10:00:00Z"))
+    users = [grading_objects.user() for _ in range(3)]
+
+    rows = list(summarize_group([survey], users))
+
+    assert [row[1] for row in rows] == ["P", "P", "P"]
+    assert grading_objects.course.lookups == 1
+@
+
 \subsection{Computing averages}
 
 To compute the average for the A--E grades; we will convert the grades into
@@ -220,24 +314,66 @@ def is_passing_grade(grade):
   return grade in ["A", "B", "C", "D", "E", "P"]
 @
 
-We reuse the shared [[missing_assignments]] implementation from
-[[canvaslms.cli.results]], providing our module-specific [[is_passing_grade]]
-function as a callback.
+Surveys must not reach that check, for the same reason they don't reach the
+grade classification: a completed survey graded [[50]] would be reported as
+\enquote{not a passing grade (50)}, and a completed but ungraded one as
+\enquote{submitted \ldots, but not graded}.
+So we split the group, let [[missing_surveys]] (\cref{surveys}) report the
+uncompleted surveys, and reuse the shared [[missing_assignments]]
+implementation from [[canvaslms.cli.results]] for the rest, providing our
+module-specific [[is_passing_grade]] function as a callback.
+That keeps [[--missing]] in agreement with [[summarize]]: both fail an
+uncompleted survey and both accept a completed one.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         optional_assignments=None):
   """
   Returns missing assignments for conjunctive average grading.
 
-  Any assignment without a passing grade (A-E, P, or complete) is missing.
+  Every uncompleted survey is missing. Any other assignment without a
+  passing grade (A-E, P, or complete) is missing.
   """
-  from canvaslms.cli import results
-  return results.missing_assignments(
-    assignments_list, users_list,
+  surveys, others = split_surveys(assignments_list)
+
+  yield from missing_surveys(surveys, users_list, optional_assignments)
+  yield from results.missing_assignments(
+    others, users_list,
     optional_assignments=optional_assignments,
     is_passing=is_passing_grade,
     normalize_grade=normalize_grade
   )
+@
+
+Let's verify that the report agrees with the summary: a completed survey is
+never missing, whatever its grade, while an uncompleted one is---and is the
+only report when the exam passes.
+<<test functions>>=
+class TestMissingSurveys:
+    """Test that --missing judges surveys by completion."""
+
+    <<missing survey test methods>>
+<<missing survey test methods>>=
+def test_completed_survey_not_missing(self, grading_objects):
+    """Neither a lowered grade nor no grade makes a survey missing."""
+    user = grading_objects.user()
+
+    for survey_grade in ["50", None]:
+        survey = grading_objects.survey(grading_objects.submission(
+            survey_grade, submitted_at="2026-01-11T10:00:00Z"))
+
+        assert list(missing_assignments([survey], [user])) == []
+
+def test_uncompleted_survey_missing_despite_passing_exam(
+        self, grading_objects):
+    """The survey is reported, as mandatory, and nothing else is."""
+    user = grading_objects.user()
+    exam = grading_objects.graded(grading_objects.submission(
+        "A", submitted_at="2026-01-10T10:00:00Z"), name="Exam")
+    survey = grading_objects.survey(None)
+
+    missing = list(missing_assignments([exam, survey], [user]))
+
+    assert missing == [(user, survey, "mandatory survey not completed")]
 @
 
 The missing-assignment report should use the same normalized grade vocabulary as
