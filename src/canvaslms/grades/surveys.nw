@@ -1,0 +1,415 @@
+\section{Recognizing surveys, the module \texttt{surveys}}\label{surveys}
+
+Assignment groups often hold mandatory surveys next to the graded work: a
+course evaluation at the end of a seminar series, say.
+A survey's score says nothing about the student.
+Canvas awards a classic graded survey its full points on submission, whatever
+the answers, so every student who answered a 100-point course evaluation has
+the grade [[100]]---and a teacher who lowers the survey to 50 points silently
+changes every one of those grades to [[50]].
+A summary module that reads a survey's grade therefore decides a student's
+result by an accident of how Canvas scores surveys.
+
+The only thing a survey can tell us is whether the student completed it.
+Every summary module in this chapter treats a survey the same way:
+\begin{itemize}
+\item a completed survey counts as passed (P), an uncompleted one as failed;
+\item a survey never contributes a letter to an A--E average or maximum;
+\item [[missing_assignments]] reports an uncompleted survey and never a
+  completed one, so that [[--missing]] agrees with the summary.
+\end{itemize}
+This module holds what the summary modules need for that and nothing else:
+the predicate [[is_survey]] that tells a survey from graded work, the
+predicate [[survey_completed]] that tells whether a student completed it, and
+the [[--missing]] report for surveys.
+<<[[surveys.py]]>>=
+"""
+<<module doc>>
+"""
+
+import re
+
+import canvasapi.course
+from canvasapi.exceptions import ResourceDoesNotExist
+
+<<constants>>
+
+<<functions>>
+@
+
+Like [[gradealiases]] (\cref{gradealiases}), this is a helper module rather
+than a grading strategy, and its docstring says so for the listing that
+[[canvaslms results -S]] prints.
+<<module doc>>=
+Survey handling shared by the summary modules.
+
+A survey is an assignment backed by a classic Canvas quiz of survey type
+(graded or ungraded survey). Its score says nothing about the student, so
+the summary modules count a survey as passed once it is completed and as
+failed otherwise.
+
+This is a helper module, not a grading strategy: it has no
+summarize_group function and cannot be used with `canvaslms results -S`.
+@
+
+The tests build real [[canvasapi]] objects with the [[grading_objects]]
+fixture (\cref{grading-objects}), so that a renamed Canvas attribute breaks
+them instead of passing unnoticed.
+<<test [[surveys.py]]>>=
+"""Tests for canvaslms.grades.surveys."""
+from unittest.mock import MagicMock
+
+from canvasapi.assignment import Assignment
+
+import canvaslms.grades.surveys as surveys
+from canvaslms.grades.surveys import *
+
+<<test functions>>
+@
+
+
+\subsection{What makes an assignment a survey}
+
+An earlier version of this predicate, then in [[maxgradesurvey]], classified
+by the assignment's grading scale: an assignment that is not graded with
+letters ([[grading_type]] other than [[letter_grade]] or [[gpa_scale]]) was
+a survey.
+That confuses the grading scale with the kind of assignment.
+Points are how Canvas grades a survey, but they are also how it grades
+plenty of real work: a FeedbackFruits peer review graded out of 100 points
+was a \enquote{survey} under that rule, and a student who merely submitted it
+passed without being assessed.
+Conversely, nothing stops a teacher from grading a survey with letters, and
+then the rule missed it.
+
+Whether an assignment is a survey is a property of the quiz behind it.
+Canvas's classic quizzes carry a [[quiz_type]]: [[assignment]] for a graded
+quiz, [[practice_quiz]], [[graded_survey]] and [[survey]].
+Graded quizzes and graded surveys create assignments; practice quizzes and
+ungraded surveys normally don't, but if an ungraded survey ever reaches a
+summary module it is no less a survey, so we accept both survey types.
+<<constants>>=
+SURVEY_QUIZ_TYPES = {"graded_survey", "survey"}
+@
+
+An assignment points to its classic quiz through [[quiz_id]], and its
+[[submission_types]] is [[["online_quiz"]]].
+Canvas sends both together, but we accept either: an assignment with
+[[online_quiz]] and no [[quiz_id]] (an object built by a teacher's own
+script, say) can still be matched to its quiz by the quiz's
+[[assignment_id]].
+<<functions>>=
+def is_classic_quiz_assignment(assignment):
+  """True iff the assignment is backed by a classic Canvas quiz."""
+  return (getattr(assignment, "quiz_id", None) is not None
+          or getattr(assignment, "submission_types", None) == ["online_quiz"])
+@
+
+The [[getattr]] calls are deliberate.
+The CLI normalizes the assignment attributes it uses at its ingress helpers
+(the attribute lists in [[canvaslms.cli.utils]]), but [[quiz_id]] is not
+among them, and the summary modules also receive assignments from teachers'
+own scripts and from older cached objects.
+An assignment that lacks the attributes cannot be backed by a quiz we could
+find, so it is not a survey.
+
+\paragraph{New Quizzes}
+Canvas's New Quizzes gained surveys, graded and ungraded, in December 2025.
+We cannot recognize them.
+The New Quizzes API documents no quiz type at all: its quiz object has an id,
+a title, a grading type, points, dates and a [[quiz_settings]] object of
+delivery options (calculator, shuffling, time limit, access code and the
+like).
+A read-only look at the sandbox course confirmed that the API returns exactly
+those fields, and that the assignment behind a New Quiz says only that it is
+one ([[is_quiz_lti_assignment]], [[submission_types]] of
+[[["external_tool"]]]), not what kind.
+So a New Quiz is never a survey here, and a graded New Quizzes survey is
+summarized like any other graded assignment.
+A course that wants the completion rule for a survey should use a classic
+graded survey.
+
+\paragraph{Looking up the quiz}
+With a classic quiz assignment in hand, we fetch its quiz to read the type.
+The summary modules call [[is_survey]] once per student and assignment---both
+[[summarize]] and [[missing_assignments]] loop over the students---so a group
+of $N$ students would fetch the same quiz $N$ times.
+We therefore remember each quiz's type.
+The summary modules get nothing but assignment and user lists, so there is
+no per-run object to keep this memory in; a module-level dictionary keyed by
+the quiz id serves, since a quiz id identifies one quiz on a Canvas instance
+and the process lives only as long as one CLI run.
+(The persisted Canvas cache also caches [[get_quiz]], but it
+is off under [[--no-cache]] and in teachers' own scripts, and even when on it
+answers per call, not per quiz.)
+An assignment that has no [[quiz_id]] is remembered by its own id instead.
+<<constants>>=
+quiz_type_cache = {}
+<<functions>>=
+def is_survey(assignment):
+  """True iff the assignment is a classic Canvas quiz of survey type.
+
+  The quiz is fetched through the assignment's course once per quiz; later
+  calls for the same quiz are answered from `quiz_type_cache`. New Quizzes
+  are never surveys: Canvas exposes no survey marker for them.
+  """
+  if not is_classic_quiz_assignment(assignment):
+    return False
+
+  quiz_id = getattr(assignment, "quiz_id", None)
+  if quiz_id is not None:
+    key = ("quiz", quiz_id)
+  else:
+    key = ("assignment", assignment.id)
+
+  if key not in quiz_type_cache:
+    quiz_type_cache[key] = fetch_quiz_type(assignment, quiz_id)
+
+  return quiz_type_cache[key] in SURVEY_QUIZ_TYPES
+@
+
+The quiz lives in the assignment's course.
+The [[results]] command attaches that course to every assignment as
+[[assignment.course]]; an assignment from a teacher's own script may not have
+it, and then we build the course from [[course_id]] with the assignment's own
+connection to Canvas.
+
+A quiz that no longer exists ([[ResourceDoesNotExist]]) gives no type, so the
+assignment is not a survey.
+That is the safe direction of the two possible mistakes.
+Taking graded work for a survey passes a student on mere submission---the
+very bug that motivated this module.
+Taking a survey for graded work does no such harm: its score of [[100]] is
+either a passing grade (in [[participation]]) or an unknown grade that the
+module reports as an error, so the teacher hears about it.
+Any other error, such as a lost connection, propagates: the summary cannot
+be trusted without the answer.
+<<functions>>=
+def fetch_quiz_type(assignment, quiz_id=None):
+  """Return the `quiz_type` of the classic quiz behind the assignment.
+
+  Returns None if the quiz cannot be found.
+  """
+  course = getattr(assignment, "course", None)
+  if course is None:
+    course = canvasapi.course.Course(assignment._requester,
+                                     {"id": assignment.course_id})
+
+  try:
+    if quiz_id is not None:
+      quiz = course.get_quiz(quiz_id)
+    else:
+      quiz = next((quiz for quiz in course.get_quizzes()
+                   if getattr(quiz, "assignment_id", None) == assignment.id),
+                  None)
+  except ResourceDoesNotExist:
+    return None
+
+  return getattr(quiz, "quiz_type", None)
+@
+
+Let's verify the classification on the three kinds of assignment that share
+the issue's assignment group: a classic graded survey, a FeedbackFruits item
+graded out of 100 points, and a letter-graded assignment.
+The second is the case the old predicate got wrong.
+<<test functions>>=
+def test_classic_graded_survey_is_survey(grading_objects):
+  assert is_survey(grading_objects.survey())
+
+
+def test_classic_ungraded_survey_is_survey(grading_objects):
+  assert is_survey(grading_objects.survey(quiz_type="survey"))
+
+
+def test_points_graded_assignment_is_not_survey(grading_objects):
+  assert not is_survey(grading_objects.points())
+
+
+def test_letter_graded_assignment_is_not_survey(grading_objects):
+  assert not is_survey(grading_objects.graded())
+@
+
+A graded classic quiz is a quiz but not a survey, and a New Quiz is neither
+as far as we can tell.
+<<test functions>>=
+def test_graded_classic_quiz_is_not_survey(grading_objects):
+  assert not is_survey(grading_objects.survey(quiz_type="assignment"))
+
+
+def test_new_quiz_is_not_survey(grading_objects):
+  assert not is_survey(grading_objects.new_quiz())
+@
+
+Without a [[quiz_id]] the quiz is found by its [[assignment_id]], and a
+deleted quiz makes the assignment graded work.
+<<test functions>>=
+def test_survey_found_by_assignment_id(grading_objects):
+  survey = grading_objects.survey()
+  survey.quiz_id = None
+
+  assert is_survey(survey)
+
+
+def test_deleted_quiz_is_not_survey(grading_objects):
+  survey = grading_objects.survey()
+  grading_objects.course.quizzes.clear()
+
+  assert not is_survey(survey)
+@
+
+An assignment without [[assignment.course]] reaches its quiz through its own
+connection.
+Here we fake Canvas at the HTTP boundary, the [[requester]], so that the real
+[[canvasapi]] code builds the course and the quiz; the assertion on the URL
+checks that we asked Canvas for the right quiz.
+<<test functions>>=
+def test_course_built_from_course_id_when_not_attached():
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {
+    "id": 98765, "quiz_type": "graded_survey"}
+  survey = Assignment(requester, {
+    "id": 4321, "course_id": 24725, "name": "Course evaluation",
+    "quiz_id": 98765, "submission_types": ["online_quiz"]})
+
+  assert is_survey(survey)
+  assert requester.request.call_args.args[1] == "courses/24725/quizzes/98765"
+@
+
+Finally the cache: summarizing a group fetches each survey's quiz once, no
+matter how many students we ask about.
+<<test functions>>=
+def test_quiz_fetched_once_per_quiz(grading_objects):
+  survey = grading_objects.survey()
+
+  for _ in range(5):
+    assert is_survey(survey)
+
+  assert grading_objects.course.lookups == 1
+@
+
+
+\subsection{When is a survey completed?}
+
+All summary modules must agree on what it means for a survey to be
+completed, so we define completion once.
+The evidence of completion is a date: a survey the student submitted has
+[[submitted_at]], and one a teacher marked manually has [[graded_at]].
+The grade plays no part, for the reason in the introduction.
+Accepting [[None]] lets call sites map a missing submission
+([[ResourceDoesNotExist]]) to \enquote{not completed} without duplicating
+the rule.
+<<functions>>=
+def survey_completed(submission):
+  """True iff the submission shows the survey was completed.
+
+  Pass None (no submission exists) for not completed.
+  """
+  if submission is None:
+    return False
+  return bool(submission.submitted_at or submission.graded_at)
+@
+
+A survey counts as completed with either date, and as uncompleted with
+neither date---or with no submission at all.
+<<test functions>>=
+def test_survey_completed_by_submission_date(grading_objects):
+  assert survey_completed(grading_objects.submission(
+    "100", submitted_at="2026-07-01T10:00:00Z"))
+
+
+def test_survey_completed_by_grading_date(grading_objects):
+  assert survey_completed(grading_objects.submission(
+    None, graded_at="2026-07-01T10:00:00Z"))
+
+
+def test_survey_without_dates_not_completed(grading_objects):
+  assert not survey_completed(grading_objects.submission(None))
+
+
+def test_missing_submission_not_completed():
+  assert not survey_completed(None)
+@
+
+
+\subsection{Reporting uncompleted surveys}
+
+For [[--missing]], surveys follow the same rule in every module, whatever the
+module does with the graded assignments: each uncompleted survey is missing,
+and it is missing regardless of the student's grades, since completing it is
+mandatory even for a student who passed everything else.
+So the modules split the group in two, report the surveys here and handle
+the rest by their own policy.
+<<functions>>=
+def split_surveys(assignments_list):
+  """Return (surveys, others), each in the order of assignments_list."""
+  surveys = []
+  others = []
+  for assignment in assignments_list:
+    if is_survey(assignment):
+      surveys.append(assignment)
+    else:
+      others.append(assignment)
+  return surveys, others
+@
+
+The survey report applies the [[optional_assignments]] patterns itself,
+because the surveys never reach the shared implementation in
+[[canvaslms.cli.results]] that would otherwise apply them.
+Its reason string is the same in every module, so the [[--missing]] output
+reads the same whichever module computed it.
+<<constants>>=
+SURVEY_MISSING_REASON = "mandatory survey not completed"
+<<functions>>=
+def missing_surveys(surveys, users_list, optional_assignments=None):
+  """Yield (user, survey, reason) for every survey a user hasn't completed.
+
+  Surveys whose name matches a regex in optional_assignments are skipped.
+  """
+  for user in users_list:
+    for assignment in surveys:
+      if optional_assignments:
+        if any(re.search(optional, assignment.name)
+               for optional in optional_assignments):
+          continue
+
+      try:
+        submission = assignment.get_submission(user)
+      except ResourceDoesNotExist:
+        submission = None
+
+      if not survey_completed(submission):
+        yield user, assignment, SURVEY_MISSING_REASON
+@
+
+Let's verify that a completed survey is never reported, that both kinds of
+uncompleted survey are, and that an optional survey is not demanded.
+<<test functions>>=
+def test_split_surveys_keeps_order(grading_objects):
+  survey = grading_objects.survey()
+  lab = grading_objects.graded()
+  feedback = grading_objects.points()
+
+  assert split_surveys([lab, survey, feedback]) == ([survey], [lab, feedback])
+
+
+def test_missing_surveys_reports_only_uncompleted(grading_objects):
+  done = grading_objects.survey(grading_objects.submission(
+    "100", submitted_at="2026-07-01T10:00:00Z"))
+  dateless = grading_objects.survey(grading_objects.submission(None))
+  absent = grading_objects.survey(None)
+  user = grading_objects.user()
+
+  rows = list(missing_surveys([done, dateless, absent], [user]))
+
+  assert [(row[1], row[2]) for row in rows] == [
+    (dateless, SURVEY_MISSING_REASON), (absent, SURVEY_MISSING_REASON)]
+
+
+def test_optional_survey_not_reported(grading_objects):
+  survey = grading_objects.survey(None, name="Optional survey")
+
+  rows = list(missing_surveys([survey], [grading_objects.user()],
+                              optional_assignments=["Optional"]))
+
+  assert rows == []
+@

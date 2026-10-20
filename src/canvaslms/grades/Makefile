@@ -2,6 +2,7 @@ NOTANGLEFLAGS.py=
 
 MODULES+=			__init__.py
 MODULES+=			gradealiases.py
+MODULES+=			surveys.py
 MODULES+=			conjunctavg.py
 MODULES+=			disjunctmax.py
 MODULES+=			maxgradesurvey.py
@@ -12,6 +13,7 @@ MODULES+=			participation.py
 .PHONY: all
 all: grades.tex
 all: gradealiases.tex
+all: surveys.tex
 all: conjunctavg.tex
 all: disjunctmax.tex
 all: maxgradesurvey.tex
@@ -21,6 +23,7 @@ all: participation.tex
 all: ${MODULES}
 
 grades.tex: gradealiases.tex
+grades.tex: surveys.tex
 grades.tex: conjunctavg.tex
 grades.tex: disjunctmax.tex
 grades.tex: maxgradesurvey.tex
