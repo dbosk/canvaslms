@@ -3155,6 +3155,7 @@ def create_command(config, canvas, args):
 
   if quiz_type == "new":
     <<warn about ignored New Quiz settings>>
+    warn_anonymity_not_settable(quiz_params.pop('anonymous_submissions', None))
 
   if 'title' not in quiz_params:
     canvaslms.cli.err(1, "Quiz title is required (use --title or include in JSON)")
@@ -3940,6 +3941,11 @@ We include fields that instructors commonly need to adjust:
   students see after submission.
 \item[Access control] [[access_code]], [[published]]---security and visibility.
 \item[Quiz type] [[quiz_type]]---distinguishes graded quizzes from surveys.
+\item[Survey anonymity] [[anonymous_submissions]]---the web interface's
+  \enquote{Keep submissions anonymous}, which Canvas honours only for the
+  survey quiz types.  A survey recreated from a file that cannot carry it
+  silently stops being anonymous (issue~\#529), which is a promise to the
+  respondents broken without anyone noticing.
 \end{description}
 We deliberately exclude fields like [[ip_filter]] (rarely used) and
 [[scoring_policy]] (complex interactions with other settings).
@@ -4047,6 +4053,12 @@ QUIZ_SCHEMA = {
         'required': False,
         'canvas_attr': 'assignment_group_id',
         'description': 'Regex naming the assignment group (name or ID)'
+    },
+    'anonymous_submissions': {
+        'default': None,
+        'required': False,
+        'canvas_attr': 'anonymous_submissions',
+        'description': 'Keep survey submissions anonymous (Classic surveys)'
     },
     'quiz_type': {
         'default': 'assignment',
@@ -6284,6 +6296,10 @@ def quiz_attributes_to_api_params(attributes, is_new, html_body):
     if key == 'hide_results' and is_new:
       continue
 
+    if key == 'anonymous_submissions' and is_new:
+      warn_anonymity_not_settable(value)
+      continue
+
     # Pass through quiz_settings as-is for New Quizzes
     if key == 'quiz_settings' and is_new:
       params['quiz_settings'] = value
@@ -7053,6 +7069,8 @@ def export_full_classic_quiz(quiz, importable=False):
     'one_question_at_a_time': bool(quiz.one_question_at_a_time),
     'cant_go_back': bool(quiz.cant_go_back),
     'access_code': getattr(quiz, 'access_code', None),
+    'anonymous_submissions': bool(getattr(quiz, 'anonymous_submissions',
+                                          False)),
   }
 
   # Get questions
@@ -7069,6 +7087,87 @@ def export_full_classic_quiz(quiz, importable=False):
     'settings': settings,
     'questions': questions
   }
+@
+
+\paragraph{Survey anonymity.}
+The classic settings carry [[anonymous_submissions]] so that a survey
+recreated from its export, for the next course round say, stays anonymous.
+Canvas leaves the attribute out of a quiz that is not a survey, which is why
+we read it with a default and export [[false]] for those.
+
+A New Quiz has no such setting to export or send.  The New Quizzes API
+documents neither a survey type nor anonymity, and a New Quiz's
+[[quiz_settings]] carry no key for it, although the web interface has
+offered anonymous New Quizzes surveys since late 2025.
+We therefore never send the key for a New Quiz, but we do not drop it
+silently either: a file that asks for anonymity and does not get it should
+say so, since the respondents were promised it.
+<<functions>>=
+def warn_anonymity_not_settable(anonymous):
+  """Warn that a New Quiz cannot be made anonymous if `anonymous` asks it."""
+  if anonymous:
+    canvaslms.cli.warn(
+      "New Quizzes: anonymous_submissions cannot be set through the API; "
+      "make the survey anonymous in the web interface")
+@
+
+Let's verify that a Classic survey's anonymity survives export and creation,
+and that a New Quiz neither sends the key nor loses it without a warning.
+The quiz is a real [[canvasapi]] [[Quiz]]; only its questions and module
+placement are stubbed, as scenery for the settings.
+
+<<test functions>>=
+def export_classic_settings(monkeypatch, **attributes):
+  """Return the settings exported for a Classic Quiz with `attributes`."""
+  from canvasapi.quiz import Quiz
+  quiz = Quiz(MagicMock(), {
+    "id": 5, "course_id": 1, "title": "Course evaluation",
+    "description": "", "quiz_type": "graded_survey",
+    "allowed_attempts": 1, "shuffle_questions": False,
+    "shuffle_answers": False, "published": False,
+    "show_correct_answers": False, "one_question_at_a_time": False,
+    "cant_go_back": False, **attributes})
+  quiz.course = MagicMock()
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  monkeypatch.setattr(quizzes, "export_classic_questions",
+                      lambda q: {'questions': []})
+  return quizzes.export_full_classic_quiz(quiz)['settings']
+
+def test_anonymous_survey_exports_its_anonymity(monkeypatch):
+  assert export_classic_settings(
+    monkeypatch, anonymous_submissions=True)['anonymous_submissions'] is True
+
+def test_quiz_without_the_attribute_exports_not_anonymous(monkeypatch):
+  assert export_classic_settings(monkeypatch)['anonymous_submissions'] is False
+
+def test_created_classic_survey_is_anonymous(monkeypatch, tmp_path):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'survey.json',
+    '{"quiz_type": "classic", "settings": {"title": "Survey", '
+    '"quiz_type": "graded_survey", "anonymous_submissions": true}}')
+
+  assert sent['anonymous_submissions'] is True
+
+def test_new_quiz_create_warns_and_drops_anonymity(monkeypatch, tmp_path,
+                                                   caplog):
+  sent = create_quiz_from_file(
+    monkeypatch, tmp_path, 'survey.json',
+    '{"quiz_type": "new", "settings": {"title": "Survey", '
+    '"anonymous_submissions": true}}')
+
+  assert 'anonymous_submissions' not in sent
+  assert 'anonymous_submissions' in caplog.text
+
+def test_edit_keeps_anonymity_for_classic_and_drops_it_for_new(caplog):
+  settings = {'title': 'Survey', 'anonymous_submissions': True}
+
+  classic = quizzes.quiz_attributes_to_api_params(settings, False, '')
+  new = quizzes.quiz_attributes_to_api_params(settings, True, '')
+
+  assert classic['anonymous_submissions'] is True
+  assert 'anonymous_submissions' not in new
+  assert 'anonymous_submissions' in caplog.text
 @
 
 
