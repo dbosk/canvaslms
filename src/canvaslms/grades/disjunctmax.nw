@@ -12,9 +12,12 @@ Disjunctive maximum means:
   2) If there are more than one assignment with a non-F grade, we take the 
      maximum as the grade. A--E are valued higher than P. The grade F is valued 
      the lowest.
+  3) Every survey (classic Canvas quiz of survey type) must be completed, or
+     the grade is F. Surveys never count towards the maximum; their scores
+     are ignored. See `canvaslms.grades.surveys`.
 
-We fail if there is an assignment which doesn't have A--F or P/F grading 
-scales.
+We fail if there is an assignment, other than a survey, which doesn't have
+A--F or P/F grading scales.
 
 This way of summarizing a grade is useful when there is an exam assignment, and 
 for each opportunity to take the exam there is a separate copy of the
@@ -35,6 +38,8 @@ This gives the following outline of the module.
 import datetime as dt
 from canvaslms.cli import results
 from canvaslms.grades.gradealiases import normalize_grade
+from canvaslms.grades.surveys import (is_survey, survey_completed,
+                                      split_surveys, missing_surveys)
 from canvasapi.exceptions import ResourceDoesNotExist
 
 <<helper functions>>
@@ -98,30 +103,39 @@ drifting apart.
 Importing the name at module level also keeps [[normalize_grade]] available as
 [[disjunctmax.normalize_grade]], where callers of this module have always
 found it.
+
+Surveys follow a rule of their own, which we explain in
+\cref{disjunctmax-surveys}: they never enter [[grades]], and an uncompleted
+one clears [[surveys_done]].
 <<helper functions>>=
 def summarize(user, assignments_list):
   """Extracts user's submissions for assignments in assingments_list to 
   summarize results into one grade and a grade date. Summarize by disjunctive 
-  maximum."""
+  maximum; every survey must be completed."""
 
   grades = []
   dates = []
   graders = []
+  surveys_done = True
 
   for assignment in assignments_list:
     try:
       submission = assignment.get_submission(user,
                                             include=["submission_history"])
     except ResourceDoesNotExist:
-      grades.append("F")
+      if is_survey(assignment):
+        surveys_done = False
+      else:
+        grades.append("F")
       continue
 
     submission.assignment = assignment
     graders += results.all_graders(submission)
 
-    grade = normalize_grade(submission.grade)
-
-    grades.append(grade)
+    if is_survey(assignment):
+      surveys_done = surveys_done and survey_completed(submission)
+    else:
+      grades.append(normalize_grade(submission.grade))
 
     grade_date = submission.submitted_at or submission.graded_at
 
@@ -129,18 +143,27 @@ def summarize(user, assignments_list):
       grade_date = dt.date.fromisoformat(grade_date.split("T")[0])
       dates.append(grade_date)
 
-  if grades:
-    final_grade = grade_max(grades) or "F"
-  else:
-    final_grade = "F"
-
-  if dates:
-    final_date = max(dates)
-  else:
-    final_date = None
-    final_grade = None
+  <<combine collected results into [[final_grade]] and [[final_date]]>>
 
   return (final_grade, final_date, graders)
+@
+
+If there are no dates at all, the student hasn't done anything; we return
+[[None]] so that the [[results]] command can skip the row entirely.
+Otherwise an uncompleted survey caps the grade at F, and only when all
+surveys are completed do we award the disjunctive maximum.
+A group with no graded assignment at all, only surveys, has nothing to take
+the maximum of, so [[grade_max]] returns [[None]] and the grade is F.
+<<combine collected results into [[final_grade]] and [[final_date]]>>=
+if not dates:
+  final_grade = None
+  final_date = None
+elif not surveys_done:
+  final_grade = "F"
+  final_date = max(dates)
+else:
+  final_grade = grade_max(grades) or "F"
+  final_date = max(dates)
 @
 
 \subsection{Computing the maximum}
@@ -239,6 +262,117 @@ class TestRankingGrades:
 @
 
 
+\subsection{Mandatory surveys}\label{disjunctmax-surveys}
+
+A disjunctive maximum picks the best of several attempts, so most of a group
+may be left unattempted.
+A survey is different: it is not an attempt at the examination, and
+skipping it is not covered by passing another attempt.
+The two kinds of assignment therefore combine by two independent rules.
+\begin{enumerate}
+\item Graded assignments combine by disjunctive maximum: one passing grade
+  suffices, the remaining graded assignments may be failed or not attempted
+  at all.
+\item Every survey is mandatory: it must be completed, and an uncompleted
+  survey caps the grade at F.
+\end{enumerate}
+A survey never enters the maximum.
+Its grade carries no information about the student (\cref{surveys}), and
+counting even a completed survey as a [[P]] would let a student pass the
+group on survey participation alone.
+What a survey does contribute is its date, since completing it is part of
+finishing the group.
+
+These rules used to live in a separate module, [[maxgradesurvey]], which
+recognized surveys by their grading scale; that module is now an alias of
+this one (\cref{maxgradesurvey}).
+Two of its lessons carry over.
+The mandatory-survey rule is tested per \emph{survey}, with [[surveys_done]],
+not as \enquote{every assignment has a date}: a graded assignment the
+student never attempted has no date either, and the disjunctive rule says
+that is fine.
+And an uncompleted survey vetoes the grade whether the student has a
+submission without any date or no submission at all.
+
+Let's verify the two rules and their interplay on a group of an exam taken
+twice and a classic graded survey.
+<<test functions>>=
+class TestMandatorySurveys:
+    """Test that surveys are mandatory and never count towards the max."""
+
+    <<mandatory survey test methods>>
+<<mandatory survey test methods>>=
+def exam(self, grading_objects, grade="A"):
+    if grade is None:
+        return grading_objects.graded(None, name="Exam")
+    return grading_objects.graded(grading_objects.submission(
+        grade, submitted_at="2026-05-01T10:00:00Z"), name="Exam")
+
+def survey(self, grading_objects, grade="100"):
+    return grading_objects.survey(grading_objects.submission(
+        grade, submitted_at="2026-05-02T10:00:00Z"))
+@
+
+First the regression from [[maxgradesurvey]]: an A on one exam, the other
+exam never attempted, and a completed survey must yield the A.
+The survey's grade does not matter, whether it is full points or the lowered
+points of a survey whose maximum was changed.
+<<mandatory survey test methods>>=
+def test_skipped_attempt_and_completed_survey_keep_the_max(
+        self, grading_objects):
+    """Neither the skipped exam nor the survey's grade affects the max."""
+    user = grading_objects.user()
+
+    for survey_grade in ["100", "50", None]:
+        grade, grade_date, _ = summarize(user, [
+            self.exam(grading_objects),
+            self.exam(grading_objects, None),
+            self.survey(grading_objects, survey_grade)])
+
+        assert grade == "A"
+        assert grade_date.isoformat() == "2026-05-02"
+@
+
+Conversely, an uncompleted survey vetoes the A.
+<<mandatory survey test methods>>=
+def test_uncompleted_survey_vetoes_grade(self, grading_objects):
+    """A dateless or absent survey caps the grade at F."""
+    user = grading_objects.user()
+    dateless = grading_objects.survey(grading_objects.submission(None))
+    absent = grading_objects.survey(None)
+
+    for survey in [dateless, absent]:
+        grade, grade_date, _ = summarize(
+            user, [self.exam(grading_objects), survey])
+
+        assert grade == "F"
+        assert grade_date.isoformat() == "2026-05-01"
+@
+
+A student who has done nothing yields no grade at all, so the row is skipped
+downstream, while a student who only completed the survey gets an F: a survey
+can never pass the group.
+<<mandatory survey test methods>>=
+def test_nothing_done_yields_no_grade(self, grading_objects):
+    user = grading_objects.user()
+
+    grade, grade_date, _ = summarize(user, [
+        self.exam(grading_objects, None), grading_objects.survey(None)])
+
+    assert grade is None
+    assert grade_date is None
+
+def test_only_survey_done_yields_f(self, grading_objects):
+    user = grading_objects.user()
+
+    grade, grade_date, _ = summarize(user, [
+        self.exam(grading_objects, None), self.survey(grading_objects)])
+
+    assert grade == "F"
+    assert grade_date.isoformat() == "2026-05-02"
+@
+
+
 \subsection{Finding missing assignments}
 
 For disjunctive maximum grading, the semantics of \enquote{missing} are
@@ -257,22 +391,41 @@ We cannot reuse the shared implementation from [[canvaslms.cli.results]] because
 that iterates assignment-by-assignment.
 Disjunctive logic requires evaluating ALL assignments first, then deciding what
 to report.
+
+Surveys follow the opposite, conjunctive rule, as in [[summarize]]
+(\cref{disjunctmax-surveys}): every uncompleted survey is missing,
+\emph{regardless} of the student's grades.
+We report them first with [[missing_surveys]] (\cref{surveys}) and keep them
+out of the passing check, where a survey's grade would let survey
+participation stand in for the examination.
+Without that split, a student with a passing grade but an uncompleted survey
+would be told that nothing is missing while their summarized grade is F.
+
+One disagreement remains, and it is inherent in the policy.
+A group of surveys only, with no graded assignment, summarizes to F even when
+every survey is completed, since there is nothing to take the maximum of; but
+there is also nothing to report as missing.
+Such a group belongs with [[conjunctavg]] or [[participation]] instead.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         optional_assignments=None):
   """
   Returns missing assignments for disjunctive maximum grading.
 
-  Only reports assignments if the student has NO passing grades.
-  If they have at least one passing grade, nothing is missing.
+  Every uncompleted survey is missing. Other assignments are only reported
+  if the student has NO passing grades among them. If they have at least
+  one passing grade, none of them is missing.
   """
   import re
+
+  surveys, others = split_surveys(assignments_list)
+  yield from missing_surveys(surveys, users_list, optional_assignments)
 
   for user in users_list:
     grades_with_assignments = []
 
     # First pass: collect all grades
-    for assignment in assignments_list:
+    for assignment in others:
       # Skip optional assignments
       if optional_assignments:
         if any(re.search(opt, assignment.name) for opt in optional_assignments):
@@ -422,4 +575,68 @@ class TestPassingGradeAliases:
         )
 
         assert missing == []
+@
+
+The surveys must reach the [[--missing]] report the same way they reach the
+summary.
+A passing exam must not hide an uncompleted survey, a completed survey is
+never reported whatever its grade---nor is its grade ranked, which would fail
+on a grade like [[50]]---and without a passing exam both rules fire: the
+survey as mandatory, each exam as an option.
+<<test functions>>=
+class TestMissingSurveys:
+    """Test the survey rule in the --missing report."""
+
+    <<missing survey test methods>>
+<<missing survey test methods>>=
+def passed_exam(self, grading_objects):
+    return grading_objects.graded(grading_objects.submission(
+        "A", submitted_at="2026-05-01T10:00:00Z"), name="Exam")
+
+def test_uncompleted_survey_reported_despite_passing_grade(
+        self, grading_objects):
+    user = grading_objects.user()
+    survey = grading_objects.survey(None)
+
+    rows = list(missing_assignments(
+        [self.passed_exam(grading_objects), survey], [user]))
+
+    assert rows == [(user, survey, "mandatory survey not completed")]
+
+def test_completed_survey_never_reported(self, grading_objects):
+    user = grading_objects.user()
+
+    for survey_grade in ["50", None]:
+        survey = grading_objects.survey(grading_objects.submission(
+            survey_grade, submitted_at="2026-05-02T10:00:00Z"))
+
+        rows = list(missing_assignments(
+            [survey, self.passed_exam(grading_objects)], [user]))
+
+        assert rows == []
+
+def test_all_reported_when_no_passing_grade(self, grading_objects):
+    user = grading_objects.user()
+    failed = grading_objects.graded(grading_objects.submission(
+        "F", submitted_at="2026-05-01T10:00:00Z"), name="Exam 1")
+    unattempted = grading_objects.graded(None, name="Exam 2")
+    survey = grading_objects.survey(None)
+
+    rows = list(missing_assignments([failed, unattempted, survey], [user]))
+
+    assert [row[1] for row in rows] == [survey, failed, unattempted]
+@
+
+A completed survey's grade never counts as passing either: a student who
+only completed the survey still has every exam reported.
+<<missing survey test methods>>=
+def test_survey_grade_never_passes(self, grading_objects):
+    user = grading_objects.user()
+    unattempted = grading_objects.graded(None, name="Exam")
+    survey = grading_objects.survey(grading_objects.submission(
+        "100", submitted_at="2026-05-02T10:00:00Z"))
+
+    rows = list(missing_assignments([unattempted, survey], [user]))
+
+    assert [row[1] for row in rows] == [unattempted]
 @
