@@ -48,7 +48,9 @@ appear after their corresponding functionality:
 
 import argparse
 import pytest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, create_autospec
+import canvasapi.course
+import canvasapi.group
 import canvaslms.cli.users as users_module
 
 <<test user fixtures>>
@@ -711,7 +713,7 @@ def filter_groups(items, regex, **kwargs):
   """
   Items is a list of either courses or group categories,
   regex is a regular expression.
-  Returns all groups whose name match regex.
+  Returns all groups whose name or Canvas ID matches regex.
 
   Keyword arguments are passed on to ``.get_groups()``.
   """
@@ -721,12 +723,72 @@ def filter_groups(items, regex, **kwargs):
   for item in items:
     for group in item.get_groups(**kwargs):
       group = canvaslms.cli.utils.ensure_group_attrs(group)
-      if name.search(group.name or ''):
+      if name.search(group.name or '') or name.search(str(group.id)):
         if isinstance(item, canvasapi.course.Course):
           group.course = item
         elif isinstance(item, canvasapi.group.GroupCategory):
           group.category = item
         yield group
+@
+
+\subsection{Matching groups by name or Canvas ID}
+
+The other selection options (courses, modules and, since the
+assignment-group fix, [[-A]]) accept either a name or a Canvas ID, because a
+user can read the ID off the Canvas URL but cannot always retype a long,
+accented group name.
+Lab groups are often called \enquote{Group 1} to \enquote{Group 40}, so a name
+pattern is easy to get wrong while the ID is unambiguous.
+We therefore also search the group's ID, converted to a string, with the same
+unanchored [[search]] that the name uses.
+The consequence is the same as for the other filters: [[1234]] selects the
+group with that ID, but [[12]] also selects every group whose ID contains those
+digits, so a pattern like [[^1234$]] is needed to pin the match.
+The [[groups]] subcommand's positional [[group_regex]] goes through
+[[filter_groups]] as well, so it gains the same behaviour.
+
+Let's verify the four cases with real [[canvasapi]] [[Course]] and [[Group]]
+objects: a name match, an exact ID match, an unanchored partial-ID match and a
+pattern that matches neither.
+Only [[get_groups]], the one method that would make a request, is replaced, by
+a stub autospecced from the real bound method so that a wrong signature fails.
+The group JSON carries fields Canvas sends; the names contain no digits, so a
+hit on [[777]] can only come from the ID.
+
+<<test functions>>=
+def make_course_with_groups(groups_json):
+    """Real Course whose get_groups returns real Groups (no requests)"""
+    requester = MagicMock()
+    course = canvasapi.course.Course(requester, {"id": 1, "name": "C"})
+    groups = [canvasapi.group.Group(requester, g) for g in groups_json]
+    course.get_groups = create_autospec(
+        course.get_groups, return_value=groups)
+    return course
+
+GROUPS_JSON = [
+    {"id": 777, "name": "Alpha", "members_count": 2},
+    {"id": 1777, "name": "Beta", "members_count": 3},
+    {"id": 42, "name": "Gamma", "members_count": 0},
+]
+
+def test_filter_groups_matches_name():
+    course = make_course_with_groups(GROUPS_JSON)
+    found = list(users_module.filter_groups([course], "^Alpha$"))
+    assert [g.id for g in found] == [777]
+
+def test_filter_groups_matches_canvas_id():
+    course = make_course_with_groups(GROUPS_JSON)
+    found = list(users_module.filter_groups([course], "^42$"))
+    assert [g.name for g in found] == ["Gamma"]
+
+def test_filter_groups_matches_partial_id_unanchored():
+    course = make_course_with_groups(GROUPS_JSON)
+    found = list(users_module.filter_groups([course], "777"))
+    assert [g.id for g in found] == [777, 1777]
+
+def test_filter_groups_no_match():
+    course = make_course_with_groups(GROUPS_JSON)
+    assert list(users_module.filter_groups([course], "nothing|999")) == []
 @
 
 
@@ -1511,7 +1573,7 @@ def add_group_option_wo_depends(parser, suppress_help=False):
   parser.add_argument("-G", "--group", metavar="group_regex",
     required=False,
     help=argparse.SUPPRESS if suppress_help else
-      "Filters user groups whose name match group_regex")
+      "Filters user groups whose name or Canvas ID match group_regex")
 
 def add_group_option(parser):
   """Adds group filtering options to argparse parser,
