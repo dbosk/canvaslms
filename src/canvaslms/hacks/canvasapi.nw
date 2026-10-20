@@ -107,7 +107,13 @@ from datetime import datetime, timedelta
 # These are the actual Canvas classes we patch.
 # We import them explicitly so we can call their patched dunder methods.
 from canvasapi.assignment import Assignment, AssignmentGroup
+from canvasapi.canvas_object import CanvasObject
+from canvasapi.course import Course
 from canvasapi.file import File
+from canvasapi.group import GroupCategory
+from canvasapi.new_quiz import NewQuiz
+from canvasapi.page import Page
+from canvasapi.quiz import Quiz
 from canvasapi.submission import Submission
 from canvasapi.user import User
 
@@ -120,7 +126,34 @@ import canvaslms.hacks.canvasapi
 # Import everything for testing
 from canvaslms.hacks.canvasapi import *
 
+<<canvas test doubles>>
 <<test functions>>
+@
+
+Most tests below decorate small stand-in classes with our caching
+decorators, and the methods of those classes return what Canvas would: a
+course, an assignment, a submission.
+Those objects are real [[canvasapi]] objects, built from the JSON fields
+Canvas sends on a [[MagicMock]] requester, rather than [[MagicMock]]s.
+The difference matters here more than anywhere: [[outdated]] decides
+whether a cached object is stale by probing its attributes---a
+[[grade]] makes it a submission, a [[page_id]] makes it a page---and a
+[[MagicMock]] has every attribute, so each mock was judged as an ungraded
+submission whatever it stood for.
+A real object has only the fields it was built from.
+Objects whose class does not matter to the cache, such as the generic
+items of the stand-in classes, are built as [[CanvasObject]], the base
+class of all [[canvasapi]] objects.
+Attributes that our cache sets rather than Canvas, such as [[_fetched_at]],
+the tests still assign after construction.
+<<canvas test doubles>>=
+def canvas_object(cls=CanvasObject, **fields):
+    """A `cls` built offline from the Canvas JSON `fields`."""
+    return cls(MagicMock(), fields)
+
+def listed_assignment():
+    """An assignment as Canvas lists it, for wrappers that keep one."""
+    return canvas_object(Assignment, id=2, name="Lab 1", course_id=1)
 @
 
 \subsection{Why monkey-patching is necessary}
@@ -235,61 +268,61 @@ class TestEqualityMonkeyPatch:
 
     def test_users_with_same_id_are_equal(self):
         """Two User objects with same ID should be equal"""
-        # Test with same mock instance (verifies ID comparison logic)
-        user1 = MagicMock()
-        user1.id = 12345
+        user1 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        user2 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
 
-        # Same object is equal to itself
-        assert User.__eq__(user1, user1)
+        assert user1 is not user2
+        assert user1 == user2
 
     def test_users_with_different_ids_not_equal(self):
         """Users with different IDs should not be equal"""
-        user1 = MagicMock()
-        user1.id = 12345
-        user2 = MagicMock()
-        user2.id = 67890
+        user1 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        user2 = User(MagicMock(), {"id": 67890, "name": "Bob Brown"})
 
-        assert not User.__eq__(user1, user2)
+        assert user1 != user2
 
     def test_different_types_not_equal(self):
         """Objects of different types should not be equal, even with same ID"""
-        user = MagicMock()
-        user.id = 12345
+        user = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        assignment = Assignment(MagicMock(), {"id": 12345, "name": "Lab 1",
+                                              "course_id": 1})
 
-        assignment = MagicMock()
-        assignment.id = 12345
-
-        # Different types (checked by type())
-        assert not User.__eq__(user, assignment)
+        assert user != assignment
 
     def test_assignments_have_equality_method(self):
         """Assignment class should have patched __eq__ method"""
-        assign = MagicMock()
-        assign.id = 5001
+        fields = {"id": 5001, "name": "Lab 1", "course_id": 1}
 
-        # Same object is equal to itself (verifies patch exists)
-        assert Assignment.__eq__(assign, assign)
+        assert Assignment(MagicMock(), fields) == \
+            Assignment(MagicMock(), fields)
 
     def test_submissions_have_equality_method(self):
         """Submission class should have patched __eq__ method"""
-        sub = MagicMock()
-        sub.id = 6001
+        fields = {"id": 6001, "user_id": 12345, "assignment_id": 5001}
 
-        # Same object is equal to itself (verifies patch exists)
-        assert Submission.__eq__(sub, sub)
+        assert Submission(MagicMock(), fields) == \
+            Submission(MagicMock(), fields)
 
     def test_assignment_groups_have_equality_method(self):
         """AssignmentGroup class should have patched __eq__ method"""
-        group = MagicMock()
-        group.id = 2001
+        fields = {"id": 2001, "name": "Labs"}
 
-        # Same object is equal to itself (verifies patch exists)
-        assert AssignmentGroup.__eq__(group, group)
+        assert AssignmentGroup(MagicMock(), fields) == \
+            AssignmentGroup(MagicMock(), fields)
 @
 
 Notice how semantic equality transforms our ability to work with Canvas objects.
 Before the patch, comparing objects was meaningless.
 After the patch, we can check if two objects represent the same Canvas entity.
+
+The objects compared are real [[canvasapi]] objects, built from Canvas JSON
+on a [[MagicMock]] requester, and compared with [[==]] as the code compares
+them.
+Earlier versions of these tests called [[User.__eq__]] on [[MagicMock]]s,
+which could not show much: every [[MagicMock]] instance has a class of its
+own, so the type check in [[is_equal]] failed for any two distinct mocks
+whatever their IDs, and the only comparison left to test was an object with
+itself.
 
 \subsubsection{Testing hashability ( [[__hash__]] )}
 
@@ -304,63 +337,50 @@ class TestHashabilityMonkeyPatch:
 
     def test_users_with_same_id_have_same_hash(self):
         """Equal users should have equal hashes"""
-        user = MagicMock()
-        user.id = 12345
+        user1 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        user2 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
 
-        # Same object hashed twice should give same hash
-        assert User.__hash__(user) == User.__hash__(user)
+        assert hash(user1) == hash(user2)
 
     def test_users_with_different_ids_have_different_hashes(self):
         """Different users should (usually) have different hashes"""
-        user1 = MagicMock()
-        user1.id = 12345
-        user2 = MagicMock()
-        user2.id = 67890
+        user1 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        user2 = User(MagicMock(), {"id": 67890, "name": "Bob Brown"})
 
         # Different IDs should produce different hashes
         # (hash collisions possible but unlikely)
-        assert User.__hash__(user1) != User.__hash__(user2)
+        assert hash(user1) != hash(user2)
 
     def test_hashability_enables_set_usage(self):
         """
         Patched __hash__ allows Canvas objects to be used in sets.
 
-        This test verifies the method is properly defined, making
-        sets and dicts possible (actual usage requires both __eq__
-        and __hash__ to work together on real Canvas objects).
+        Two objects for the same user collapse into one set element,
+        which needs __eq__ and __hash__ to agree.
         """
-        user1 = MagicMock()
-        user1.id = 12345
-        user2 = MagicMock()
-        user2.id = 67890
+        user1 = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        same_user = User(MagicMock(), {"id": 12345, "name": "Alice Anderson"})
+        user2 = User(MagicMock(), {"id": 67890, "name": "Bob Brown"})
 
-        # Both should be hashable
-        hash1 = User.__hash__(user1)
-        hash2 = User.__hash__(user2)
-
-        assert isinstance(hash1, int)
-        assert isinstance(hash2, int)
-        assert hash1 != hash2
+        assert len({user1, same_user, user2}) == 2
 
     def test_hashability_enables_dict_usage(self):
         """
         Patched __hash__ allows Canvas objects as dictionary keys.
 
-        Verifies the hash method is properly defined and returns
-        valid hash values based on type and ID.
+        A key stored with one object is found with another object for
+        the same assignment.
         """
-        assign1 = MagicMock()
-        assign1.id = 5001
-        assign2 = MagicMock()
-        assign2.id = 5002
+        assign1 = Assignment(MagicMock(), {"id": 5001, "name": "Lab 1",
+                                           "course_id": 1})
+        assign2 = Assignment(MagicMock(), {"id": 5002, "name": "Lab 2",
+                                           "course_id": 1})
+        grades = {assign1: "P", assign2: "F"}
 
-        # Both should produce valid hashes
-        hash1 = Assignment.__hash__(assign1)
-        hash2 = Assignment.__hash__(assign2)
-
-        assert isinstance(hash1, int)
-        assert isinstance(hash2, int)
-        assert hash1 != hash2
+        same_assignment = Assignment(MagicMock(), {"id": 5001,
+                                                   "name": "Lab 1",
+                                                   "course_id": 1})
+        assert grades[same_assignment] == "P"
 @
 
 These tests demonstrate the power of hashability: we can now use sets for deduplication and dictionaries for fast lookups.
@@ -408,33 +428,29 @@ class TestUserStringRepresentation:
 
     def test_user_str_with_name_and_login(self):
         """User string should show name and login ID"""
-        user = MagicMock(spec=User)
-        user.name = "Alice Anderson"
-        user.login_id = "alice"
+        user = User(MagicMock(), {"id": 1, "name": "Alice Anderson",
+                                  "login_id": "alice"})
 
-        result = User.__str__(user)
+        result = str(user)
 
         assert result == "Alice Anderson <alice>"
 
     def test_user_str_without_login_id(self):
         """If login_id is missing, show empty brackets"""
-        user = MagicMock(spec=User)
-        user.name = "Bob Brown"
-        # Simulate missing login_id attribute
-        del user.login_id
+        # Canvas omits login_id, e.g. for users no longer enrolled
+        user = User(MagicMock(), {"id": 2, "name": "Bob Brown"})
 
-        result = User.__str__(user)
+        result = str(user)
 
         assert result == "Bob Brown <>"
 
     def test_user_str_useful_for_debugging(self):
         """String representation should be human-readable"""
-        user = MagicMock(spec=User)
-        user.name = "Charlie Chen"
-        user.login_id = "cchen"
+        user = User(MagicMock(), {"id": 3, "name": "Charlie Chen",
+                                  "login_id": "cchen"})
 
         # Should not contain Canvas ID or object address
-        result = User.__str__(user)
+        result = str(user)
 
         assert "Charlie Chen" in result
         assert "cchen" in result
@@ -1047,7 +1063,7 @@ class TestCacheGetMethodsInit:
                 pass
 
             def get_test(self, test_id):
-                return MagicMock(id=test_id)
+                return canvas_object(id=test_id)
 
             def get_tests(self):
                 return []
@@ -1086,9 +1102,11 @@ class TestCacheKeyUrlParameter:
             def __init__(self):
                 pass
             def get_page(self, url):
-                obj = MagicMock()
-                obj.url = url
-                obj.title = f"Page: {url}"
+                obj = canvas_object(
+                    Page,
+                    url=url,
+                    title=f"Page: {url}",
+                )
                 return obj
             def get_pages(self):
                 return []
@@ -1111,8 +1129,7 @@ class TestCacheKeyUrlParameter:
                 pass
             def get_page(self, url):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.url = url
+                obj = canvas_object(Page, url=url)
                 return obj
             def get_pages(self):
                 return []
@@ -1132,8 +1149,7 @@ class TestCacheKeyUrlParameter:
             def __init__(self):
                 pass
             def get_page(self, url):
-                obj = MagicMock()
-                obj.url = url
+                obj = canvas_object(Page, url=url)
                 return obj
             def get_pages(self):
                 return []
@@ -1155,14 +1171,13 @@ class TestCacheKeyUrlParameter:
             def __init__(self):
                 pass
             def get_page(self, url):
-                obj = MagicMock()
-                obj.url = url
+                obj = canvas_object(Page, url=url)
                 return obj
             def get_pages(self):
                 return [
-                    MagicMock(url="page-a"),
-                    MagicMock(url="page-b"),
-                    MagicMock(url="page-c")
+                    canvas_object(Page, url="page-a"),
+                    canvas_object(Page, url="page-b"),
+                    canvas_object(Page, url="page-c")
                 ]
 
         CacheGetMethods("page", cache_key='url')(TestClass)
@@ -1180,8 +1195,7 @@ class TestCacheKeyUrlParameter:
             def __init__(self):
                 pass
             def get_page(self, url):
-                obj = MagicMock()
-                obj.url = url
+                obj = canvas_object(Page, url=url)
                 return obj
             def get_pages(self):
                 return []
@@ -1304,7 +1318,7 @@ class TestCacheAttributeInjection:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 return []
 
@@ -1320,7 +1334,7 @@ class TestCacheAttributeInjection:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 return []
 
@@ -1336,7 +1350,7 @@ class TestCacheAttributeInjection:
             def __init__(self):
                 pass
             def get_submission(self, sub_id):
-                return MagicMock(id=sub_id)
+                return canvas_object(Submission, id=sub_id)
             def get_submissions(self):
                 return []
 
@@ -1351,11 +1365,11 @@ class TestCacheAttributeInjection:
             def __init__(self):
                 pass
             def get_assignment(self, asgn_id):
-                return MagicMock(id=asgn_id)
+                return canvas_object(Assignment, id=asgn_id)
             def get_assignments(self):
                 return []
             def get_user(self, user_id):
-                return MagicMock(id=user_id)
+                return canvas_object(User, id=user_id)
             def get_users(self):
                 return []
 
@@ -1374,7 +1388,7 @@ class TestCacheAttributeInjection:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 return []
 
@@ -1393,7 +1407,7 @@ class TestCacheAttributeInjection:
             def __init__(self, value):
                 self.value = value
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 return []
 
@@ -1544,8 +1558,7 @@ class TestSingularMethodCaching:
                 pass
             def get_item(self, item_id):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1567,8 +1580,7 @@ class TestSingularMethodCaching:
                 pass
             def get_item(self, item_id):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1588,8 +1600,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id, **kwargs):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1612,8 +1623,7 @@ class TestSingularMethodCaching:
                 pass
             def get_item(self, item_id, **kwargs):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1635,9 +1645,11 @@ class TestSingularMethodCaching:
                 pass
             def get_submission(self, sub_id):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.id = sub_id
-                obj.grade = "B"  # Non-passing grade
+                obj = canvas_object(
+                    Submission,
+                    id=sub_id,
+                    grade="B",  # Non-passing grade
+                )
                 return obj
             def get_submissions(self):
                 return []
@@ -1663,8 +1675,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1682,20 +1693,15 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                if hasattr(item_id, 'id'):
-                    obj.id = item_id.id
-                else:
-                    obj.id = item_id
-                return obj
+                return canvas_object(
+                    id=item_id.id if hasattr(item_id, 'id') else item_id)
             def get_items(self):
                 return []
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
 
-        canvas_obj = MagicMock()
-        canvas_obj.id = 99
+        canvas_obj = canvas_object(id=99)
         result = instance.get_item(canvas_obj)
 
         assert result.id == 99
@@ -1706,8 +1712,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1724,8 +1729,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1746,8 +1750,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1764,8 +1767,7 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 return []
@@ -1783,8 +1785,8 @@ class TestSingularMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id if isinstance(item_id, int) else item_id.id
+                obj = canvas_object(
+                    id=item_id if isinstance(item_id, int) else item_id.id)
                 return obj
             def get_items(self):
                 return []
@@ -1793,8 +1795,7 @@ class TestSingularMethodCaching:
         instance = TestClass()
 
         # Pass Canvas object
-        canvas_obj = MagicMock()
-        canvas_obj.id = 123
+        canvas_obj = canvas_object(id=123)
         instance.get_item(canvas_obj)
 
         # Cache key should be the ID, not the object
@@ -2004,9 +2005,11 @@ class TestPluralOnlyStaleObjects:
             def __init__(self):
                 pass
             def get_items(self, **kwargs):
-                obj = MagicMock()
-                obj.id = 1
-                obj.grade = "F"  # non-passing grade, can become stale
+                obj = canvas_object(
+                    Submission,
+                    id=1,
+                    grade="F",  # non-passing grade, can become stale
+                )
                 return [obj]
 
         CacheGetMethods("item", include_singular=False)(TestClass)
@@ -2170,10 +2173,10 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 call_count["count"] += 1
-                return [MagicMock(id=1), MagicMock(id=2), MagicMock(id=3)]
+                return [canvas_object(id=i) for i in [1, 2, 3]]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2188,9 +2191,9 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
-                return [MagicMock(id=i) for i in [10, 20, 30]]
+                return [canvas_object(id=i) for i in [10, 20, 30]]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2207,9 +2210,9 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
-                return [MagicMock(id=1)]
+                return [canvas_object(id=1)]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2229,10 +2232,10 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 call_count["count"] += 1
-                return [MagicMock(id=i) for i in [1, 2, 3]]
+                return [canvas_object(id=i) for i in [1, 2, 3]]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2248,9 +2251,9 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
-                return [MagicMock(id=1)]
+                return [canvas_object(id=1)]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2269,12 +2272,15 @@ class TestPluralMethodCaching:
                 pass
             def get_submission(self, sub_id):
                 refetch_count["count"] += 1
-                obj = MagicMock()
-                obj.id = sub_id
-                obj.grade = "A"  # Won't be outdated
+                obj = canvas_object(
+                    Submission,
+                    id=sub_id,
+                    grade="A",  # Won't be outdated
+                )
                 return obj
             def get_submissions(self):
-                return [MagicMock(id=i, grade="A") for i in [1, 2]]
+                return [canvas_object(Submission, id=i, grade="A")
+                        for i in [1, 2]]
 
         CacheGetMethods("submission")(TestClass)
         instance = TestClass()
@@ -2296,12 +2302,14 @@ class TestPluralMethodCaching:
                 pass
             def get_submission(self, sub_id):
                 refetch_count["count"] += 1
-                obj = MagicMock()
-                obj.id = sub_id
-                obj.grade = "B"  # Non-passing grade
+                obj = canvas_object(
+                    Submission,
+                    id=sub_id,
+                    grade="B",  # Non-passing grade
+                )
                 return obj
             def get_submissions(self):
-                return [MagicMock(id=1, grade="B")]
+                return [canvas_object(Submission, id=1, grade="B")]
 
         CacheGetMethods("submission")(TestClass)
         instance = TestClass()
@@ -2326,10 +2334,10 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id, **kwargs):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self, **kwargs):
                 # Return objects with merged kwargs visible
-                return [MagicMock(id=1)]
+                return [canvas_object(id=1)]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2352,9 +2360,9 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_group_category(self, cat_id):
-                return MagicMock(id=cat_id)
+                return canvas_object(GroupCategory, id=cat_id)
             def get_group_categories(self):
-                return [MagicMock(id=1)]
+                return [canvas_object(GroupCategory, id=1)]
 
         CacheGetMethods("group_category",
                         plural_name="group_categories")(TestClass)
@@ -2373,10 +2381,10 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
                 call_count["count"] += 1
-                return [MagicMock(id=1)]
+                return [canvas_object(id=1)]
 
         CacheGetMethods("item")(TestClass)
         instance = TestClass()
@@ -2393,11 +2401,13 @@ class TestPluralMethodCaching:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                return MagicMock(id=item_id)
+                return canvas_object(id=item_id)
             def get_items(self):
-                obj1 = MagicMock()
-                obj1.id = 1
-                obj1.grade = "B"  # Non-passing (would be checked if double-yield)
+                obj1 = canvas_object(
+                    Submission,
+                    id=1,
+                    grade="B",  # Non-passing (would be checked if double-yield)
+                )
                 return [obj1]
 
         CacheGetMethods("item")(TestClass)
@@ -2451,12 +2461,10 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_course(self, course_id):
-                obj = MagicMock()
-                obj.id = course_id
+                obj = canvas_object(Course, id=course_id)
                 return obj
             def get_courses(self):
-                obj = MagicMock()
-                obj.id = 1
+                obj = canvas_object(Course, id=1)
                 return [obj]
 
         CacheGetMethods("course")(TestClass)
@@ -2490,14 +2498,12 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 counter["val"] += 1
                 # Return object with consistent ID
-                obj = MagicMock()
-                obj.id = 1
+                obj = canvas_object(id=1)
                 return [obj]
 
         CacheGetMethods("item")(TestClass)
@@ -2524,12 +2530,10 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
-                obj = MagicMock()
-                obj.id = 1
+                obj = canvas_object(id=1)
                 return [obj]
 
         CacheGetMethods("item")(TestClass)
@@ -2556,12 +2560,10 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_course(self, course_id):
-                obj = MagicMock()
-                obj.id = course_id
+                obj = canvas_object(Course, id=course_id)
                 return obj
             def get_courses(self):
-                obj = MagicMock()
-                obj.id = 1
+                obj = canvas_object(Course, id=1)
                 return [obj]
 
         CacheGetMethods("course")(TestClass)
@@ -2595,12 +2597,10 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
-                obj = MagicMock()
-                obj.id = 1
+                obj = canvas_object(id=1)
                 return [obj]
 
         CacheGetMethods("item")(TestClass)
@@ -2627,13 +2627,11 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
+                obj = canvas_object(id=item_id)
                 return obj
             def get_items(self):
                 # Return new object not in cache
-                obj = MagicMock()
-                obj.id = 99
+                obj = canvas_object(id=99)
                 return [obj]
 
         CacheGetMethods("item")(TestClass)
@@ -2652,14 +2650,16 @@ class TestCacheSynchronization:
             def __init__(self):
                 pass
             def get_item(self, item_id):
-                obj = MagicMock()
-                obj.id = item_id
-                obj.name = f"Item {item_id}"
+                obj = canvas_object(
+                    id=item_id,
+                    name=f"Item {item_id}",
+                )
                 return obj
             def get_items(self):
-                obj = MagicMock()
-                obj.id = 1
-                obj.name = "Updated Item 1"
+                obj = canvas_object(
+                    id=1,
+                    name="Updated Item 1",
+                )
                 return [obj]
 
         CacheGetMethods("item")(TestClass)
@@ -2693,17 +2693,23 @@ class TestRealisticCanvasScenarios:
         """Course with cached assignments should work like real Canvas"""
         class Canvas:
             def get_course(self, course_id):
-                obj = MagicMock()
-                obj.id = course_id
-                obj.name = f"Course {course_id}"
+                obj = canvas_object(
+                    Course,
+                    id=course_id,
+                    name=f"Course {course_id}",
+                )
                 return obj
             def get_courses(self):
-                c1 = MagicMock()
-                c1.id = 1
-                c1.name = "Course 1"
-                c2 = MagicMock()
-                c2.id = 2
-                c2.name = "Course 2"
+                c1 = canvas_object(
+                    Course,
+                    id=1,
+                    name="Course 1",
+                )
+                c2 = canvas_object(
+                    Course,
+                    id=2,
+                    name="Course 2",
+                )
                 return [c1, c2]
 
         # Apply decorator
@@ -2727,13 +2733,11 @@ class TestRealisticCanvasScenarios:
 
         class Canvas:
             def get_course(self, course_id):
-                obj = MagicMock()
-                obj.id = course_id
+                obj = canvas_object(Course, id=course_id)
                 return obj
             def get_courses(self, **kwargs):
                 call_counts["fetch"] += 1
-                c = MagicMock()
-                c.id = 1
+                c = canvas_object(Course, id=1)
                 return [c]
 
         CacheGetMethods("course")(Canvas)
@@ -2755,20 +2759,16 @@ class TestRealisticCanvasScenarios:
         """Course with both assignment and user caches (like production)"""
         class Course:
             def get_assignment(self, assignment_id):
-                obj = MagicMock()
-                obj.id = assignment_id
+                obj = canvas_object(Assignment, id=assignment_id)
                 return obj
             def get_assignments(self):
-                a = MagicMock()
-                a.id = 10
+                a = canvas_object(Assignment, id=10)
                 return [a]
             def get_user(self, user_id):
-                obj = MagicMock()
-                obj.id = user_id
+                obj = canvas_object(User, id=user_id)
                 return obj
             def get_users(self):
-                u = MagicMock()
-                u.id = 100
+                u = canvas_object(User, id=100)
                 return [u]
 
         # Apply multiple decorators like production
@@ -2799,18 +2799,24 @@ class TestRealisticCanvasScenarios:
         class Canvas:
             def get_course(self, course_id):
                 call_counts["get_course"] += 1
-                obj = MagicMock()
-                obj.id = course_id
-                obj.name = f"Course {course_id}"
+                obj = canvas_object(
+                    Course,
+                    id=course_id,
+                    name=f"Course {course_id}",
+                )
                 return obj
             def get_courses(self):
                 call_counts["get_courses"] += 1
-                c1 = MagicMock()
-                c1.id = 1
-                c1.name = "Course 1"
-                c2 = MagicMock()
-                c2.id = 2
-                c2.name = "Course 2"
+                c1 = canvas_object(
+                    Course,
+                    id=1,
+                    name="Course 1",
+                )
+                c2 = canvas_object(
+                    Course,
+                    id=2,
+                    name="Course 2",
+                )
                 return [c1, c2]
 
         CacheGetMethods("course")(Canvas)
@@ -2832,12 +2838,10 @@ class TestRealisticCanvasScenarios:
         """group_categories uses custom plural_name like production"""
         class Course:
             def get_group_category(self, category_id):
-                obj = MagicMock()
-                obj.id = category_id
+                obj = canvas_object(GroupCategory, id=category_id)
                 return obj
             def get_group_categories(self):
-                gc = MagicMock()
-                gc.id = 1
+                gc = canvas_object(GroupCategory, id=1)
                 return [gc]
 
         CacheGetMethods("group_category",
@@ -2855,8 +2859,7 @@ class TestRealisticCanvasScenarios:
         """assignment_groups decorator uses include_singular=False"""
         class Course:
             def get_assignment_groups(self):
-                ag = MagicMock()
-                ag.id = 1
+                ag = canvas_object(AssignmentGroup, id=1)
                 return [ag]
 
         CacheGetMethods("assignment_group",
@@ -2882,14 +2885,15 @@ class TestRealisticCanvasScenarios:
 
         class Canvas:
             def get_course(self, course_id):
-                obj = MagicMock()
-                obj.id = course_id
+                obj = canvas_object(Course, id=course_id)
                 return obj
             def get_courses(self):
                 call_count["count"] += 1
-                c = MagicMock()
-                c.id = 1
-                c.name = "Test Course"
+                c = canvas_object(
+                    Course,
+                    id=1,
+                    name="Test Course",
+                )
                 return [c]
 
         CacheGetMethods("course")(Canvas)
@@ -3191,40 +3195,35 @@ class TestOutdated:
 
     def test_passing_grade_a_not_outdated(self):
         """Submissions with grade A should never be outdated"""
-        submission = MagicMock()
-        submission.grade = "A"
+        submission = canvas_object(Submission, grade="A")
         submission._fetched_at = datetime.now() - timedelta(days=365)
 
         assert not outdated(submission)
 
     def test_passing_grade_p_not_outdated(self):
         """Submissions with grade P should never be outdated"""
-        submission = MagicMock()
-        submission.grade = "P"
+        submission = canvas_object(Submission, grade="P")
         submission._fetched_at = datetime.now() - timedelta(days=100)
 
         assert not outdated(submission)
 
     def test_passing_grade_p_plus_not_outdated(self):
         """Submissions with grade P+ should never be outdated"""
-        submission = MagicMock()
-        submission.grade = "P+"
+        submission = canvas_object(Submission, grade="P+")
         submission._fetched_at = datetime.now() - timedelta(days=50)
 
         assert not outdated(submission)
 
     def test_passing_grade_complete_not_outdated(self):
         """Submissions with grade 'complete' should never be outdated"""
-        submission = MagicMock()
-        submission.grade = "complete"
+        submission = canvas_object(Submission, grade="complete")
         submission._fetched_at = datetime.now() - timedelta(days=30)
 
         assert not outdated(submission)
 
     def test_non_passing_grade_recent_not_outdated(self):
         """Non-passing grade within the TTL should not be outdated"""
-        submission = MagicMock()
-        submission.grade = "F"
+        submission = canvas_object(Submission, grade="F")
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES - 1)
 
@@ -3232,8 +3231,7 @@ class TestOutdated:
 
     def test_non_passing_grade_old_is_outdated(self):
         """Non-passing grade past the TTL should be outdated"""
-        submission = MagicMock()
-        submission.grade = "B"
+        submission = canvas_object(Submission, grade="B")
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES + 1)
 
@@ -3241,8 +3239,7 @@ class TestOutdated:
 
     def test_non_passing_grade_at_ttl_not_outdated(self):
         """Exactly at the TTL should not trigger update (not >TTL)"""
-        submission = MagicMock()
-        submission.grade = "C"
+        submission = canvas_object(Submission, grade="C")
         # Just under the TTL to account for execution time
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES, seconds=-1)
@@ -3251,22 +3248,20 @@ class TestOutdated:
 
     def test_no_grade_attribute_not_outdated(self):
         """Objects without grade attribute should not be outdated"""
-        obj = MagicMock(spec=[])  # No attributes
+        obj = canvas_object()  # No attributes
 
         assert not outdated(obj)
 
     def test_no_fetched_at_with_non_passing_grade_is_outdated(self):
         """Non-passing grade without _fetched_at should be outdated"""
-        submission = MagicMock()
-        submission.grade = "F"
-        del submission._fetched_at
+        submission = canvas_object(Submission, grade="F")
+        assert not hasattr(submission, "_fetched_at")
 
         assert outdated(submission)
 
     def test_none_grade_is_outdated(self):
         """Ungraded submissions (None grade) should refresh"""
-        submission = MagicMock()
-        submission.grade = None
+        submission = canvas_object(Submission, grade=None)
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES + 1)
 
@@ -3274,8 +3269,7 @@ class TestOutdated:
 
     def test_empty_string_grade_is_outdated(self):
         """Empty grade string should refresh if old"""
-        submission = MagicMock()
-        submission.grade = ""
+        submission = canvas_object(Submission, grade="")
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES + 1)
 
@@ -3283,8 +3277,7 @@ class TestOutdated:
 
     def test_numeric_grade_is_outdated(self):
         """Numeric grades (improvable) should refresh if old"""
-        submission = MagicMock()
-        submission.grade = "85"
+        submission = canvas_object(Submission, grade="85")
         submission._fetched_at = datetime.now() - timedelta(
             minutes=SUBMISSION_TTL_MINUTES + 1)
 
@@ -3603,29 +3596,40 @@ def make_module_item_resolvable():
 
 Now let's verify that the resolution methods work correctly and provide object
 identity with the page and assignment caches.
+The module items are real [[ModuleItem]] objects, so the tests call the
+methods as the code does, through the patched class, rather than binding the
+functions onto stand-ins; the course's [[get_page]] and [[get_assignment]]
+are stubs with the signatures of the real methods.
 
 <<test functions>>=
 class TestModuleItemResolution:
     """Test module item resolution to cached content objects"""
 
+    def course_with(self, page=None, assignment=None):
+        """A course whose get_page and get_assignment return the given
+        objects, stubbed with the signatures of the real methods"""
+        from unittest.mock import create_autospec
+        course = canvas_object(Course, id=1, name="Course",
+                               course_code="DD1310")
+        course.get_page = create_autospec(course.get_page,
+                                          return_value=page)
+        course.get_assignment = create_autospec(course.get_assignment,
+                                                return_value=assignment)
+        return course
+
+    def module_item(self, item_type, **fields):
+        """A module item as Canvas lists it"""
+        from canvasapi.module import ModuleItem
+        return canvas_object(ModuleItem, id=345, module_id=12,
+                             title=f"A {item_type}", type=item_type,
+                             position=1, **fields)
+
     def test_resolve_to_page_returns_cached_page(self):
         """resolve_to_page should return the same object as course.get_page"""
-        # Create a mock course with page caching
-        course = MagicMock()
-        cached_page = MagicMock()
-        cached_page.url = "intro-page"
-        course.get_page.return_value = cached_page
-
-        # Create a page module item
-        module_item = MagicMock()
-        module_item.type = "Page"
-        module_item.page_url = "intro-page"
-
-        # Apply the resolution method
-        import canvasapi.module
-        module_item.resolve_to_page = \
-            canvasapi.module.ModuleItem.resolve_to_page.__get__(
-                module_item, type(module_item))
+        cached_page = canvas_object(Page, url="intro-page", title="Intro",
+                                    page_id=7)
+        course = self.course_with(page=cached_page)
+        module_item = self.module_item("Page", page_url="intro-page")
 
         result = module_item.resolve_to_page(course)
 
@@ -3636,19 +3640,10 @@ class TestModuleItemResolution:
     def test_resolve_to_assignment_returns_cached_assignment(self):
         """resolve_to_assignment should return the same object as
         course.get_assignment"""
-        course = MagicMock()
-        cached_assignment = MagicMock()
-        cached_assignment.id = 12345
-        course.get_assignment.return_value = cached_assignment
-
-        module_item = MagicMock()
-        module_item.type = "Assignment"
-        module_item.content_id = 12345
-
-        import canvasapi.module
-        module_item.resolve_to_assignment = \
-            canvasapi.module.ModuleItem.resolve_to_assignment.__get__(
-                module_item, type(module_item))
+        cached_assignment = canvas_object(Assignment, id=12345,
+                                          name="Lab 1", course_id=1)
+        course = self.course_with(assignment=cached_assignment)
+        module_item = self.module_item("Assignment", content_id=12345)
 
         result = module_item.resolve_to_assignment(course)
 
@@ -3658,15 +3653,8 @@ class TestModuleItemResolution:
 
     def test_resolve_to_page_raises_for_wrong_type(self):
         """resolve_to_page should raise TypeError for non-Page items"""
-        course = MagicMock()
-
-        module_item = MagicMock()
-        module_item.type = "Assignment"
-
-        import canvasapi.module
-        module_item.resolve_to_page = \
-            canvasapi.module.ModuleItem.resolve_to_page.__get__(
-                module_item, type(module_item))
+        course = self.course_with()
+        module_item = self.module_item("Assignment", content_id=12345)
 
         with pytest.raises(TypeError, match="Cannot resolve Assignment"):
             module_item.resolve_to_page(course)
@@ -3674,35 +3662,18 @@ class TestModuleItemResolution:
     def test_resolve_to_assignment_raises_for_wrong_type(self):
         """resolve_to_assignment should raise TypeError for non-Assignment
         items"""
-        course = MagicMock()
-
-        module_item = MagicMock()
-        module_item.type = "Page"
-
-        import canvasapi.module
-        module_item.resolve_to_assignment = \
-            canvasapi.module.ModuleItem.resolve_to_assignment.__get__(
-                module_item, type(module_item))
+        course = self.course_with()
+        module_item = self.module_item("Page", page_url="intro-page")
 
         with pytest.raises(TypeError, match="Cannot resolve Page"):
             module_item.resolve_to_assignment(course)
 
     def test_resolve_dispatches_to_page(self):
         """resolve should call resolve_to_page for Page items"""
-        course = MagicMock()
-        cached_page = MagicMock()
-        course.get_page.return_value = cached_page
-
-        module_item = MagicMock()
-        module_item.type = "Page"
-        module_item.page_url = "some-page"
-
-        import canvasapi.module
-        module_item.resolve = canvasapi.module.ModuleItem.resolve.__get__(
-            module_item, type(module_item))
-        module_item.resolve_to_page = \
-            canvasapi.module.ModuleItem.resolve_to_page.__get__(
-                module_item, type(module_item))
+        cached_page = canvas_object(Page, url="some-page", title="Some",
+                                    page_id=8)
+        course = self.course_with(page=cached_page)
+        module_item = self.module_item("Page", page_url="some-page")
 
         result = module_item.resolve(course)
 
@@ -3710,20 +3681,10 @@ class TestModuleItemResolution:
 
     def test_resolve_dispatches_to_assignment(self):
         """resolve should call resolve_to_assignment for Assignment items"""
-        course = MagicMock()
-        cached_assignment = MagicMock()
-        course.get_assignment.return_value = cached_assignment
-
-        module_item = MagicMock()
-        module_item.type = "Assignment"
-        module_item.content_id = 99
-
-        import canvasapi.module
-        module_item.resolve = canvasapi.module.ModuleItem.resolve.__get__(
-            module_item, type(module_item))
-        module_item.resolve_to_assignment = \
-            canvasapi.module.ModuleItem.resolve_to_assignment.__get__(
-                module_item, type(module_item))
+        cached_assignment = canvas_object(Assignment, id=99, name="Lab 2",
+                                          course_id=1)
+        course = self.course_with(assignment=cached_assignment)
+        module_item = self.module_item("Assignment", content_id=99)
 
         result = module_item.resolve(course)
 
@@ -3731,21 +3692,18 @@ class TestModuleItemResolution:
 
     def test_resolve_returns_none_for_unsupported_types(self):
         """resolve should return None for File, ExternalUrl, SubHeader, etc."""
-        course = MagicMock()
+        course = self.course_with()
 
         for unsupported_type in ["File", "ExternalUrl", "SubHeader",
                                   "ExternalTool"]:
-            module_item = MagicMock()
-            module_item.type = unsupported_type
-
-            import canvasapi.module
-            module_item.resolve = canvasapi.module.ModuleItem.resolve.__get__(
-                module_item, type(module_item))
+            module_item = self.module_item(unsupported_type)
 
             result = module_item.resolve(course)
 
             assert result is None, \
                 f"Expected None for type {unsupported_type}"
+        course.get_page.assert_not_called()
+        course.get_assignment.assert_not_called()
 
     def test_object_identity_page_via_module(self):
         """Page accessed via module item should be same object as direct
@@ -3753,20 +3711,10 @@ class TestModuleItemResolution:
         # This test verifies the key requirement: object identity
         # A page from module_item.resolve() should be the same Python object
         # as the page from course.get_page()
-
-        course = MagicMock()
-        the_page = MagicMock()
-        the_page.url = "shared-page"
-        course.get_page.return_value = the_page
-
-        module_item = MagicMock()
-        module_item.type = "Page"
-        module_item.page_url = "shared-page"
-
-        import canvasapi.module
-        module_item.resolve_to_page = \
-            canvasapi.module.ModuleItem.resolve_to_page.__get__(
-                module_item, type(module_item))
+        the_page = canvas_object(Page, url="shared-page", title="Shared",
+                                 page_id=9)
+        course = self.course_with(page=the_page)
+        module_item = self.module_item("Page", page_url="shared-page")
 
         # Get page via module item
         page_via_module = module_item.resolve_to_page(course)
@@ -3844,8 +3792,7 @@ class TestGroupUserCaching:
                 pass
             def get_users(self, **kwargs):
                 call_count["count"] += 1
-                user = MagicMock()
-                user.id = 100
+                user = canvas_object(User, id=100)
                 return [user]
 
         CacheGetMethods("user", include_singular=False)(TestGroup)
@@ -4057,7 +4004,8 @@ class TestLazySubmissionStaleness:
     def wrap(self, *, grade, age_minutes):
         """Wrap a stand-in submission whose last refresh is age_minutes old."""
         lazy = LazySubmission(
-            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+            self.StandInSubmission(grade), listed_assignment(), set(),
+            MagicMock())
         object.__setattr__(
             lazy, "_last_refresh",
             datetime.now() - timedelta(minutes=age_minutes))
@@ -4119,7 +4067,7 @@ class TestLazySubmissionNormalization:
         """Normalising a stale wrapper must not issue a refresh call."""
         refresh = MagicMock()
         lazy = LazySubmission(
-            self.StandInSubmission("F"), MagicMock(), set(), refresh)
+            self.StandInSubmission("F"), listed_assignment(), set(), refresh)
         object.__setattr__(
             lazy, "_last_refresh",
             datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
@@ -4131,7 +4079,8 @@ class TestLazySubmissionNormalization:
     def test_ensure_attrs_fills_missing_fields(self):
         """Absent fields become None; existing fields are untouched."""
         lazy = LazySubmission(
-            self.StandInSubmission("F"), MagicMock(), set(), MagicMock())
+            self.StandInSubmission("F"), listed_assignment(), set(),
+            MagicMock())
 
         lazy.ensure_attrs(["grade", "missing_field"])
 
@@ -4297,7 +4246,7 @@ class TestLazySubmissionAnnotationsSurviveRefresh:
     def stale_wrapper(self, fresh):
         """A stale wrapper whose next mutable read fetches `fresh`."""
         lazy = LazySubmission(
-            self.StandInSubmission(), MagicMock(),
+            self.StandInSubmission(), listed_assignment(),
             {"submission_history"}, MagicMock(return_value=fresh))
         object.__setattr__(
             lazy, "_last_refresh",
@@ -4351,7 +4300,7 @@ class TestLazySubmissionAnnotationsSurviveRefresh:
         old = self.StandInSubmission()
         old.rubric_assessment = {"_1": {"points": 1.0}}
         lazy = LazySubmission(
-            old, MagicMock(), {"submission_history"},
+            old, listed_assignment(), {"submission_history"},
             MagicMock(return_value=self.StandInSubmission()))
         object.__setattr__(
             lazy, "_last_refresh",
@@ -4387,7 +4336,7 @@ class TestLazySubmissionRefreshNotFound:
             side_effect=canvasapi.exceptions.ResourceDoesNotExist(
                 "Not Found"))
         lazy = LazySubmission(
-            self.StandInSubmission(), MagicMock(),
+            self.StandInSubmission(), listed_assignment(),
             {"submission_history"}, refetch)
         object.__setattr__(
             lazy, "_last_refresh",
@@ -4461,7 +4410,8 @@ class TestLazySubmissionForcedRefresh:
         fresh = self.StandInSubmission({"_1": {"points": 1.0}})
         refetch = MagicMock(return_value=fresh)
         lazy = LazySubmission(
-            self.StandInSubmission({"_1": {"points": 0.0}}), MagicMock(),
+            self.StandInSubmission({"_1": {"points": 0.0}}),
+            listed_assignment(),
             {"rubric_assessment"}, refetch)
 
         assert lazy.refresh() is lazy
@@ -4538,7 +4488,8 @@ class TestLazySubmissionDelegation:
     def wrap(self, *, grade, age_minutes):
         """Wrap a stand-in submission whose last refresh is age_minutes old."""
         lazy = LazySubmission(
-            self.StandInSubmission(grade), MagicMock(), set(), MagicMock())
+            self.StandInSubmission(grade), listed_assignment(), set(),
+            MagicMock())
         object.__setattr__(
             lazy, "_last_refresh",
             datetime.now() - timedelta(minutes=age_minutes))
@@ -4619,7 +4570,8 @@ class TestLazySubmissionEditKeepsAttachmentFiles:
             "id": 3, "assignment_id": 2, "user_id": 1, "course_id": 4,
             "grade": None, "attachments": [dict(attachment)]})
         refetch = MagicMock()
-        lazy = LazySubmission(submission, MagicMock(), set(), refetch)
+        lazy = LazySubmission(submission, listed_assignment(), set(),
+                              refetch)
 
         lazy.edit(submission={"posted_grade": "P"})
 
@@ -5070,8 +5022,7 @@ class TestQuizCaching:
             def __init__(self):
                 pass
             def get_quiz(self, quiz_id):
-                obj = MagicMock()
-                obj.id = quiz_id
+                obj = canvas_object(Quiz, id=quiz_id)
                 return obj
             def get_quizzes(self):
                 return []
@@ -5088,8 +5039,7 @@ class TestQuizCaching:
             def __init__(self):
                 pass
             def get_new_quiz(self, quiz_id):
-                obj = MagicMock()
-                obj.id = quiz_id
+                obj = canvas_object(NewQuiz, id=quiz_id)
                 return obj
             def get_new_quizzes(self):
                 return []
@@ -5109,8 +5059,7 @@ class TestQuizCaching:
                 pass
             def get_quiz(self, quiz_id):
                 call_count["count"] += 1
-                obj = MagicMock()
-                obj.id = quiz_id
+                obj = canvas_object(Quiz, id=quiz_id)
                 return obj
             def get_quizzes(self):
                 return []
@@ -5130,11 +5079,10 @@ class TestQuizCaching:
             def __init__(self):
                 pass
             def get_quiz(self, quiz_id):
-                obj = MagicMock()
-                obj.id = quiz_id
+                obj = canvas_object(Quiz, id=quiz_id)
                 return obj
             def get_quizzes(self):
-                return [MagicMock(id=1), MagicMock(id=2), MagicMock(id=3)]
+                return [canvas_object(Quiz, id=i) for i in [1, 2, 3]]
 
         CacheGetMethods("quiz", plural_name="quizzes")(TestCourse)
         instance = TestCourse()
@@ -5151,11 +5099,10 @@ class TestQuizCaching:
             def __init__(self):
                 pass
             def get_new_quiz(self, quiz_id):
-                obj = MagicMock()
-                obj.id = quiz_id
+                obj = canvas_object(NewQuiz, id=quiz_id)
                 return obj
             def get_new_quizzes(self):
-                return [MagicMock(id=10), MagicMock(id=20)]
+                return [canvas_object(NewQuiz, id=i) for i in [10, 20]]
 
         CacheGetMethods("new_quiz", plural_name="new_quizzes")(TestCourse)
         instance = TestCourse()
@@ -5647,9 +5594,13 @@ class TestAssignmentSubmissionRefreshStrategy:
 
     def make_lazy_submission(self, *, needs_refresh):
         """Create a cached lazy submission with configurable staleness."""
-        lazy_submission = MagicMock()
-        lazy_submission.would_need_refresh.return_value = needs_refresh
-        lazy_submission._includes = set()
+        lazy_submission = LazySubmission(
+            canvas_object(Submission, id=1, user_id=1, grade="F"),
+            listed_assignment(), set(), MagicMock())
+        if needs_refresh:
+            object.__setattr__(
+                lazy_submission, "_last_refresh",
+                datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
         return lazy_submission
 
     def test_no_bulk_refresh_when_threshold_not_reached(self):
@@ -5686,9 +5637,13 @@ class TestFilteredBulkRefreshScope:
 
     def make_lazy_submission(self, *, needs_refresh):
         """Create a cached lazy submission with configurable staleness."""
-        lazy_submission = MagicMock()
-        lazy_submission.would_need_refresh.return_value = needs_refresh
-        lazy_submission._includes = set()
+        lazy_submission = LazySubmission(
+            canvas_object(Submission, id=1, user_id=1, grade="F"),
+            listed_assignment(), set(), MagicMock())
+        if needs_refresh:
+            object.__setattr__(
+                lazy_submission, "_last_refresh",
+                datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1))
         return lazy_submission
 
     def test_relevant_count_scopes_to_student_ids(self):
