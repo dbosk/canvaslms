@@ -48,6 +48,7 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+<<constants>>
 <<functions>>
 
 def add_command(subp):
@@ -77,6 +78,8 @@ the helpers they verify.
 
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
+import argparse
+import pytest
 import requests
 from unittest.mock import MagicMock, Mock, patch
 
@@ -746,6 +749,161 @@ def filter_assignment_groups(course, regex):
       yield group
 @
 
+\subsection{Naming an assignment group in a file}
+\label{sec:assignment-group-spec}
+
+The assignment group decides grading: [[results -A]] summarizes a group, so
+an item in the wrong group silently drops out of one group's grade and into
+another's.
+A file must therefore be able to say which group its assignment or quiz
+belongs to (issue~\#528), or a course round rebuilt from files puts every new
+item in whatever group Canvas picks---the course's first---and the author has
+to drag them into place in the web interface.
+
+The file says it with an [[assignment_group]] key, for example
+\begin{verbatim}
+assignment_group: ^Participation INL1$
+\end{verbatim}
+Its value is a regex matched against the group names and Canvas IDs, the same
+convention as [[regex]] and [[modules]] use, and for the same reason: Canvas
+IDs change when a course is copied for the next round, names do not.
+An export therefore writes the group's name, escaped and anchored, rather than
+the [[assignment_group_id]] Canvas gives us.
+
+Unlike [[modules]], where a regex may legitimately place an item in several
+modules, an assignment is in exactly one group.
+A spec that matches no group, or several, is therefore an error, reported
+before anything is written---with one exception.
+Group names need not be unique, and courses built by importing others often
+have two groups called \enquote{Assignments}.
+The exported spec [[^Assignments$]] then matches both, and refusing it would
+make every unchanged round trip of such an item fail, the interactive editor
+included, since it shows the spec too.
+So the caller may say which group the item is in now: when the spec matches
+several groups and the current one is among them, the item stays where it
+is, which is all an unchanged file can mean.
+A new item has no current group, so for it the ambiguity remains an error.
+
+We raise [[ValueError]] for every failure, not the [[EmptyListError]] and
+[[MultipleMatchesError]] that [[match_item_by_regex]] raises for items: the
+callers already turn [[ValueError]] into a message for an unparseable date,
+and an [[EmptyListError]] escaping into the file-edit code would be mistaken
+for \enquote{no assignment matches} and trigger [[--create]].
+A YAML file may give an ID as a bare number; we anchor it, because the regex
+[[3]] would also match group 13.
+<<functions>>=
+def resolve_assignment_group(course, spec, current=None):
+  """Return the ID of the one assignment group of `course` matching `spec`.
+
+  `spec` is a regex matched against group names and IDs, or an integer
+  ID. `current` is the ID of the item's present group, if any; it is kept
+  when `spec` matches several groups including it.
+  Raises ValueError when no group or several groups match, or when the
+  regex is invalid.
+  """
+  if isinstance(spec, int):
+    spec = f"^{spec}$"
+  try:
+    pattern = re.compile(str(spec))
+  except re.error as e:
+    raise ValueError(f"assignment_group: invalid regex '{spec}': {e}")
+  matches = [group for group in course.get_assignment_groups()
+             if pattern.search(group.name or '')
+             or pattern.search(str(group.id))]
+  for group in matches:
+    if current is not None and str(group.id) == str(current):
+      return group.id
+  if len(matches) == 1:
+    return matches[0].id
+  if not matches:
+    raise ValueError(f"assignment_group: no assignment group matches "
+                     f"'{spec}'")
+  names = ", ".join(f"'{group.name}'" for group in matches)
+  raise ValueError(f"assignment_group: '{spec}' matches {len(matches)} "
+                   f"assignment groups ({names}); make it more specific")
+@
+
+The export goes the other way: from the [[assignment_group_id]] of an
+assignment or quiz to the spec a file carries.
+An ID that names no group of the course (a group deleted since) gives no spec
+rather than an error, because a view should still show the rest of the item.
+We compare the IDs as strings, because the two APIs disagree on their type:
+the Assignments and Classic Quizzes APIs give [[assignment_group_id]] as a
+number, but the New Quizzes API gives it as a string ([["37658"]]), and a
+numeric comparison silently found no group for any New Quiz.
+<<functions>>=
+def assignment_group_spec(course, group_id):
+  """Return an anchored regex naming assignment group `group_id`.
+
+  Returns None when `group_id` is None or names no group of `course`.
+  """
+  if group_id is None:
+    return None
+  for group in course.get_assignment_groups():
+    if str(group.id) == str(group_id):
+      return '^' + re.escape(group.name or '') + '$'
+  return None
+@
+
+Let's verify both directions on real [[AssignmentGroup]] objects.
+The course is a [[MagicMock]] only to hand them over without faking the
+paginated listing.
+The round trip through a name full of regex metacharacters is the case the
+escaping is for.
+<<test functions>>=
+def course_with_groups(*groups):
+  """A course whose assignment groups are `groups`, (id, name) pairs."""
+  course = MagicMock()
+  course.get_assignment_groups.return_value = [
+      AssignmentGroup(MagicMock(), {"id": i, "name": n}) for i, n in groups]
+  return course
+
+class TestAssignmentGroupSpec:
+  def test_name_regex_resolves_to_the_group_id(self):
+    course = course_with_groups((31, "Labs"), (32, "Participation INL1"))
+    assert resolve_assignment_group(course, "^Participation") == 32
+
+  def test_numeric_id_resolves(self):
+    course = course_with_groups((31, "Labs"), (32, "Surveys"))
+    assert resolve_assignment_group(course, 31) == 31
+
+  def test_no_match_is_an_error(self):
+    course = course_with_groups((31, "Labs"))
+    with pytest.raises(ValueError, match="no assignment group matches"):
+      resolve_assignment_group(course, "^Exams$")
+
+  def test_several_matches_are_an_error(self):
+    course = course_with_groups((31, "Labs 1"), (32, "Labs 2"))
+    with pytest.raises(ValueError, match="matches 2 assignment groups"):
+      resolve_assignment_group(course, "^Labs")
+
+  def test_numeric_id_is_matched_exactly(self):
+    course = course_with_groups((3, "Labs"), (13, "Surveys"))
+    assert resolve_assignment_group(course, 3) == 3
+
+  def test_duplicate_names_keep_the_current_group(self):
+    course = course_with_groups((31, "Assignments"), (32, "Assignments"))
+    spec = assignment_group_spec(course, 32)
+    assert resolve_assignment_group(course, spec, current="32") == 32
+    with pytest.raises(ValueError, match="matches 2 assignment groups"):
+      resolve_assignment_group(course, spec)
+
+  def test_exported_spec_resolves_back_to_the_same_group(self):
+    course = course_with_groups((31, "Labs (INL1)"), (32, "Labs (INL1) extra"))
+    spec = assignment_group_spec(course, 31)
+    assert spec == r"^Labs\ \(INL1\)$"
+    assert resolve_assignment_group(course, spec) == 31
+
+  def test_group_id_given_as_a_string_is_found(self):
+    course = course_with_groups((31, "Labs"), (32, "Surveys"))
+    assert assignment_group_spec(course, "32") == "^Surveys$"
+
+  def test_unknown_group_has_no_spec(self):
+    course = course_with_groups((31, "Labs"))
+    assert assignment_group_spec(course, 99) is None
+    assert assignment_group_spec(course, None) is None
+@
+
 We also want to filter out the assignments of a course that belong to a given
 assignment group.
 <<functions>>=
@@ -940,13 +1098,15 @@ When editing:
 <<get current modules for assignment>>
 <<get rubric for assignment>>
 <<determine regex for assignment>>
+<<get assignment group spec for assignment>>
 output = canvaslms.cli.content.render_to_markdown(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     content_attr='description',
     extra_attributes={'modules': assignment_modules,
                       'rubric': assignment_rubric,
-                      'regex': assignment_regex},
+                      'regex': assignment_regex,
+                      'assignment_group': assignment_group},
     course=canvaslms.cli.content.translation_course(assignment.course, args))
 print(output)
 @
@@ -978,6 +1138,45 @@ if hasattr(args, 'assignment') and args.assignment not in (None, '.*'):
 else:
   # Generate exact-match regex from name
   assignment_regex = '^' + re.escape(assignment.name) + '$'
+@
+
+The [[assignment_group]] field names the assignment's group by an anchored
+regex on its name (\cref{sec:assignment-group-spec}), so that pushing the
+file to a copy of the course puts the assignment in the group of the same
+name there.
+<<get assignment group spec for assignment>>=
+assignment_group = assignment_group_spec(
+    assignment.course, getattr(assignment, 'assignment_group_id', None))
+@
+
+Let's verify that both editable outputs carry the spec, by running
+[[assignments view]] on one real [[Assignment]].
+Module membership is patched to none, as scenery; captured output is not a
+terminal, so the command takes the editable path.
+<<test functions>>=
+@pytest.mark.parametrize("html", [False, True])
+def test_view_exports_the_assignment_group(capsys, html):
+  requester = MagicMock()
+  course = Course(requester, {"id": 1, "course_code": "CODE"})
+  course.get_assignment_groups = lambda: [
+      AssignmentGroup(requester, {"id": 31, "name": "Labs"}),
+      AssignmentGroup(requester, {"id": 32, "name": "Participation INL1"})]
+  assignment = Assignment(requester, {
+      "id": 7, "course_id": 1, "name": "Survey", "description": "",
+      "assignment_group_id": 32})
+  assignment.course = course
+
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "view", "-c", "CODE"]
+                           + (["--html"] if html else []))
+  with patch("canvaslms.cli.assignments.process_assignment_option",
+             return_value=[assignment]), \
+       patch("canvaslms.cli.assignments.modules.export_module_specs",
+             return_value=[]):
+    assignments_view_command({}, MagicMock(), args)
+
+  assert "assignment_group: ^Participation\\ INL1$" in capsys.readouterr().out
 @
 
 \subsection{HTML output format}
@@ -1018,13 +1217,15 @@ and pushed back using [[assignments edit --html -f]].
 <<get current modules for assignment>>
 <<get rubric for assignment>>
 <<determine regex for assignment>>
+<<get assignment group spec for assignment>>
 output = canvaslms.cli.content.render_to_html(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     content_attr='description',
     extra_attributes={'modules': assignment_modules,
                       'rubric': assignment_rubric,
-                      'regex': assignment_regex},
+                      'regex': assignment_regex,
+                      'assignment_group': assignment_group},
     course=canvaslms.cli.content.translation_course(assignment.course, args))
 print(output)
 @
@@ -1728,25 +1929,20 @@ except Exception as e:
 
 When [[--create]] is specified and the assignment doesn't exist, we create a
 new one. We use the Canvas API's [[create_assignment]] method.
+The optional attributes come from [[assignment_attributes_to_params]]
+(\cref{sec:assignment-attributes-to-params}), told that it is creating, so
+that an empty date is left out rather than sent as a removal.
 <<create new assignment>>=
 create_params = {
   'name': attributes.get('name', 'Untitled Assignment'),
   'description': canvaslms.cli.content.resolve_body_for(
       html_content, course, args),
 }
-if 'due_at' in attributes and attributes['due_at'] is not None:
-  create_params['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
-if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
-  create_params['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
-if 'lock_at' in attributes and attributes['lock_at'] is not None:
-  create_params['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
-if 'points_possible' in attributes and attributes['points_possible'] is not None:
-  create_params['points_possible'] = attributes['points_possible']
-if 'published' in attributes:
-  create_params['published'] = attributes['published']
+try:
+  create_params.update(
+      assignment_attributes_to_params(attributes, course, creating=True))
+except ValueError as e:
+  canvaslms.cli.err(1, f"Cannot create assignment: {e}")
 
 try:
   new_assignment = course.create_assignment(assignment=create_params)
@@ -1828,9 +2024,73 @@ except canvaslms.cli.EmptyListError:
       f"Use --create to create a new assignment.")
 @
 
-We add optional attributes only if they are present in the YAML front matter.
-This allows users to update just the description without changing dates, or to
-update dates along with content.
+\subsubsection{From front matter to assignment parameters}
+\label{sec:assignment-attributes-to-params}
+
+Three paths write front matter to Canvas: updating an existing assignment
+from a file, creating one with [[--create]], and accepting an interactive
+edit.
+They used to carry three copies of the same block of [[if]]s, and a defect
+in that block was therefore three defects.
+They now share one function,
+[[assignment_attributes_to_params]], which turns the optional attributes into
+the fields of the [[assignment]] parameter; each path adds only the
+[[name]] and [[description]], which it derives in its own way.
+
+The function distinguishes three states of an attribute in the front matter,
+because the user means three different things by them.
+\begin{description}
+\item[Absent] The file says nothing about the attribute, so we send nothing
+  and Canvas keeps its value.
+  This lets a file update the description alone.
+\item[Present with a value] We send the value, converted for Canvas.
+\item[Present but empty] For a date, [[due_at: null]] (which is also how
+  [[assignments view]] exports an assignment without that date) or
+  [[due_at: '']] asks for the date to be removed.
+\end{description}
+The third state is where the old block failed (issue~\#527): it tested
+[[is not None]] and so treated an emptied date like an absent one.
+A snapshot restored from a file therefore kept whatever date the assignment
+had acquired since, the command still reported success, and a due date moved
+before a stale [[unlock_at]] could not be fixed from the file at all, since
+Canvas refuses a due date outside the availability window.
+
+We send a removal as the empty string, the wire encoding of \enquote{no
+date} that \cref{clearing-a-date} explains: a [[None]] would be dropped by
+[[requests]] before it reached Canvas.
+Reading an empty date as a removal is safe for a file that is current,
+because [[assignments view]] and the interactive editor fill in every date
+the assignment has: a [[null]] that nobody touched stands for a date that is
+already absent, and removing it again changes nothing.
+It is not safe for a stale file.
+A file exported before someone set a date in the web interface still says
+[[due_at: null]], and pushing it now removes that date, where it used to be
+kept by accident.
+We accept that, because it is what the file says and what it already did to
+every date it does set: the file is the authority over the attributes it
+names, and a file kept in a course repository must be refreshed from Canvas
+after edits made in the web interface, or those edits are undone.
+
+Creating is the exception.
+A new assignment has no date to remove, so the [[creating]] flag makes the
+function leave empty dates out, which keeps the creation request to what the
+file actually sets.
+
+The other two optional attributes keep their old reading.
+An empty [[points_possible]] is left out, for the reason that empty quiz
+settings are (\cref{sec:quiz-null-attributes}): we know of no Canvas
+spelling that would clear it, and a [[null]] sent as [[None]] would vanish
+anyway.
+[[published]] has no empty state worth the name, so it is sent whenever it
+is present.
+An [[assignment_group]] spec (\cref{sec:assignment-group-spec}) is resolved
+against the course to the [[assignment_group_id]] Canvas expects, which is
+why the function takes the course, and the assignment's present group for
+the ambiguous case; an empty spec, [[null]] or [['']], leaves the group
+alone, since an assignment cannot be in no group.
+A spec that names no group, or several, raises [[ValueError]], as an
+unparseable date does, and each caller turns that into a message before it
+writes anything.
 
 Date attributes require special handling: what YAML's [[safe_load]] yields
 depends on how complete the timestamp is.
@@ -1843,20 +2103,142 @@ ending with~``Z''.
 We use [[format_canvas_time]] to perform this conversion; it
 handles all three input types, so users need not know which form YAML
 happened to parse.
+<<constants>>=
+ASSIGNMENT_DATE_ATTRIBUTES = ('due_at', 'unlock_at', 'lock_at')
+<<functions>>=
+def assignment_attributes_to_params(attributes, course=None,
+                                    creating=False, current_group=None):
+  """Return the optional `assignment` API fields that `attributes` set.
+
+  An absent attribute is left out, so Canvas keeps its value. A date
+  that is present but null or empty is sent as '', which clears it in
+  Canvas; with `creating` it is left out instead, since a new
+  assignment has no date to clear. An `assignment_group` spec is
+  resolved against `course` to an `assignment_group_id`; `current_group`
+  is the assignment's present group, kept when the spec is ambiguous.
+  Raises ValueError for a date or group spec Canvas cannot be given.
+  """
+  params = {}
+  for key in ASSIGNMENT_DATE_ATTRIBUTES:
+    if key not in attributes:
+      continue
+    value = attributes[key]
+    if value is None or value == '':
+      if not creating:
+        params[key] = ''
+    else:
+      params[key] = canvaslms.cli.utils.format_canvas_time(value)
+  if attributes.get('points_possible') is not None:
+    params['points_possible'] = attributes['points_possible']
+  if 'published' in attributes:
+    params['published'] = attributes['published']
+  if attributes.get('assignment_group') not in (None, ''):
+    params['assignment_group_id'] = resolve_assignment_group(
+        course, attributes['assignment_group'], current_group)
+  return params
+@
+
+The update path merges these fields into the parameters it has already
+built from the name and the description.
 <<add optional assignment attributes to update>>=
-if 'due_at' in attributes and attributes['due_at'] is not None:
-  update_data['assignment']['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['due_at'])
-if 'unlock_at' in attributes and attributes['unlock_at'] is not None:
-  update_data['assignment']['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['unlock_at'])
-if 'lock_at' in attributes and attributes['lock_at'] is not None:
-  update_data['assignment']['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(attributes['lock_at'])
-if 'points_possible' in attributes and attributes['points_possible'] is not None:
-  update_data['assignment']['points_possible'] = attributes['points_possible']
-if 'published' in attributes:
-  update_data['assignment']['published'] = attributes['published']
+try:
+  update_data['assignment'].update(assignment_attributes_to_params(
+      attributes, assignment.course,
+      current_group=getattr(assignment, 'assignment_group_id', None)))
+except ValueError as e:
+  canvaslms.cli.err(1, f"Cannot update assignment '{assignment.name}': {e}")
+@
+
+Let's verify the three states of a date, and that creating leaves empty
+dates out:
+<<test functions>>=
+def test_absent_date_is_left_out():
+  assert assignment_attributes_to_params({'name': 'Lab'}) == {}
+
+def test_null_and_empty_dates_clear():
+  params = assignment_attributes_to_params(
+      {'due_at': None, 'unlock_at': ''})
+  assert params == {'due_at': '', 'unlock_at': ''}
+
+def test_present_date_is_converted_for_canvas():
+  import datetime as dt
+  params = assignment_attributes_to_params(
+      {'due_at': dt.datetime(2026, 12, 1, 10, 0, tzinfo=dt.timezone.utc)})
+  assert params == {'due_at': '2026-12-01T10:00:00Z'}
+
+def test_creating_leaves_empty_dates_out():
+  params = assignment_attributes_to_params(
+      {'due_at': None, 'lock_at': '', 'published': False}, creating=True)
+  assert params == {'published': False}
+
+def test_empty_points_possible_is_left_out():
+  assert assignment_attributes_to_params({'points_possible': None}) == {}
+@
+
+The test that matters to a user drives the whole file path: a file is read,
+matched to an assignment and written, and we look at the form fields that
+reach the requester---the last point we own before the request leaves.
+The requester is a [[MagicMock]] because a live write cannot run offline;
+listing the course's assignments is patched to hand over one real
+[[Assignment]], which spares us faking the paginated listing.
+<<test functions>>=
+def edit_assignment_from_file(tmp_path, front_matter):
+  """Run `assignments edit -f` on a file; return the form fields sent."""
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  course = Course(requester, {"id": 1, "course_code": "CODE"})
+  course.get_assignment_groups = lambda: [
+      AssignmentGroup(requester, {"id": 31, "name": "Labs"}),
+      AssignmentGroup(requester, {"id": 32, "name": "Surveys (INL1)"})]
+  assignment = Assignment(requester, {
+      "id": 7, "course_id": 1, "name": "Lab", "description": "",
+      "due_at": "2026-11-20T22:59:00Z",
+      "unlock_at": "2026-11-09T07:00:00Z",
+      "lock_at": "2026-11-27T22:59:00Z"})
+  assignment.course = course
+  path = tmp_path / "lab.md"
+  path.write_text(f"---\n{front_matter}---\n\nBody\n")
+
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(
+      ["assignments", "edit", "-c", "CODE", "-f", str(path)])
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]), \
+       patch("canvaslms.cli.assignments.list_assignments",
+             return_value=[assignment]):
+    assignments_edit_command({}, MagicMock(), args)
+
+  if not requester.request.called:
+    return None
+  return dict(requester.request.call_args.kwargs["_kwargs"])
+
+def test_file_with_null_and_empty_dates_clears_them(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\nunlock_at: null\nlock_at: ''\n")
+
+  assert sent["assignment[unlock_at]"] == ""
+  assert sent["assignment[lock_at]"] == ""
+  assert "assignment[due_at]" not in sent
+
+def test_file_date_is_sent_in_canvas_format(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\ndue_at: 2026-12-01T10:00:00Z\n")
+
+  assert sent["assignment[due_at]"] == "2026-12-01T10:00:00Z"
+  assert "assignment[unlock_at]" not in sent
+
+def test_file_moves_assignment_to_the_named_group(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\n"
+                "assignment_group: ^Surveys \\(INL1\\)$\n")
+
+  assert sent["assignment[assignment_group_id]"] == 32
+
+def test_file_naming_no_group_writes_nothing(tmp_path):
+  with pytest.raises(SystemExit):
+    edit_assignment_from_file(
+        tmp_path, "regex: ^Lab$\nname: Lab\nassignment_group: ^Exams$\n")
 @
 
 \subsection{Processing module membership}
@@ -1976,6 +2358,7 @@ current_attrs = canvaslms.cli.content.extract_attributes_from_object(
 current_attrs['description'] = getattr(
     assignment, 'description', '') or ''
 <<get current modules for assignment>>
+<<get assignment group spec for assignment>>
 assignment_rubric = None
 if hasattr(assignment, 'rubric') and assignment.rubric:
   assignment_rubric = assignment.rubric
@@ -1995,7 +2378,9 @@ result = canvaslms.cli.content.get_content_from_editor(
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
     current_attrs,
     content_attr='description',
-    extra_attributes={'modules': assignment_modules, 'rubric': assignment_rubric},
+    extra_attributes={'modules': assignment_modules,
+                      'rubric': assignment_rubric,
+                      'assignment_group': assignment_group},
     html_mode=args.html)
 if result is None:
   print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
@@ -2028,7 +2413,11 @@ When the user accepts, we convert the Markdown to HTML and update the assignment
 If the user is working in HTML mode, we skip the conversion since the content
 is already HTML.
 As in the file-based path, a malformed [[modules]] list is reported and the
-assignment skipped before anything is written.
+assignment skipped before anything is written, and the optional attributes
+go through [[assignment_attributes_to_params]]
+(\cref{sec:assignment-attributes-to-params}).
+The editor shows every date the assignment has, so a date the user empties
+is removed and one left untouched is sent back unchanged.
 <<update single assignment from interactive edit>>=
 <<reject invalid module specs before editing assignment>>
 if args.html:
@@ -2043,21 +2432,15 @@ update_data = {
         html_content, assignment.course, args),
   }
 }
-
-# Add optional attributes (format dates for Canvas API)
-if 'due_at' in final_attrs and final_attrs['due_at'] is not None:
-  update_data['assignment']['due_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['due_at'])
-if 'unlock_at' in final_attrs and final_attrs['unlock_at'] is not None:
-  update_data['assignment']['unlock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['unlock_at'])
-if 'lock_at' in final_attrs and final_attrs['lock_at'] is not None:
-  update_data['assignment']['lock_at'] = \
-    canvaslms.cli.utils.format_canvas_time(final_attrs['lock_at'])
-if 'points_possible' in final_attrs and final_attrs['points_possible'] is not None:
-  update_data['assignment']['points_possible'] = final_attrs['points_possible']
-if 'published' in final_attrs:
-  update_data['assignment']['published'] = final_attrs['published']
+try:
+  update_data['assignment'].update(assignment_attributes_to_params(
+      final_attrs, assignment.course,
+      current_group=getattr(assignment, 'assignment_group_id', None)))
+except ValueError as e:
+  print(f"Cannot update assignment '{assignment.name}': {e}",
+        file=sys.stderr)
+  skipped_count += 1
+  continue
 
 try:
   assignment.edit(**update_data)
