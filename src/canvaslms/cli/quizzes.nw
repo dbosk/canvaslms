@@ -45,7 +45,7 @@ import pytest
 import requests
 from unittest.mock import MagicMock, create_autospec
 
-from canvasapi.assignment import AssignmentGroup
+from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.content_migration import ContentMigration, MigrationIssue
 from canvasapi.course import Course
 from canvasapi.new_quiz import NewQuiz
@@ -102,6 +102,9 @@ def make_course(course_id=1, groups=(), requester=None):
                               "course_code": "DD1310"})
   stub_canvas_method(course, "get_assignment_groups", [
     AssignmentGroup(requester, {"id": i, "name": n}) for i, n in groups])
+  stub_canvas_method(course, "get_assignment").side_effect = (
+    lambda assignment, **kwargs: Assignment(requester, {
+      "id": int(assignment), "course_id": course_id, "name": "Quiz"}))
   return course
 
 def make_classic_quiz(course=None, **fields):
@@ -3029,7 +3032,8 @@ STRUCTURE:
 
 SETTINGS FOR NEW QUIZZES (time_limit in seconds), named as in the New
 Quizzes API documentation (https://canvas.instructure.com/doc/api/new_quizzes.html):
-  title, instructions, points_possible, due_at, unlock_at, lock_at
+  title, instructions, points_possible, grading_type, due_at, unlock_at,
+  lock_at
   published: not a documented parameter, but Canvas applies it
   time_limit: ours, translated into the quiz_settings time limit below
   The Classic-only settings (allowed_attempts, shuffle_answers, etc.) are
@@ -3058,6 +3062,16 @@ MODULES (both quiz types, in settings.modules):
   "must_contribute"|"none"|{"type": "min_score", "min_score": N}} to also
   place the quiz at that position and set what students must do with it.
   This is what quizzes export writes.
+
+ASSIGNMENT SETTINGS (both quiz types, in settings.assignment):
+  A mapping of grading settings for the quiz's assignment, named as in the
+  Assignments API documentation
+  (https://canvas.instructure.com/doc/api/assignments.html):
+  omit_from_final_grade, and for Classic Quizzes also grading_type,
+  peer_reviews and automatic_peer_reviews.  A quiz limits attempts itself,
+  so allowed_attempts is not sent here, and a New Quiz states grading_type
+  among its own settings.  Practice quizzes and ungraded surveys have no
+  assignment.  This is what quizzes export writes.
 
 QUESTION GROUPS (Classic Quizzes only):
   A questions entry may be a group entry wrapping a pool of questions:
@@ -3255,6 +3269,7 @@ def create_command(config, canvas, args):
 
   <<take canvaslms-only keys out of the quiz settings>>
   <<resolve the quiz's assignment group>>
+  <<take the assignment settings out of the quiz settings>>
   <<put the body under the key the target quiz system reads>>
 
   if quiz_type == "new":
@@ -3280,6 +3295,7 @@ def create_command(config, canvas, args):
   quiz_id = quiz.get('id', 'unknown')
   print(f"Created quiz: {quiz_params.get('title')} (ID: {quiz_id})")
 
+  <<send the new quiz's assignment settings>>
   <<place new quiz in requested modules>>
 
   # Add questions if the file carried any
@@ -3418,6 +3434,32 @@ except ValueError as e:
   canvaslms.cli.err(1, f"Invalid quiz file {args.file}: {e}")
 @
 
+\paragraph{The assignment's settings.}
+The [[assignment]] mapping holds grading settings for the quiz's assignment
+(\cref{sec:quiz-assignment-settings}), not for the quiz, so it must leave the
+quiz settings before they are sent.
+We check it here, before the quiz exists, so that a malformed mapping stops
+the command with nothing created; the warnings about dropped keys come
+before the quiz is created too.
+<<take the assignment settings out of the quiz settings>>=
+try:
+  assignment_params = quiz_assignment_params(
+    quiz_params.pop('assignment', None), quiz_type == "new")
+except ValueError as e:
+  canvaslms.cli.err(1, f"Invalid quiz file {args.file}: {e}")
+@
+
+The settings can only be sent once the quiz exists, because only then
+does it have an assignment.
+A Classic Quiz reports its assignment; a New Quiz's assignment has the
+quiz's ID.
+<<send the new quiz's assignment settings>>=
+update_quiz_assignment(
+  course,
+  int(quiz_id) if quiz_type == "new" else quiz.get('assignment_id'),
+  assignment_params, quiz_params.get('title'))
+@
+
 
 \paragraph{The body goes where the target quiz system reads it.}
 One more key in the settings needs attention before they become API
@@ -3477,14 +3519,15 @@ creation functions are replaced.
 
 <<test functions>>=
 def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
-                          quiz_type=None, groups=()):
+                          quiz_type=None, groups=(), course=None):
   """Run quizzes create on a file, return the params it would send Canvas
 
-  `groups` are the course's assignment groups as (id, name) pairs.
+  `groups` are the course's assignment groups as (id, name) pairs. A
+  created Classic Quiz reports assignment 66.
   """
   path = tmp_path / name
   path.write_text(contents, encoding='utf-8')
-  course = cached_course()
+  course = course or cached_course()
   course.get_assignment_groups.return_value = [
     AssignmentGroup(course._requester, {"id": i, "name": n})
     for i, n in groups]
@@ -3496,7 +3539,8 @@ def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
     lambda course, requester, params: sent.update(params) or {"id": 394105})
   monkeypatch.setattr(
     quizzes, "create_classic_quiz",
-    lambda course, params: sent.update(params) or {"id": 394105})
+    lambda course, params: sent.update(params) or {"id": 394105,
+                                                   "assignment_id": 66})
   args = argparse.Namespace(example=False, course=["datintro26"],
                             file=str(path), title=None, type=quiz_type)
 
@@ -4150,10 +4194,384 @@ def create_classic_quiz(course, quiz_params):
   """
   try:
     quiz = course.create_quiz(quiz=quiz_params)
-    return {'id': quiz.id, 'title': quiz.title}
+    return {'id': quiz.id, 'title': quiz.title,
+            'assignment_id': getattr(quiz, 'assignment_id', None)}
   except Exception as e:
     canvaslms.cli.warn(f"Failed to create Classic Quiz: {e}")
     return None
+@
+
+We return the [[assignment_id]] as well, because the quiz's grading settings
+are sent to that assignment once the quiz exists
+(\cref{sec:quiz-assignment-settings}).
+
+
+\subsection{Settings of the quiz's assignment}
+\label{sec:quiz-assignment-settings}
+
+A quiz that counts towards a grade is also an assignment.
+A graded Classic Quiz or graded survey has one, at [[assignment_id]]; a
+practice quiz or an ungraded survey has none.
+A New Quiz is an LTI assignment under the quiz's own ID.
+Some grading settings exist only on that assignment: whether the quiz counts
+towards the final grade ([[omit_from_final_grade]]), and for a Classic Quiz
+whether it is graded pass/fail ([[grading_type]]).
+Neither quiz API has them, so a quiz file could not state them, and a course
+round rebuilt from files lost them (issue~\#555).
+
+A file states them in an [[assignment]] mapping among the settings:
+\begin{verbatim}
+assignment:
+  omit_from_final_grade: true
+  grading_type: pass_fail
+\end{verbatim}
+Its keys are the grading settings that assignment files carry
+(\cref{sec:assignment-attributes-to-params}), under the Assignments API's
+names.
+We keep them in a mapping of their own rather than among the top-level
+settings, because the two sets follow two APIs.
+The top-level keys are the quiz API's fields and the mapping's keys are the
+Assignments API's, so each set is described by its own documentation.
+A key that both APIs have, such as [[allowed_attempts]], then always says
+which API it belongs to.
+
+Not every grading setting means something on a quiz's assignment.
+We probed both kinds in the sandbox (October 2026).
+Settings that only the assignment has, such as [[omit_from_final_grade]],
+stick on both kinds.
+Two cases do not work:
+\begin{description}
+\item[The quiz holds it itself] A quiz limits attempts with its own
+  setting: the top-level [[allowed_attempts]] for a Classic Quiz, and
+  [[quiz_settings.multiple_attempts]] for a New Quiz.
+  The assignment's [[allowed_attempts]] would state the limit a second time,
+  and the file would no longer say which statement wins.
+  The same goes for a New Quiz's [[grading_type]]: the New Quizzes API
+  documents it as a field of the quiz, and Canvas keeps the quiz's and the
+  assignment's value in step, so a New Quiz states it among its own
+  settings (\cref{sec:quiz-schema}).
+  A Classic Quiz has no such field, so for it [[grading_type]] belongs here.
+\item[Canvas drops it] A New Quiz's assignment keeps no [[peer_reviews]]:
+  Canvas accepts the request and leaves the field false.
+  We exclude [[automatic_peer_reviews]] with it, since it only assigns the
+  reviews that [[peer_reviews]] asks for.
+  A [[false]] value asks for what Canvas does anyway, so only a [[true]] one
+  is worth a warning; this keeps a Classic export created as a New Quiz from
+  warning about peer reviews it never had.
+\end{description}
+We drop such keys, and keys that are no grading setting at all, with one
+warning, as we do for the Classic-only settings
+(\cref{sec:classic-only-settings}).
+The warning names each key, says where the setting belongs instead and links
+the Assignments API documentation.
+A key that is not a grading setting, such as [[due_at]], belongs among the
+quiz's own settings: Canvas copies the quiz's dates, title and publication
+state to its assignment, so they need no second statement.
+<<constants>>=
+CLASSIC_QUIZ_ASSIGNMENT_EXCLUSIONS = {
+  'allowed_attempts': "the quiz's own allowed_attempts",
+}
+NEW_QUIZ_ASSIGNMENT_EXCLUSIONS = {
+  'allowed_attempts': 'quiz_settings.multiple_attempts',
+  'grading_type': "the quiz's own grading_type",
+  'peer_reviews': None,
+  'automatic_peer_reviews': None,
+}
+ASSIGNMENTS_API_DOCS = 'https://canvas.instructure.com/doc/api/assignments.html'
+<<functions>>=
+def quiz_assignment_exclusions(is_new):
+  """Return the grading settings a quiz's assignment cannot take, with hints"""
+  if is_new:
+    return NEW_QUIZ_ASSIGNMENT_EXCLUSIONS
+  return CLASSIC_QUIZ_ASSIGNMENT_EXCLUSIONS
+@
+
+The settings to send are then the mapping minus the exclusions and the
+[[null]] values.
+A [[null]] says nothing, as it does for an assignment file, so it is left out
+silently.
+A value that is not a mapping is an error rather than something to warn
+about, since we cannot tell what was meant.
+<<functions>>=
+def quiz_assignment_params(mapping, is_new):
+  """Return the Assignments-API parameters an `assignment` mapping sets.
+
+  Null values are left out. Keys that are no grading setting, or that a
+  quiz of this kind cannot take on its assignment, are left out with one
+  warning. Raises ValueError when `mapping` is neither a mapping nor None.
+  """
+  if mapping is None:
+    return {}
+  if not isinstance(mapping, dict):
+    raise ValueError("assignment: must be a mapping of Assignments API "
+                     "fields")
+
+  excluded = quiz_assignment_exclusions(is_new)
+  params, hints = {}, []
+  for key, value in mapping.items():
+    if value is None:
+      continue
+    if key in excluded:
+      if excluded[key]:
+        hints.append(f"{key}: use {excluded[key]}")
+      elif value is not False:
+        hints.append(f"{key}: Canvas ignores it on a New Quiz")
+    elif key not in content.ASSIGNMENT_API_SETTINGS:
+      hints.append(f"{key}: not a grading setting; set the quiz's own field")
+    else:
+      params[key] = value
+
+  if hints:
+    canvaslms.cli.warn(
+      "The quiz's assignment was not given " + "; ".join(hints) +
+      f" (see {ASSIGNMENTS_API_DOCS})")
+  return params
+@
+
+Let's verify the selection on both kinds of quiz.  The mapping below mixes
+the cases: two settings that work on either kind, one that the quiz holds
+itself, one that is no grading setting, one that Canvas drops from a New
+Quiz, and a [[null]].
+<<test functions>>=
+MIXED_ASSIGNMENT_SETTINGS = {
+  'omit_from_final_grade': True, 'grading_type': 'pass_fail',
+  'allowed_attempts': 3, 'due_at': '2026-12-01T10:00:00Z',
+  'peer_reviews': True, 'automatic_peer_reviews': None}
+
+def test_classic_quiz_assignment_takes_the_grading_settings(caplog):
+  params = quizzes.quiz_assignment_params(MIXED_ASSIGNMENT_SETTINGS, False)
+
+  assert params == {'omit_from_final_grade': True,
+                    'grading_type': 'pass_fail', 'peer_reviews': True}
+  warnings = [r.getMessage() for r in caplog.records]
+  assert len(warnings) == 1
+  assert "allowed_attempts: use the quiz's own allowed_attempts" in warnings[0]
+  assert "due_at: not a grading setting" in warnings[0]
+  assert 'automatic_peer_reviews' not in warnings[0]
+  assert quizzes.ASSIGNMENTS_API_DOCS in warnings[0]
+
+def test_new_quiz_assignment_drops_what_canvas_ignores(caplog):
+  params = quizzes.quiz_assignment_params(MIXED_ASSIGNMENT_SETTINGS, True)
+
+  assert params == {'omit_from_final_grade': True}
+  assert 'allowed_attempts: use quiz_settings.multiple_attempts' in caplog.text
+  assert "grading_type: use the quiz's own grading_type" in caplog.text
+  assert 'peer_reviews: Canvas ignores it on a New Quiz' in caplog.text
+
+def test_new_quiz_is_not_warned_about_peer_reviews_it_lacks(caplog):
+  params = quizzes.quiz_assignment_params(
+    {'peer_reviews': False, 'automatic_peer_reviews': False}, True)
+
+  assert params == {}
+  assert not caplog.records
+
+def test_quiz_assignment_settings_must_be_a_mapping():
+  assert quizzes.quiz_assignment_params(None, False) == {}
+  with pytest.raises(ValueError):
+    quizzes.quiz_assignment_params(['omit_from_final_grade'], False)
+@
+
+To send the settings we need the assignment's ID, which depends on the kind
+of quiz.
+<<functions>>=
+def quiz_assignment_id(quiz):
+  """Return the ID of the assignment behind `quiz`, None if it has none"""
+  if is_new_quiz(quiz):
+    return int(quiz.id)
+  return getattr(quiz, 'assignment_id', None)
+@
+
+We send the settings after the quiz itself has been written.
+A newly created quiz has no assignment before that.
+Writing to the assignment afterwards is also safe for an existing quiz: our
+probe showed that a later quiz edit leaves the assignment's own settings
+alone.
+We fetch the assignment and edit it, rather than building a request by hand,
+because [[edit]] updates the object in place: when the course caches its
+assignments, the cache then holds the new values.
+A quiz without an assignment gets a warning instead of a silent no-op,
+since the file asked for something Canvas has no place for.
+<<functions>>=
+def update_quiz_assignment(course, assignment_id, params, title):
+  """Send `params` to the assignment behind the quiz titled `title`.
+
+  Returns True when there was nothing to send or the update succeeded,
+  False (after a warning) otherwise.
+  """
+  if not params:
+    return True
+  if assignment_id is None:
+    canvaslms.cli.warn(
+      f"{title}: a practice quiz or ungraded survey has no assignment, "
+      f"so its assignment settings were not sent")
+    return False
+  try:
+    assignment = course.get_assignment(assignment_id)
+    assignment.edit(assignment=params)
+  except Exception as e:
+    canvaslms.cli.warn(f"{title}: could not update its assignment: {e}")
+    return False
+  return True
+@
+
+The tests below give the course a real [[Assignment]] on a requester of its
+own, so that we can look at the form fields that reach it---the last point
+we own before the request leaves.  The requester is a [[MagicMock]] because a
+live write cannot run offline.
+<<test functions>>=
+def course_with_quiz_assignment(assignment_id=66, **fields):
+  """A course whose assignment `assignment_id` has `fields`.
+
+  Returns the course and the assignment's requester.
+  """
+  course = make_course()
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  course.get_assignment.side_effect = None
+  course.get_assignment.return_value = Assignment(requester, {
+    "id": assignment_id, "course_id": 1, "name": "Quiz", **fields})
+  return course, requester
+
+def sent_to_assignment(requester):
+  """The form fields of the one request made on `requester`"""
+  assert requester.request.call_count == 1
+  return dict(requester.request.call_args.kwargs['_kwargs'])
+
+def test_quiz_assignment_gets_the_settings():
+  course, requester = course_with_quiz_assignment()
+
+  assert quizzes.update_quiz_assignment(
+    course, 66, {'omit_from_final_grade': True}, 'Exam')
+
+  course.get_assignment.assert_called_once_with(66)
+  assert sent_to_assignment(requester) == {
+    'assignment[omit_from_final_grade]': True}
+
+def test_quiz_without_an_assignment_gets_a_warning(caplog):
+  course, requester = course_with_quiz_assignment()
+
+  assert not quizzes.update_quiz_assignment(
+    course, None, {'omit_from_final_grade': True}, 'Practice')
+
+  assert not requester.request.called
+  assert 'has no assignment' in caplog.text
+
+def test_no_settings_need_no_assignment():
+  course, requester = course_with_quiz_assignment()
+
+  assert quizzes.update_quiz_assignment(course, None, {}, 'Practice')
+  assert not course.get_assignment.called
+@
+
+An export writes the same mapping, read from the assignment, so that a quiz
+created from the export gets the grading settings back.
+It writes only the keys a quiz of that kind can take, and leaves out the
+[[null]] ones.
+If the export could not fetch the assignment, we warn and write no mapping
+rather than fail the whole export: the quiz and its questions are what the
+user asked for.
+<<functions>>=
+def quiz_assignment_settings(quiz):
+  """Return the `assignment` mapping describing `quiz`'s assignment.
+
+  None when the quiz has no assignment or it cannot be fetched.
+  """
+  assignment_id = quiz_assignment_id(quiz)
+  if assignment_id is None:
+    return None
+  try:
+    assignment = canvaslms.cli.utils.ensure_assignment_attrs(
+      quiz.course.get_assignment(assignment_id))
+  except Exception as e:
+    canvaslms.cli.warn(f"{quiz.title}: could not fetch its assignment: {e}")
+    return None
+
+  excluded = quiz_assignment_exclusions(is_new_quiz(quiz))
+  return {key: getattr(assignment, key)
+          for key in content.ASSIGNMENT_API_SETTINGS
+          if key not in excluded and getattr(assignment, key) is not None}
+@
+
+Let's verify that an export reads the right assignment for each kind and
+writes only what that kind can take back.  The assignment below has every
+grading setting: a Classic Quiz's mapping leaves out [[allowed_attempts]],
+a New Quiz's also [[grading_type]] and the peer reviews, and neither writes
+the [[null]] one.
+<<test functions>>=
+GRADED_ASSIGNMENT = {
+  'grading_type': 'pass_fail', 'omit_from_final_grade': True,
+  'allowed_attempts': -1, 'peer_reviews': False,
+  'automatic_peer_reviews': None}
+
+def test_classic_quiz_exports_its_assignment_settings():
+  course, _ = course_with_quiz_assignment(66, **GRADED_ASSIGNMENT)
+  quiz = make_classic_quiz(course, assignment_id=66)
+
+  assert quizzes.quiz_assignment_settings(quiz) == {
+    'grading_type': 'pass_fail', 'omit_from_final_grade': True,
+    'peer_reviews': False}
+  course.get_assignment.assert_called_once_with(66)
+
+def test_new_quiz_exports_its_assignment_settings():
+  course, _ = course_with_quiz_assignment(394105, **GRADED_ASSIGNMENT)
+  quiz = make_new_quiz(course, id="394105")
+
+  assert quizzes.quiz_assignment_settings(quiz) == {
+    'omit_from_final_grade': True}
+  course.get_assignment.assert_called_once_with(394105)
+
+def test_practice_quiz_exports_no_assignment_settings():
+  course, _ = course_with_quiz_assignment()
+  quiz = make_classic_quiz(course, quiz_type='practice_quiz',
+                           assignment_id=None)
+
+  assert quizzes.quiz_assignment_settings(quiz) is None
+  assert not course.get_assignment.called
+
+def test_export_without_its_assignment_warns_and_writes_none(caplog):
+  from canvasapi.exceptions import ResourceDoesNotExist
+  course = make_course()
+  course.get_assignment.side_effect = ResourceDoesNotExist("gone")
+  quiz = make_classic_quiz(course, assignment_id=66)
+
+  assert quizzes.quiz_assignment_settings(quiz) is None
+  assert 'could not fetch its assignment' in caplog.text
+@
+
+Let's verify the whole create path for both kinds
+(\cref{sec:quizzes-create}): the mapping must not
+reach the quiz, and its settings must reach the assignment the new quiz
+has.
+<<test functions>>=
+GRADED_SURVEY_YAML = (
+  'settings:\n'
+  '  title: Course evaluation\n'
+  '  assignment:\n'
+  '    omit_from_final_grade: true\n')
+
+@pytest.mark.parametrize("quiz_type, assignment_id",
+                         [("classic", 66), ("new", 394105)])
+def test_create_sends_the_assignment_settings(monkeypatch, tmp_path,
+                                              quiz_type, assignment_id):
+  course, requester = course_with_quiz_assignment(assignment_id)
+
+  sent = create_quiz_from_file(monkeypatch, tmp_path, 'survey.yaml',
+                               GRADED_SURVEY_YAML, quiz_type=quiz_type,
+                               course=course)
+
+  assert 'assignment' not in sent
+  course.get_assignment.assert_called_once_with(assignment_id)
+  assert sent_to_assignment(requester) == {
+    'assignment[omit_from_final_grade]': True}
+
+def test_create_rejects_assignment_settings_that_are_no_mapping(
+    monkeypatch, tmp_path):
+  course, _ = course_with_quiz_assignment()
+
+  with pytest.raises(SystemExit):
+    create_quiz_from_file(monkeypatch, tmp_path, 'bad.yaml',
+                          'settings:\n  title: T\n  assignment: true\n',
+                          quiz_type='classic', course=course)
 @
 
 
@@ -4224,6 +4642,10 @@ We include fields that instructors commonly need to adjust:
   which grade, the quiz counts towards.  It holds a regex on the group's name
   rather than Canvas's [[assignment_group_id]], because IDs change when a
   course is copied (\cref{sec:assignment-group-spec}).
+\item[Assignment grading] [[assignment]]---the grading settings that only
+  the quiz's assignment has, such as [[omit_from_final_grade]], as a mapping
+  in the Assignments API's terms (\cref{sec:quiz-assignment-settings}).
+  The editor fetches the assignment to fill it in.
 \item[Presentation] [[shuffle_answers]], [[one_question_at_a_time]],
   [[cant_go_back]]---anti-cheating and UX options.  There is no
   [[shuffle_questions]]: a Classic Quiz has no such setting
@@ -4342,6 +4764,13 @@ QUIZ_SCHEMA = {
         'canvas_attr': 'assignment_group_id',
         'description': 'Regex naming the assignment group (name or ID)'
     },
+    'assignment': {
+        'default': None,
+        'required': False,
+        'canvas_attr': None,
+        'description': "Grading settings of the quiz's assignment, "
+                       "as the Assignments API names them"
+    },
     'anonymous_submissions': {
         'default': None,
         'required': False,
@@ -4371,12 +4800,21 @@ showed a New Quiz as not shuffling its answers, whatever its
 [[quiz_settings]] said, and invited edits that Canvas ignores.  What the
 editor shows for a New Quiz is now what the New Quizzes API documents: these
 top-level fields, plus the [[quiz_settings]] that [[extract_quiz_attributes]]
-fetches.
+fetches.  One documented field is a New Quiz's alone: [[grading_type]], which
+a Classic Quiz keeps on its assignment instead
+(\cref{sec:quiz-assignment-settings}), so we add it to this schema only.
 
 <<constants>>=
 NEW_QUIZ_SCHEMA = {key: spec for key, spec in QUIZ_SCHEMA.items()
                    if key not in CLASSIC_ONLY_SETTINGS
                    and key != 'anonymous_submissions'}
+NEW_QUIZ_SCHEMA['grading_type'] = {
+    'default': None,
+    'required': False,
+    'canvas_attr': 'grading_type',
+    'description': 'points, pass_fail, percent, letter_grade, gpa_scale '
+                   'or not_graded'
+}
 <<functions>>=
 def quiz_schema(quiz):
   """Return the schema the editor uses for quiz"""
@@ -4901,6 +5339,9 @@ FILE MODE (-f):
 
   The JSON/YAML format is the same as 'quizzes export' output, enabling
   a round-trip workflow: export, modify, edit.
+  The settings are those 'quizzes create --help' lists, including
+  settings.assignment: the grading settings of the quiz's assignment, named
+  as in https://canvas.instructure.com/doc/api/assignments.html.
 
   When using -f, the -a/--assignment selector is optional if the file provides
   enough information to identify the quiz. We use the first available of:
@@ -6171,8 +6612,11 @@ def extract_quiz_attributes(quiz, requester=None):
   quiz_settings = fetch_new_quiz_settings(quiz, requester) if is_new else None
 
   for key, spec in quiz_schema(quiz).items():
-    canvas_attr = spec.get('canvas_attr', key)
-    value = getattr(quiz, canvas_attr, spec.get('default'))
+    if key == 'assignment':
+      value = quiz_assignment_settings(quiz)
+    else:
+      canvas_attr = spec.get('canvas_attr', key)
+      value = getattr(quiz, canvas_attr, spec.get('default'))
 
     if key == 'time_limit' and is_new:
       value = time_limit_for_front_matter(
@@ -6211,6 +6655,31 @@ def test_editor_shows_the_assignment_group_spec():
   attributes = quizzes.extract_quiz_attributes(quiz)
 
   assert attributes['assignment_group'] == r"^Participation\ INL1$"
+@
+
+The editor also shows the grading settings of the quiz's assignment
+(\cref{sec:quiz-assignment-settings}), so that accepting the editor sends
+them back unchanged rather than leaving them unknown:
+<<test functions>>=
+def test_editor_shows_the_assignment_settings():
+  course, _ = course_with_quiz_assignment(66, **GRADED_ASSIGNMENT)
+  quiz = make_classic_quiz(course, assignment_id=66)
+
+  attributes = quizzes.extract_quiz_attributes(quiz)
+
+  assert attributes['assignment']['omit_from_final_grade'] is True
+  assert 'allowed_attempts' not in attributes['assignment']
+@
+
+A New Quiz's grading type is shown among its own settings instead, and a
+Classic Quiz, which has no such field, gets none there:
+<<test functions>>=
+def test_editor_shows_a_new_quiz_its_own_grading_type():
+  quiz = make_new_quiz(grading_type='pass_fail')
+
+  assert quizzes.extract_quiz_attributes(quiz)['grading_type'] == 'pass_fail'
+  assert 'grading_type' not in quizzes.extract_quiz_attributes(
+    make_classic_quiz(grading_type='pass_fail'))
 @
 
 Let's verify that the editor is shown the limit Canvas actually keeps---a
@@ -6464,6 +6933,22 @@ edit paths.  A spec that matches no group, or several, fails the edit of
 that quiz before anything is sent, the way any other failed update does: the
 caller warns and moves on.
 
+The same holds for the [[assignment]] mapping
+(\cref{sec:quiz-assignment-settings}).  It is taken out of the attributes
+before they become quiz parameters, and sent to the quiz's assignment only
+after the quiz update succeeded, so a failed quiz update writes nothing
+further.  We copy the attributes before taking it out, because they may be
+the caller's.
+
+A failed write to the assignment, on the other hand, does not make the edit
+fail.  The quiz has been written by then, and the callers' next steps---the
+module membership, the questions of [[--replace-items]]---belong to the quiz
+and should still run; [[update_quiz_assignment]] has already warned.
+Reporting the whole edit as failed would also mislead when a regex matches
+graded quizzes and practice quizzes alike, since only the latter lack an
+assignment.  An editor session that changed nothing still writes the
+mapping back, which is one more request but no change.
+
 <<functions>>=
 def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
                     args=None):
@@ -6491,8 +6976,10 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
     html_body = content.resolve_body_for(html_body, quiz.course, args)
 
   try:
-    attributes = settings_with_assignment_group_id(
-      attributes, quiz.course, getattr(quiz, 'assignment_group_id', None))
+    attributes = dict(settings_with_assignment_group_id(
+      attributes, quiz.course, getattr(quiz, 'assignment_group_id', None)))
+    assignment_params = quiz_assignment_params(
+      attributes.pop('assignment', None), is_new_quiz(quiz))
   except ValueError as e:
     canvaslms.cli.warn(f"{quiz.title}: {e}")
     return False
@@ -6504,9 +6991,14 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
 
   # Update based on quiz type
   if is_new_quiz(quiz):
-    return update_new_quiz(quiz.course, quiz.id, requester, quiz_params)
+    updated = update_new_quiz(quiz.course, quiz.id, requester, quiz_params)
   else:
-    return update_classic_quiz(quiz, quiz_params)
+    updated = update_classic_quiz(quiz, quiz_params)
+
+  if updated:
+    update_quiz_assignment(quiz.course, quiz_assignment_id(quiz),
+                           assignment_params, quiz.title)
+  return updated
 @
 
 Let's verify the group on a real Classic [[Quiz]], looking at the form
@@ -6553,6 +7045,94 @@ def test_edit_keeps_a_quiz_among_equally_named_groups():
 
   sent = dict(requester.request.call_args.kwargs['_kwargs'])
   assert sent['quiz[assignment_group_id]'] == 32
+@
+
+The [[assignment]] mapping takes the same path on both kinds of quiz: the
+quiz is updated without it, and the quiz's assignment gets its settings.
+When the quiz update fails, the assignment must be left alone.
+<<test functions>>=
+def quiz_on_own_requester(quiz_type):
+  """A quiz of `quiz_type` whose assignment has a requester of its own.
+
+  Returns the quiz, the quiz's requester and the assignment's requester.
+  """
+  from canvasapi.quiz import Quiz
+  quiz_requester = MagicMock()
+  quiz_requester.request.return_value.json.return_value = {}
+  if quiz_type == "new":
+    course, assignment_requester = course_with_quiz_assignment(394105)
+    quiz = make_new_quiz(course, id="394105")
+  else:
+    course, assignment_requester = course_with_quiz_assignment(66)
+    quiz = Quiz(quiz_requester, {"id": 5, "course_id": 1,
+                                 "title": "Survey", "assignment_id": 66})
+    quiz.course = course
+  return quiz, quiz_requester, assignment_requester
+
+@pytest.mark.parametrize("quiz_type", ["classic", "new"])
+def test_edit_sends_the_assignment_settings_to_the_assignment(quiz_type):
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    quiz_type)
+  attributes = {'title': 'Survey',
+                'assignment': {'omit_from_final_grade': True}}
+
+  assert quizzes.apply_quiz_edit(quiz, attributes, '', quiz_requester)
+
+  request = quiz_requester.request.call_args.kwargs
+  sent_to_quiz = {**request, **dict(request.get('_kwargs', []))}
+  assert sent_to_quiz
+  assert not [key for key in sent_to_quiz
+              if 'assignment' in str(key)
+              or 'omit_from_final_grade' in str(key)]
+  assert sent_to_assignment(assignment_requester) == {
+    'assignment[omit_from_final_grade]': True}
+  assert 'assignment' in attributes
+
+def test_failed_quiz_edit_leaves_the_assignment_alone():
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    "classic")
+  from canvasapi.exceptions import CanvasException
+  quiz_requester.request.side_effect = CanvasException("quiz update failed")
+
+  assert not quizzes.apply_quiz_edit(
+    quiz, {'title': 'Survey', 'assignment': {'omit_from_final_grade': True}},
+    '', quiz_requester)
+
+  assert not assignment_requester.request.called
+@
+
+A quiz whose edit makes it graded gets its assignment in that very edit, and
+the settings must reach that assignment, which Canvas names in its reply.
+A quiz that has no assignment after the edit still counts as edited: only
+the warning tells of the settings that had nowhere to go.
+<<test functions>>=
+def test_quiz_made_graded_sends_settings_to_its_new_assignment():
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    "classic")
+  del quiz.assignment_id
+  quiz_requester.request.return_value.json.return_value = {
+    "id": 5, "course_id": 1, "title": "Survey", "assignment_id": 66}
+
+  assert quizzes.apply_quiz_edit(
+    quiz, {'quiz_type': 'assignment',
+           'assignment': {'omit_from_final_grade': True}},
+    '', quiz_requester)
+
+  assert sent_to_assignment(assignment_requester) == {
+    'assignment[omit_from_final_grade]': True}
+
+def test_practice_quiz_edit_succeeds_without_its_assignment(caplog):
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    "classic")
+  del quiz.assignment_id
+
+  assert quizzes.apply_quiz_edit(
+    quiz, {'assignment': {'omit_from_final_grade': True}}, '',
+    quiz_requester)
+
+  assert quiz_requester.request.called
+  assert not assignment_requester.request.called
+  assert 'has no assignment' in caplog.text
 @
 
 \paragraph{From attributes to API parameters.}
@@ -6946,12 +7526,24 @@ def update_classic_quiz(quiz, quiz_params):
     True on success, False on failure
   """
   try:
-    quiz.edit(quiz=quiz_params)
+    edited = quiz.edit(quiz=quiz_params)
+    quiz.assignment_id = getattr(edited, 'assignment_id',
+                                 getattr(quiz, 'assignment_id', None))
     return True
   except Exception as e:
     canvaslms.cli.warn(f"Failed to update Classic Quiz: {e}")
     return False
 @
+
+[[Quiz.edit]] returns the edited quiz as a new object and leaves [[quiz]] as
+it was.  We copy the one attribute that later steps read: the
+[[assignment_id]], to which [[apply_quiz_edit]] sends the quiz's
+assignment settings (\cref{sec:quiz-assignment-settings}).  It changes when
+the edit changes the quiz type: a practice quiz made graded gets an
+assignment, and a graded quiz made a practice quiz loses its own.  Without the
+copy, the settings would go to the assignment the quiz had before the edit,
+or be refused because it had none.  We keep the old value if the reply does
+not carry the field.
 
 
 \section{The [[quizzes delete]] subcommand}
@@ -7273,8 +7865,10 @@ def export_full_new_quiz(quiz, requester, include_banks=True, importable=False):
     'instructions': quiz.instructions or '',
     'time_limit': new_quiz_time_limit(quiz, quiz_settings),
     'points_possible': getattr(quiz, 'points_possible', None),
+    'grading_type': getattr(quiz, 'grading_type', None),
     'assignment_group': assignments.assignment_group_spec(
         quiz.course, getattr(quiz, 'assignment_group_id', None)),
+    'assignment': quiz_assignment_settings(quiz),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
     'lock_at': getattr(quiz, 'lock_at', None),
@@ -7328,18 +7922,24 @@ fetch we control; everything else about the export is scenery here.
 
 <<test functions>>=
 def export_new_quiz_settings(monkeypatch, quiz_settings,
-                             object_time_limit=None, group=None):
+                             object_time_limit=None, group=None,
+                             assignment=None, **fields):
   """Return the settings exported for a quiz whose fetch gave quiz_settings
 
-  `group` is the (id, name) of the quiz's assignment group, if any.
+  `group` is the (id, name) of the quiz's assignment group, if any;
+  `assignment` the fields of the quiz's assignment, if any; `fields` more
+  fields of the quiz.
   """
-  fields = {}
   if object_time_limit is not None:
     fields['time_limit'] = object_time_limit
   if group:
     fields['assignment_group_id'] = group[0]
-  quiz = make_new_quiz(make_course(groups=[group] if group else []),
-                       id=42, **fields)
+  course = make_course(groups=[group] if group else [])
+  if assignment is not None:
+    course.get_assignment.side_effect = None
+    course.get_assignment.return_value = Assignment(MagicMock(), {
+      "id": 42, "course_id": 1, **assignment})
+  quiz = make_new_quiz(course, id=42, **fields)
 
   monkeypatch.setattr(quizzes, "fetch_new_quiz_settings",
                       lambda q, r: quiz_settings)
@@ -7418,6 +8018,43 @@ def test_exported_assignment_group_resolves_back(monkeypatch):
   assert resolved['assignment_group_id'] == 32
 @
 
+The grading settings of the quiz's assignment
+(\cref{sec:quiz-assignment-settings}) are exported from both kinds of quiz.
+They make the round trip too: a quiz created from the export gives its new
+assignment the settings the old one had.  We leave out the export's module
+specs, which this test is not about and which would need modules in the
+target course.
+<<test functions>>=
+def test_new_quiz_export_carries_the_assignment_settings(monkeypatch):
+  settings = export_new_quiz_settings(monkeypatch, {},
+                                      assignment=GRADED_ASSIGNMENT,
+                                      grading_type='pass_fail')
+
+  assert settings['assignment'] == {'omit_from_final_grade': True}
+  assert settings['grading_type'] == 'pass_fail'
+
+def test_exported_assignment_settings_reach_the_new_assignment(monkeypatch,
+                                                               tmp_path):
+  source, _ = course_with_quiz_assignment(66, **GRADED_ASSIGNMENT)
+  quiz = make_classic_quiz(source, assignment_id=66)
+  monkeypatch.setattr(quizzes.modules, "export_module_specs",
+                      lambda course, item_type, item_id: [])
+  monkeypatch.setattr(quizzes, "export_classic_questions",
+                      lambda q: {'questions': []})
+  exported = quizzes.export_full_classic_quiz(quiz, importable=True)
+  del exported['settings']['modules']
+
+  target, requester = course_with_quiz_assignment(66)
+  import json
+  create_quiz_from_file(monkeypatch, tmp_path, 'quiz.json',
+                        json.dumps(exported), course=target)
+
+  assert sent_to_assignment(requester) == {
+    'assignment[grading_type]': 'pass_fail',
+    'assignment[omit_from_final_grade]': True,
+    'assignment[peer_reviews]': False}
+@
+
 
 \subsection{Exporting a complete Classic Quiz}
 \label{sec:classic-quiz-export}
@@ -7460,6 +8097,7 @@ def export_full_classic_quiz(quiz, importable=False):
     'points_possible': getattr(quiz, 'points_possible', None),
     'assignment_group': assignments.assignment_group_spec(
         quiz.course, getattr(quiz, 'assignment_group_id', None)),
+    'assignment': quiz_assignment_settings(quiz),
     'published': bool(quiz.published),
     'due_at': getattr(quiz, 'due_at', None),
     'unlock_at': getattr(quiz, 'unlock_at', None),
@@ -12393,6 +13031,8 @@ def print_full_quiz_example_json():
   print()
   print("Field reference: the New Quizzes API documentation,")
   print("  https://canvas.instructure.com/doc/api/new_quizzes.html")
+  print("  and for settings.assignment the Assignments API documentation,")
+  print("  https://canvas.instructure.com/doc/api/assignments.html")
   print()
   print("BASIC SETTINGS:")
   print("  title              - Quiz title")
@@ -12459,6 +13099,8 @@ def print_full_quiz_example_json():
   print("Classic Quizzes use different field names and units.")
   print("Field reference: the Quizzes API documentation,")
   print("  https://canvas.instructure.com/doc/api/quizzes.html")
+  print("  and for settings.assignment the Assignments API documentation,")
+  print("  https://canvas.instructure.com/doc/api/assignments.html")
   print()
   print("Settings (time_limit in MINUTES for Classic Quizzes):")
   print("  title, description (not instructions), quiz_type,")

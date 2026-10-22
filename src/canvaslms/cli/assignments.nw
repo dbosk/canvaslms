@@ -583,6 +583,10 @@ edit_parser = assignments_subp.add_parser("edit",
       "(2) If no 'regex' is present but 'name' is, exact name matching is "
       "used. "
       "(3) Otherwise, falls back to -a, -A, and -M filters. "
+      "Grading settings are written under the Assignments API's own names "
+      "and values: grading_type, omit_from_final_grade, allowed_attempts, "
+      "peer_reviews and automatic_peer_reviews; "
+      "see https://canvas.instructure.com/doc/api/assignments.html. "
       "Use --html to read/edit HTML directly without Markdown conversion.")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
@@ -1208,8 +1212,8 @@ Let's verify that both editable outputs carry the spec, by running
 Module membership is patched to none, as scenery; captured output is not a
 terminal, so the command takes the editable path.
 <<test functions>>=
-@pytest.mark.parametrize("html", [False, True])
-def test_view_exports_the_assignment_group(capsys, html):
+def view_output(capsys, assignment_json, html):
+  """Run `assignments view` on one assignment; return what it prints."""
   requester = MagicMock()
   course = Course(requester, {"id": 1, "course_code": "CODE"})
   course.get_assignment_groups = lambda: [
@@ -1217,7 +1221,7 @@ def test_view_exports_the_assignment_group(capsys, html):
       AssignmentGroup(requester, {"id": 32, "name": "Participation INL1"})]
   assignment = Assignment(requester, {
       "id": 7, "course_id": 1, "name": "Survey", "description": "",
-      "assignment_group_id": 32})
+      **assignment_json})
   assignment.course = course
 
   parser = argparse.ArgumentParser()
@@ -1229,8 +1233,26 @@ def test_view_exports_the_assignment_group(capsys, html):
        patch("canvaslms.cli.assignments.modules.export_module_specs",
              return_value=[]):
     assignments_view_command({}, MagicMock(), args)
+  return capsys.readouterr().out
 
-  assert "assignment_group: ^Participation\\ INL1$" in capsys.readouterr().out
+@pytest.mark.parametrize("html", [False, True])
+def test_view_exports_the_assignment_group(capsys, html):
+  out = view_output(capsys, {"assignment_group_id": 32}, html)
+  assert "assignment_group: ^Participation\\ INL1$" in out
+@
+
+The grading settings (issue~\#555) are exported the same way, under the
+names the Assignments API gives them, so that a file pushed back says what
+the assignment already is:
+<<test functions>>=
+@pytest.mark.parametrize("html", [False, True])
+def test_view_exports_the_grading_settings(capsys, html):
+  out = view_output(capsys, {"grading_type": "pass_fail",
+                             "omit_from_final_grade": True,
+                             "allowed_attempts": -1}, html)
+  assert "grading_type: pass_fail" in out
+  assert "omit_from_final_grade: true" in out
+  assert "allowed_attempts: -1" in out
 @
 
 \subsection{HTML output format}
@@ -2130,7 +2152,7 @@ A new assignment has no date to remove, so the [[creating]] flag makes the
 function leave empty dates out, which keeps the creation request to what the
 file actually sets.
 
-The other two optional attributes keep their old reading.
+[[points_possible]] and [[published]] keep their old reading.
 An empty [[points_possible]] is left out, for the reason that empty quiz
 settings are (\cref{sec:quiz-null-attributes}): we know of no Canvas
 spelling that would clear it, and a [[null]] sent as [[None]] would vanish
@@ -2145,6 +2167,23 @@ alone, since an assignment cannot be in no group.
 A spec that names no group, or several, raises [[ValueError]], as an
 unparseable date does, and each caller turns that into a message before it
 writes anything.
+
+The grading settings, [[grading_type]], [[omit_from_final_grade]] and the
+others in [[ASSIGNMENT_API_SETTINGS]] (issue~\#555), need none of this.
+They are fields of the Assignments API under their own names, so each is
+sent as the file gives it, and the Canvas documentation says what the
+values mean.
+A [[null]] is left out, as for [[points_possible]]: the template of a new
+assignment lists every key with an empty value, and only the settings the
+file fills in should reach Canvas.
+Canvas itself sets one limit.
+When an assignment is created without an online submission type, which is
+the case for one created from a file, Canvas drops [[allowed_attempts]] and
+keeps its default of unlimited ($-1$); an edit of the same assignment keeps
+the value (sandbox, October 2026).
+Attempts only count for online submissions, so nothing is lost, but a file
+pushed with [[--create]] and then exported shows $-1$ where it said
+otherwise.
 
 Date attributes require special handling: what YAML's [[safe_load]] yields
 depends on how complete the timestamp is.
@@ -2189,6 +2228,9 @@ def assignment_attributes_to_params(attributes, course=None,
   if attributes.get('assignment_group') not in (None, ''):
     params['assignment_group_id'] = resolve_assignment_group(
         course, attributes['assignment_group'], current_group)
+  for key in canvaslms.cli.content.ASSIGNMENT_API_SETTINGS:
+    if attributes.get(key) is not None:
+      params[key] = attributes[key]
   return params
 @
 
@@ -2227,6 +2269,15 @@ def test_creating_leaves_empty_dates_out():
 
 def test_empty_points_possible_is_left_out():
   assert assignment_attributes_to_params({'points_possible': None}) == {}
+
+def test_grading_settings_are_sent_as_the_api_names_them():
+  params = assignment_attributes_to_params(
+      {'grading_type': 'pass_fail', 'omit_from_final_grade': True,
+       'allowed_attempts': -1, 'peer_reviews': False,
+       'automatic_peer_reviews': None})
+  assert params == {'grading_type': 'pass_fail',
+                    'omit_from_final_grade': True,
+                    'allowed_attempts': -1, 'peer_reviews': False}
 @
 
 The test that matters to a user drives the whole file path: a file is read,
@@ -2293,6 +2344,15 @@ def test_file_naming_no_group_writes_nothing(tmp_path):
   with pytest.raises(SystemExit):
     edit_assignment_from_file(
         tmp_path, "regex: ^Lab$\nname: Lab\nassignment_group: ^Exams$\n")
+
+def test_file_grading_settings_reach_canvas(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\ngrading_type: pass_fail\n"
+                "omit_from_final_grade: true\npeer_reviews: null\n")
+
+  assert sent["assignment[grading_type]"] == "pass_fail"
+  assert sent["assignment[omit_from_final_grade]"] is True
+  assert "assignment[peer_reviews]" not in sent
 @
 
 \subsection{Processing module membership}
