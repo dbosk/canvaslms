@@ -42,10 +42,15 @@ DOC_MODULES := conftest.tex
 
 # The cross-reference lint is tangled next to the manual it audits, and
 # test_lint.py imports it from there, so build it along with the tests.
+# We tangle it directly rather than via "make -C ../doc lint.py": doc/Makefile
+# includes didactic/didactic.mk, so that route would make the tests depend on
+# the doc/didactic submodule, which a fresh worktree does not have.  The
+# recipe repeats what noweb.mk's .py rule does there, black included, so both
+# routes produce the same file.
 LINT= ../doc/lint.py
 
 $(LINT): ../doc/lint.nw
-	$(MAKE) -C ../doc lint.py
+	notangle -R"[[lint.py]]" $< | cpif $@ && black -q $@
 
 # Main targets
 .PHONY: all

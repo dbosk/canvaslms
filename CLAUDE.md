@@ -611,7 +611,9 @@ A fresh clone or **git worktree** has no initialized submodules, and the
 failures this causes are cryptic:
 
 ```bash
-# Required for ANY make (tangling/weaving):
+# Required for ANY make (tangling/weaving), including `make -C tests all`
+# and the whole pytest run (tests/Makefile tangles doc/lint.py directly,
+# so the tests do not need doc/didactic):
 git submodule update --init makefiles
 
 # Additionally required for building the manual (make -C doc):
