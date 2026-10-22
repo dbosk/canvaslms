@@ -85,6 +85,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.course import Course
+from canvasapi.grading_standard import GradingStandard
 from canvasapi.util import combine_kwargs
 
 from canvaslms.cli.assignments import *
@@ -587,6 +588,8 @@ edit_parser = assignments_subp.add_parser("edit",
       "and values: grading_type, omit_from_final_grade, allowed_attempts, "
       "peer_reviews and automatic_peer_reviews; "
       "see https://canvas.instructure.com/doc/api/assignments.html. "
+      "Like assignment_group, grading_standard is a regex naming the "
+      "grading scheme by its title or Canvas ID. "
       "Use --html to read/edit HTML directly without Markdown conversion.")
 edit_parser.set_defaults(func=assignments_edit_command)
 add_assignment_option(edit_parser, ungraded=False, required=True)
@@ -849,7 +852,44 @@ and an [[EmptyListError]] escaping into the file-edit code would be mistaken
 for \enquote{no assignment matches} and trigger [[--create]].
 A YAML file may give an ID as a bare number; we anchor it, because the regex
 [[3]] would also match group 13.
+
+A file names a second kind of course item the same way: the grading scheme
+of a letter-graded assignment (\cref{sec:grading-standard-spec}).
+The matching is therefore written for any items that have an ID and a name,
+and [[key]] and [[kind]] only say, in the messages, which file key and which
+kind of item the spec was meant for.
 <<functions>>=
+def resolve_named_item(items, spec, key, kind, current=None,
+                       name_attr='name'):
+  """Return the ID of the one item of `items` that `spec` names.
+
+  `spec` is a regex matched against each item's `name_attr` and ID, or an
+  integer ID. `key` and `kind` name the file key and the kind of item in
+  error messages. `current` is the ID of the item in use now, if any; it
+  is kept when `spec` matches several items including it.
+  Raises ValueError when no item or several items match, or when the
+  regex is invalid.
+  """
+  if isinstance(spec, int):
+    spec = f"^{spec}$"
+  try:
+    pattern = re.compile(str(spec))
+  except re.error as e:
+    raise ValueError(f"{key}: invalid regex '{spec}': {e}")
+  matches = [item for item in items
+             if pattern.search(getattr(item, name_attr, None) or '')
+             or pattern.search(str(item.id))]
+  for item in matches:
+    if current is not None and str(item.id) == str(current):
+      return item.id
+  if len(matches) == 1:
+    return matches[0].id
+  if not matches:
+    raise ValueError(f"{key}: no {kind} matches '{spec}'")
+  names = ", ".join(f"'{getattr(item, name_attr, None)}'" for item in matches)
+  raise ValueError(f"{key}: '{spec}' matches {len(matches)} {kind}s "
+                   f"({names}); make it more specific")
+
 def resolve_assignment_group(course, spec, current=None):
   """Return the ID of the one assignment group of `course` matching `spec`.
 
@@ -859,26 +899,8 @@ def resolve_assignment_group(course, spec, current=None):
   Raises ValueError when no group or several groups match, or when the
   regex is invalid.
   """
-  if isinstance(spec, int):
-    spec = f"^{spec}$"
-  try:
-    pattern = re.compile(str(spec))
-  except re.error as e:
-    raise ValueError(f"assignment_group: invalid regex '{spec}': {e}")
-  matches = [group for group in course.get_assignment_groups()
-             if pattern.search(group.name or '')
-             or pattern.search(str(group.id))]
-  for group in matches:
-    if current is not None and str(group.id) == str(current):
-      return group.id
-  if len(matches) == 1:
-    return matches[0].id
-  if not matches:
-    raise ValueError(f"assignment_group: no assignment group matches "
-                     f"'{spec}'")
-  names = ", ".join(f"'{group.name}'" for group in matches)
-  raise ValueError(f"assignment_group: '{spec}' matches {len(matches)} "
-                   f"assignment groups ({names}); make it more specific")
+  return resolve_named_item(course.get_assignment_groups(), spec,
+                            'assignment_group', 'assignment group', current)
 @
 
 The export goes the other way: from the [[assignment_group_id]] of an
@@ -889,7 +911,19 @@ We compare the IDs as strings, because the two APIs disagree on their type:
 the Assignments and Classic Quizzes APIs give [[assignment_group_id]] as a
 number, but the New Quizzes API gives it as a string ([["37658"]]), and a
 numeric comparison silently found no group for any New Quiz.
+The wrapper checks for a missing ID before it lists the groups, so an item
+without one costs no request.
 <<functions>>=
+def named_item_spec(items, item_id, name_attr='name'):
+  """Return an anchored regex naming the item of `items` with ID `item_id`.
+
+  Returns None when no item has that ID.
+  """
+  for item in items:
+    if str(item.id) == str(item_id):
+      return '^' + re.escape(getattr(item, name_attr, None) or '') + '$'
+  return None
+
 def assignment_group_spec(course, group_id):
   """Return an anchored regex naming assignment group `group_id`.
 
@@ -897,10 +931,7 @@ def assignment_group_spec(course, group_id):
   """
   if group_id is None:
     return None
-  for group in course.get_assignment_groups():
-    if str(group.id) == str(group_id):
-      return '^' + re.escape(group.name or '') + '$'
-  return None
+  return named_item_spec(course.get_assignment_groups(), group_id)
 @
 
 Let's verify both directions on real [[AssignmentGroup]] objects.
@@ -1071,6 +1102,162 @@ class TestFilterAssignmentsByGroupList:
 @
 
 
+\section{Naming a grading scheme in a file}
+\label{sec:grading-standard-spec}
+
+An assignment graded with letters, [[grading_type]] [[letter_grade]] or
+[[gpa_scale]], turns its points into a grade through a grading scheme, which
+the Assignments API calls a grading standard.
+A course defines its own schemes, such as P/F/Fx, and an assignment that
+names none gets Canvas's default A--F scheme.
+A course round rebuilt from files must therefore say which scheme each
+assignment uses, or every letter-graded assignment falls back to A--F and
+its grades come out wrong (issue~\#557).
+
+The API's field, [[grading_standard_id]], has the problem of
+[[assignment_group_id]]: a course's schemes are copied with the course and
+get new IDs there, so a file carrying the ID would point the next round at
+the old round's scheme.
+We therefore solve it as for the group (\cref{sec:assignment-group-spec}).
+A file names the scheme by a regex on its title or ID,
+\begin{verbatim}
+grading_standard: ^P/F/Fx$
+\end{verbatim}
+an export writes the title, escaped and anchored, and a write resolves the
+regex against the course's schemes, with the same errors before anything
+is written and the same exception for equally named schemes.
+The key is the API's field without its [[_id]], as [[assignment_group]] is,
+so the Assignments API documentation still says what it means.
+
+As for the other grading settings, an empty key leaves the scheme alone.
+Canvas has a way back to its default scheme, an empty
+[[grading_standard_id]] (sandbox, October 2026), but the default has no title
+to name, so an export of an assignment that uses it has nothing to write,
+and pushing that export must not change the scheme of another assignment.
+A file therefore cannot switch an assignment back to the default scheme;
+that takes the web interface.
+
+We list the schemes with [[get_grading_standards]], which gives those the
+course itself defines.
+In fifteen KTH courses that listing held no scheme from the account, so we
+cannot tell whether Canvas would list one there.
+A scheme the listing does not show behaves like a deleted assignment group:
+the export writes no spec, and a push leaves the scheme alone.
+
+Unlike the assignment groups, which every caller lists anyway, the schemes
+are a listing of their own, which Canvas may refuse a role or fail to
+deliver.
+The two directions treat that failure as they treat a scheme that is not
+there.
+A write turns it into the [[ValueError]] its callers already report before
+writing anything, rather than letting a [[CanvasException]] end the command
+halfway through a list of files.
+An export warns and writes no spec, so that a view or a quiz export still
+shows the rest of the item; pushing that file back then leaves the scheme
+alone.
+<<functions>>=
+def course_grading_standards(course):
+  """Return the grading standards of `course` as a list.
+
+  Raises ValueError when Canvas does not list them.
+  """
+  try:
+    return list(course.get_grading_standards())
+  except canvasapi.exceptions.CanvasException as e:
+    raise ValueError(f"grading_standard: cannot list the course's grading "
+                     f"standards: {e}")
+
+def resolve_grading_standard(course, spec, current=None):
+  """Return the ID of the one grading standard of `course` matching `spec`.
+
+  `spec` is a regex matched against the standards' titles and IDs, or an
+  integer ID. `current` is the ID of the standard in use now, kept when
+  `spec` matches several standards including it.
+  Raises ValueError when no standard or several standards match, when the
+  regex is invalid, or when the standards cannot be listed.
+  """
+  return resolve_named_item(course_grading_standards(course), spec,
+                            'grading_standard', 'grading standard', current,
+                            name_attr='title')
+
+def grading_standard_spec(course, standard_id):
+  """Return an anchored regex naming grading standard `standard_id`.
+
+  Returns None when `standard_id` is None or names no standard of `course`,
+  and, after a warning, when the standards cannot be listed.
+  """
+  if standard_id is None:
+    return None
+  try:
+    standards = course_grading_standards(course)
+  except ValueError as e:
+    canvaslms.cli.warn(str(e))
+    return None
+  return named_item_spec(standards, standard_id, name_attr='title')
+@
+
+Let's verify both directions on real [[GradingStandard]] objects, through a
+title with the slashes and parentheses that scheme titles tend to have.
+The course is a [[MagicMock]], as for the groups, only to hand them over.
+One test makes sure that an assignment without a scheme, which is most
+of them, costs no request; the last that a refused listing fails a write
+before it starts but only costs an export its spec.
+<<test functions>>=
+def course_with_standards(*standards):
+  """A course whose grading standards are `standards`, (id, title) pairs."""
+  course = MagicMock()
+  course.get_grading_standards.return_value = [
+      GradingStandard(MagicMock(), {"id": i, "title": t,
+                                    "context_type": "Course"})
+      for i, t in standards]
+  return course
+
+class TestGradingStandardSpec:
+  def test_title_regex_resolves_to_the_standard_id(self):
+    course = course_with_standards((101, "P/F"), (102, "P/F/Fx (lab)"))
+    assert resolve_grading_standard(course, "^P/F/Fx") == 102
+
+  def test_no_match_is_an_error(self):
+    course = course_with_standards((101, "P/F"))
+    with pytest.raises(ValueError,
+                       match="grading_standard: no grading standard matches"):
+      resolve_grading_standard(course, "^A-E$")
+
+  def test_several_matches_are_an_error(self):
+    course = course_with_standards((101, "P/F"), (102, "P/F/Fx"))
+    with pytest.raises(ValueError, match="matches 2 grading standards"):
+      resolve_grading_standard(course, "^P/F")
+
+  def test_equally_named_standards_keep_the_current_one(self):
+    course = course_with_standards((101, "P/F"), (102, "P/F"))
+    spec = grading_standard_spec(course, 102)
+    assert resolve_grading_standard(course, spec, current=102) == 102
+
+  def test_exported_spec_resolves_back_to_the_same_standard(self):
+    course = course_with_standards((101, "P/F/Fx (lab)"),
+                                   (102, "P/F/Fx (lab) old"))
+    spec = grading_standard_spec(course, 101)
+    assert spec == r"^P/F/Fx\ \(lab\)$"
+    assert resolve_grading_standard(course, spec) == 101
+
+  def test_no_standard_has_no_spec_and_costs_no_request(self):
+    course = course_with_standards((101, "P/F"))
+    assert grading_standard_spec(course, 99) is None
+    course.get_grading_standards.reset_mock()
+    assert grading_standard_spec(course, None) is None
+    course.get_grading_standards.assert_not_called()
+
+  def test_refused_listing_fails_a_write_and_warns_an_export(self, caplog):
+    from canvasapi.exceptions import Unauthorized
+    course = MagicMock()
+    course.get_grading_standards.side_effect = Unauthorized("no access")
+    with pytest.raises(ValueError, match="cannot list"):
+      resolve_grading_standard(course, "^P/F$")
+    assert grading_standard_spec(course, 101) is None
+    assert "cannot list" in caplog.text
+@
+
+
 \section{The [[assignments view]] subcommand and its options}
 
 The [[assignments view]] subcommand (previously the [[assignment]] command) 
@@ -1157,6 +1344,7 @@ When editing:
 <<get rubric for assignment>>
 <<determine regex for assignment>>
 <<get assignment group spec for assignment>>
+<<get grading standard spec for assignment>>
 output = canvaslms.cli.content.render_to_markdown(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
@@ -1164,7 +1352,8 @@ output = canvaslms.cli.content.render_to_markdown(
     extra_attributes={'modules': assignment_modules,
                       'rubric': assignment_rubric,
                       'regex': assignment_regex,
-                      'assignment_group': assignment_group},
+                      'assignment_group': assignment_group,
+                      'grading_standard': grading_standard},
     course=canvaslms.cli.content.translation_course(assignment.course, args))
 print(output)
 @
@@ -1207,6 +1396,13 @@ assignment_group = assignment_group_spec(
     assignment.course, getattr(assignment, 'assignment_group_id', None))
 @
 
+The [[grading_standard]] field names the assignment's grading scheme the
+same way (\cref{sec:grading-standard-spec}).
+<<get grading standard spec for assignment>>=
+grading_standard = grading_standard_spec(
+    assignment.course, getattr(assignment, 'grading_standard_id', None))
+@
+
 Let's verify that both editable outputs carry the spec, by running
 [[assignments view]] on one real [[Assignment]].
 Module membership is patched to none, as scenery; captured output is not a
@@ -1219,6 +1415,8 @@ def view_output(capsys, assignment_json, html):
   course.get_assignment_groups = lambda: [
       AssignmentGroup(requester, {"id": 31, "name": "Labs"}),
       AssignmentGroup(requester, {"id": 32, "name": "Participation INL1"})]
+  course.get_grading_standards = lambda: [
+      GradingStandard(requester, {"id": 101, "title": "P/F/Fx"})]
   assignment = Assignment(requester, {
       "id": 7, "course_id": 1, "name": "Survey", "description": "",
       **assignment_json})
@@ -1253,6 +1451,15 @@ def test_view_exports_the_grading_settings(capsys, html):
   assert "grading_type: pass_fail" in out
   assert "omit_from_final_grade: true" in out
   assert "allowed_attempts: -1" in out
+@
+
+The grading scheme is exported as a spec, like the group:
+<<test functions>>=
+@pytest.mark.parametrize("html", [False, True])
+def test_view_exports_the_grading_standard(capsys, html):
+  out = view_output(capsys, {"grading_type": "letter_grade",
+                             "grading_standard_id": 101}, html)
+  assert "grading_standard: ^P/F/Fx$" in out
 @
 
 \subsection{HTML output format}
@@ -1294,6 +1501,7 @@ and pushed back using [[assignments edit --html -f]].
 <<get rubric for assignment>>
 <<determine regex for assignment>>
 <<get assignment group spec for assignment>>
+<<get grading standard spec for assignment>>
 output = canvaslms.cli.content.render_to_html(
     assignment,
     canvaslms.cli.content.ASSIGNMENT_SCHEMA,
@@ -1301,7 +1509,8 @@ output = canvaslms.cli.content.render_to_html(
     extra_attributes={'modules': assignment_modules,
                       'rubric': assignment_rubric,
                       'regex': assignment_regex,
-                      'assignment_group': assignment_group},
+                      'assignment_group': assignment_group,
+                      'grading_standard': grading_standard},
     course=canvaslms.cli.content.translation_course(assignment.course, args))
 print(output)
 @
@@ -2164,6 +2373,9 @@ against the course to the [[assignment_group_id]] Canvas expects, which is
 why the function takes the course, and the assignment's present group for
 the ambiguous case; an empty spec, [[null]] or [['']], leaves the group
 alone, since an assignment cannot be in no group.
+A [[grading_standard]] spec (\cref{sec:grading-standard-spec}) is resolved
+to a [[grading_standard_id]] the same way, with the assignment's present
+scheme for the ambiguous case.
 A spec that names no group, or several, raises [[ValueError]], as an
 unparseable date does, and each caller turns that into a message before it
 writes anything.
@@ -2200,7 +2412,8 @@ happened to parse.
 ASSIGNMENT_DATE_ATTRIBUTES = ('due_at', 'unlock_at', 'lock_at')
 <<functions>>=
 def assignment_attributes_to_params(attributes, course=None,
-                                    creating=False, current_group=None):
+                                    creating=False, current_group=None,
+                                    current_standard=None):
   """Return the optional `assignment` API fields that `attributes` set.
 
   An absent attribute is left out, so Canvas keeps its value. A date
@@ -2209,7 +2422,9 @@ def assignment_attributes_to_params(attributes, course=None,
   assignment has no date to clear. An `assignment_group` spec is
   resolved against `course` to an `assignment_group_id`; `current_group`
   is the assignment's present group, kept when the spec is ambiguous.
-  Raises ValueError for a date or group spec Canvas cannot be given.
+  A `grading_standard` spec is resolved to a `grading_standard_id` in the
+  same way, with `current_standard`.
+  Raises ValueError for a date or spec Canvas cannot be given.
   """
   params = {}
   for key in ASSIGNMENT_DATE_ATTRIBUTES:
@@ -2228,6 +2443,9 @@ def assignment_attributes_to_params(attributes, course=None,
   if attributes.get('assignment_group') not in (None, ''):
     params['assignment_group_id'] = resolve_assignment_group(
         course, attributes['assignment_group'], current_group)
+  if attributes.get('grading_standard') not in (None, ''):
+    params['grading_standard_id'] = resolve_grading_standard(
+        course, attributes['grading_standard'], current_standard)
   for key in canvaslms.cli.content.ASSIGNMENT_API_SETTINGS:
     if attributes.get(key) is not None:
       params[key] = attributes[key]
@@ -2240,7 +2458,8 @@ built from the name and the description.
 try:
   update_data['assignment'].update(assignment_attributes_to_params(
       attributes, assignment.course,
-      current_group=getattr(assignment, 'assignment_group_id', None)))
+      current_group=getattr(assignment, 'assignment_group_id', None),
+      current_standard=getattr(assignment, 'grading_standard_id', None)))
 except ValueError as e:
   canvaslms.cli.err(1, f"Cannot update assignment '{assignment.name}': {e}")
 @
@@ -2270,6 +2489,13 @@ def test_creating_leaves_empty_dates_out():
 def test_empty_points_possible_is_left_out():
   assert assignment_attributes_to_params({'points_possible': None}) == {}
 
+def test_empty_grading_standard_leaves_the_scheme_alone():
+  course = course_with_standards((101, "P/F"))
+  assert assignment_attributes_to_params(
+      {'grading_standard': ''}, course) == {}
+  assert assignment_attributes_to_params(
+      {'grading_standard': None}, course) == {}
+
 def test_grading_settings_are_sent_as_the_api_names_them():
   params = assignment_attributes_to_params(
       {'grading_type': 'pass_fail', 'omit_from_final_grade': True,
@@ -2287,19 +2513,25 @@ The requester is a [[MagicMock]] because a live write cannot run offline;
 listing the course's assignments is patched to hand over one real
 [[Assignment]], which spares us faking the paginated listing.
 <<test functions>>=
-def edit_assignment_from_file(tmp_path, front_matter):
-  """Run `assignments edit -f` on a file; return the form fields sent."""
+def edit_assignment_from_file(tmp_path, front_matter, **assignment_fields):
+  """Run `assignments edit -f` on a file; return the form fields sent.
+
+  The assignment in Canvas also has `assignment_fields`.
+  """
   requester = MagicMock()
   requester.request.return_value.json.return_value = {}
   course = Course(requester, {"id": 1, "course_code": "CODE"})
   course.get_assignment_groups = lambda: [
       AssignmentGroup(requester, {"id": 31, "name": "Labs"}),
       AssignmentGroup(requester, {"id": 32, "name": "Surveys (INL1)"})]
+  course.get_grading_standards = lambda: [
+      GradingStandard(requester, {"id": 101, "title": "P/F"}),
+      GradingStandard(requester, {"id": 102, "title": "P/F/Fx"})]
   assignment = Assignment(requester, {
       "id": 7, "course_id": 1, "name": "Lab", "description": "",
       "due_at": "2026-11-20T22:59:00Z",
       "unlock_at": "2026-11-09T07:00:00Z",
-      "lock_at": "2026-11-27T22:59:00Z"})
+      "lock_at": "2026-11-27T22:59:00Z", **assignment_fields})
   assignment.course = course
   path = tmp_path / "lab.md"
   path.write_text(f"---\n{front_matter}---\n\nBody\n")
@@ -2353,6 +2585,26 @@ def test_file_grading_settings_reach_canvas(tmp_path):
   assert sent["assignment[grading_type]"] == "pass_fail"
   assert sent["assignment[omit_from_final_grade]"] is True
   assert "assignment[peer_reviews]" not in sent
+
+def test_file_sets_the_named_grading_standard(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\ngrading_type: letter_grade\n"
+                "grading_standard: ^P/F/Fx$\n")
+
+  assert sent["assignment[grading_standard_id]"] == 102
+  assert "assignment[grading_standard]" not in sent
+
+def test_file_naming_no_grading_standard_writes_nothing(tmp_path):
+  with pytest.raises(SystemExit):
+    edit_assignment_from_file(
+        tmp_path, "regex: ^Lab$\nname: Lab\ngrading_standard: ^A-E$\n")
+
+def test_file_matching_the_present_scheme_among_others_keeps_it(tmp_path):
+  sent = edit_assignment_from_file(
+      tmp_path, "regex: ^Lab$\nname: Lab\ngrading_standard: ^P/F\n",
+      grading_standard_id=101)
+
+  assert sent["assignment[grading_standard_id]"] == 101
 @
 
 \subsection{Processing module membership}
@@ -2473,6 +2725,7 @@ current_attrs['description'] = getattr(
     assignment, 'description', '') or ''
 <<get current modules for assignment>>
 <<get assignment group spec for assignment>>
+<<get grading standard spec for assignment>>
 assignment_rubric = None
 if hasattr(assignment, 'rubric') and assignment.rubric:
   assignment_rubric = assignment.rubric
@@ -2494,7 +2747,8 @@ result = canvaslms.cli.content.get_content_from_editor(
     content_attr='description',
     extra_attributes={'modules': assignment_modules,
                       'rubric': assignment_rubric,
-                      'assignment_group': assignment_group},
+                      'assignment_group': assignment_group,
+                      'grading_standard': grading_standard},
     html_mode=args.html)
 if result is None:
   print("Editor cancelled. Skipping this assignment.", file=sys.stderr)
@@ -2549,7 +2803,8 @@ update_data = {
 try:
   update_data['assignment'].update(assignment_attributes_to_params(
       final_attrs, assignment.course,
-      current_group=getattr(assignment, 'assignment_group_id', None)))
+      current_group=getattr(assignment, 'assignment_group_id', None),
+      current_standard=getattr(assignment, 'grading_standard_id', None)))
 except ValueError as e:
   print(f"Cannot update assignment '{assignment.name}': {e}",
         file=sys.stderr)
@@ -2577,6 +2832,54 @@ if 'modules' in final_attrs:
             file=sys.stderr)
     skipped_count += 1
     continue
+@
+
+Let's verify that the editor round trip keeps the assignment's grading
+scheme when the course has two schemes of the same title.
+The editor must be shown the scheme's spec, and the write must know the
+present scheme, or the spec it shows comes back ambiguous.
+We stand in for the user with stubs: the editor returns what it was shown,
+which is what saving it unchanged does, and the prompts are answered yes.
+The stub leaves out the module membership, so that the edit stops at the
+assignment; module updates have tests of their own.
+The requester is a [[MagicMock]] because a live write cannot run offline.
+<<test functions>>=
+def test_editor_round_trip_keeps_an_equally_named_scheme():
+  requester = MagicMock()
+  requester.request.return_value.json.return_value = {}
+  course = Course(requester, {"id": 1, "course_code": "CODE"})
+  course.get_assignment_groups = lambda: []
+  course.get_grading_standards = lambda: [
+      GradingStandard(requester, {"id": 101, "title": "P/F"}),
+      GradingStandard(requester, {"id": 102, "title": "P/F"})]
+  assignment = Assignment(requester, {
+      "id": 7, "course_id": 1, "name": "Lab", "description": "",
+      "grading_type": "letter_grade", "grading_standard_id": 102})
+  assignment.course = course
+
+  def save_unchanged(schema, attrs, content_attr, extra_attributes,
+                     html_mode):
+    shown = {**attrs, **extra_attributes}
+    del shown['modules']
+    return shown, ''
+
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "CODE"])
+  with patch("canvaslms.cli.assignments.process_assignment_option",
+             return_value=[assignment]), \
+       patch("canvaslms.cli.assignments.modules.export_module_specs",
+             return_value=[]), \
+       patch("builtins.input", return_value="y"), \
+       patch("canvaslms.cli.content.get_content_from_editor",
+             side_effect=save_unchanged), \
+       patch("canvaslms.cli.content.interactive_confirm_and_edit",
+             side_effect=lambda title, body, attrs, *rest, **kw:
+               (attrs, body)):
+    assignments_edit_command({}, MagicMock(), args)
+
+  sent = dict(requester.request.call_args.kwargs["_kwargs"])
+  assert sent["assignment[grading_standard_id]"] == 102
 @
 
 Finally, we report a summary of what was done.

@@ -48,6 +48,7 @@ from unittest.mock import MagicMock, create_autospec
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.content_migration import ContentMigration, MigrationIssue
 from canvasapi.course import Course
+from canvasapi.grading_standard import GradingStandard
 from canvasapi.new_quiz import NewQuiz
 from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
 from canvasapi.quiz_group import QuizGroup
@@ -92,16 +93,19 @@ def stub_canvas_method(canvas_object, name, return_value=None):
   setattr(canvas_object, name, stub)
   return stub
 
-def make_course(course_id=1, groups=(), requester=None):
+def make_course(course_id=1, groups=(), requester=None, standards=()):
   """A course as Canvas lists it, whose assignment groups are `groups`
 
-  `groups` are (id, name) pairs.
+  `groups` are (id, name) pairs; `standards`, the course's grading
+  standards, are (id, title) pairs.
   """
   requester = requester or MagicMock()
   course = Course(requester, {"id": course_id, "name": f"Course {course_id}",
                               "course_code": "DD1310"})
   stub_canvas_method(course, "get_assignment_groups", [
     AssignmentGroup(requester, {"id": i, "name": n}) for i, n in groups])
+  stub_canvas_method(course, "get_grading_standards", [
+    GradingStandard(requester, {"id": i, "title": t}) for i, t in standards])
   stub_canvas_method(course, "get_assignment").side_effect = (
     lambda assignment, **kwargs: Assignment(requester, {
       "id": int(assignment), "course_id": course_id, "name": "Quiz"}))
@@ -3068,7 +3072,9 @@ ASSIGNMENT SETTINGS (both quiz types, in settings.assignment):
   Assignments API documentation
   (https://canvas.instructure.com/doc/api/assignments.html):
   omit_from_final_grade, and for Classic Quizzes also grading_type,
-  peer_reviews and automatic_peer_reviews.  A quiz limits attempts itself,
+  peer_reviews and automatic_peer_reviews.  grading_standard names a
+  letter-graded quiz's grading scheme by a regex on its title or ID, as in
+  assignment files.  A quiz limits attempts itself,
   so allowed_attempts is not sent here, and a New Quiz states grading_type
   among its own settings.  Practice quizzes and ungraded surveys have no
   assignment.  This is what quizzes export writes.
@@ -3438,13 +3444,15 @@ except ValueError as e:
 The [[assignment]] mapping holds grading settings for the quiz's assignment
 (\cref{sec:quiz-assignment-settings}), not for the quiz, so it must leave the
 quiz settings before they are sent.
-We check it here, before the quiz exists, so that a malformed mapping stops
-the command with nothing created; the warnings about dropped keys come
-before the quiz is created too.
+We check it here, before the quiz exists, so that a malformed mapping, or a
+grading scheme the course does not have, stops the command with nothing
+created; the warnings about dropped keys come before the quiz is created too.
 <<take the assignment settings out of the quiz settings>>=
 try:
-  assignment_params = quiz_assignment_params(
-    quiz_params.pop('assignment', None), quiz_type == "new")
+  assignment_params = assignment_params_with_grading_standard_id(
+    quiz_assignment_params(
+      quiz_params.pop('assignment', None), quiz_type == "new"),
+    course)
 except ValueError as e:
   canvaslms.cli.err(1, f"Invalid quiz file {args.file}: {e}")
 @
@@ -3519,11 +3527,12 @@ creation functions are replaced.
 
 <<test functions>>=
 def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
-                          quiz_type=None, groups=(), course=None):
+                          quiz_type=None, groups=(), course=None, sent=None):
   """Run quizzes create on a file, return the params it would send Canvas
 
   `groups` are the course's assignment groups as (id, name) pairs. A
-  created Classic Quiz reports assignment 66.
+  created Classic Quiz reports assignment 66. The params are collected in
+  `sent`, if given, so a caller can inspect them when the command exits.
   """
   path = tmp_path / name
   path.write_text(contents, encoding='utf-8')
@@ -3533,7 +3542,7 @@ def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
     for i, n in groups]
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
-  sent = {}
+  sent = {} if sent is None else sent
   monkeypatch.setattr(
     quizzes, "create_new_quiz",
     lambda course, requester, params: sent.update(params) or {"id": 394105})
@@ -4227,7 +4236,9 @@ assignment:
 \end{verbatim}
 Its keys are the grading settings that assignment files carry
 (\cref{sec:assignment-attributes-to-params}), under the Assignments API's
-names.
+names, and the [[grading_standard]] spec naming a letter-graded quiz's
+grading scheme (\cref{sec:grading-standard-spec}), which we come back to
+below.
 We keep them in a mapping of their own rather than among the top-level
 settings, because the two sets follow two APIs.
 The top-level keys are the quiz API's fields and the mapping's keys are the
@@ -4286,6 +4297,12 @@ def quiz_assignment_exclusions(is_new):
   return CLASSIC_QUIZ_ASSIGNMENT_EXCLUSIONS
 @
 
+The keys a mapping may hold are the grading settings and the
+[[grading_standard]] spec.
+<<constants>>=
+QUIZ_ASSIGNMENT_KEYS = content.ASSIGNMENT_API_SETTINGS + ('grading_standard',)
+@
+
 The settings to send are then the mapping minus the exclusions and the
 [[null]] values.
 A [[null]] says nothing, as it does for an assignment file, so it is left out
@@ -4316,7 +4333,9 @@ def quiz_assignment_params(mapping, is_new):
         hints.append(f"{key}: use {excluded[key]}")
       elif value is not False:
         hints.append(f"{key}: Canvas ignores it on a New Quiz")
-    elif key not in content.ASSIGNMENT_API_SETTINGS:
+    elif key == 'grading_standard_id':
+      hints.append(f"{key}: use grading_standard")
+    elif key not in QUIZ_ASSIGNMENT_KEYS:
       hints.append(f"{key}: not a grading setting; set the quiz's own field")
     else:
       params[key] = value
@@ -4371,6 +4390,124 @@ def test_quiz_assignment_settings_must_be_a_mapping():
     quizzes.quiz_assignment_params(['omit_from_final_grade'], False)
 @
 
+\paragraph{The grading scheme.}
+A letter-graded quiz needs its grading scheme, which is a setting of the
+assignment for both kinds: neither quiz API has a field for it, whereas the
+Assignments API's [[grading_standard_id]] sticks on the assignment of either
+kind and survives later edits of the quiz (sandbox, October 2026).
+A New Quiz has its own [[grading_type]], but no scheme, so for once the two
+kinds take the same key.
+The mapping names the scheme as an assignment file does
+(\cref{sec:grading-standard-spec}), so the spec passes the selection above
+unchanged, and here it is resolved against the quiz's course.
+A [[grading_standard_id]] in the mapping is dropped with a hint to the spec,
+since the ID would not survive a course copy.
+
+A spec can name no scheme of the course, or several, and we want that
+reported before anything is written, as for an assignment file.
+We therefore resolve it with the other checks of the mapping, before the
+quiz is written, not when the settings are sent after it.
+When several schemes have the same title, the one the assignment uses now is
+kept, for the reason given for assignment groups
+(\cref{sec:assignment-group-spec}): an unchanged export must push back
+without error.
+The present scheme is a field of the assignment, which a quiz object does
+not carry, so for an existing quiz we fetch the assignment, but only when
+the mapping names a scheme.
+If that fetch fails we know of no present scheme, and an ambiguous spec is an
+error; the write that would follow reports the failure itself.
+An empty spec leaves the scheme alone, as in an assignment file.
+<<functions>>=
+def quiz_grading_standard_id(quiz):
+  """Return the ID of the grading standard `quiz`'s assignment uses.
+
+  None when the quiz has no assignment, it uses none, or it cannot be
+  fetched.
+  """
+  assignment_id = quiz_assignment_id(quiz)
+  if assignment_id is None:
+    return None
+  try:
+    assignment = quiz.course.get_assignment(assignment_id)
+  except Exception:
+    return None
+  return getattr(assignment, 'grading_standard_id', None)
+
+def assignment_params_with_grading_standard_id(params, course, quiz=None):
+  """Return `params` with its `grading_standard` spec resolved.
+
+  The spec is replaced by the ID of the one grading standard of `course` it
+  matches; an empty spec is dropped. For an existing `quiz`, the standard
+  its assignment uses is kept when the spec matches several.
+  Raises ValueError when no standard or several standards match.
+  """
+  if 'grading_standard' not in params:
+    return params
+  params = dict(params)
+  spec = params.pop('grading_standard')
+  if spec not in (None, ''):
+    current = quiz_grading_standard_id(quiz) if quiz is not None else None
+    params['grading_standard_id'] = assignments.resolve_grading_standard(
+      course, spec, current)
+  return params
+@
+
+Let's verify the resolution on a course with two schemes whose titles share
+a prefix.
+The selection keeps the spec for both kinds, and resolving it gives the ID;
+a spec matching both is an error for a new quiz but keeps the scheme an
+existing quiz has; and a mapping without a scheme costs no request.
+<<test functions>>=
+@pytest.mark.parametrize("is_new", [False, True])
+def test_grading_standard_passes_the_selection(caplog, is_new):
+  params = quizzes.quiz_assignment_params(
+    {'grading_standard': '^P/F/Fx$'}, is_new)
+
+  assert params == {'grading_standard': '^P/F/Fx$'}
+  assert not caplog.records
+
+def test_grading_standard_id_is_pointed_to_the_spec(caplog):
+  assert quizzes.quiz_assignment_params(
+    {'grading_standard_id': 5}, False) == {}
+  assert 'grading_standard_id: use grading_standard' in caplog.text
+
+def test_grading_standard_spec_is_resolved_to_its_id():
+  course, _ = course_with_quiz_assignment()
+
+  params = quizzes.assignment_params_with_grading_standard_id(
+    {'grading_standard': '^P/F/Fx$', 'omit_from_final_grade': True}, course)
+
+  assert params == {'grading_standard_id': 102,
+                    'omit_from_final_grade': True}
+
+def test_ambiguous_grading_standard_keeps_the_present_one():
+  course, _ = course_with_quiz_assignment(66, grading_standard_id=101)
+  quiz = make_classic_quiz(course, assignment_id=66)
+
+  with pytest.raises(ValueError, match="matches 2 grading standards"):
+    quizzes.assignment_params_with_grading_standard_id(
+      {'grading_standard': '^P/F'}, course)
+  assert quizzes.assignment_params_with_grading_standard_id(
+    {'grading_standard': '^P/F'}, course, quiz) == {
+      'grading_standard_id': 101}
+
+def test_empty_grading_standard_leaves_the_scheme_alone():
+  course, _ = course_with_quiz_assignment()
+
+  assert quizzes.assignment_params_with_grading_standard_id(
+    {'grading_standard': ''}, course) == {}
+
+def test_no_grading_standard_needs_no_request():
+  course, _ = course_with_quiz_assignment()
+  quiz = make_classic_quiz(course, assignment_id=66)
+
+  assert quizzes.assignment_params_with_grading_standard_id(
+    {'omit_from_final_grade': True}, course, quiz) == {
+      'omit_from_final_grade': True}
+  assert not course.get_grading_standards.called
+  assert not course.get_assignment.called
+@
+
 To send the settings we need the assignment's ID, which depends on the kind
 of quiz.
 <<functions>>=
@@ -4422,9 +4559,10 @@ live write cannot run offline.
 def course_with_quiz_assignment(assignment_id=66, **fields):
   """A course whose assignment `assignment_id` has `fields`.
 
+  The course has the grading standards 101 "P/F" and 102 "P/F/Fx".
   Returns the course and the assignment's requester.
   """
-  course = make_course()
+  course = make_course(standards=((101, "P/F"), (102, "P/F/Fx")))
   requester = MagicMock()
   requester.request.return_value.json.return_value = {}
   course.get_assignment.side_effect = None
@@ -4467,6 +4605,7 @@ An export writes the same mapping, read from the assignment, so that a quiz
 created from the export gets the grading settings back.
 It writes only the keys a quiz of that kind can take, and leaves out the
 [[null]] ones.
+The grading scheme, if the assignment has one, is written as its spec.
 If the export could not fetch the assignment, we warn and write no mapping
 rather than fail the whole export: the quiz and its questions are what the
 user asked for.
@@ -4487,9 +4626,14 @@ def quiz_assignment_settings(quiz):
     return None
 
   excluded = quiz_assignment_exclusions(is_new_quiz(quiz))
-  return {key: getattr(assignment, key)
-          for key in content.ASSIGNMENT_API_SETTINGS
-          if key not in excluded and getattr(assignment, key) is not None}
+  settings = {key: getattr(assignment, key)
+              for key in content.ASSIGNMENT_API_SETTINGS
+              if key not in excluded and getattr(assignment, key) is not None}
+  standard = assignments.grading_standard_spec(
+    quiz.course, assignment.grading_standard_id)
+  if standard is not None:
+    settings['grading_standard'] = standard
+  return settings
 @
 
 Let's verify that an export reads the right assignment for each kind and
@@ -4519,6 +4663,18 @@ def test_new_quiz_exports_its_assignment_settings():
   assert quizzes.quiz_assignment_settings(quiz) == {
     'omit_from_final_grade': True}
   course.get_assignment.assert_called_once_with(394105)
+
+@pytest.mark.parametrize("quiz_type", ["classic", "new"])
+def test_quiz_exports_its_grading_scheme(quiz_type):
+  course, _ = course_with_quiz_assignment(
+    66, grading_type='letter_grade', grading_standard_id=102)
+  if quiz_type == "new":
+    quiz = make_new_quiz(course, id="66")
+  else:
+    quiz = make_classic_quiz(course, assignment_id=66)
+
+  assert quizzes.quiz_assignment_settings(quiz)['grading_standard'] == \
+    '^P/F/Fx$'
 
 def test_practice_quiz_exports_no_assignment_settings():
   course, _ = course_with_quiz_assignment()
@@ -4563,6 +4719,31 @@ def test_create_sends_the_assignment_settings(monkeypatch, tmp_path,
   course.get_assignment.assert_called_once_with(assignment_id)
   assert sent_to_assignment(requester) == {
     'assignment[omit_from_final_grade]': True}
+
+def test_create_sends_the_named_grading_scheme(monkeypatch, tmp_path):
+  course, requester = course_with_quiz_assignment(66)
+
+  create_quiz_from_file(
+    monkeypatch, tmp_path, 'lab.yaml',
+    'settings:\n  title: Lab\n  assignment:\n'
+    '    grading_standard: ^P/F/Fx$\n',
+    quiz_type='classic', course=course)
+
+  assert sent_to_assignment(requester) == {
+    'assignment[grading_standard_id]': 102}
+
+def test_create_naming_no_grading_scheme_creates_nothing(monkeypatch,
+                                                         tmp_path):
+  course, _ = course_with_quiz_assignment(66)
+  sent = {}
+
+  with pytest.raises(SystemExit):
+    create_quiz_from_file(
+      monkeypatch, tmp_path, 'lab.yaml',
+      'settings:\n  title: Lab\n  assignment:\n'
+      '    grading_standard: ^A-E$\n',
+      quiz_type='classic', course=course, sent=sent)
+  assert not sent
 
 def test_create_rejects_assignment_settings_that_are_no_mapping(
     monkeypatch, tmp_path):
@@ -5341,7 +5522,8 @@ FILE MODE (-f):
   a round-trip workflow: export, modify, edit.
   The settings are those 'quizzes create --help' lists, including
   settings.assignment: the grading settings of the quiz's assignment, named
-  as in https://canvas.instructure.com/doc/api/assignments.html.
+  as in https://canvas.instructure.com/doc/api/assignments.html, and
+  grading_standard, a regex naming the grading scheme by title or ID.
 
   When using -f, the -a/--assignment selector is optional if the file provides
   enough information to identify the quiz. We use the first available of:
@@ -6934,11 +7116,11 @@ that quiz before anything is sent, the way any other failed update does: the
 caller warns and moves on.
 
 The same holds for the [[assignment]] mapping
-(\cref{sec:quiz-assignment-settings}).  It is taken out of the attributes
-before they become quiz parameters, and sent to the quiz's assignment only
-after the quiz update succeeded, so a failed quiz update writes nothing
-further.  We copy the attributes before taking it out, because they may be
-the caller's.
+(\cref{sec:quiz-assignment-settings}), including its grading scheme.  It is
+taken out of the attributes before they become quiz parameters, and sent to
+the quiz's assignment only after the quiz update succeeded, so a failed quiz
+update writes nothing further.  We copy the attributes before taking it
+out, because they may be the caller's.
 
 A failed write to the assignment, on the other hand, does not make the edit
 fail.  The quiz has been written by then, and the callers' next steps---the
@@ -6978,8 +7160,10 @@ def apply_quiz_edit(quiz, attributes, body, requester, html_mode=False,
   try:
     attributes = dict(settings_with_assignment_group_id(
       attributes, quiz.course, getattr(quiz, 'assignment_group_id', None)))
-    assignment_params = quiz_assignment_params(
-      attributes.pop('assignment', None), is_new_quiz(quiz))
+    assignment_params = assignment_params_with_grading_standard_id(
+      quiz_assignment_params(
+        attributes.pop('assignment', None), is_new_quiz(quiz)),
+      quiz.course, quiz)
   except ValueError as e:
     canvaslms.cli.warn(f"{quiz.title}: {e}")
     return False
@@ -7087,6 +7271,39 @@ def test_edit_sends_the_assignment_settings_to_the_assignment(quiz_type):
   assert sent_to_assignment(assignment_requester) == {
     'assignment[omit_from_final_grade]': True}
   assert 'assignment' in attributes
+
+@pytest.mark.parametrize("quiz_type", ["classic", "new"])
+def test_edit_sends_the_named_grading_scheme(quiz_type):
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    quiz_type)
+
+  assert quizzes.apply_quiz_edit(
+    quiz, {'assignment': {'grading_standard': '^P/F$'}}, '', quiz_requester)
+
+  assert sent_to_assignment(assignment_requester) == {
+    'assignment[grading_standard_id]': 101}
+
+def test_edit_keeps_the_present_scheme_among_equally_matched_ones():
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    "classic")
+  quiz.course.get_assignment.return_value.grading_standard_id = 102
+
+  assert quizzes.apply_quiz_edit(
+    quiz, {'assignment': {'grading_standard': '^P/F'}}, '', quiz_requester)
+
+  assert sent_to_assignment(assignment_requester) == {
+    'assignment[grading_standard_id]': 102}
+
+def test_edit_naming_no_grading_scheme_writes_nothing():
+  quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
+    "classic")
+
+  assert not quizzes.apply_quiz_edit(
+    quiz, {'title': 'Survey', 'assignment': {'grading_standard': '^A-E$'}},
+    '', quiz_requester)
+
+  assert not quiz_requester.request.called
+  assert not assignment_requester.request.called
 
 def test_failed_quiz_edit_leaves_the_assignment_alone():
   quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
