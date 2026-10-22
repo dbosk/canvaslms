@@ -49,13 +49,48 @@ appear after their corresponding functionality:
 import argparse
 import pytest
 from unittest.mock import Mock, MagicMock, create_autospec
-import canvasapi.course
-import canvasapi.group
+from canvasapi import Canvas
+from canvasapi.course import Course
+from canvasapi.group import Group
+from canvasapi.user import User
+import canvaslms.cli.utils
 import canvaslms.cli.users as users_module
 
+<<canvas test doubles>>
 <<test user fixtures>>
 <<test functions>>
 @
+
+The tests stand in for Canvas without contacting it, and how they do so
+decides what they can catch.
+A course, user or group in these tests is not a [[Mock]] but the real
+[[canvasapi]] class, built from the JSON fields Canvas sends on a [[MagicMock]]
+requester: [[User(MagicMock(), {"id": 100, ...})]].
+The two differ when the code reads an attribute the test did not set.
+A [[Mock]] invents it, so a test stays green while the code reads a field
+Canvas never sends, or one Canvas has renamed.
+A real [[User]] has exactly the fields it was built from, so the same read
+raises [[AttributeError]] in the test, as it would in the user's run.
+The requester is only used when a method makes a request, so building and
+reading the objects stays offline.
+
+The methods that do make requests, such as [[Course.get_users]], we replace
+on the instance by a stub autospecced from the real bound method.
+The stub returns what the test asks for and records its calls like any mock,
+but a call with arguments the real method does not take still raises
+[[TypeError]].
+<<canvas test doubles>>=
+def stub_canvas_method(canvas_object, name, return_value=None):
+    """Replace a request-making method by a stub with its signature."""
+    stub = create_autospec(getattr(canvas_object, name),
+                           return_value=return_value)
+    setattr(canvas_object, name, stub)
+    return stub
+@
+
+We keep plain mocks only where no Canvas object is involved: the
+requester itself, the parsed [[args]] and, where a test never touches it, the
+[[canvas]] client.
 
 
 \section{The \texttt{users} command}
@@ -293,15 +328,22 @@ Let's verify that each of those names produces a row instead of a traceback.
 The splitting happens inside [[make_user_rows]], so we drive it through that
 generator with a single user whose sortable name we control, stubbing out the
 course lookup and the role filtering that we test elsewhere.
+Since that stubs out [[filter_users]] too, the user does not pass through
+[[ensure_user_attrs]] on its way in, so we normalize it ourselves.
+That is what makes the [[None]] case honest: there the user is built without
+a [[sortable_name]], as Canvas sends it, and the normalization supplies the
+[[None]].
 
 <<test functions>>=
 def split_name_rows(monkeypatch, sortable_name):
     """Return the --split-name rows for one user with this sortable name"""
-    user = Mock()
-    user.course = Mock()
-    user.course.course_code = "prgi25"
-    user.login_id = "user@example.com"
-    user.sortable_name = sortable_name
+    course = Course(MagicMock(), {"id": 1, "name": "Programmering",
+                                  "course_code": "prgi25"})
+    fields = {"id": 100, "name": "A User", "login_id": "user@example.com"}
+    if sortable_name is not None:
+        fields["sortable_name"] = sortable_name
+    user = canvaslms.cli.utils.ensure_user_attrs(User(MagicMock(), fields))
+    user.course = course
 
     args = Mock()
     args.regex = ".*"
@@ -311,7 +353,7 @@ def split_name_rows(monkeypatch, sortable_name):
     args.email = False
 
     monkeypatch.setattr(users_module.courses, "process_course_option",
-                        lambda canvas, args: [Mock()])
+                        lambda canvas, args: [course])
     monkeypatch.setattr(users_module, "filter_users",
                         lambda course_list, regex, roles: [user])
 
@@ -435,40 +477,44 @@ def group_member_ids(group):
 Let's verify both ways of resolving membership: a complete embedded list
 should be used as is, while a truncated one (fewer embedded users than
 [[members_count]]) must fall back to fetching.
+The groups are built as [[filter_groups]] hands them over: the JSON of the
+listing, normalized by [[ensure_group_attrs]], so that a group listed without
+[[include=["users"]]] has [[users]] set to [[None]] rather than missing.
 
 <<test functions>>=
+def listed_group(**fields):
+    """A Group as the listing sends it, normalized like filter_groups does"""
+    group = Group(MagicMock(), {"id": 7, "name": "Labb 1",
+                                "group_category_id": 3, **fields})
+    canvaslms.cli.utils.ensure_group_attrs(group)
+    stub_canvas_method(group, "get_users", [])
+    return group
+
+def member(user_id):
+    """A group member as group.get_users() returns it"""
+    return User(MagicMock(), {"id": user_id, "name": f"User {user_id}"})
+
 def test_group_member_ids_uses_embedded_users():
     """Complete embedded membership should not trigger an API call"""
-    group = Mock(spec=['users', 'members_count', 'get_users'])
-    group.users = [{"id": 100}, {"id": 200}]
-    group.members_count = 2
+    group = listed_group(members_count=2,
+                         users=[{"id": 100, "name": "User 100"},
+                                {"id": 200, "name": "User 200"}])
 
     assert users_module.group_member_ids(group) == {100, 200}
     group.get_users.assert_not_called()
 
 def test_group_member_ids_falls_back_when_truncated():
     """Incomplete embedded membership should fall back to get_users()"""
-    group = Mock(spec=['users', 'members_count', 'get_users'])
-    group.users = [{"id": 100}]
-    group.members_count = 2
-
-    member = Mock(spec=['id'])
-    member.id = 100
-    other = Mock(spec=['id'])
-    other.id = 200
-    group.get_users = Mock(return_value=[member, other])
+    group = listed_group(members_count=2,
+                         users=[{"id": 100, "name": "User 100"}])
+    group.get_users.return_value = [member(100), member(200)]
 
     assert users_module.group_member_ids(group) == {100, 200}
 
 def test_group_member_ids_falls_back_without_embedding():
     """A normalized group without embedded users should fetch members"""
-    group = Mock(spec=['users', 'members_count', 'get_users'])
-    group.users = None
-    group.members_count = 1
-
-    member = Mock(spec=['id'])
-    member.id = 100
-    group.get_users = Mock(return_value=[member])
+    group = listed_group(members_count=1)
+    group.get_users.return_value = [member(100)]
 
     assert users_module.group_member_ids(group) == {100}
 @
@@ -496,36 +542,28 @@ enrollments.
 <<test functions>>=
 def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
     """Grouped rows should use course enrollments for role filtering."""
-    course = Mock()
-    course.course_code = "DD1390/91 prosam 25/26"
+    course = Course(MagicMock(), {"id": 1, "name": "Programmeringsteknik",
+                                  "course_code": "DD1390/91 prosam 25/26"})
 
-    student = Mock()
-    student.id = 100
-    student.name = "Alice Student"
-    student.login_id = "alice@example.com"
-    student.sortable_name = "Student, Alice"
-    student.enrollments = [{"type": "StudentEnrollment"}]
+    student = User(MagicMock(), {
+        "id": 100,
+        "name": "Alice Student",
+        "login_id": "alice@example.com",
+        "sortable_name": "Student, Alice",
+        "enrollments": [{"type": "StudentEnrollment"}],
+    })
+    ta = User(MagicMock(), {
+        "id": 200,
+        "name": "Bob TA",
+        "login_id": "bob@example.com",
+        "sortable_name": "TA, Bob",
+        "enrollments": [{"type": "TaEnrollment"}],
+    })
+    stub_canvas_method(course, "get_users", [student, ta])
 
-    ta = Mock()
-    ta.id = 200
-    ta.name = "Bob TA"
-    ta.login_id = "bob@example.com"
-    ta.sortable_name = "TA, Bob"
-    ta.enrollments = [{"type": "TaEnrollment"}]
-
-    course.get_users = Mock(return_value=[student, ta])
-
-    member_student = Mock(spec=['id'])
-    member_student.id = 100
-    member_ta = Mock(spec=['id'])
-    member_ta.id = 200
-
-    group = Mock(spec=['name', 'course', 'get_users',
-                       'users', 'members_count'])
-    group.name = "mentorsgrupp 7-9"
+    group = listed_group(name="mentorsgrupp 7-9", members_count=2)
     group.course = course
-    group.users = None  # normalized but not embedded
-    group.get_users = Mock(return_value=[member_student, member_ta])
+    group.get_users.return_value = [member(100), member(200)]
 
     args = Mock()
     args.regex = ".*"
@@ -561,31 +599,27 @@ once per group.
 <<test functions>>=
 def test_make_user_rows_w_groups_filters_course_roster_once(monkeypatch):
     """Groups in the same course should share one role-filtered roster"""
-    course = Mock()
-    course.id = 1
-    course.course_code = "prgi25"
+    course = Course(MagicMock(), {"id": 1, "name": "Programmering",
+                                  "course_code": "prgi25"})
 
-    student1 = Mock()
-    student1.id = 100
-    student1.name = "Alice Student"
-    student1.login_id = "alice@example.com"
-    student1.enrollments = [{"type": "StudentEnrollment"}]
-
-    student2 = Mock()
-    student2.id = 200
-    student2.name = "Bob Student"
-    student2.login_id = "bob@example.com"
-    student2.enrollments = [{"type": "StudentEnrollment"}]
-
-    course.get_users = Mock(return_value=[student1, student2])
+    student1 = User(MagicMock(), {
+        "id": 100,
+        "name": "Alice Student",
+        "login_id": "alice@example.com",
+        "enrollments": [{"type": "StudentEnrollment"}],
+    })
+    student2 = User(MagicMock(), {
+        "id": 200,
+        "name": "Bob Student",
+        "login_id": "bob@example.com",
+        "enrollments": [{"type": "StudentEnrollment"}],
+    })
+    stub_canvas_method(course, "get_users", [student1, student2])
 
     def make_group(name, member_id):
-        group = Mock(spec=['name', 'course', 'get_users',
-                           'users', 'members_count'])
-        group.name = name
+        group = listed_group(name=name, members_count=1,
+                             users=[{"id": member_id}])
         group.course = course
-        group.users = [{"id": member_id}]
-        group.members_count = 1
         return group
 
     groups = [make_group("Labb 1", 100), make_group("Labb 2", 200)]
@@ -759,8 +793,8 @@ hit on [[777]] can only come from the ID.
 def make_course_with_groups(groups_json):
     """Real Course whose get_groups returns real Groups (no requests)"""
     requester = MagicMock()
-    course = canvasapi.course.Course(requester, {"id": 1, "name": "C"})
-    groups = [canvasapi.group.Group(requester, g) for g in groups_json]
+    course = Course(requester, {"id": 1, "name": "C"})
+    groups = [Group(requester, g) for g in groups_json]
     course.get_groups = create_autospec(
         course.get_groups, return_value=groups)
     return course
@@ -923,66 +957,57 @@ if user.enrollments:
 
 \subsubsection{Test fixtures for user filtering}
 
-We create mock users with different enrollment types to simulate Canvas API
+We create users with different enrollment types to simulate Canvas API
 responses and test the filtering logic.
+Each user carries exactly the fields Canvas sends for
+[[course.get_users(include=["enrollments"])]]---here the identifiers we match
+on and the [[enrollments]] list, whose entries have both a [[type]] and a
+[[role]].
+The course's [[get_users]] is stubbed to return nothing; each test sets the
+stub's [[return_value]] to the roster it needs, which keeps the signature
+check of the autospec.
 
 <<test user fixtures>>=
 @pytest.fixture
 def mock_course():
-    """Create a mock course object"""
-    course = Mock()
-    course.id = 12345
-    course.name = "Test Course"
+    """Create a course whose get_users() returns no users until set"""
+    course = Course(MagicMock(), {"id": 12345, "name": "Test Course",
+                                  "course_code": "TEST101"})
+    stub_canvas_method(course, "get_users", [])
     return course
+
+def enrolled_user(user_id, name, login_id, *enrollment_types):
+    """A User as get_users(include=["enrollments"]) sends it"""
+    return User(MagicMock(), {
+        "id": user_id,
+        "name": name,
+        "login_id": login_id,
+        "enrollments": [{"type": kind, "role": kind}
+                        for kind in enrollment_types],
+    })
 
 @pytest.fixture
 def mock_student():
-    """Create a mock student user"""
-    user = Mock()
-    user.id = 100
-    user.name = "Alice Student"
-    user.login_id = "alice@example.com"
-    user.enrollments = [
-        {"type": "StudentEnrollment", "role": "StudentEnrollment"}
-    ]
-    return user
+    """Create a student user"""
+    return enrolled_user(100, "Alice Student", "alice@example.com",
+                         "StudentEnrollment")
 
 @pytest.fixture
 def mock_ta():
-    """Create a mock TA user"""
-    user = Mock()
-    user.id = 200
-    user.name = "Bob TA"
-    user.login_id = "bob@example.com"
-    user.enrollments = [
-        {"type": "TaEnrollment", "role": "TaEnrollment"}
-    ]
-    return user
+    """Create a TA user"""
+    return enrolled_user(200, "Bob TA", "bob@example.com", "TaEnrollment")
 
 @pytest.fixture
 def mock_teacher():
-    """Create a mock teacher user"""
-    user = Mock()
-    user.id = 300
-    user.name = "Carol Teacher"
-    user.login_id = "carol@example.com"
-    user.enrollments = [
-        {"type": "TeacherEnrollment", "role": "TeacherEnrollment"}
-    ]
-    return user
+    """Create a teacher user"""
+    return enrolled_user(300, "Carol Teacher", "carol@example.com",
+                         "TeacherEnrollment")
 
 @pytest.fixture
 def mock_multi_role_user():
     """Create a user with multiple enrollments"""
-    user = Mock()
-    user.id = 400
-    user.name = "Dave Multi"
-    user.login_id = "dave@example.com"
-    user.enrollments = [
-        {"type": "StudentEnrollment", "role": "StudentEnrollment"},
-        {"type": "TaEnrollment", "role": "TaEnrollment"}
-    ]
-    return user
+    return enrolled_user(400, "Dave Multi", "dave@example.com",
+                         "StudentEnrollment", "TaEnrollment")
 @
 
 \subsubsection{Testing user fetching with enrollment data}
@@ -996,7 +1021,7 @@ def test_list_users_fetches_with_enrollments(
 ):
     """Test that list_users fetches all users with enrollment data"""
     # Setup mock course to return users
-    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
+    mock_course.get_users.return_value = [mock_student, mock_ta]
     
     # Call list_users without role filter
     result = users_module.list_users([mock_course], roles=[])
@@ -1019,9 +1044,9 @@ def test_list_users_filters_by_student_role(
 ):
     """Test that filtering by student role works correctly"""
     # Setup mock course to return all user types
-    mock_course.get_users = Mock(
-        return_value=[mock_student, mock_ta, mock_teacher]
-    )
+    mock_course.get_users.return_value = [
+        mock_student, mock_ta, mock_teacher
+    ]
     
     # Call list_users with student role filter
     result = users_module.list_users([mock_course], roles=["student"])
@@ -1037,9 +1062,9 @@ def test_list_users_filters_by_ta_role(
 ):
     """Test that filtering by TA role works correctly"""
     # Setup mock course to return all user types
-    mock_course.get_users = Mock(
-        return_value=[mock_student, mock_ta, mock_teacher]
-    )
+    mock_course.get_users.return_value = [
+        mock_student, mock_ta, mock_teacher
+    ]
     
     # Call list_users with TA role filter
     result = users_module.list_users([mock_course], roles=["ta"])
@@ -1055,9 +1080,9 @@ def test_list_users_filters_with_multiple_roles(
 ):
     """Test that filtering with multiple roles returns matching users"""
     # Setup mock course to return all user types
-    mock_course.get_users = Mock(
-        return_value=[mock_student, mock_ta, mock_teacher]
-    )
+    mock_course.get_users.return_value = [
+        mock_student, mock_ta, mock_teacher
+    ]
     
     # Call list_users with both student and TA roles
     result = users_module.list_users(
@@ -1079,9 +1104,9 @@ def test_list_users_returns_all_when_no_roles_specified(
 ):
     """Test that all users are returned when no roles specified"""
     # Setup mock course to return all user types
-    mock_course.get_users = Mock(
-        return_value=[mock_student, mock_ta, mock_teacher]
-    )
+    mock_course.get_users.return_value = [
+        mock_student, mock_ta, mock_teacher
+    ]
     
     # Call list_users without role filter (empty list)
     result = users_module.list_users([mock_course], roles=[])
@@ -1096,7 +1121,7 @@ def test_list_users_handles_multi_role_user(
 ):
     """Test that users with multiple enrollments are not duplicated"""
     # Setup mock course
-    mock_course.get_users = Mock(return_value=[mock_multi_role_user])
+    mock_course.get_users.return_value = [mock_multi_role_user]
     
     # Call list_users filtering by student role
     result = users_module.list_users([mock_course], roles=["student"])
@@ -1109,19 +1134,19 @@ def test_list_users_handles_multi_role_user(
 <<test functions>>=
 def test_list_users_handles_user_without_enrollments(mock_course):
     """Test that users without enrollment attribute are skipped"""
-    # Create user without enrollments attribute using spec
-    user_no_enrollments = Mock(spec=['id', 'name', 'login_id'])
-    user_no_enrollments.id = 500
-    user_no_enrollments.name = "Eve NoEnroll"
-    user_no_enrollments.login_id = "eve@example.com"
-    # Note: spec explicitly excludes 'enrollments' attribute
+    # A user built without the enrollments field
+    user_no_enrollments = User(MagicMock(), {
+        "id": 500,
+        "name": "Eve NoEnroll",
+        "login_id": "eve@example.com",
+    })
     
-    mock_course.get_users = Mock(return_value=[user_no_enrollments])
+    mock_course.get_users.return_value = [user_no_enrollments]
     
     # Call list_users with role filter
     result = users_module.list_users([mock_course], roles=["student"])
     
-    # Verify user is skipped (hasattr check fails)
+    # Verify user is skipped (normalized enrollments is None)
     assert len(result) == 0
 @
 
@@ -1129,21 +1154,23 @@ def test_list_users_handles_user_without_enrollments(mock_course):
 def test_list_users_case_insensitive_matching(mock_course):
     """Test that role matching is case-insensitive"""
     # Create user with enrollment
-    user = Mock()
-    user.id = 600
-    user.enrollments = [{"type": "StudentEnrollment"}]
+    user = User(MagicMock(), {
+        "id": 600,
+        "name": "Frank Case",
+        "enrollments": [{"type": "StudentEnrollment"}],
+    })
     
-    mock_course.get_users = Mock(return_value=[user])
+    mock_course.get_users.return_value = [user]
     
     # Try matching with different case variations
     result_lower = users_module.list_users([mock_course], roles=["student"])
     assert len(result_lower) == 1
     
-    mock_course.get_users = Mock(return_value=[user])
+    mock_course.get_users.return_value = [user]
     result_upper = users_module.list_users([mock_course], roles=["STUDENT"])
     assert len(result_upper) == 1
     
-    mock_course.get_users = Mock(return_value=[user])
+    mock_course.get_users.return_value = [user]
     result_mixed = users_module.list_users([mock_course], roles=["Student"])
     assert len(result_mixed) == 1
 @
@@ -1153,7 +1180,7 @@ def test_list_users_sets_course_attribute(
     mock_course, mock_student
 ):
     """Test that returned users have course attribute set"""
-    mock_course.get_users = Mock(return_value=[mock_student])
+    mock_course.get_users.return_value = [mock_student]
     
     result = users_module.list_users([mock_course], roles=[])
     
@@ -1176,9 +1203,9 @@ def test_process_user_option_filters_by_role(
 ):
     """Test that process_user_option correctly filters users by role"""
     # Setup mock course and canvas
-    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
-    mock_canvas = Mock()
-    mock_canvas.get_courses = Mock(return_value=[mock_course])
+    mock_course.get_users.return_value = [mock_student, mock_ta]
+    mock_canvas = create_autospec(Canvas, instance=True)
+    mock_canvas.get_courses.return_value = [mock_course]
     
     # Setup args with role="student" (as a string, like argparse provides)
     mock_args = Mock()
@@ -1194,7 +1221,7 @@ def test_process_user_option_filters_by_role(
     assert result[0].id == 100  # Alice Student
     
     # Now test with TA role
-    mock_course.get_users = Mock(return_value=[mock_student, mock_ta])
+    mock_course.get_users.return_value = [mock_student, mock_ta]
     mock_args.role = "ta"
     result = users_module.process_user_option(mock_canvas, mock_args)
     
@@ -1338,6 +1365,8 @@ raise AttributeError(f"no unique user attribute existed, tried: {attributes}")
 Normalizing users means the preferred identifier attributes may now exist with
 value [[None]]. The fallback logic must therefore continue past [[None]] values
 rather than treating them as successful lookups.
+The user in the test is one Canvas sent without a [[login_id]], normalized the
+way every ingress helper does it.
 
 <<test functions>>=
 class TestGetUid:
@@ -1345,10 +1374,13 @@ class TestGetUid:
 
     def test_falls_back_when_preferred_attr_is_none(self):
         """A ``None`` login_id should fall through to integration_id."""
-        user = Mock(spec=['login_id', 'integration_id'])
-        user.login_id = None
-        user.integration_id = "abc123"
+        user = canvaslms.cli.utils.ensure_user_attrs(User(MagicMock(), {
+            "id": 100,
+            "name": "A User",
+            "integration_id": "abc123",
+        }))
 
+        assert user.login_id is None
         assert users_module.get_uid(user) == "abc123"
 @
 
@@ -1786,20 +1818,20 @@ Accepting the combination is only half of it; the result must be the
 intersection.
 We stand in for Canvas with a group holding two members and check that naming
 Daniel leaves only Daniel, while naming nobody leaves both.
-Note that [[name]] has to be assigned after construction: passing it to
-[[Mock]] would name the mock itself rather than set the attribute we match on.
+The members are real [[User]]s carrying only an ID, a name and a login ID,
+which also puts the normalization above to work: a member the regex rejects
+on name and login ID is next asked for its [[integration_id]], which Canvas
+did not send.
 
 <<user or group option test methods>>=
 def group_of(self, monkeypatch, *names):
-    members = []
-    for index, name in enumerate(names):
-        member = Mock()
-        member.id = 100 + index
-        member.name = name
-        member.login_id = f"{index}@example.com"
-        members.append(member)
+    members = [
+        User(MagicMock(), {"id": 100 + index, "name": name,
+                           "login_id": f"{index}@example.com"})
+        for index, name in enumerate(names)
+    ]
 
-    group = Mock()
+    group = listed_group(name="Group X", members_count=len(members))
     group.get_users.return_value = members
     monkeypatch.setattr(users_module, "process_group_options",
                         lambda canvas, args: [group])
