@@ -65,6 +65,16 @@ incomplete
 We want all assignments to have either complete or 100 to get a passing grade.
 Otherwise the student gets an F.
 
+The group can also hold a survey: later rounds put a classic graded survey,
+a course evaluation of the seminars, worth 100 points in it.
+Its grade happened to fit the rule, because Canvas gives a submitted graded
+survey its full points whatever the answers---in the rounds we checked, every
+submission was graded [[100]].
+But that is an accident of how Canvas scores surveys: lower the survey to 50
+points and every student who answered it would fail.
+So a survey passes when it is completed, whatever its grade
+(\cref{participation-surveys}).
+
 \subsection{Grading logic: conjunctive P/F}
 
 This module implements what we call \emph{conjunctive P/F grading}.
@@ -82,6 +92,7 @@ The grading rule is simple: if \emph{all} participation assignments have a
 passing grade, the student passes.
 If \emph{any} assignment is missing or has an incomplete grade, the student
 fails.
+A survey passes by being completed instead of by its grade.
 
 \subsection{Module structure}
 
@@ -93,6 +104,8 @@ iterates over users and delegates to a [[summarize]] helper function.
 """
 import datetime as dt
 from canvaslms.cli import results
+from canvaslms.grades.surveys import (is_survey, survey_completed,
+                                      split_surveys, missing_surveys)
 from canvasapi.exceptions import ResourceDoesNotExist
 
 <<helper functions>>
@@ -122,6 +135,8 @@ from canvaslms.grades.participation import *
 <<module doc>>=
 Summarizes participation assignments using conjunctive P/F grading.
 All assignments must have 'complete' or '100' for P, otherwise F.
+A survey (a classic Canvas quiz of survey type) passes when it is
+completed, whatever its grade; see `canvaslms.grades.surveys`.
 @
 
 \subsection{What counts as passing?}
@@ -201,10 +216,14 @@ except ResourceDoesNotExist:
 submission.assignment = assignment
 @
 
-We extract the grade from the submission and check whether it's passing.
+We extract the grade from the submission and check whether it's passing---unless
+the assignment is a survey, which passes by being completed
+(\cref{participation-surveys}).
 <<check if grade is passing>>=
-grade = submission.grade
-passed.append(is_passing_grade(grade))
+if is_survey(assignment):
+  passed.append(survey_completed(submission))
+else:
+  passed.append(is_passing_grade(submission.grade))
 @
 
 We collect all graders from the submission history.
@@ -242,6 +261,72 @@ else:
 @
 
 
+\subsection{Surveys pass by completion}\label{participation-surveys}
+
+The exception in [[<<check if grade is passing>>]] is the survey.
+A survey's grade says nothing about the student (\cref{surveys}), and the
+rule \enquote{[[complete]] or [[100]]} only fits it while the survey happens
+to be worth 100 points: Canvas grades a submitted graded survey with its full
+points, so a survey worth 50 would fail every student who answered it.
+Completion is what participation asks for, so completion is what we check.
+A missing submission needs no special case: it has already failed the
+assignment, survey or not, in [[<<get submission for assignment>>]].
+
+Let's verify on a group like the one above: a survey next to a
+FeedbackFruits item graded out of 100 points.
+A completed survey passes whatever its grade, the lowered [[50]] included,
+while an uncompleted one fails the group.
+<<test functions>>=
+class TestSurveys:
+    """Test that a survey passes by completion, not by its grade."""
+
+    <<survey test methods>>
+<<survey test methods>>=
+def peer_review(self, grading_objects):
+    return grading_objects.points(grading_objects.submission(
+        "100", submitted_at="2026-01-10T10:00:00Z"))
+
+def test_completed_survey_passes_whatever_its_grade(self, grading_objects):
+    user = grading_objects.user()
+
+    for survey_grade in ["100", "50", None]:
+        survey = grading_objects.survey(grading_objects.submission(
+            survey_grade, submitted_at="2026-01-11T10:00:00Z"))
+
+        grade, grade_date, _ = summarize(
+            user, [self.peer_review(grading_objects), survey])
+
+        assert grade == "P"
+        assert grade_date.isoformat() == "2026-01-11"
+
+def test_uncompleted_survey_fails(self, grading_objects):
+    user = grading_objects.user()
+    dateless = grading_objects.survey(grading_objects.submission(None))
+    absent = grading_objects.survey(None)
+
+    for survey in [dateless, absent]:
+        grade, _, _ = summarize(
+            user, [self.peer_review(grading_objects), survey])
+
+        assert grade == "F"
+@
+
+The completion rule is for surveys only.
+A points-graded assignment that is not a survey still needs its [[100]]: a
+FeedbackFruits item that the student submitted but that was graded [[50]] is
+not passed.
+<<survey test methods>>=
+def test_points_assignment_still_needs_100(self, grading_objects):
+    user = grading_objects.user()
+    partial = grading_objects.points(grading_objects.submission(
+        "50", submitted_at="2026-01-10T10:00:00Z"))
+
+    grade, _, _ = summarize(user, [partial])
+
+    assert grade == "F"
+@
+
+
 \subsection{Finding missing assignments}
 
 For participation grading, a student is \enquote{missing} any assignment that
@@ -249,23 +334,64 @@ doesn't have a passing grade ([[complete]] or [[100]]).
 Since this is conjunctive grading (all must pass), each incomplete assignment
 prevents the student from passing the group.
 
-We already have [[is_passing_grade]] defined above, so we simply reuse the
-shared implementation from [[canvaslms.cli.results]] with our callback.
+Surveys are judged by completion here as well, so they go to
+[[missing_surveys]] (\cref{surveys}) rather than to the grade check, which
+would report a completed survey graded [[50]] as \enquote{not a passing
+grade (50)}.
+For everything else we already have [[is_passing_grade]] defined above, so we
+simply reuse the shared implementation from [[canvaslms.cli.results]] with our
+callback.
 <<helper functions>>=
 def missing_assignments(assignments_list, users_list,
                         optional_assignments=None):
   """
   Returns missing assignments for participation grading.
 
-  Any assignment without 'complete' or '100' is missing.
+  Every uncompleted survey is missing. Any other assignment without
+  'complete' or '100' is missing.
   """
-  from canvaslms.cli import results
-  return results.missing_assignments(
-    assignments_list, users_list,
+  surveys, others = split_surveys(assignments_list)
+
+  yield from missing_surveys(surveys, users_list, optional_assignments)
+  yield from results.missing_assignments(
+    others, users_list,
     optional_assignments=optional_assignments,
     is_passing=is_passing_grade,
     normalize_grade=normalize_grade
   )
+@
+
+Let's verify that the report agrees with the summary on surveys, and that
+the optional patterns reach the survey report.
+<<test functions>>=
+class TestMissingSurveys:
+    """Test that --missing judges surveys by completion."""
+
+    <<missing survey test methods>>
+<<missing survey test methods>>=
+def test_completed_survey_with_lowered_grade_not_missing(
+        self, grading_objects):
+    user = grading_objects.user()
+    survey = grading_objects.survey(grading_objects.submission(
+        "50", submitted_at="2026-01-11T10:00:00Z"))
+
+    assert list(missing_assignments([survey], [user])) == []
+
+def test_uncompleted_survey_missing(self, grading_objects):
+    user = grading_objects.user()
+    survey = grading_objects.survey(grading_objects.submission(None))
+
+    rows = list(missing_assignments([survey], [user]))
+
+    assert rows == [(user, survey, "mandatory survey not completed")]
+
+def test_optional_survey_not_missing(self, grading_objects):
+    survey = grading_objects.survey(None, name="Optional survey")
+
+    rows = list(missing_assignments([survey], [grading_objects.user()],
+                                    optional_assignments=["Optional"]))
+
+    assert rows == []
 @
 
 Both the summary and the missing-assignment output should collapse [[must fix]]

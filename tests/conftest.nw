@@ -134,6 +134,7 @@ import arrow
 <<mock user and group fixtures>>
 <<mock submission fixtures>>
 <<mock configuration fixture>>
+<<grading objects fixture>>
 @
 
 \subsection{The mock Canvas API instance}
@@ -424,6 +425,143 @@ def mock_config():
         "course_id": None,
         "assignment": None,
     }
+@
+
+\section{Real Canvas objects for the grade summary modules}
+\label{grading-objects}
+
+The fixtures above are [[MagicMock]]s: any attribute exists, so a test keeps
+passing when the code reads an attribute Canvas never sends.
+The grade summary modules of \cref{summary-modules} decide students' results
+from a handful of attributes---[[grade]], [[submitted_at]], [[graded_at]],
+[[quiz_id]], [[submission_types]], a quiz's [[quiz_type]]---so their tests use
+real [[canvasapi]] objects instead, built from the same JSON fields that
+Canvas sends.
+Only the two calls that would reach Canvas are replaced: the assignment's
+[[get_submission]] and the course's quiz lookup.
+
+The fixture is a factory, since a test needs several assignments of
+different kinds in one group.
+It names them after the kinds the summary modules must tell apart: a
+[[graded]] assignment (letters or P/F), a [[points]] assignment such as a
+FeedbackFruits item graded out of 100, a classic quiz [[survey]] (or, with
+[[quiz_type="assignment"]], a graded classic quiz) and a [[new_quiz]].
+Passing no submission means that the student has none: [[get_submission]]
+raises [[ResourceDoesNotExist]], as Canvas does.
+
+[[canvaslms.grades.surveys]] remembers each quiz's type for the rest of the
+process, keyed by quiz id.
+A test that reused a quiz id would get the type an earlier test left there,
+so an autouse fixture empties that memory before every test; the ids also
+come from one counter shared by all tests, so that objects of one test never
+look like those of another.
+<<grading objects fixture>>=
+import itertools
+from types import SimpleNamespace
+
+from canvasapi.assignment import Assignment
+from canvasapi.exceptions import ResourceDoesNotExist
+from canvasapi.quiz import Quiz
+from canvasapi.submission import Submission
+from canvasapi.user import User
+
+grading_ids = itertools.count(900000)
+
+
+class QuizCourse:
+    """The course side of a quiz lookup, counting the lookups."""
+
+    def __init__(self):
+        self.id = 24725
+        self.quizzes = {}
+        self.lookups = 0
+
+    def get_quiz(self, quiz_id):
+        self.lookups += 1
+        if quiz_id not in self.quizzes:
+            raise ResourceDoesNotExist("Not Found")
+        return self.quizzes[quiz_id]
+
+    def get_quizzes(self):
+        self.lookups += 1
+        return list(self.quizzes.values())
+
+
+class GradingObjects:
+    """Builds real canvasapi objects as the summary modules receive them."""
+
+    def __init__(self):
+        self.course = QuizCourse()
+
+    def user(self):
+        return User(MagicMock(), {"id": next(grading_ids)})
+
+    def submission(self, grade, submitted_at=None, graded_at=None):
+        return Submission(MagicMock(), {
+            "id": next(grading_ids),
+            "grade": grade,
+            "submitted_at": submitted_at,
+            "graded_at": graded_at,
+            "submission_history": [],
+        })
+
+    def assignment(self, attributes, submission=None):
+        assignment = Assignment(MagicMock(), {
+            "id": next(grading_ids), "course_id": self.course.id,
+            **attributes})
+        assignment.course = self.course
+
+        def get_submission(user, **kwargs):
+            if submission is None:
+                raise ResourceDoesNotExist("Not Found")
+            return submission
+
+        assignment.get_submission = get_submission
+        return assignment
+
+    def graded(self, submission=None, name="Lab 1",
+               grading_type="letter_grade"):
+        return self.assignment({
+            "name": name, "grading_type": grading_type,
+            "submission_types": ["online_upload"]}, submission)
+
+    def points(self, submission=None, name="Peer review"):
+        return self.assignment({
+            "name": name, "grading_type": "points", "points_possible": 100,
+            "submission_types": ["external_tool"]}, submission)
+
+    def survey(self, submission=None, name="Course evaluation",
+               quiz_type="graded_survey", grading_type="points"):
+        quiz_id = next(grading_ids)
+        assignment = self.assignment({
+            "name": name, "grading_type": grading_type,
+            "points_possible": 100,
+            "submission_types": ["online_quiz"], "quiz_id": quiz_id,
+            "is_quiz_assignment": quiz_type == "assignment"}, submission)
+        self.course.quizzes[quiz_id] = Quiz(MagicMock(), {
+            "id": quiz_id, "title": name, "quiz_type": quiz_type,
+            "assignment_id": assignment.id, "course_id": self.course.id})
+        return assignment
+
+    def new_quiz(self, submission=None, name="Topic quiz"):
+        return self.assignment({
+            "name": name, "grading_type": "points", "points_possible": 100,
+            "submission_types": ["external_tool"],
+            "is_quiz_assignment": False,
+            "is_quiz_lti_assignment": True}, submission)
+
+
+@pytest.fixture
+def grading_objects():
+    """Factory for real canvasapi assignments, submissions and quizzes."""
+    return GradingObjects()
+
+
+@pytest.fixture(autouse=True)
+def empty_quiz_type_cache():
+    """Start every test without remembered quiz types."""
+    import canvaslms.grades.surveys
+    canvaslms.grades.surveys.quiz_type_cache.clear()
 @
 
 \section{Using these fixtures in tests}
