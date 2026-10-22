@@ -31,8 +31,8 @@ The [[quizzes]] command has the following subcommands:
 Tests for this module are distributed throughout the chapter, each appearing
 right after the functionality it verifies.  We define the test file skeleton
 here; the [[<<test functions>>]] chunks are filled in along the way.  The
-Canvas API is mocked ([[MagicMock]]), so the tests exercise our logic---
-dispatching, grouping, cleaning---without network access.
+tests exercise our logic---dispatching, grouping, cleaning---without network
+access.
 
 <<test [[quizzes.py]]>>=
 """Tests for canvaslms.cli.quizzes."""
@@ -43,14 +43,106 @@ import sys
 
 import pytest
 import requests
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 from canvasapi.assignment import AssignmentGroup
+from canvasapi.content_migration import ContentMigration, MigrationIssue
+from canvasapi.course import Course
+from canvasapi.new_quiz import NewQuiz
+from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
+from canvasapi.quiz_group import QuizGroup
 from canvasapi.util import combine_kwargs
 
 import canvaslms.cli.quizzes as quizzes
 
+<<canvas test doubles>>
 <<test functions>>
+@
+
+The Canvas objects in these tests---courses, Classic Quizzes and their
+questions and groups, New Quizzes, reports and migrations---are the real
+[[canvasapi]] classes, built from the JSON fields Canvas sends on a
+[[MagicMock]] requester, rather than [[MagicMock]]s.
+A [[MagicMock]] invents any attribute the code reads, so a test stays green
+while the code reads a field Canvas never sends, or one Canvas renamed; a
+real [[Quiz]] has exactly the fields it was built from, and the same read
+raises [[AttributeError]] as it would in the user's run.
+It matters most for New Quizzes: their JSON has neither a [[time_limit]] nor
+a [[description]], so only a real [[NewQuiz]] shows whether the code reads
+them anyway.
+A real [[NewQuiz]] is also what [[is_new_quiz]] recognizes, so the tests no
+longer need to patch that function.
+Our own commands attach a [[course]] to each quiz they list
+([[filter_quizzes]]), and the builders below do the same.
+
+The methods that make requests, such as [[Quiz.create_question]] or
+[[Course.get_assignment_groups]], we replace on the instance by stubs
+autospecced from the real bound method.
+A stub returns what the test asks for and records its calls, so the tests can
+check what would have been sent, but a call with arguments the real method
+does not take raises [[TypeError]].
+Plain [[MagicMock]]s remain where no Canvas object is involved: the
+requesters and their HTTP responses, the [[canvas]] client, and stand-ins for
+our own functions.
+<<canvas test doubles>>=
+def stub_canvas_method(canvas_object, name, return_value=None):
+  """Replace a request-making method by a stub with its signature."""
+  stub = create_autospec(getattr(canvas_object, name),
+                         return_value=return_value)
+  setattr(canvas_object, name, stub)
+  return stub
+
+def make_course(course_id=1, groups=(), requester=None):
+  """A course as Canvas lists it, whose assignment groups are `groups`
+
+  `groups` are (id, name) pairs.
+  """
+  requester = requester or MagicMock()
+  course = Course(requester, {"id": course_id, "name": f"Course {course_id}",
+                              "course_code": "DD1310"})
+  stub_canvas_method(course, "get_assignment_groups", [
+    AssignmentGroup(requester, {"id": i, "name": n}) for i, n in groups])
+  return course
+
+def make_classic_quiz(course=None, **fields):
+  """A Classic Quiz as Canvas lists it, with `course` attached
+
+  Its requests are stubbed: it has no questions, and a created question
+  group gets ID 77.
+  """
+  quiz = Quiz(MagicMock(), {
+    "id": 5, "course_id": 1, "title": "Quiz", "description": "",
+    "quiz_type": "assignment", "published": False, "allowed_attempts": 1,
+    "shuffle_questions": False, "shuffle_answers": False,
+    "show_correct_answers": True, "one_question_at_a_time": False,
+    "cant_go_back": False, **fields})
+  quiz.course = course or make_course()
+  stub_canvas_method(quiz, "get_questions", [])
+  stub_canvas_method(quiz, "get_question")
+  stub_canvas_method(quiz, "create_question")
+  stub_canvas_method(quiz, "create_question_group",
+                     QuizGroup(MagicMock(), {"id": 77, "quiz_id": quiz.id}))
+  stub_canvas_method(quiz, "get_quiz_group")
+  stub_canvas_method(quiz, "edit", quiz)
+  return quiz
+
+def make_new_quiz(course=None, **fields):
+  """A New Quiz as the New Quizzes API lists it, with `course` attached"""
+  quiz = NewQuiz(MagicMock(), {"id": "42", "title": "Midterm",
+                               "instructions": "", **fields})
+  quiz.course = course or make_course()
+  return quiz
+
+def make_question(question_id, **fields):
+  """A Classic Quiz question as Canvas sends it, its requests stubbed"""
+  question = QuizQuestion(MagicMock(), {
+    "id": question_id, "quiz_id": 5, "position": 1, "quiz_group_id": None,
+    "question_name": f"Q{question_id}", "question_type": "essay_question",
+    "question_text": "<p>Explain.</p>", "points_possible": 1.0,
+    "answers": [], **fields})
+  stub_canvas_method(question, "edit", question)
+  stub_canvas_method(question, "delete", question)
+  return question
 @
 
 
@@ -736,16 +828,15 @@ share an ID are both listed.
 <<test functions>>=
 def list_two_quizzes_with_one_id(monkeypatch, capsys, show_id):
   """Run `list_command` over a Classic quiz and a New Quiz, both ID 7"""
-  course = MagicMock(id=1, course_code="DD1310")
-  classic = MagicMock(id=7, title="Classic", quiz_type="assignment",
-                      published=True, due_at=None, course=course)
-  new = MagicMock(id="7", title="New", published=False, due_at=None,
-                  course=course)
+  course = make_course()
+  classic = make_classic_quiz(course, id=7, title="Classic",
+                              published=True, due_at=None)
+  new = make_new_quiz(course, id="7", title="New", published=False,
+                      due_at=None)
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   monkeypatch.setattr(quizzes, "filter_quizzes",
                       lambda course_list, regex: iter([classic, new]))
-  monkeypatch.setattr(quizzes, "is_new_quiz", lambda quiz: quiz is new)
   args = argparse.Namespace(delimiter="\t", id=show_id)
   quizzes.list_command({}, MagicMock(), args)
   return [line.split("\t") for line in capsys.readouterr().out.splitlines()]
@@ -1174,9 +1265,11 @@ def test_poll_progress_refreshes_and_sleeps_between_attempts(monkeypatch):
   sleeps = []
   monkeypatch.setattr(time, 'sleep', lambda seconds: sleeps.append(seconds))
 
-  incomplete = MagicMock(spec=[])
-  completed = MagicMock(spec=['file'])
-  completed.file = {'url': 'https://example.com/report.csv'}
+  incomplete = QuizReport(MagicMock(), {"id": 1, "quiz_id": 5,
+                                        "report_type": "student_analysis"})
+  completed = QuizReport(MagicMock(), {
+    "id": 1, "quiz_id": 5, "report_type": "student_analysis",
+    "file": {'url': 'https://example.com/report.csv'}})
 
   snapshots = [incomplete, incomplete, completed]
   fetched = []
@@ -1185,7 +1278,7 @@ def test_poll_progress_refreshes_and_sleeps_between_attempts(monkeypatch):
     fetched.append(current)
     return snapshots[len(fetched) - 1]
 
-  result = quizzes.poll_progress(MagicMock(spec=[]), max_attempts=30,
+  result = quizzes.poll_progress(incomplete, max_attempts=30,
                                  refresh=refresh)
 
   assert result is completed
@@ -1205,8 +1298,9 @@ def test_poll_progress_completes_on_file_without_sleeping(monkeypatch):
   sleeps = []
   monkeypatch.setattr(time, 'sleep', lambda seconds: sleeps.append(seconds))
 
-  report = MagicMock(spec=['file'])
-  report.file = {'url': 'https://example.com/report.csv'}
+  report = QuizReport(MagicMock(), {
+    "id": 1, "quiz_id": 5, "report_type": "student_analysis",
+    "file": {'url': 'https://example.com/report.csv'}})
 
   assert quizzes.poll_progress(report) is report
   assert sleeps == []
@@ -2864,9 +2958,8 @@ survives the call.
 
 <<test functions>>=
 def cached_course(course_id=1):
-  """A MagicMock course whose quiz listings are cached as fully fetched"""
-  course = MagicMock()
-  course.id = course_id
+  """A course whose quiz listings are cached as fully fetched"""
+  course = make_course(course_id)
   course.quiz_cache = {11: ("classic quiz", {})}
   course.new_quiz_cache = {12: ("new quiz", {})}
   course.quiz_all_fetched = "some timestamp"
@@ -3381,7 +3474,8 @@ def create_quiz_from_file(monkeypatch, tmp_path, name, contents,
   path.write_text(contents, encoding='utf-8')
   course = cached_course()
   course.get_assignment_groups.return_value = [
-    AssignmentGroup(MagicMock(), {"id": i, "name": n}) for i, n in groups]
+    AssignmentGroup(course._requester, {"id": i, "name": n})
+    for i, n in groups]
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   sent = {}
@@ -4272,19 +4366,15 @@ def test_apply_quiz_module_specs_delegates_to_modules(monkeypatch):
     calls.append((course, item_type, item_id, specs))
     return ([], [], [], [])
   monkeypatch.setattr(quizzes.modules, "update_item_modules", fake_update)
-  course = MagicMock()
+  course = make_course()
   specs = [{"module": "^Week 1$", "position": 2}]
   quizzes.apply_quiz_module_specs(course, 'Quiz', 42, specs)
   assert calls == [(course, 'Quiz', 42, specs)]
 
-def test_quiz_module_item_distinguishes_quiz_kinds(monkeypatch):
-  quiz = MagicMock()
-  quiz.id = "42"
-  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
-  assert quizzes.quiz_module_item(quiz) == ('Assignment', 42)
-  quiz.id = 7
-  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: False)
-  assert quizzes.quiz_module_item(quiz) == ('Quiz', 7)
+def test_quiz_module_item_distinguishes_quiz_kinds():
+  assert quizzes.quiz_module_item(make_new_quiz(id="42")) == (
+    'Assignment', 42)
+  assert quizzes.quiz_module_item(make_classic_quiz(id=7)) == ('Quiz', 7)
 
 
 <<functions>>=
@@ -4710,7 +4800,8 @@ observe by recording the calls:
 <<test functions>>=
 def test_edit_command_invalidates_each_course_once(monkeypatch):
   course = cached_course()
-  quiz_list = [MagicMock(course=course), MagicMock(course=course)]
+  quiz_list = [make_classic_quiz(course, id=5, title="Git quiz"),
+               make_classic_quiz(course, id=6, title="Git quiz")]
   monkeypatch.setattr(quizzes, "read_quiz_from_file",
                       lambda path: {"format": "json",
                                     "settings": {"title": "Git quiz"},
@@ -5374,10 +5465,9 @@ def apply_quiz_from_dict(quiz, data, requester, replace_items=False):
 
 Let's verify the invariant end to end on the path where it matters most.  We
 feed an untouched Classic export straight back in---the no-op round trip---and
-check that the description Canvas receives is the one the export carried.  A
-plain [[MagicMock]] stands in for the quiz: [[is_new_quiz]] recognises New
-Quizzes by class name, so the mock is treated as Classic and the update lands
-in [[quiz.edit]], where we can inspect what would have been sent.
+check that the description Canvas receives is the one the export carried.
+The quiz is a Classic [[Quiz]] whose [[edit]] is a stub, so the update lands
+there and we can inspect what would have been sent.
 
 <<test functions>>=
 def test_apply_quiz_from_dict_keeps_classic_description():
@@ -5391,7 +5481,7 @@ def test_apply_quiz_from_dict_keeps_classic_description():
       'time_limit': 60,
     },
   }
-  quiz = MagicMock()
+  quiz = make_classic_quiz(title='Exam', description='')
 
   assert quizzes.apply_quiz_from_dict(quiz, exported, MagicMock())
 
@@ -5579,9 +5669,7 @@ the listing fails, nothing is deleted.
 <<test functions>>=
 def test_delete_all_new_quiz_items_deletes_every_page():
   next_url = "https://canvas.example/api/quiz/v1/items?page=2"
-  quiz = MagicMock()
-  quiz.course.id = 7
-  quiz.id = 9
+  quiz = make_new_quiz(make_course(7), id="9")
   requester = MagicMock()
   requester.request.side_effect = [
     new_quizzes_page([{'id': 1}, {'id': 2}], next_url),
@@ -5597,9 +5685,7 @@ def test_delete_all_new_quiz_items_deletes_every_page():
   assert deleted == [f"courses/7/quizzes/9/items/{i}" for i in (1, 2, 3)]
 
 def test_delete_all_new_quiz_items_listing_error_deletes_nothing():
-  quiz = MagicMock()
-  quiz.course.id = 7
-  quiz.id = 9
+  quiz = make_new_quiz(make_course(7), id="9")
   requester = MagicMock()
   requester.request.side_effect = quizzes.CanvasException("boom")
 
@@ -5665,18 +5751,22 @@ with them:
 
 <<test functions>>=
 def test_delete_all_classic_quiz_questions_deletes_groups():
-  q1 = MagicMock(quiz_group_id=None)
-  q2 = MagicMock(quiz_group_id=5)
-  q3 = MagicMock(quiz_group_id=5)
-  quiz = MagicMock()
+  q1 = make_question(1, quiz_group_id=None)
+  q2 = make_question(2, quiz_group_id=5)
+  q3 = make_question(3, quiz_group_id=5)
+  quiz = make_classic_quiz()
   quiz.get_questions.return_value = [q1, q2, q3]
+  group = QuizGroup(MagicMock(), {"id": 5, "quiz_id": 5, "name": "pool",
+                                  "pick_count": 1, "question_points": 1})
+  stub_canvas_method(group, "delete", True)
+  quiz.get_quiz_group.return_value = group
 
   assert quizzes.delete_all_classic_quiz_questions(quiz)
 
   for question in (q1, q2, q3):
     question.delete.assert_called_once()
   quiz.get_quiz_group.assert_called_once_with(5)
-  quiz.get_quiz_group.return_value.delete.assert_called_once()
+  group.delete.assert_called_once()
 @
 
 The chunk [[<<check submissions and replace items>>]] combines submission
@@ -5762,21 +5852,27 @@ def time_limit_for_front_matter(seconds):
 
 \subsubsection{Where a New Quiz keeps its time limit}
 \label{sec:reading-new-quiz-time-limit}
-Those seconds do not arrive in the attribute named after them.  A New Quiz
-object reports [[time_limit]] as [[null]] even when its timer is running---the
-mirror image of the field being ignored on the way in
-(\cref{sec:new-quiz-time-limit-params})---and the value lives in
-[[quiz_settings]] in both directions.  We still read the attribute first, so
-that an object which does carry a limit is believed, and fall back to the
-settings when it does not.
+Those seconds do not arrive in an attribute named after them.  A New
+Quiz as Canvas sends it has no [[time_limit]] at all, even when its timer is
+running: on our sandbox course a New Quiz carried [[assignment_group_id]],
+[[due_at]], [[grading_type]], [[id]], [[instructions]], [[lock_at]],
+[[points_possible]], [[published]], [[quiz_settings]], [[title]] and
+[[unlock_at]], plus the [[course_id]] that canvasapi adds.  That is the mirror image of the field being
+ignored on the way in (\cref{sec:new-quiz-time-limit-params}), and the value
+lives in [[quiz_settings]] in both directions.  In the program the attribute
+exists anyway, as [[None]], because [[fetch_all_quizzes]] normalizes New
+Quizzes like Classic ones and [[QUIZ_ATTRS]] lists [[time_limit]]; only an
+object that skipped normalization lacks it.  We still read the attribute
+first, with [[getattr]] for that case, so that an object which does carry a
+limit is believed, and fall back to the settings when it does not.
 
 <<functions>>=
 def new_quiz_time_limit(quiz, quiz_settings):
   """Return a New Quiz's time limit in seconds, or None
 
-  Canvas reports the limit in `quiz_settings`; the quiz object's own
-  time_limit attribute is null for New Quizzes, and is consulted first
-  only so that an object which does carry one is believed.
+  Canvas reports the limit in `quiz_settings`; a New Quiz object from
+  Canvas has no time_limit attribute, which is consulted first only so
+  that an object which does carry one is believed.
   """
   return (getattr(quiz, 'time_limit', None)
           or quiz_settings_time_limit(quiz_settings))
@@ -5842,9 +5938,7 @@ def test_editor_shows_the_assignment_group_spec():
   from canvasapi.quiz import Quiz
   quiz = Quiz(MagicMock(), {"id": 5, "course_id": 1, "title": "Survey",
                             "assignment_group_id": 32})
-  quiz.course = MagicMock()
-  quiz.course.get_assignment_groups.return_value = [
-    AssignmentGroup(MagicMock(), {"id": 32, "name": "Participation INL1"})]
+  quiz.course = make_course(groups=[(32, "Participation INL1")])
 
   attributes = quizzes.extract_quiz_attributes(quiz)
 
@@ -5856,14 +5950,7 @@ quiz whose own attribute says nothing, and settings that say half an hour:
 
 <<test functions>>=
 def test_front_matter_shows_the_time_limit_from_quiz_settings():
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.id = 42
-  quiz.title = 'Midterm'
-  quiz.time_limit = None
-  quiz.course = MagicMock(id=1)
+  quiz = make_new_quiz(id=42)
 
   requester = MagicMock()
   requester.request.return_value.json.return_value = {
@@ -6165,9 +6252,7 @@ def classic_quiz_in_course(groups):
   requester = MagicMock()
   requester.request.return_value.json.return_value = {}
   quiz = Quiz(requester, {"id": 5, "course_id": 1, "title": "Survey"})
-  quiz.course = MagicMock()
-  quiz.course.get_assignment_groups.return_value = [
-    AssignmentGroup(requester, {"id": i, "name": n}) for i, n in groups]
+  quiz.course = make_course(groups=groups, requester=requester)
   return quiz, requester
 
 def test_edited_quiz_moves_to_the_named_group():
@@ -6495,12 +6580,7 @@ parameters, showing the minutes the instructor sees in between:
 
 <<test functions>>=
 def test_front_matter_edit_returns_the_time_limit_canvas_gave_us():
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.title = 'Midterm'
-  quiz.time_limit = 1800
+  quiz = make_new_quiz(title='Midterm', time_limit=1800)
 
   attributes = quizzes.extract_quiz_attributes(quiz)
   assert attributes['time_limit'] == 30
@@ -6517,12 +6597,7 @@ must see the ninety in between rather than the one that flooring left:
 
 <<test functions>>=
 def test_a_sub_minute_limit_survives_the_front_matter_round_trip():
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.title = 'Reaction test'
-  quiz.time_limit = 90
+  quiz = make_new_quiz(title='Reaction test', time_limit=90)
 
   attributes = quizzes.extract_quiz_attributes(quiz)
   assert attributes['time_limit'] == '90 seconds'
@@ -6949,11 +7024,7 @@ time limit however many seconds Canvas left lying beside it.
 
 <<test functions>>=
 def test_new_quiz_time_limit_comes_from_the_quiz_settings():
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.time_limit = None
+  quiz = make_new_quiz()
 
   assert quizzes.new_quiz_time_limit(
     quiz, {'has_time_limit': True,
@@ -6976,21 +7047,14 @@ def export_new_quiz_settings(monkeypatch, quiz_settings,
 
   `group` is the (id, name) of the quiz's assignment group, if any.
   """
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.id = 42
-  quiz.title = 'Midterm'
-  quiz.instructions = ''
-  quiz.time_limit = object_time_limit
-  quiz.course = MagicMock(id=1)
+  fields = {}
+  if object_time_limit is not None:
+    fields['time_limit'] = object_time_limit
   if group:
-    quiz.assignment_group_id = group[0]
-    quiz.course.get_assignment_groups.return_value = [
-      AssignmentGroup(MagicMock(), {"id": group[0], "name": group[1]})]
+    fields['assignment_group_id'] = group[0]
+  quiz = make_new_quiz(make_course(groups=[group] if group else []),
+                       id=42, **fields)
 
-  monkeypatch.setattr(quizzes, "is_new_quiz", lambda q: True)
   monkeypatch.setattr(quizzes, "fetch_new_quiz_settings",
                       lambda q, r: quiz_settings)
   monkeypatch.setattr(quizzes.modules, "export_module_specs",
@@ -7061,10 +7125,8 @@ def test_exported_assignment_group_resolves_back(monkeypatch):
     monkeypatch, {}, group=(32, "Participation INL1"))
   assert settings['assignment_group'] == r"^Participation\ INL1$"
 
-  course = MagicMock()
-  course.get_assignment_groups.return_value = [
-    AssignmentGroup(MagicMock(), {"id": 31, "name": "Participation"}),
-    AssignmentGroup(MagicMock(), {"id": 32, "name": "Participation INL1"})]
+  course = make_course(groups=[(31, "Participation"),
+                               (32, "Participation INL1")])
   resolved = quizzes.settings_with_assignment_group_id(settings, course)
 
   assert resolved['assignment_group_id'] == 32
@@ -7178,7 +7240,7 @@ def export_classic_settings(monkeypatch, **attributes):
     "shuffle_answers": False, "published": False,
     "show_correct_answers": False, "one_question_at_a_time": False,
     "cant_go_back": False, **attributes})
-  quiz.course = MagicMock()
+  quiz.course = make_course()
   monkeypatch.setattr(quizzes.modules, "export_module_specs",
                       lambda course, item_type, item_id: [])
   monkeypatch.setattr(quizzes, "export_classic_questions",
@@ -7738,10 +7800,10 @@ collide, and that a written record is private and complete.
 
 <<test functions>>=
 def course_on(server, course_id=1):
-  """A MagicMock course on the Canvas `server`"""
-  course = MagicMock(id=course_id)
-  course._requester.base_url = f"https://{server}/api/v1/"
-  return course
+  """A course on the Canvas `server`"""
+  requester = MagicMock()
+  requester.base_url = f"https://{server}/api/v1/"
+  return make_course(course_id, requester=requester)
 
 def test_qti_receipt_path_separates_servers():
   first = quizzes.qti_receipt_path(course_on("canvas.kth.se"), 42)
@@ -7829,14 +7891,16 @@ that waiting will not resolve.
 
 <<test functions>>=
 def course_with_migration_states(states, issues=()):
-  """A MagicMock course whose migration passes through `states`"""
+  """A course whose migration passes through `states`"""
   migrations = []
   for state in states:
-    migration = MagicMock(workflow_state=state)
-    migration.get_migration_issues.return_value = list(issues)
+    migration = ContentMigration(MagicMock(), {
+      "id": 42, "context_type": "Course", "course_id": 1,
+      "migration_type": "qti_converter", "workflow_state": state})
+    stub_canvas_method(migration, "get_migration_issues", list(issues))
     migrations.append(migration)
-  course = MagicMock()
-  course.get_content_migration.side_effect = migrations
+  course = make_course()
+  stub_canvas_method(course, "get_content_migration").side_effect = migrations
   return course
 
 def test_qti_wait_follows_a_migration_to_completion(monkeypatch):
@@ -7849,7 +7913,9 @@ def test_qti_wait_without_waiting_reports_a_running_migration():
   assert quizzes.qti_wait(course, 42, False, 0) is False
 
 def test_qti_wait_fails_on_an_error_issue():
-  issue = MagicMock(issue_type="error", description="Question 3 skipped")
+  issue = MigrationIssue(MagicMock(), {
+    "id": 1, "content_migration_id": 42, "workflow_state": "active",
+    "issue_type": "error", "description": "Question 3 skipped"})
   course = course_with_migration_states(["completed"], [issue])
   with pytest.raises(quizzes.QtiImportError):
     quizzes.qti_wait(course, 42, True, 60)
@@ -7928,14 +7994,14 @@ def test_qti_ready_waits_for_canvas_to_catch_up(monkeypatch):
   ready = {'published': False, 'question_count': 2, 'points_possible': 3}
   classic_snapshots(monkeypatch, [(stale, questions), (ready, questions)])
   receipt = {'quiz_id': 5, 'question_count': 2}
-  assert quizzes.qti_ready(MagicMock(), receipt, 60) == (ready, questions)
+  assert quizzes.qti_ready(make_course(), receipt, 60) == (ready, questions)
 
 def test_qti_ready_with_no_time_left_looks_once(monkeypatch):
   quiz = {'published': False, 'question_count': 1, 'points_possible': 1}
   classic_snapshots(monkeypatch, [(quiz, [{'points_possible': 1}])])
   receipt = {'quiz_id': 5, 'question_count': 2}
   with pytest.raises(TimeoutError, match="1 of 2 questions"):
-    quizzes.qti_ready(MagicMock(), receipt, 0)
+    quizzes.qti_ready(make_course(), receipt, 0)
 @
 
 Points are floating-point numbers, and the quiz total is computed by Canvas
@@ -8369,21 +8435,20 @@ unambiguous, and refused when it is published or has, or may have, attempts.
 <<test functions>>=
 @pytest.mark.parametrize("matches, message", [
   ([], "No quiz matches"),
-  ([MagicMock(id=1), MagicMock(id=2)], "matches 2 quizzes"),
+  ([make_classic_quiz(id=1), make_classic_quiz(id=2)], "matches 2 quizzes"),
 ])
 def test_qti_target_quiz_needs_exactly_one_match(monkeypatch, matches,
                                                  message):
   monkeypatch.setattr(quizzes, "filter_quizzes",
                       lambda course_list, regex: iter(matches))
   with pytest.raises(quizzes.QtiImportError, match=message):
-    quizzes.qti_target_quiz(MagicMock(), "Week")
+    quizzes.qti_target_quiz(make_course(), "Week")
 
 def test_qti_target_quiz_refuses_a_new_quiz(monkeypatch):
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter([MagicMock(id="7")]))
-  monkeypatch.setattr(quizzes, "is_new_quiz", lambda quiz: True)
+                      lambda course_list, regex: iter([make_new_quiz(id="7")]))
   with pytest.raises(quizzes.QtiImportError, match="Classic quizzes only"):
-    quizzes.qti_target_quiz(MagicMock(), "^7$")
+    quizzes.qti_target_quiz(make_course(), "^7$")
 
 @pytest.mark.parametrize("data, attempts, message", [
   ({'published': True, 'unpublishable': True}, 0, "unpublished"),
@@ -8393,11 +8458,12 @@ def test_qti_target_quiz_refuses_a_new_quiz(monkeypatch):
 ])
 def test_qti_check_target_refuses(monkeypatch, data, attempts, message):
   monkeypatch.setattr(quizzes, "qti_fresh_quiz",
-                      lambda course, quiz_id: (MagicMock(), data))
+                      lambda course, quiz_id: (
+                        make_classic_quiz(course, id=quiz_id), data))
   monkeypatch.setattr(quizzes, "get_quiz_submission_count",
                       lambda quiz, requester: attempts)
   with pytest.raises(quizzes.QtiImportError, match=message):
-    quizzes.qti_check_target(MagicMock(), 20)
+    quizzes.qti_check_target(make_course(), 20)
 @
 
 \paragraph{Reading the staged questions.}
@@ -8675,8 +8741,10 @@ both reported with the command that restores the backup.
 <<test functions>>=
 def mock_qti_replacement(monkeypatch, create_failures=0, after_changes={},
                          question_type='essay_question'):
-  """Mock Canvas for `qti_replace` of staging quiz 10 into quiz 20"""
-  staged, destination = MagicMock(id=10), MagicMock(id=20)
+  """Stand in for Canvas in `qti_replace` of staging quiz 10 into quiz 20"""
+  course = make_course()
+  staged = make_classic_quiz(course, id=10, title="Week 1 (staging)")
+  destination = make_classic_quiz(course, id=20, title="Week 1")
   question = {'question_name': 'Q1', 'question_type': question_type,
               'points_possible': 2, 'answers': []}
   before = {'id': 20, 'published': False, 'unpublishable': True,
@@ -8706,7 +8774,7 @@ def mock_qti_replacement(monkeypatch, create_failures=0, after_changes={},
   monkeypatch.setattr(quizzes.time, "sleep", lambda seconds: None)
   receipt = {'quiz_id': 10, 'target_id': 20, 'question_count': 1,
              'phase': 'submitted'}
-  return MagicMock(id=1), receipt, after
+  return course, receipt, after
 
 def test_qti_replace_verifies_and_completes(monkeypatch, tmp_path, capsys):
   course, receipt, after = mock_qti_replacement(monkeypatch)
@@ -8803,18 +8871,22 @@ cannot be read, the replacement stops before the receipt says
 exception is one that [[qti_import_command]] reports.  The backup is taken
 by the real export functions here, while the staged questions still come
 from the mock.  The destination therefore needs settings that would export,
-so that only its questions can stop the backup.
+so that only its questions can stop the backup: the fields Canvas sends on
+every Classic Quiz, which [[make_classic_quiz]] supplies.
+The [[MagicMock]] that played this quiz before had none of them, so the
+export read [[shuffle_questions]] and the other flags as truthy mocks and the
+backup claimed every one of them was switched on.
 
 <<test functions>>=
 def classic_quiz_with_unreadable_questions():
   """Return a Classic quiz whose settings export but questions fail"""
   from canvasapi.exceptions import Unauthorized
 
-  quiz = MagicMock(id=20, title='Week 1', description='',
-                   quiz_type='assignment', time_limit=None,
-                   allowed_attempts=1, points_possible=1, due_at=None,
-                   unlock_at=None, lock_at=None, show_correct_answers=True,
-                   access_code=None)
+  quiz = make_classic_quiz(id=20, title='Week 1', description='',
+                           quiz_type='assignment', time_limit=None,
+                           allowed_attempts=1, points_possible=1,
+                           due_at=None, unlock_at=None, lock_at=None,
+                           show_correct_answers=True, access_code=None)
   quiz.get_questions.side_effect = Unauthorized("Invalid access token")
   return quiz
 
@@ -9237,7 +9309,7 @@ def test_format_time_limit_reports_a_partial_minute_in_seconds():
 @
 
 We can walk the whole path too, from Canvas's settings to the line a reader
-sees: a quiz whose own [[time_limit]] is null, and settings that say
+sees: a quiz without a [[time_limit]] of its own, and settings that say
 [[1800]], must be viewed as a half-hour quiz rather than as nothing or as
 thirty hours.
 The view asks Canvas twice, first for the settings and then for the items,
@@ -9245,14 +9317,7 @@ which we answer with an empty page.
 
 <<test functions>>=
 def test_view_reports_a_new_quiz_time_limit_in_minutes():
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.id = 42
-  quiz.title = 'Midterm'
-  quiz.time_limit = None
-  quiz.course = MagicMock(id=1)
+  quiz = make_new_quiz(id=42)
 
   settings = MagicMock()
   settings.json.return_value = {
@@ -10711,7 +10776,7 @@ def test_list_new_quiz_items_reads_every_page():
     new_quizzes_page([new_quiz_item(3)]),
   ]
 
-  items = quizzes.list_new_quiz_items(MagicMock(id=1), 42, requester)
+  items = quizzes.list_new_quiz_items(make_course(), 42, requester)
 
   assert [item['position'] for item in items] == [1, 2, 3]
   assert items[2]['title'] == "Q3"
@@ -10723,7 +10788,7 @@ def test_list_new_quiz_items_propagates_api_errors():
   requester.request.side_effect = Unauthorized("Invalid access token")
 
   with pytest.raises(Unauthorized):
-    quizzes.list_new_quiz_items(MagicMock(id=1), 42, requester)
+    quizzes.list_new_quiz_items(make_course(), 42, requester)
 @
 
 
@@ -10768,7 +10833,7 @@ iterate, and the test makes [[get_questions]] itself fail.
 def test_list_classic_questions_propagates_api_errors():
   from canvasapi.exceptions import Unauthorized
 
-  quiz = MagicMock()
+  quiz = make_classic_quiz()
   quiz.get_questions.side_effect = Unauthorized("Invalid access token")
 
   with pytest.raises(Unauthorized):
@@ -10809,20 +10874,13 @@ def list_quiz_items_or_exit(quiz, requester):
 
 Let's verify, through [[items list]], that a failed request is reported as an
 error and not printed as an empty quiz.
-The quiz must be an instance of a class named [[NewQuiz]], since that is how
-[[is_new_quiz]] recognizes one.
+The quiz is a real [[NewQuiz]], which is how [[is_new_quiz]] recognizes one.
 <<test functions>>=
 def new_quiz_whose_items_fail(monkeypatch, canvas):
   """Make the commands find one New Quiz whose item listing fails"""
   from canvasapi.exceptions import Unauthorized
 
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.id = 42
-  quiz.title = 'Midterm'
-  quiz.course = MagicMock(id=1)
+  quiz = make_new_quiz(id=42)
 
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [quiz.course])
@@ -10847,8 +10905,7 @@ def test_items_list_reports_api_errors(monkeypatch, capsys, caplog):
 def test_list_quiz_items_or_exit_reports_classic_errors(caplog):
   from canvasapi.exceptions import Unauthorized
 
-  quiz = MagicMock()
-  quiz.title = 'Midterm'
+  quiz = make_classic_quiz(title='Midterm')
   quiz.get_questions.side_effect = Unauthorized("Invalid access token")
 
   with pytest.raises(SystemExit) as exit_info:
@@ -12640,7 +12697,7 @@ API calls.
 
 <<test functions>>=
 def test_add_classic_questions_flat():
-  quiz = MagicMock()
+  quiz = make_classic_quiz()
   questions = [
     {'question_name': 'Q1', 'question_type': 'essay_question'},
     {'question_name': 'Q2', 'question_type': 'essay_question'},
@@ -12660,8 +12717,7 @@ An ungrouped question after the group must stay ungrouped.
 
 <<test functions>>=
 def test_add_classic_questions_group():
-  quiz = MagicMock()
-  quiz.create_question_group.return_value = MagicMock(id=77)
+  quiz = make_classic_quiz()
   entries = [
     {
       'group': {'id': 12, 'position': 1, 'name': 'aspect 11',
@@ -12692,7 +12748,7 @@ the whole pool counts as failed, but later entries must still be processed.
 
 <<test functions>>=
 def test_add_classic_questions_group_failure():
-  quiz = MagicMock()
+  quiz = make_classic_quiz()
   quiz.create_question_group.side_effect = Exception("API error")
   entries = [
     {'group': {'name': 'broken', 'pick_count': 1},
@@ -12716,8 +12772,7 @@ than on standard error.
 
 <<test functions>>=
 def test_add_classic_question_group_warns(caplog):
-  quiz = MagicMock()
-  quiz.create_question_group.return_value = MagicMock(id=1)
+  quiz = make_classic_quiz()
 
   with caplog.at_level(logging.WARNING):
     success, failed = quizzes.add_classic_question_group(
@@ -12801,8 +12856,7 @@ added on its own or into a group.
 
 <<test functions>>=
 def test_add_classic_questions_renames_numerical_answer_fields():
-  quiz = MagicMock()
-  quiz.create_question_group.return_value = MagicMock(id=77)
+  quiz = make_classic_quiz()
   numerical = {'question_name': 'N', 'question_type': 'numerical_question',
                'answers': [
     {'weight': 100, 'numerical_answer_type': 'exact_answer',
@@ -12995,9 +13049,9 @@ question whose type Canvas has stored.
 ], ids=['full question', 'answers only'])
 def test_update_classic_question_renames_numerical_answer_fields(
     update_data):
-  quiz = MagicMock()
-  question = quiz.get_question.return_value
-  question.question_type = 'numerical_question'
+  quiz = make_classic_quiz()
+  question = make_question(1, question_type='numerical_question')
+  quiz.get_question.return_value = question
 
   assert quizzes.update_classic_question(quiz, 1, update_data)
 
@@ -13017,9 +13071,9 @@ that a translation applied by mistake would show.
 
 <<test functions>>=
 def test_update_classic_question_leaves_other_edits_unchanged():
-  quiz = MagicMock()
-  question = quiz.get_question.return_value
-  question.question_type = 'numerical_question'
+  quiz = make_classic_quiz()
+  question = make_question(1, question_type='numerical_question')
+  quiz.get_question.return_value = question
 
   to_text = {'question_type': 'short_answer_question',
              'answers': [{'text': 'exact', 'weight': 100, 'exact': 1}]}
@@ -13774,14 +13828,9 @@ through the export to what [[create_question]] receives:
 
 <<test functions>>=
 def test_classic_question_round_trip_keeps_html_feedback():
-  question = MagicMock(spec=['id', 'question_name', 'question_text',
-                             'question_type', 'points_possible', 'answers',
-                             'correct_comments', 'correct_comments_html'])
-  question.id = 1
-  question.question_type = 'essay_question'
-  question.answers = []
-  question.correct_comments = ''
-  question.correct_comments_html = '<p>Well <em>done</em></p>'
+  question = make_question(
+    1, question_type='essay_question', answers=[], correct_comments='',
+    correct_comments_html='<p>Well <em>done</em></p>')
 
   cleaned = quizzes.clean_classic_question_for_import(
     quizzes.classic_question_to_dict(question))
@@ -14022,14 +14071,7 @@ are those of the listing tests (\cref{sec:list-new-quiz-items}).
 <<test functions>>=
 def exportable_new_quiz():
   """Return a New Quiz object with nothing cached"""
-  class NewQuiz:
-    pass
-
-  quiz = NewQuiz()
-  quiz.id = 42
-  quiz.title = 'Midterm'
-  quiz.course = MagicMock(id=1)
-  return quiz
+  return make_new_quiz(id=42)
 
 def test_export_new_quiz_items_reads_every_page():
   next_url = "https://canvas.example/api/quiz/v1/items?page=2"
@@ -14308,14 +14350,15 @@ first member's slot in the walk order, later members must fold into the
 same entry (sorted by their group-relative positions), and
 [[quiz_group_id]] must not leak into the export.
 
-Note that [[MagicMock(name=...)]] sets the mock's \emph{mock name}, not a
-[[name]] attribute, so we assign the group's [[name]] after construction.
+The group is a real [[QuizGroup]], built from the fields Canvas sends for
+one.
 
 <<test functions>>=
 def test_group_classic_questions_folds_nonadjacent():
-  group = MagicMock(pick_count=1, question_points=2, position=2)
-  group.name = 'parallel forms'
-  quiz = MagicMock()
+  group = QuizGroup(MagicMock(), {
+    "id": 5, "quiz_id": 5, "name": 'parallel forms', "pick_count": 1,
+    "question_points": 2, "position": 2})
+  quiz = make_classic_quiz()
   quiz.get_quiz_group.return_value = group
 
   items = [
@@ -14350,7 +14393,7 @@ folding step and through the export, which is what the commands call.
 def test_group_classic_questions_fetch_failure():
   from canvasapi.exceptions import CanvasException, Unauthorized
 
-  quiz = MagicMock()
+  quiz = make_classic_quiz()
   quiz.get_quiz_group.side_effect = Unauthorized("Invalid access token")
 
   items = [
@@ -14364,8 +14407,8 @@ def test_group_classic_questions_fetch_failure():
 def test_export_classic_questions_group_failure_raises():
   from canvasapi.exceptions import CanvasException, Unauthorized
 
-  question = MagicMock(id=2, quiz_group_id=9, position=None)
-  quiz = MagicMock()
+  question = make_question(2, quiz_group_id=9, position=None)
+  quiz = make_classic_quiz()
   quiz.get_questions.return_value = [question]
   quiz.get_quiz_group.side_effect = Unauthorized("Invalid access token")
 
@@ -14381,7 +14424,7 @@ none.
 def test_export_classic_questions_raises():
   from canvasapi.exceptions import CanvasException, Unauthorized
 
-  quiz = MagicMock()
+  quiz = make_classic_quiz()
   quiz.get_questions.side_effect = Unauthorized("Invalid access token")
 
   with pytest.raises(CanvasException):
@@ -14455,7 +14498,7 @@ When [[edit --full-json --replace-items]] cannot read the questions of a
 Classic quiz, it must stop before the editor opens, and so before any
 question can be deleted.  We reuse the quiz from the test of the QTI
 replacement's backup (\cref{sec:qti-replace}); should the editor open after
-all, the mock cancels it.
+all, the stand-in editor cancels it.
 
 <<test functions>>=
 def test_edit_full_json_stops_when_questions_cannot_be_read(monkeypatch):
