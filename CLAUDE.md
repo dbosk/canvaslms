@@ -671,6 +671,7 @@ src/canvaslms/
 │   └── utils.nw      # Shared utilities
 ├── grades/           # Grading algorithms (.nw sources)
 ├── hacks/            # Canvas API extensions
+├── scripts/          # Shipped shell scripts (.nw -> .sh), e.g. ungraded.sh for cron
 ├── tutorials/        # Bundled tutorials (.nw -> .md loaded by pytorial)
 └── __init__.py       # Generated from canvaslms.nw
 ```
@@ -864,6 +865,18 @@ Registration checklist:
 4. `make -C src/canvaslms all && make -C tests all && poetry run pytest`.
 5. Editing a bundled tutorial changes its digest, so users' in-progress runs
    of it must be restarted with `--restart`; mention it in release notes.
+
+## Shipped Shell Scripts
+
+`src/canvaslms/scripts/<name>.nw` tangles to `<name>.sh` (`chmod 755` in its
+Makefile) and weaves to a `\subsection` that `doc/intro.nw` `\input`s under
+"Workflow examples". Deployments (the rpi Ansible repo) copy every `*.sh` from
+`site-packages/canvaslms/` to run from cron, so the scripts must stay generic:
+personal settings go in a config file, never in the script. To add one: a
+`MODULES+=` line in `src/canvaslms/scripts/Makefile`, an include entry by name
+in `pyproject.toml`, the `\input` in `doc/intro.nw` and a `canvaslms.pdf:`
+line in `doc/Makefile`. Test the script by running it with stub `canvaslms`
+and `date` on `PATH` (see `ungraded.nw`).
 
 ## Configuration and Authentication
 
