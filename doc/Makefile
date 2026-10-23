@@ -51,6 +51,7 @@ canvaslms.pdf: ${SRC_DIR}/cli/calendar.tex
 canvaslms.pdf: ${SRC_DIR}/cli/discussions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/quizzes.tex
 canvaslms.pdf: ${SRC_DIR}/cli/cache.tex
+canvaslms.pdf: ${SRC_DIR}/scripts/ungraded.tex
 canvaslms.pdf: ${SRC_DIR}/cli/tutorial.tex
 canvaslms.pdf: ${SRC_DIR}/tutorials/getting-started.tex
 canvaslms.pdf: ${SRC_DIR}/tutorials/assignments-and-grading.tex

@@ -1,0 +1,433 @@
+\subsection{Weekly teaching: A cron report of ungraded work}
+\label{sec:cron-ungraded}
+
+The previous script answers the question \enquote{what needs grading?} when
+we sit down and ask it.
+A teacher with several courses also wants the question asked for them: a
+mail every Sunday evening listing what is still waiting, course by course,
+so that nothing is forgotten in a course one does not look at every day.
+That is a job for [[cron]], and running unattended changes what the script
+must do.
+\begin{description}
+\item[What to report lives in a file] Nobody types a course pattern on the
+  command line of a cron job, and the patterns are personal: which courses
+  one teaches, which assignment groups are graded by hand, which
+  resubmissions can be ignored.
+\item[The report must survive the turn of the year] Course rounds are
+  named by year, such as [[prgi25]] and [[prgi26]], and a cron job that
+  names this year's round silently reports nothing once the next round
+  starts.
+\item[The output is read in a mail] Each part of the report needs a
+  header, so that the reader can tell which course a row belongs to, and
+  which course had nothing to grade.
+\end{description}
+
+This script, unlike the others in this chapter, is shipped with
+[[canvaslms]]: it is installed as [[canvaslms/scripts/ungraded.sh]] in the
+package's directory, so the script on a server always matches the
+[[canvaslms]] installed there.
+That is the reason the course list is kept out of the script.
+A version with one's own courses written into it must be edited, and kept
+somewhere, by hand, and every upgrade of [[canvaslms]] would overwrite it.
+The script is generic and the file is personal, so an upgrade replaces
+only the script.
+
+The whole script is four steps:
+<<[[ungraded.sh]]>>=
+#!/bin/bash
+# ungraded.sh - report ungraded submissions, one section per config line
+#
+# Usage: ungraded.sh [config-file]
+#
+# Each line of the config file is
+#   course regex <TAB> assignment group regex <TAB> grades to skip
+# {YY} in the course regex matches last year's and this year's rounds.
+
+config="${1:-${XDG_CONFIG_HOME:-$HOME/.config}/canvaslms/ungraded.tsv}"
+<<refuse to run without a readable config>>
+<<compute the year window [[years]]>>
+<<report each line of the config>>
+@ The default location is beside [[canvaslms]]'s own configuration
+file, so that the two are found, and backed up, together.
+An argument overrides it, which is how one keeps several reports, for
+instance one for oneself and one for a co-teacher.
+
+
+\subsubsection{The configuration file}
+
+Each line of the file describes one section of the report.
+It has up to three columns, separated by tabs, the same separator that
+[[canvaslms]] itself prints:
+\begin{description}
+\item[Course] A regex matching the course, as given to [[-c]].
+  The placeholder [[{YY}]] stands for this year's and last year's
+  two-digit years.
+\item[Assignment group] A regex matching assignment groups, as given to
+  [[-A]].
+  If it is left out, all groups are reported.
+\item[Grades to skip] An optional regex.
+  A row whose current grade matches it is left out of the report.
+\end{description}
+Empty lines and lines starting with [[#]] are ignored, so the file can
+explain itself.
+
+\Cref{tab:ungraded-config} shows the file that produces the weekly report
+for the courses of this manual's author.
+The first four lines ask for the hand-graded assignment groups of two
+courses.
+The last line needs its third column because of how
+[[submissions list -U]] counts: a student who resubmits after passing has
+an ungraded submission again, but in that course a passed lab is never
+regraded, so rows whose current grade is already passing ([[A]]--[[E]] or
+[[P]]) are only noise.
+
+\begin{table}
+\centering
+\caption{A configuration file for the weekly report.
+  The columns are separated by single tabs.}
+\label{tab:ungraded-config}
+\begin{tabular}{lll}
+\toprule
+Course & Assignment group & Grades to skip \\
+\midrule
+[[vetcyb{YY}]] & [[^INL1]] & \\
+[[vetcyb{YY}]] & [[^Participation]] & \\
+[[tilkry{YY}]] & [[^INL1]] & \\
+[[tilkry{YY}]] & [[LAB1]] & \\
+[[prg[im]{YY}]] & [[LAB[123]]] & [[^[A-EP]]] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsubsection{Failing loudly without a configuration}
+
+A cron job that silently prints nothing looks exactly like a week with
+nothing to grade.
+So a missing or unreadable file is an error: [[cron]] mails whatever the
+job writes to standard error, and the message names the file it looked for
+and reminds the reader of its format.
+<<refuse to run without a readable config>>=
+if [ ! -r "$config" ]; then
+  echo "${0##*/}: cannot read configuration file $config" >&2
+  echo "Each line: course<TAB>assignment group<TAB>grades to skip" >&2
+  exit 1
+fi
+@
+
+
+\subsubsection{The year window}
+
+The [[{YY}]] placeholder becomes a regex that matches two rounds, such as
+[[(25|26)]].
+Both are needed in the autumn: the new round has started, but last year's
+students are still handing in late work.
+Matching the current year alone would make the report forget those
+students on New Year's Eve; matching any year would bring back every
+student who never finished.
+
+Two details make the computation correct for every year rather than for
+most.
+The year is read as a base-10 number ([[10#]]), since the shell would
+otherwise take [[08]] and [[09]] as broken octal numbers.
+And the previous year wraps around and is padded to two digits, so that
+2000 gives [[(99|00)]] and 2010 gives [[(09|10)]], not [[(-1|00)]] or
+[[(9|10)]].
+<<compute the year window [[years]]>>=
+this_year=$(date +%y)
+last_year=$(printf %02d $(( (10#$this_year + 99) % 100 )))
+years="(${last_year}|${this_year})"
+@
+
+
+\subsubsection{One section per line}
+
+The main loop reads the file one line at a time and turns each line into
+one call of [[canvaslms submissions list -U]], under a header that shows
+the patterns actually used.
+<<report each line of the config>>=
+while IFS=$'\t' read -r course group skip <&3 || [ -n "$course" ]; do
+  case "$course" in
+    ""|"#"*) continue ;;
+  esac
+  course="${course//\{YY\}/$years}"
+  group="${group:-.*}"
+  printf '### %s\t%s\n' "$course" "$group"
+  canvaslms submissions list -c "$course" -A "$group" -U \
+    | <<drop rows whose grade matches [[skip]]>>
+  echo
+done 3< "$config"
+@
+
+Three things in the loop are less obvious than they look.
+
+The file is read on file descriptor~3 instead of standard input.
+Every command in a [[while read]] loop inherits the loop's standard input,
+so if the file were on standard input, any command in the body that reads
+it would consume the rest of the configuration, and the report would end
+after the first section without an error.
+[[canvaslms]] does not read standard input today, but [[ssh]], for
+example, does, and a script that runs unattended should not depend on
+that.
+
+The test after [[read]] keeps the last line when the file does not end in
+a newline.
+In that case [[read]] fills in the variables but reports failure, and
+without the test the last section of a file saved by some editors would be
+silently dropped.
+
+[[canvaslms]] exits with an error when a section has nothing to grade, and
+the message, such as [[No submissions found matching the criteria]], ends
+up in the mail under the section's header.
+We let it through rather than pass [[-q]].
+The same message is what one sees when a pattern in the file is mistyped
+and matches no course at all, and a report that hides that would never be
+corrected.
+
+
+\subsubsection{Skipping rows by grade}
+
+The third column is matched against the grade column only.
+The script this one replaces used
+\begin{minted}{bash}
+canvaslms submissions -c "prg[im]${POTENTIAL_YEAR}" -A "LAB[123]" -U \
+  | grep -Ev "\s[A-EP]"
+\end{minted}
+which looks for a whitespace character followed by a passing grade
+\emph{anywhere} in the row.
+The student's name is also preceded by a tab, so every student whose name
+begins with a letter from A to E, or with P, disappeared from the report,
+whatever their grade.
+
+[[submissions list]] prints the course, the assignment, the student, the
+grade and two dates, so the grade is field~4 of a tab-separated row, and
+[[awk]] can test that field alone.
+An empty third column keeps every row.
+<<drop rows whose grade matches [[skip]]>>=
+skip="$skip" awk -F'\t' 'ENVIRON["skip"] == "" || $4 !~ ENVIRON["skip"]'
+@ The regex is passed through the environment rather than with
+[[awk -v]], because [[-v]] interprets backslash escapes in the value: a
+pattern such as [[\.]] would reach [[awk]] as [[.]].
+
+
+\subsubsection{Running it from cron}
+
+The script needs only [[bash]], [[awk]] and [[canvaslms]].
+Its location depends on how [[canvaslms]] was installed; Python can tell:
+\begin{minted}{bash}
+python3 -c 'import canvaslms, pathlib
+print(pathlib.Path(canvaslms.__file__).parent / "scripts" / "ungraded.sh")'
+\end{minted}
+With [[pipx]], the [[python3]] to ask is the one in the package's own
+environment, typically [[~/.local/share/pipx/venvs/canvaslms/bin/python]].
+One can either point the crontab at that path, or copy the script, for
+example to [[~/ungraded.sh]], whenever [[canvaslms]] is upgraded.
+A crontab entry that mails the report every Sunday at 23.45 is then
+\begin{minted}{text}
+45 23 * * Sun ${HOME}/ungraded.sh
+\end{minted}
+
+The script leaves the credentials to [[canvaslms]], and that needs care
+under [[cron]].
+Jobs run with an almost empty environment and outside the desktop session
+in which the keyring is usually unlocked, so the token stored by
+[[canvaslms login]] may not be reachable.
+The robust choice is the environment variables [[CANVAS_SERVER]] and
+[[CANVAS_TOKEN]] (\cref{sec:environment-variables}), set by the crontab
+itself or by a file that [[BASH_ENV]] names.
+The script deliberately does not read a profile of its own: what a job's
+environment contains is the job's business, not the report's.
+
+
+\subsubsection{Verifying the script}
+
+We test the script by running it, with the two programs whose answers
+change from run to run replaced.
+A stub [[canvaslms]] early on [[PATH]] records the arguments it was called
+with and prints rows the test chose, so the tests need no Canvas
+connection and no personal data.
+A stub [[date]] fixes the year, because a test that computes the expected
+year from the real clock would fail when the clock crosses New Year
+between the script's call and the test's.
+Everything else, [[bash]], [[awk]] and the script itself, is real.
+<<test [[ungraded.py]]>>=
+"""Tests for the cron report script ungraded.sh."""
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+import pytest
+
+import canvaslms
+import canvaslms.cli.submissions
+
+SCRIPT = pathlib.Path(canvaslms.__file__).parent / "scripts" / "ungraded.sh"
+
+<<stubs for [[canvaslms]] and [[date]]>>
+<<test functions>>
+@
+
+The [[canvaslms]] stub appends its arguments as one JSON line to a log and
+prints the rows in [[rows.tsv]].
+It also reads its standard input to the end, as a misbehaving command
+might, which is how the tests catch a loop that gives its configuration
+to the commands in its body.
+The [[run]] fixture writes the configuration, runs the script with a
+given year and returns the result together with the recorded calls.
+<<stubs for [[canvaslms]] and [[date]]>>=
+CANVASLMS_STUB = """#!{python}
+import json, sys
+sys.stdin.read()
+with open({log!r}, "a") as log:
+  log.write(json.dumps(sys.argv[1:]) + "\\n")
+with open({rows!r}) as rows:
+  sys.stdout.write(rows.read())
+"""
+
+DATE_STUB = """#!/bin/sh
+echo {year}
+"""
+
+@pytest.fixture
+def run(tmp_path):
+  """Return a function that runs the script on a config and stubbed rows."""
+  bin_dir = tmp_path / "bin"
+  bin_dir.mkdir()
+  log = tmp_path / "calls.jsonl"
+  rows = tmp_path / "rows.tsv"
+
+  def run_script(config, *, rows_text="", year="26", args=None, env=None):
+    (bin_dir / "canvaslms").write_text(CANVASLMS_STUB.format(
+      python=sys.executable, log=str(log), rows=str(rows)))
+    (bin_dir / "date").write_text(DATE_STUB.format(year=year))
+    for stub in bin_dir.iterdir():
+      stub.chmod(0o755)
+    rows.write_text(rows_text)
+    config_file = tmp_path / "ungraded.tsv"
+    if config is not None:
+      config_file.write_text(config)
+    run_env = dict(os.environ)
+    run_env["PATH"] = f"{bin_dir}{os.pathsep}{run_env['PATH']}"
+    run_env.update(env or {})
+    result = subprocess.run(
+      ["bash", str(SCRIPT)] + (args if args is not None
+                               else [str(config_file)]),
+      env=run_env, stdin=subprocess.DEVNULL,
+      capture_output=True, text=True)
+    calls = ([json.loads(line) for line in log.read_text().splitlines()]
+             if log.exists() else [])
+    if log.exists():
+      log.unlink()
+    return result, calls
+
+  return run_script
+@
+
+First, the script must at least be valid [[bash]], and must refuse to run
+without its configuration, naming the file it looked for.
+<<test functions>>=
+def test_script_is_valid_bash():
+  subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
+
+def test_missing_config_is_an_error(run, tmp_path):
+  missing = tmp_path / "nowhere.tsv"
+  result, calls = run(None, args=[str(missing)])
+  assert result.returncode != 0
+  assert str(missing) in result.stderr
+  assert calls == []
+@
+
+Without an argument, the file is looked for beside [[canvaslms]]'s own
+configuration.
+<<test functions>>=
+def test_default_config_is_in_the_config_directory(run, tmp_path):
+  config_dir = tmp_path / "xdg" / "canvaslms"
+  config_dir.mkdir(parents=True)
+  (config_dir / "ungraded.tsv").write_text("dd1301\tLAB\n")
+  result, calls = run(None, args=[],
+                      env={"XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+  assert result.returncode == 0, result.stderr
+  assert [call[call.index("-c") + 1] for call in calls] == ["dd1301"]
+@
+
+The year window must be right for ordinary years and for the years where
+octal parsing or the wrap-around would break it, and a pattern without
+the placeholder must be passed on unchanged.
+<<test functions>>=
+@pytest.mark.parametrize("year,window", [
+  ("26", "(25|26)"), ("10", "(09|10)"), ("08", "(07|08)"), ("00", "(99|00)"),
+])
+def test_year_placeholder_matches_two_rounds(run, year, window):
+  result, calls = run("prg[im]{YY}\tLAB[123]\n", year=year)
+  assert result.returncode == 0, result.stderr
+  assert calls[0][calls[0].index("-c") + 1] == f"prg[im]{window}"
+
+def test_pattern_without_placeholder_is_unchanged(run):
+  result, calls = run("DD1301 HT26\tLAB\n")
+  assert calls[0][calls[0].index("-c") + 1] == "DD1301 HT26"
+@
+
+Every line, the last one included even without a final newline, gives
+exactly one section, while comments and empty lines give none.
+Since the stub reads its standard input, these tests also fail if the
+loop's input reached the commands in it.
+<<test functions>>=
+def test_one_section_per_config_line(run):
+  config = ("# my courses\n"
+            "\n"
+            "vetcyb{YY}\t^INL1\n"
+            "tilkry{YY}\tLAB1\n"
+            "dd1301")
+  result, calls = run(config)
+  assert result.returncode == 0, result.stderr
+  courses = [call[call.index("-c") + 1] for call in calls]
+  assert courses == ["vetcyb(25|26)", "tilkry(25|26)", "dd1301"]
+  headers = [line for line in result.stdout.splitlines()
+             if line.startswith("### ")]
+  assert headers == ["### vetcyb(25|26)\t^INL1",
+                     "### tilkry(25|26)\tLAB1",
+                     "### dd1301\t.*"]
+@
+
+The grade filter is the reason this script exists in its current form, so
+we test it on the case the old [[grep]] got wrong: a student whose name
+begins with a passing grade's letter, and who has no grade yet.
+<<test functions>>=
+ROWS = (
+  "prgi26\tLAB1\tBeata Exempel\t\t2026-10-01 10:00\t\n"
+  "prgi26\tLAB1\tTolvan Tolvansson\tP\t2026-10-02 10:00\t2026-09-20 12:00\n"
+  "prgi26\tLAB2\tTolvan Tolvansson\tF\t2026-10-03 10:00\t2026-09-21 12:00\n"
+)
+
+def test_skip_column_tests_the_grade_only(run):
+  result, _ = run("prg[im]{YY}\tLAB[123]\t^[A-EP]\n", rows_text=ROWS)
+  assert result.returncode == 0, result.stderr
+  assert "Beata Exempel" in result.stdout
+  assert "Tolvan Tolvansson\tP" not in result.stdout
+  assert "Tolvan Tolvansson\tF" in result.stdout
+
+def test_no_skip_column_keeps_every_row(run):
+  result, _ = run("prg[im]{YY}\tLAB[123]\n", rows_text=ROWS)
+  assert all(row in result.stdout for row in ROWS.splitlines())
+@
+
+Finally, the stub accepts any arguments, so we check the recorded calls
+against the real parser of the [[submissions]] command.
+If one of its options is renamed, this test fails, not the cron job on a
+Sunday evening.
+<<test functions>>=
+def test_calls_parse_with_the_real_parser(run):
+  result, calls = run("vetcyb{YY}\t^INL1\ndd1301\n")
+  parser = argparse.ArgumentParser()
+  canvaslms.cli.submissions.add_command(
+    parser.add_subparsers(dest="command"))
+  parsed = [parser.parse_args(call) for call in calls]
+  assert [args.submissions_subcommand for args in parsed] == ["list"] * 2
+  assert all(args.ungraded for args in parsed)
+  assert [(args.course, args.assignment_group) for args in parsed] == [
+    ("vetcyb(25|26)", "^INL1"), ("dd1301", ".*")]
+@
