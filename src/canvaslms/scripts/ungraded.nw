@@ -45,10 +45,14 @@ The whole script is four steps:
 
 config="${1:-${XDG_CONFIG_HOME:-$HOME/.config}/canvaslms/ungraded.tsv}"
 <<refuse to run without a readable config>>
+<<refuse to run without [[canvaslms]] on [[PATH]]>>
 <<compute the year window [[years]]>>
-<<report each line of the config>>
-@ The default location is beside [[canvaslms]]'s own configuration
-file, so that the two are found, and backed up, together.
+<<read the config as one record per section>>
+<<report each section>>
+@ On Linux the default location is beside [[canvaslms]]'s own
+configuration file, so that the two are found, and backed up, together.
+(On macOS [[canvaslms]] keeps its configuration elsewhere, but cron jobs
+are rarer there, and the argument covers it.)
 An argument overrides it, which is how one keeps several reports, for
 instance one for oneself and one for a co-teacher.
 
@@ -64,12 +68,17 @@ It has up to three columns, separated by tabs, the same separator that
   two-digit years.
 \item[Assignment group] A regex matching assignment groups, as given to
   [[-A]].
-  If it is left out, all groups are reported.
+  If it is empty, all groups are reported.
 \item[Grades to skip] An optional regex.
   A row whose current grade matches it is left out of the report.
 \end{description}
 Empty lines and lines starting with [[#]] are ignored, so the file can
 explain itself.
+The file is edited by hand, and possibly on another system, so the script
+is forgiving about what does not change the meaning: a column may be
+empty, blanks around a column and Windows line endings are dropped, an
+indented comment is still a comment, and columns after the third are
+ignored.
 
 \Cref{tab:ungraded-config} shows the file that produces the weekly report
 for the courses of this manual's author.
@@ -84,7 +93,7 @@ regraded, so rows whose current grade is already passing ([[A]]--[[E]] or
 \begin{table}
 \centering
 \caption{A configuration file for the weekly report.
-  The columns are separated by single tabs.}
+  Each column ends at a tab, so an empty column is two tabs in a row.}
 \label{tab:ungraded-config}
 \begin{tabular}{lll}
 \toprule
@@ -100,7 +109,7 @@ Course & Assignment group & Grades to skip \\
 \end{table}
 
 
-\subsubsection{Failing loudly without a configuration}
+\subsubsection{Failing loudly when the job cannot run}
 
 A cron job that silently prints nothing looks exactly like a week with
 nothing to grade.
@@ -111,6 +120,20 @@ and reminds the reader of its format.
 if [ ! -r "$config" ]; then
   echo "${0##*/}: cannot read configuration file $config" >&2
   echo "Each line: course<TAB>assignment group<TAB>grades to skip" >&2
+  exit 1
+fi
+@
+
+A missing [[canvaslms]] is the other way the job fails without looking
+like it.
+[[cron]] runs jobs with a [[PATH]] of only [[/usr/bin:/bin]], while
+[[pipx]] installs [[canvaslms]] in [[~/.local/bin]].
+Each section would then print [[canvaslms: command not found]] and the
+script would still finish normally, so we check once, before the first
+section, and say which [[PATH]] we searched.
+<<refuse to run without [[canvaslms]] on [[PATH]]>>=
+if ! command -v canvaslms > /dev/null; then
+  echo "${0##*/}: canvaslms is not on PATH ($PATH)" >&2
   exit 1
 fi
 @
@@ -140,41 +163,65 @@ years="(${last_year}|${this_year})"
 @
 
 
-\subsubsection{One section per line}
+\subsubsection{Reading the configuration}
 
-The main loop reads the file one line at a time and turns each line into
-one call of [[canvaslms submissions list -U]], under a header that shows
-the patterns actually used.
-<<report each line of the config>>=
-while IFS=$'\t' read -r course group skip <&3 || [ -n "$course" ]; do
-  case "$course" in
-    ""|"#"*) continue ;;
-  esac
+The obvious way to read a tab-separated file in [[bash]] is
+[[IFS=$'\t' read -r course group skip]], and it is subtly wrong here.
+A tab is one of the characters [[read]] counts as whitespace, and runs of
+whitespace separators collapse into one.
+The line [[prgi{YY}<TAB><TAB>^[A-EP] ]], which leaves the assignment group
+empty, would put the grade pattern in [[group]] and leave [[skip]] empty:
+the report would ask for an assignment group named like a grade, and skip
+nothing.
+A Windows line ending fares no better, since the carriage return stays at
+the end of the last column and becomes part of its regex.
+
+[[awk]] splits on every single tab, so we let it bring each line into a
+fixed shape first: strip a carriage return, trim the blanks around the
+first three columns, drop comments and empty lines, and print exactly
+three fields.
+They are separated by the ASCII unit separator, character~[[\037]], which
+cannot occur in a hand-written regex and, not being whitespace, is never
+collapsed by [[read]].
+<<read the config as one record per section>>=
+sections() {
+  awk -F'\t' '
+    { sub(/\r$/, "") }
+    { for (i = 1; i <= 3; i++) gsub(/^ +| +$/, "", $i) }
+    $1 == "" || $1 ~ /^#/ { next }
+    { printf "%s\037%s\037%s\n", $1, $2, $3 }
+  ' "$1"
+}
+@ As a bonus, [[awk]] reads a last line that lacks its newline like any
+other, a case where [[read]] fills in the variables but reports failure,
+and a [[while read]] loop would silently drop the last section of a file
+saved by some editors.
+
+
+\subsubsection{One section per record}
+
+The main loop turns each record into one call of
+[[canvaslms submissions list -U]], under a header that shows the patterns
+actually used.
+<<report each section>>=
+while IFS=$'\037' read -r course group skip <&3; do
   course="${course//\{YY\}/$years}"
   group="${group:-.*}"
   printf '### %s\t%s\n' "$course" "$group"
   canvaslms submissions list -c "$course" -A "$group" -U \
     | <<drop rows whose grade matches [[skip]]>>
   echo
-done 3< "$config"
+done 3< <(sections "$config")
 @
 
-Three things in the loop are less obvious than they look.
-
-The file is read on file descriptor~3 instead of standard input.
+The records are read on file descriptor~3 instead of standard input.
 Every command in a [[while read]] loop inherits the loop's standard input,
-so if the file were on standard input, any command in the body that reads
-it would consume the rest of the configuration, and the report would end
-after the first section without an error.
+so if the records were on standard input, any command in the body that
+reads it would consume the rest of them, and the report would end after
+the first section without an error.
 [[canvaslms]] does not read standard input today, but [[ssh]], for
 example, does, and a script that runs unattended should not depend on
 that.
-
-The test after [[read]] keeps the last line when the file does not end in
-a newline.
-In that case [[read]] fills in the variables but reports failure, and
-without the test the last section of a file saved by some editors would be
-silently dropped.
 
 [[canvaslms]] exits with an error when a section has nothing to grade, and
 the message, such as [[No submissions found matching the criteria]], ends
@@ -206,8 +253,10 @@ An empty third column keeps every row.
 <<drop rows whose grade matches [[skip]]>>=
 skip="$skip" awk -F'\t' 'ENVIRON["skip"] == "" || $4 !~ ENVIRON["skip"]'
 @ The regex is passed through the environment rather than with
-[[awk -v]], because [[-v]] interprets backslash escapes in the value: a
-pattern such as [[\.]] would reach [[awk]] as [[.]].
+[[awk -v]], because [[-v]] interprets backslash escapes in the value: in
+GNU and BusyBox [[awk]], a pattern such as [[\.]] would arrive as [[.]],
+while [[mawk]] keeps it.
+[[ENVIRON]] passes the value untouched in all of them.
 
 
 \subsubsection{Running it from cron}
@@ -222,10 +271,15 @@ With [[pipx]], the [[python3]] to ask is the one in the package's own
 environment, typically [[~/.local/share/pipx/venvs/canvaslms/bin/python]].
 One can either point the crontab at that path, or copy the script, for
 example to [[~/ungraded.sh]], whenever [[canvaslms]] is upgraded.
-A crontab entry that mails the report every Sunday at 23.45 is then
+A crontab that mails the report every Sunday at 23.45 is then
 \begin{minted}{text}
+PATH=/home/teacher/.local/bin:/usr/bin:/bin
 45 23 * * Sun ${HOME}/ungraded.sh
 \end{minted}
+The [[PATH]] line is what lets the job find a [[pipx]]-installed
+[[canvaslms]].
+[[cron]] does not expand variables in such assignments, so the home
+directory must be written out.
 
 The script leaves the credentials to [[canvaslms]], and that needs care
 under [[cron]].
@@ -260,6 +314,8 @@ import pathlib
 import subprocess
 import sys
 
+import shutil
+
 import pytest
 
 import canvaslms
@@ -278,6 +334,10 @@ might, which is how the tests catch a loop that gives its configuration
 to the commands in its body.
 The [[run]] fixture writes the configuration, runs the script with a
 given year and returns the result together with the recorded calls.
+An environment value of [[None]] removes that variable, and
+[[canvaslms=False]] runs the script with nothing on [[PATH]] but the
+[[date]] stub and [[awk]], as under a [[cron]] that cannot find
+[[canvaslms]].
 <<stubs for [[canvaslms]] and [[date]]>>=
 CANVASLMS_STUB = """#!{python}
 import json, sys
@@ -300,21 +360,30 @@ def run(tmp_path):
   log = tmp_path / "calls.jsonl"
   rows = tmp_path / "rows.tsv"
 
-  def run_script(config, *, rows_text="", year="26", args=None, env=None):
-    (bin_dir / "canvaslms").write_text(CANVASLMS_STUB.format(
-      python=sys.executable, log=str(log), rows=str(rows)))
+  def run_script(config, *, rows_text="", year="26", args=None, env=None,
+                 canvaslms=True):
     (bin_dir / "date").write_text(DATE_STUB.format(year=year))
-    for stub in bin_dir.iterdir():
-      stub.chmod(0o755)
+    (bin_dir / "date").chmod(0o755)
+    if canvaslms:
+      (bin_dir / "canvaslms").write_text(CANVASLMS_STUB.format(
+        python=sys.executable, log=str(log), rows=str(rows)))
+      (bin_dir / "canvaslms").chmod(0o755)
+    else:
+      (bin_dir / "awk").symlink_to(shutil.which("awk"))
     rows.write_text(rows_text)
     config_file = tmp_path / "ungraded.tsv"
     if config is not None:
       config_file.write_text(config)
     run_env = dict(os.environ)
-    run_env["PATH"] = f"{bin_dir}{os.pathsep}{run_env['PATH']}"
-    run_env.update(env or {})
+    run_env["PATH"] = (f"{bin_dir}{os.pathsep}{run_env['PATH']}"
+                       if canvaslms else str(bin_dir))
+    for name, value in (env or {}).items():
+      if value is None:
+        run_env.pop(name, None)
+      else:
+        run_env[name] = value
     result = subprocess.run(
-      ["bash", str(SCRIPT)] + (args if args is not None
+      [shutil.which("bash"), str(SCRIPT)] + (args if args is not None
                                else [str(config_file)]),
       env=run_env, stdin=subprocess.DEVNULL,
       capture_output=True, text=True)
@@ -338,7 +407,19 @@ def test_missing_config_is_an_error(run, tmp_path):
   result, calls = run(None, args=[str(missing)])
   assert result.returncode != 0
   assert str(missing) in result.stderr
+  assert "Each line: course<TAB>" in result.stderr
   assert calls == []
+@
+
+Nor may it run when [[canvaslms]] cannot be found; the message must say
+where it looked.
+<<test functions>>=
+def test_missing_canvaslms_is_an_error(run, tmp_path):
+  result, calls = run("dd1301\tLAB\n", canvaslms=False)
+  assert result.returncode != 0
+  assert "canvaslms is not on PATH" in result.stderr
+  assert str(tmp_path / "bin") in result.stderr
+  assert "###" not in result.stdout
 @
 
 Without an argument, the file is looked for beside [[canvaslms]]'s own
@@ -350,6 +431,15 @@ def test_default_config_is_in_the_config_directory(run, tmp_path):
   (config_dir / "ungraded.tsv").write_text("dd1301\tLAB\n")
   result, calls = run(None, args=[],
                       env={"XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+  assert result.returncode == 0, result.stderr
+  assert [call[call.index("-c") + 1] for call in calls] == ["dd1301"]
+
+def test_config_directory_defaults_to_home_config(run, tmp_path):
+  config_dir = tmp_path / "home" / ".config" / "canvaslms"
+  config_dir.mkdir(parents=True)
+  (config_dir / "ungraded.tsv").write_text("dd1301\tLAB\n")
+  result, calls = run(None, args=[], env={
+    "HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": None})
   assert result.returncode == 0, result.stderr
   assert [call[call.index("-c") + 1] for call in calls] == ["dd1301"]
 @
@@ -393,6 +483,35 @@ def test_one_section_per_config_line(run):
                      "### dd1301\t.*"]
 @
 
+The forgiving reading of the file is tested on the cases where
+[[read]] alone goes wrong: an empty middle column, Windows line endings,
+blanks around a column, an indented comment and a fourth column.
+<<test functions>>=
+def sections(calls):
+  """Return the (course, group) pairs of the recorded calls."""
+  return [(call[call.index("-c") + 1], call[call.index("-A") + 1])
+          for call in calls]
+
+def test_empty_group_column_leaves_skip_in_place(run):
+  result, calls = run("prgi{YY}\t\t^[A-EP]\n", rows_text=ROWS)
+  assert result.returncode == 0, result.stderr
+  assert sections(calls) == [("prgi(25|26)", ".*")]
+  assert "Tolvan Tolvansson\tP" not in result.stdout
+
+def test_sloppy_config_lines_mean_what_they_say(run):
+  config = ("tilkry{YY}\tLAB1\r\n"
+            "  # an indented comment\r\n"
+            " prg[im]{YY} \t LAB[123] \t^[A-EP]\textra column\r\n")
+  result, calls = run(config, rows_text=ROWS)
+  assert result.returncode == 0, result.stderr
+  assert sections(calls) == [("tilkry(25|26)", "LAB1"),
+                             ("prg[im](25|26)", "LAB[123]")]
+  assert "\r" not in result.stdout
+  prg_section = result.stdout.split("### prg[im]")[1]
+  assert "Tolvan Tolvansson\tP" not in prg_section
+  assert "Tolvan Tolvansson\tF" in prg_section
+@
+
 The grade filter is the reason this script exists in its current form, so
 we test it on the case the old [[grep]] got wrong: a student whose name
 begins with a passing grade's letter, and who has no grade yet.
@@ -413,6 +532,20 @@ def test_skip_column_tests_the_grade_only(run):
 def test_no_skip_column_keeps_every_row(run):
   result, _ = run("prg[im]{YY}\tLAB[123]\n", rows_text=ROWS)
   assert all(row in result.stdout for row in ROWS.splitlines())
+@
+
+A backslash in the pattern must reach [[awk]] intact, which is why the
+pattern travels through the environment.
+With [[awk -v]], [[^4\.5$]] would become [[^4.5$]] and also skip the
+grade [[4,5]], written with a decimal comma.
+<<test functions>>=
+def test_backslash_in_skip_pattern_is_kept(run):
+  rows = ("dd1301\tLAB1\tBeata Exempel\t4,5\t2026-10-01 10:00\t\n"
+          "dd1301\tLAB1\tTolvan Tolvansson\t4.5\t2026-10-01 10:00\t\n")
+  result, _ = run("dd1301\tLAB1\t^4\\.5$\n", rows_text=rows)
+  assert result.returncode == 0, result.stderr
+  assert "Beata Exempel\t4,5" in result.stdout
+  assert "Tolvan Tolvansson" not in result.stdout
 @
 
 Finally, the stub accepts any arguments, so we check the recorded calls
