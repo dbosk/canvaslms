@@ -39,7 +39,7 @@ See the [lab handout]($IMS-CC-FILEBASE$/handouts/lab1.pdf?canvas_download=1&wrap
 [[pages edit]] resolves it against the course it pushes into, and stops
 the push if the course has no such file.
 What was missing is a way to find out what to write, so both [[files list]]
-and [[files upload]] print that link for every file.
+and [[files upload]] print that link for every file (\cref{sec:files-link}).
 
 
 \section{Module outline}
@@ -191,6 +191,9 @@ Canvas lists a course's files and folders in two flat listings, each
 paginated, and a file knows only the id of its folder.
 Two listings and a dictionary from folder id to path therefore name every
 file, where asking for each file's folder would cost one request per file.
+A folder missing from the listing, should Canvas ever leave one out, is
+fetched on its own and remembered; guessing the root instead would print a
+path and a link to a file that is not there.
 The path of a folder comes from [[links.folder_path]], which strips the
 [[course files]] prefix that every folder's full name starts with.
 We keep the path, and the course for the output, on the file object.
@@ -207,8 +210,10 @@ def list_course_files(course):
   for file in course.get_files():
     file = canvaslms.cli.utils.ensure_file_attrs(file)
     file.course = course
-    file.path = join_path(folders.get(file.folder_id, ""),
-                          file.display_name)
+    if file.folder_id not in folders:
+      folders[file.folder_id] = canvaslms.cli.links.folder_path(
+        course.get_folder(file.folder_id))
+    file.path = join_path(folders[file.folder_id], file.display_name)
     files.append(file)
   return files
 
@@ -253,6 +258,14 @@ def test_list_course_files_names_files_by_path():
   assert paths == ["handouts/lab1.pdf", "handouts/lab2.pdf",
                    "old slides/intro a.pdf", "syllabus.pdf",
                    "Lab #1/lab 1 & 2.pdf"]
+
+@responses.activate
+def test_list_course_files_fetches_a_folder_missing_from_the_listing():
+  serve_listing(responses, files=[file_json(15, "notes.pdf", 9)])
+  responses.get(f"{API}/courses/1/folders/9",
+                json=folder_json(9, "course files/elsewhere", 1))
+  files = list_course_files(canvasapi_course(Canvas(SERVER, "token")))
+  assert [f.path for f in files] == ["elsewhere/notes.pdf"]
 
 @responses.activate
 def test_filter_files_by_path_id_and_folder():
@@ -358,7 +371,8 @@ def add_file_options(parser, required=False):
   canvaslms.cli.courses.add_course_option(parser, required=required)
   parser.add_argument("-f", "--file", default=".*", required=required,
     help="Regex matching the file's path below the course files root "
-         "(e.g. handouts/lab1.pdf) or its Canvas ID, default: '.*'")
+         "(e.g. handouts/lab1.pdf) or its Canvas ID"
+         + ("" if required else ", default: '.*'"))
   parser.add_argument("--folder", metavar="REGEX",
     help="Regex matching the path of the file's folder; the root folder's "
          "path is the empty string")
@@ -476,6 +490,8 @@ upload_parser.add_argument("paths", nargs="+", metavar="FILE",
 
 The local files are checked before anything is uploaded, so that a typo
 in the last name does not leave the course with half the batch.
+Two of them with the same name would land on the same name in the folder,
+the second replacing the first, so that is refused too.
 The folder path is passed as Canvas takes it, without the slashes at the
 ends, so [[/]] becomes the empty path, which Canvas takes as the root.
 <<functions>>=
@@ -484,6 +500,11 @@ def files_upload_command(config, canvas, args):
   missing = [path for path in args.paths if not os.path.isfile(path)]
   if missing:
     canvaslms.cli.err(1, "No such file: " + ", ".join(missing))
+  names = [os.path.basename(path) for path in args.paths]
+  clashes = sorted({name for name in names if names.count(name) > 1})
+  if clashes:
+    canvaslms.cli.err(1, "Several files would get the same name: "
+                         + ", ".join(clashes))
   folder = args.folder.strip("/")
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
   for course in canvaslms.cli.courses.process_course_option(canvas, args):
@@ -500,6 +521,9 @@ the sandbox course, [[a//handouts]] landed in [[a/handouts]], and
 [[a/handouts ]] with a trailing space in a new folder [[a/handouts 3]].
 Only the folder Canvas reports gives a path and a link that agree with
 [[files list]].
+Looking that folder up is one more request after the upload has
+succeeded; should it fail, the file is in the course all the same, so we
+fall back on the folder we asked for and go on with the batch.
 A failure is reported per file and the batch goes on, as module item
 changes do.
 <<functions>>=
@@ -520,9 +544,12 @@ def upload_file(course, path, folder, args):
   <<lock or hide the uploaded file when asked>>
   file = canvaslms.cli.utils.ensure_file_attrs(file)
   file.course = course
-  file.path = join_path(
-    canvaslms.cli.links.folder_path(course.get_folder(file.folder_id)),
-    file.display_name)
+  try:
+    landed = canvaslms.cli.links.folder_path(
+      course.get_folder(file.folder_id))
+  except Exception:
+    landed = folder
+  file.path = join_path(landed, file.display_name)
   return file
 @
 
@@ -555,13 +582,20 @@ def serve_upload(rsps, uploaded):
             json={"upload_url": "https://upload.example.invalid/x",
                   "upload_params": {"key": "SYNTHETIC"}})
   rsps.post("https://upload.example.invalid/x", json=uploaded)
+  if "folder_id" not in uploaded:
+    return
   rsps.get(f"{API}/courses/1/folders/{uploaded['folder_id']}",
            json=[f for f in FOLDERS if f["id"] == uploaded["folder_id"]][0])
 
 def preflight(rsps):
   """Return the parameters of the upload request sent to Canvas."""
   body = rsps.calls[0].request.body
-  return dict(urllib.parse.parse_qsl(body))
+  return dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+
+def updates(rsps):
+  """Return the parameters of every update request, in order."""
+  return [dict(urllib.parse.parse_qsl(call.request.body))
+          for call in rsps.calls if call.request.method == "PUT"]
 
 def upload_args(tmp_path, **options):
   """Return the options of files upload for one local file."""
@@ -599,8 +633,7 @@ def test_upload_lock_alone_sends_only_locked(tmp_path):
                                                   locked=True))
   run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
       **upload_args(tmp_path, lock=True))
-  update = dict(urllib.parse.parse_qsl(responses.calls[2].request.body))
-  assert update == {"locked": "true"}
+  assert updates(responses) == [{"locked": "true"}]
 
 @responses.activate
 def test_upload_reports_a_failed_lock_and_prints_the_real_flags(
@@ -621,8 +654,7 @@ def test_upload_can_rename_lock_and_hide(tmp_path, capsys):
   run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
       **upload_args(tmp_path, rename=True, lock=True, hidden=True))
   assert preflight(responses)["on_duplicate"] == "rename"
-  update = dict(urllib.parse.parse_qsl(responses.calls[2].request.body))
-  assert update == {"locked": "true", "hidden": "true"}
+  assert updates(responses) == [{"locked": "true", "hidden": "true"}]
   assert capsys.readouterr().out.split("\t")[1:5] == [
     "handouts/lab1-1.pdf", "21", "locked", "hidden"]
 
@@ -631,6 +663,47 @@ def test_upload_checks_the_local_files_first(tmp_path):
     with pytest.raises(SystemExit):
       run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
           **upload_args(tmp_path, paths=[str(tmp_path / "missing.pdf")]))
+    assert len(rsps.calls) == 0
+
+@responses.activate
+def test_upload_to_the_root_sends_the_empty_path(tmp_path, capsys):
+  serve_upload(responses, file_json(25, "lab1.pdf", 1))
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path, folder="/"))
+  assert preflight(responses)["parent_folder_path"] == ""
+  assert capsys.readouterr().out.split("\t")[1] == "lab1.pdf"
+
+@responses.activate
+def test_upload_not_confirmed_is_reported(tmp_path, capsys, caplog):
+  serve_upload(responses, {"message": "quota exceeded"})
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path))
+  assert capsys.readouterr().out == ""
+  assert "Could not upload" in caplog.text
+  assert "quota exceeded" in caplog.text
+
+@responses.activate
+def test_upload_goes_on_when_the_folder_lookup_fails(tmp_path, capsys):
+  responses.post(f"{API}/courses/1/files",
+                 json={"upload_url": "https://upload.example.invalid/x",
+                       "upload_params": {"key": "SYNTHETIC"}})
+  responses.post("https://upload.example.invalid/x",
+                 json=file_json(26, "lab1.pdf", 2))
+  responses.get(f"{API}/courses/1/folders/2", status=500)
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path))
+  assert capsys.readouterr().out.split("\t")[1:3] == ["handouts/lab1.pdf",
+                                                     "26"]
+
+def test_upload_refuses_two_files_with_one_name(tmp_path):
+  (tmp_path / "a").mkdir()
+  (tmp_path / "a" / "lab1.pdf").write_bytes(b"%PDF-1.4\n")
+  options = upload_args(tmp_path)
+  with responses.RequestsMock() as rsps:
+    with pytest.raises(SystemExit):
+      run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+          **{**options,
+             "paths": options["paths"] + [str(tmp_path / "a" / "lab1.pdf")]})
     assert len(rsps.calls) == 0
 
 @responses.activate
@@ -721,13 +794,22 @@ def test_edit_sends_only_the_given_flags(capsys):
                   json=file_json(file_id, name, 2, locked=False, hidden=True))
   run(files_edit_command, canvasapi_course(Canvas(SERVER, "token")),
       file="^handouts/", folder=None, locked=None, hidden=True)
-  updates = [dict(urllib.parse.parse_qsl(call.request.body))
-             for call in responses.calls if call.request.method == "PUT"]
-  assert updates == [{"hidden": "true"}, {"hidden": "true"}]
+  assert updates(responses) == [{"hidden": "true"}, {"hidden": "true"}]
   rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
   assert [row[1:5] for row in rows] == [
     ["handouts/lab1.pdf", "10", "unlocked", "hidden"],
     ["handouts/lab2.pdf", "11", "unlocked", "hidden"]]
+
+@responses.activate
+def test_edit_failure_is_reported_and_the_rest_edited(capsys, caplog):
+  serve_listing(responses)
+  responses.put(f"{API}/files/10", status=500)
+  responses.put(f"{API}/files/11", json=file_json(11, "lab2.pdf", 2))
+  run(files_edit_command, canvasapi_course(Canvas(SERVER, "token")),
+      file="^handouts/", folder=None, locked=False, hidden=None)
+  assert "Could not edit handouts/lab1.pdf" in caplog.text
+  rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+  assert [row[1] for row in rows] == ["handouts/lab2.pdf"]
 
 def test_edit_without_flags_is_an_error():
   with responses.RequestsMock() as rsps:
