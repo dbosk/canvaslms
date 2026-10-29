@@ -1972,14 +1972,36 @@ The order of the conjunction matters: [[outdated()]] must run even when we
 cannot refresh, because it has the side effect of resetting expired
 [[_all_fetched]] timestamps on the object's own child caches, which is what
 drives the periodic bulk refreshes.
+
+The refresh can find that the object no longer exists: a page deleted in
+Canvas's web interface since the listing was cached is still in the cache,
+and listed pages lack their [[body]], so they are always refreshed.
+Canvas answers with a 404, which [[canvasapi]] raises as
+[[ResourceDoesNotExist]].
+Letting it escape aborts the whole listing, and every later one, until the
+cache is cleared by hand (issue \#570).
+The answer Canvas gave is the one we need, though: the object is gone, so
+we drop it from the cache and leave it out of the listing.
+This is the opposite of what a submission does when its refresh fails
+(\cref{sec:missing-submission}), and for a reason: a submission of a
+student who left the course is still a row the results need, whereas an
+object deleted from a course has no place in that course's listing.
+Dropping entries while iterating over the dictionary is not allowed, so we
+iterate over a copy of its items.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
-for obj, obj_kwargs in attr_cache.values():
+for obj, obj_kwargs in list(attr_cache.values()):
   if outdated(obj) and get_attr is not None:
     obj_key = getattr(obj, cache_key)
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
     refresh_start = time.perf_counter()
-    obj = get_attr(self, obj_key, **obj_kwargs)
+    try:
+      obj = get_attr(self, obj_key, **obj_kwargs)
+    except canvasapi.exceptions.ResourceDoesNotExist:
+      logger.info(f"Dropped from cache: {attr_name} {cache_key}={obj_key} "
+                  f"no longer exists")
+      attr_cache.pop(obj_key, None)
+      continue
     refresh_elapsed = time.perf_counter() - refresh_start
     logger.info(f"Individual refresh: {attr_name} {cache_key}={obj_key} in "
                 f"{refresh_elapsed:.2f}s{reason_str}")
@@ -2029,6 +2051,41 @@ class TestPluralOnlyStaleObjects:
 
         assert len(result) == 1
         assert result[0] is obj
+@
+
+Let's also verify the case of issue \#570: an object deleted in Canvas
+since the listing was cached.
+Its individual refresh gets a 404, which [[canvasapi]] raises as
+[[ResourceDoesNotExist]]; the listing must go on without the object, and
+the cache must forget it, so that the next listing does not ask again.
+
+<<test functions>>=
+class TestDeletedCachedObjects:
+    """Test the cached path when a stale object no longer exists"""
+
+    def test_deleted_object_is_dropped_from_listing_and_cache(self):
+        """A 404 on refresh drops the object; the others are yielded"""
+        class TestClass:
+            def get_items(self, **kwargs):
+                return [canvas_object(Submission, id=1, grade="F"),
+                        canvas_object(Submission, id=2, grade="F")]
+            def get_item(self, item_id, **kwargs):
+                if item_id == 2:
+                    raise canvasapi.exceptions.ResourceDoesNotExist(
+                        "Not Found")
+                return canvas_object(Submission, id=item_id, grade="F")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        for key, (obj, kwargs) in list(instance.item_cache.items()):
+            obj._fetched_at = datetime.now() - timedelta(
+                minutes=SUBMISSION_TTL_MINUTES + 1)
+
+        result = list(instance.get_items())
+
+        assert [obj.id for obj in result] == [1]
+        assert list(instance.item_cache) == [1]
 @
 
 \subsubsection{Testing cache timing and logging}
