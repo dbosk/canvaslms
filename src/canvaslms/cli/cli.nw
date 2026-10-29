@@ -69,10 +69,14 @@ keeps global options global.
 """
 import pytest
 import argparse
+import importlib
+import importlib.util
 import json
 import logging
 import re
 import shlex
+import sys
+import textwrap
 
 import canvaslms.cli
 
@@ -1017,6 +1021,227 @@ class TestCommandsThatNeedNoCanvasObject:
         func = canvaslms.cli.courses.courses_command
 
         assert not (<<we don't need [[canvas]]>>)
+@
+
+\paragraph{The optional \texttt{fbf} command}
+
+The \texttt{fbf} command extracts detailed data from FeedbackFruits
+activities: discussions, progress and peer reviews.
+It lives in a package of its own, [[fbf]], which reaches FeedbackFruits by
+doing the Canvas LTI launch with the same token as this tool; its commands
+follow the [[(config, canvas, args)]] convention, so its [[add_command]]
+plugs into [[subp]] like the commands above.
+The package is optional, installed with the [[fbf]] extra
+([[pip install canvaslms[fbf]]]), and the command is shown only when it is
+installed: most users have no FeedbackFruits activities, and a command that
+can only answer \enquote{install something first} is noise in their help.
+
+Two things make it different from the other commands.
+First, we do not import it in [[<<modules>>]] at the top of this module, but
+when the subcommands are added, in [[main]].
+[[fbf]] imports [[canvaslms.cli]] and several of its command modules at its
+top; that works today even from [[<<modules>>]], as our own command modules
+show, but only as long as [[fbf]] reads nothing from [[canvaslms.cli]] while
+it loads, which is a promise another package should not have to keep.
+Importing it in [[main]], when this module is complete, removes the
+question, and it keeps [[import canvaslms.cli]], which the package API and
+other tools do, free of an optional plug-in and of its failures.
+
+Second, we must tell \enquote{not installed} from \enquote{installed but
+broken}.
+Only the first should go unnoticed; a broken installation hidden by a broad
+[[except ImportError]] would look exactly like a missing one, and the user
+would never learn why the command disappeared.
+So we ask the import system where [[fbf]] would come from, which imports
+nothing, and treat only \enquote{nowhere} as absent; once we know it is
+there, its import runs unguarded, and its errors reach the user.
+
+The name [[fbf]] is also taken on PyPI, by an unrelated program, a
+Brainfuck interpreter, which is a package too but has no [[cli]] module.
+Ours is a package with a [[cli]] module that has [[add_command]], so
+anything else answering to the name is not ours and adds no command.
+We look for [[fbf.cli]] in the package's directories with the path finder,
+rather than with [[find_spec("fbf.cli")]], because the latter imports the
+parent package to find its submodules: the unrelated package's code would
+then run on every [[canvaslms]] invocation, and a failure in it would break
+every command for a package that has nothing to do with us.
+(The two distributions install the same import package, so they cannot be
+installed side by side anyway.)
+<<modules>>=
+import importlib.machinery
+import importlib.util
+<<functions>>=
+def optional_fbf_cli():
+  """Return `fbf.cli` of the optional fbf package, or None if not installed.
+
+  An unrelated package named fbf also gives None. An installed fbf that
+  fails to import raises its error.
+  """
+  spec = importlib.util.find_spec("fbf")
+  if spec is None or spec.submodule_search_locations is None:
+    return None
+  if importlib.machinery.PathFinder.find_spec(
+      "fbf.cli", spec.submodule_search_locations) is None:
+    return None
+  import fbf.cli
+  if not hasattr(fbf.cli, "add_command"):
+    return None
+  return fbf.cli
+<<add subcommands to subp>>=
+fbf_cli = canvaslms.cli.optional_fbf_cli()
+if fbf_cli is not None:
+  fbf_cli.add_command(subp)
+@
+
+Two of the [[fbf]] subcommands only read a HAR file saved from a browser
+session, so they need no Canvas object, like [[login]] above.
+We cannot compare [[func]] with them here, since [[fbf]] wraps its commands
+(to turn its own errors into [[canvaslms.cli.err]]) and the import is
+optional; [[fbf]] answers the question itself through [[needs_canvas]].
+An [[fbf]] from before [[needs_canvas]] existed is still ours and has the
+command, so we ask only if it can answer, and otherwise give every [[fbf]]
+command a Canvas object; failing instead would break every command, since
+this question is asked for all of them.
+<<functions>>=
+def fbf_command_needs_canvas(func):
+  """False only for an fbf command that works without a Canvas object."""
+  fbf_cli = optional_fbf_cli()
+  if fbf_cli is None or not hasattr(fbf_cli, "needs_canvas"):
+    return True
+  return fbf_cli.needs_canvas(func)
+<<we don't need [[canvas]]>>=
+or not canvaslms.cli.fbf_command_needs_canvas(func)
+@
+
+Let's verify the four cases: no [[fbf]], our [[fbf]], an unrelated one and a
+broken one.
+The tests do not depend on [[fbf]] being installed: a small package of that
+name, written to a temporary directory put first on the path, stands in for
+it, with one command that needs Canvas and one that does not.
+A real [[fbf]] that an earlier test imported is taken out of
+[[sys.modules]] for the duration, or the import would return it instead of
+the stand-in.
+It is a real package imported by the real import system, so what is tested
+is the detection and the import, not a mock of them.
+For the absent case we hide [[fbf]] from [[find_spec]], since the
+development environment may well have it installed.
+
+<<test functions>>=
+class TestOptionalFbfCommand:
+    """Test the fbf command that the optional fbf package provides"""
+
+    <<optional fbf test helpers>>
+    <<optional fbf tests>>
+@
+
+<<optional fbf test helpers>>=
+@pytest.fixture
+def fbf_package(self, tmp_path, monkeypatch):
+    """Put a package named fbf on the path; yield a function writing it."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [name for name in sys.modules
+                 if name.split(".")[0] == "fbf"]:
+        monkeypatch.delitem(sys.modules, name)
+    def write(files):
+        for name, text in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(textwrap.dedent(text))
+        importlib.invalidate_caches()
+    yield write
+    for name in [name for name in sys.modules
+                 if name.split(".")[0] == "fbf"]:
+        del sys.modules[name]
+
+FAKE_FBF_CLI = '''
+def har_shape_command(config, canvas, args):
+    pass
+
+def discussions_command(config, canvas, args):
+    pass
+
+def add_command(subp):
+    parser = subp.add_parser("fbf", help="Detailed data from FeedbackFruits")
+    fbf_subp = parser.add_subparsers(dest="fbf_command", required=True)
+    har = fbf_subp.add_parser("har-shape", help="Shape of a HAR file")
+    har.add_argument("har")
+    har.set_defaults(func=har_shape_command)
+    fbf_subp.add_parser("discussions", help="Discussion data").set_defaults(
+        func=discussions_command)
+
+def needs_canvas(func):
+    return func is not har_shape_command
+'''
+
+def commands(self, parser):
+    """Return the names of the top-level commands of `parser`."""
+    subparsers = next(action for action in parser._actions
+                      if isinstance(action, argparse._SubParsersAction))
+    return set(subparsers.choices)
+
+def build(self):
+    """Build the full parser tree, the way main() does."""
+    return TestGlobalOptionsAreNotShadowed.build_parser(self)
+@
+
+<<optional fbf tests>>=
+def test_no_fbf_command_without_the_package(self, monkeypatch):
+    """Without fbf installed, there is no fbf command and no error"""
+    find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec",
+        lambda name, *rest: None if name.split(".")[0] == "fbf"
+                            else find_spec(name, *rest))
+    assert "fbf" not in self.commands(self.build())
+    assert "courses" in self.commands(self.build())
+
+def test_fbf_command_with_the_package(self, fbf_package, capsys):
+    """With fbf installed, canvaslms fbf --help lists its subcommands"""
+    fbf_package({"fbf/__init__.py": "", "fbf/cli.py": self.FAKE_FBF_CLI})
+    parser = self.build()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["fbf", "--help"])
+    help_text = capsys.readouterr().out
+    assert "har-shape" in help_text and "discussions" in help_text
+
+def test_fbf_har_shape_needs_no_canvas(self, fbf_package):
+    """An fbf command that reads only a local file gets no Canvas object"""
+    fbf_package({"fbf/__init__.py": "", "fbf/cli.py": self.FAKE_FBF_CLI})
+    args = self.build().parse_args(["fbf", "har-shape", "x.har"])
+    func = args.func
+    assert (<<we don't need [[canvas]]>>)
+    args = self.build().parse_args(["fbf", "discussions"])
+    func = args.func
+    assert not (<<we don't need [[canvas]]>>)
+
+@pytest.mark.parametrize("files", [
+    {"fbf/__init__.py": "raise RuntimeError('an unrelated fbf ran')\n",
+     "fbf/run.py": ""},
+    {"fbf.py": "# an unrelated program\n"},
+    {"fbf/__init__.py": "", "fbf/cli.py": "def main():\n    pass\n"},
+])
+def test_an_unrelated_fbf_is_ignored(self, fbf_package, files):
+    """Another fbf adds no command, and its code does not run"""
+    fbf_package(files)
+    assert "fbf" not in self.commands(self.build())
+
+def test_an_fbf_without_needs_canvas_breaks_no_command(self, fbf_package):
+    """An fbf predating needs_canvas gives its commands a Canvas object"""
+    old_cli = self.FAKE_FBF_CLI.split("def needs_canvas")[0]
+    fbf_package({"fbf/__init__.py": "", "fbf/cli.py": old_cli})
+    args = self.build().parse_args(["fbf", "har-shape", "x.har"])
+    func = args.func
+    assert not (<<we don't need [[canvas]]>>)
+    func = canvaslms.cli.login.login_command
+    assert (<<we don't need [[canvas]]>>)
+
+@pytest.mark.parametrize("broken", ["fbf/__init__.py", "fbf/cli.py"])
+def test_a_broken_fbf_package_is_reported(self, fbf_package, broken):
+    """An installed fbf that fails to import must not vanish silently"""
+    files = {"fbf/__init__.py": "", "fbf/cli.py": self.FAKE_FBF_CLI}
+    files[broken] = "import a_missing_dependency\n"
+    fbf_package(files)
+    with pytest.raises(ImportError):
+        self.build()
 @
 
 \subsubsection{The tutorials only name real commands}%
