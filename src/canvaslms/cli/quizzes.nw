@@ -43,6 +43,7 @@ import sys
 
 import pytest
 import requests
+import responses
 from unittest.mock import MagicMock, create_autospec
 
 from canvasapi.assignment import Assignment, AssignmentGroup
@@ -2939,9 +2940,28 @@ fetched} timestamp, which is exactly what the plural method treats as
 [[fetch_all_quizzes]] reads both and the caller cannot generally tell which
 system a title, an ID or a module placement will end up matching.
 
+Creating, editing and deleting a quiz change the course's assignment
+listing as well: a New Quiz \emph{is} an assignment, and a graded Classic
+quiz has one.  Creating such a quiz adds an assignment, deleting it removes
+one, and editing its title or dates edits the assignment, which Canvas
+keeps in step with the quiz.  The assignment listing is cached in the same
+way, a dictionary and a timestamp on the [[Course]], so after
+[[quizzes create]] a cached [[assignments list]] would not show the new
+quiz's assignment (issue \#568).
+
+For the assignments we reset only the timestamp, unlike for the quizzes,
+whose dictionaries we empty.  Each cached assignment carries the cache of
+its submissions, and a refetch of the listing hands those on from the old
+entries to the new ones (\cref{sec:cache-copy-to-new}); emptying the dictionary
+would leave nothing to hand on, and the next [[results]] would fetch every
+submission of the course again.  The price is that a refetch only adds and
+updates entries, it never drops one that Canvas no longer lists, so
+[[quizzes delete]] removes the deleted quiz's assignment itself
+(\cref{sec:quiz-delete-assignment}).
+
 The [[hasattr]] guards follow [[invalidate_module_items]] in
-[[canvaslms.cli.modules]].  The four attributes exist only on classes that
-[[make_course_quizzes_cacheable]] has wrapped, so on a plain [[canvasapi]]
+[[canvaslms.cli.modules]].  The attributes exist only on classes that
+the caching hacks have wrapped, so on a plain [[canvasapi]]
 [[Course]]---what a caller holds when the hacks were never installed---the
 helper must be a silent no-op rather than an [[AttributeError]] raised right
 after a successful write.
@@ -2950,8 +2970,9 @@ after a successful write.
 def invalidate_quiz_listing_cache(course):
   """Forget the cached quiz listing of `course` so the next access refetches.
 
-  Clears both the Classic and the New Quizzes listing; safe to call on a
-  course that was never wrapped for caching.
+  Clears both the Classic and the New Quizzes listing, and makes the
+  assignment listing refetch, keeping its entries' submission caches;
+  safe to call on a course that was never wrapped for caching.
   """
   if hasattr(course, 'quiz_cache'):
     course.quiz_cache.clear()
@@ -2961,11 +2982,14 @@ def invalidate_quiz_listing_cache(course):
     course.new_quiz_cache.clear()
   if hasattr(course, 'new_quiz_all_fetched'):
     course.new_quiz_all_fetched = None
+  if hasattr(course, 'assignment_all_fetched'):
+    course.assignment_all_fetched = None
 @
 
-Let us verify that a course whose listing has been fully fetched is returned
-to the never-fetched state, and that a course without the caching attributes
-survives the call.
+Let us verify that a course whose quiz listings have been fully fetched is
+returned to the never-fetched state, that its assignment listing will be
+refetched, and that a course without the caching attributes survives the
+call.
 
 <<test functions>>=
 def cached_course(course_id=1):
@@ -2975,6 +2999,8 @@ def cached_course(course_id=1):
   course.new_quiz_cache = {12: ("new quiz", {})}
   course.quiz_all_fetched = "some timestamp"
   course.new_quiz_all_fetched = "some timestamp"
+  course.assignment_cache = {13: ("assignment", {})}
+  course.assignment_all_fetched = "some timestamp"
   return course
 
 def test_invalidate_quiz_listing_clears_both_quiz_systems():
@@ -2986,6 +3012,54 @@ def test_invalidate_quiz_listing_clears_both_quiz_systems():
   assert course.new_quiz_cache == {}
   assert course.quiz_all_fetched is None
   assert course.new_quiz_all_fetched is None
+
+def test_invalidate_quiz_listing_refetches_the_assignment_listing():
+  course = cached_course()
+
+  quizzes.invalidate_quiz_listing_cache(course)
+
+  assert course.assignment_all_fetched is None
+@
+
+The fake attributes above show what is reset; whether that does the job
+shows only on a real course wrapped for caching.
+We answer its requests with [[responses]]: the course lists its assignments
+and one assignment's submissions, a quiz write invalidates, and the course
+lists them again.
+The new quiz's assignment must appear, and the submissions must still come
+from the cache.
+<<test functions>>=
+CACHE_API = "https://canvas.example.invalid/api/v1"
+
+def wrapped_course():
+  """A real course, wrapped for caching, whose requests go to responses."""
+  import canvasapi.course
+  from canvasapi import Canvas
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  return canvasapi.course.Course(canvas._Canvas__requester,
+                                 {"id": 1, "course_code": "SBX101"})
+
+@responses.activate
+def test_quiz_write_shows_new_assignments_and_keeps_submissions():
+  listing = responses.get(f"{CACHE_API}/courses/1/assignments",
+                          json=[{"id": 7, "name": "Lab", "course_id": 1}])
+  submissions = responses.get(
+    f"{CACHE_API}/courses/1/assignments/7/submissions",
+    json=[{"id": 1, "user_id": 5, "assignment_id": 7, "grade": "A",
+           "workflow_state": "graded"}])
+  course = wrapped_course()
+  lab = next(iter(course.get_assignments()))
+  [submission.grade for submission in lab.get_submissions()]
+  responses.replace(responses.GET, f"{CACHE_API}/courses/1/assignments",
+                    json=[{"id": 7, "name": "Lab", "course_id": 1},
+                          {"id": 8, "name": "Quiz", "course_id": 1}])
+
+  quizzes.invalidate_quiz_listing_cache(course)
+
+  assignments = list(course.get_assignments())
+  assert [a.id for a in assignments] == [7, 8]
+  [submission.grade for submission in assignments[0].get_submissions()]
+  assert submissions.call_count == 1
 
 def test_invalidate_quiz_listing_ignores_uncached_course():
   quizzes.invalidate_quiz_listing_cache(object())
@@ -3679,6 +3753,7 @@ def test_create_command_invalidates_the_course_quiz_listing(monkeypatch):
   assert course.new_quiz_cache == {}
   assert course.quiz_all_fetched is None
   assert course.new_quiz_all_fetched is None
+  assert course.assignment_all_fetched is None
 @
 
 The claim to check about the shared reader is that formats [[create]] could
@@ -7840,10 +7915,52 @@ def delete_command(config, canvas, args):
     result = delete_classic_quiz(quiz)
 
   if result:
+    forget_quiz_assignment(quiz.course, quiz)
     invalidate_quiz_listing_cache(quiz.course)
     print(f"Deleted quiz: {quiz.title}")
   else:
     canvaslms.cli.err(1, "Failed to delete quiz")
+@
+
+\subsection{Forgetting a deleted quiz's assignment}
+\label{sec:quiz-delete-assignment}
+
+Deleting a quiz deletes its assignment too, and the refetch that
+[[invalidate_quiz_listing_cache]] arranges does not drop it from the cached
+listing, so we drop it here.
+A New Quiz is its assignment and has the same id; a Classic quiz names its
+assignment in [[assignment_id]], which a practice quiz or a survey without
+points does not have.
+<<functions>>=
+def forget_quiz_assignment(course, quiz):
+  """Drop the assignment of the deleted `quiz` from the cache of `course`."""
+  if not hasattr(course, 'assignment_cache'):
+    return
+  if is_new_quiz(quiz):
+    assignment_id = int(quiz.id)
+  else:
+    assignment_id = getattr(quiz, 'assignment_id', None)
+  course.assignment_cache.pop(assignment_id, None)
+@
+
+Let's verify that after a New Quiz is deleted, the next cached listing no
+longer has its assignment, while the other assignment keeps its place.
+<<test functions>>=
+@responses.activate
+def test_deleted_quiz_assignment_leaves_the_cached_listing():
+  responses.get(f"{CACHE_API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1},
+                      {"id": 8, "name": "Quiz", "course_id": 1}])
+  course = wrapped_course()
+  assert [a.id for a in course.get_assignments()] == [7, 8]
+  responses.replace(responses.GET, f"{CACHE_API}/courses/1/assignments",
+                    json=[{"id": 7, "name": "Lab", "course_id": 1}])
+  quiz = NewQuiz(MagicMock(), {"id": "8", "title": "Quiz", "course_id": 1})
+
+  quizzes.forget_quiz_assignment(course, quiz)
+  quizzes.invalidate_quiz_listing_cache(course)
+
+  assert [a.id for a in course.get_assignments()] == [7]
 @
 
 
@@ -10110,17 +10227,35 @@ for the reasons given in \cref{sec:quiz-listing-invalidation}.  It also
 changes the course's assignments: a New Quiz \emph{is} an assignment, and a
 graded Classic quiz has one.  So we forget both listings, and we do it
 whether the import succeeded or not, since a failed import may still have
-created a quiz.  The assignment cache follows the same pattern as the quiz
-cache, a dictionary and a timestamp of the last complete fetch, and the same
-[[hasattr]] guards make the function safe on a course that was never
-wrapped for caching.
+created a quiz.  Unlike [[invalidate_quiz_listing_cache]], which only makes
+the assignment listing refetch (\cref{sec:quiz-listing-invalidation}), we
+empty it: the import deletes quizzes we do not track one by one, and a
+refetch would not drop their assignments.  The cost is the course's cached
+submissions, which an import is rare enough to bear.
 <<functions>>=
 def forget_qti_import_listings(course):
   """Forgets the cached quiz and assignment listings of `course`"""
   invalidate_quiz_listing_cache(course)
   if hasattr(course, 'assignment_cache'):
     course.assignment_cache.clear()
-    course.assignment_all_fetched = None
+@
+
+Let's verify that an assignment the import deleted leaves the cached
+listing, which the refetch alone would not do.
+<<test functions>>=
+@responses.activate
+def test_qti_import_drops_assignments_canvas_no_longer_lists():
+  responses.get(f"{CACHE_API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1},
+                      {"id": 9, "name": "Staging", "course_id": 1}])
+  course = wrapped_course()
+  assert [a.id for a in course.get_assignments()] == [7, 9]
+  responses.replace(responses.GET, f"{CACHE_API}/courses/1/assignments",
+                    json=[{"id": 7, "name": "Lab", "course_id": 1}])
+
+  quizzes.forget_qti_import_listings(course)
+
+  assert [a.id for a in course.get_assignments()] == [7]
 @
 
 \subsection{The [[quizzes import-status]] subcommand}

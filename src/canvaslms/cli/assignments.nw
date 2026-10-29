@@ -83,6 +83,9 @@ import pytest
 import requests
 from unittest.mock import MagicMock, Mock, patch
 
+import canvasapi.course
+import responses
+from canvasapi import Canvas
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.course import Course
 from canvasapi.grading_standard import GradingStandard
@@ -2035,6 +2038,7 @@ for assignment in assignment_list:
 @
 
 \subsection{Updating the cache after editing}
+\label{sec:assignment-cache-after-edit}
 
 After successfully editing an assignment, we must update the cache entry to
 prevent unnecessary re-fetches.
@@ -2232,11 +2236,27 @@ except ValueError as e:
 try:
   new_assignment = course.create_assignment(assignment=create_params)
   new_assignment.course = course
+  <<add the new assignment to the assignment cache>>
   logger.info(f"Created assignment: {new_assignment.name} "
     f"(id: {new_assignment.id})")
   <<update new assignment module membership>>
 except Exception as e:
   canvaslms.cli.err(1, f"Error creating assignment: {e}")
+@
+
+The course's assignment listing is cached across runs, and once it has
+been fetched in full the cache answers the next listing without asking
+Canvas, so an assignment created here would be missing from it: the next
+command reports that it does not exist, and a script that creates it when
+missing creates it twice (issue \#568).
+Canvas answers the create with the complete assignment, so we add it to the
+cache, as the edit path does for an edited assignment
+(\cref{sec:assignment-cache-after-edit}), instead of forgetting the
+listing.
+<<add the new assignment to the assignment cache>>=
+new_assignment._fetched_at = datetime.now()
+if hasattr(course, 'assignment_cache'):
+  course.assignment_cache[new_assignment.id] = (new_assignment, {})
 @
 
 For newly created assignments, we also process module membership if specified.
@@ -2246,6 +2266,48 @@ if 'modules' in attributes:
   added, removed, moved, required = modules.update_item_modules(
       new_assignment.course, 'Assignment', new_assignment.id, module_specs)
   modules.print_module_changes(added, removed, moved, required)
+@
+
+Let's verify that an assignment created here is listed by the next command
+that uses the cache (issue \#568).
+The course is a real [[canvasapi]] course, wrapped for caching as in a run,
+whose requests are answered by [[responses]]: it lists its assignments once,
+which makes the listing complete in the cache, the file creates an
+assignment, and the course lists its assignments again without asking
+Canvas.
+<<test functions>>=
+def assignment_json(assignment_id, name):
+  """Return an assignment as the listing sends it, with the fields we read."""
+  return {"id": assignment_id, "name": name, "course_id": 1,
+          "description": "", "published": False, "due_at": None,
+          "unlock_at": None, "lock_at": None, "points_possible": 0,
+          "assignment_group_id": 1, "submission_types": ["none"],
+          "grading_type": "points", "position": assignment_id,
+          "html_url": f"https://canvas.example.invalid/courses/1/"
+                      f"assignments/{assignment_id}"}
+
+@responses.activate
+def test_created_assignment_is_in_the_cached_listing(tmp_path):
+  api = "https://canvas.example.invalid/api/v1"
+  listing = responses.get(f"{api}/courses/1/assignments",
+                          json=[assignment_json(7, "Lab")])
+  responses.post(f"{api}/courses/1/assignments",
+                 json=assignment_json(8, "New lab"))
+  course = canvasapi.course.Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101"})
+  assert [a.id for a in course.get_assignments()] == [7]
+  path = tmp_path / "new-lab.md"
+  path.write_text("---\nname: New lab\n---\n\nBody\n")
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "SBX101", "-f",
+                            str(path), "--create", "--no-link-translation"])
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]):
+    assignments_edit_command({}, MagicMock(), args)
+  assert sorted(a.id for a in course.get_assignments()) == [7, 8]
+  assert listing.call_count == 1
 @
 
 \subsubsection{Filter-based assignment matching}
