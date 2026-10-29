@@ -56,6 +56,25 @@ def add_command(subp):
   <<add pages edit subcommand>>
 @
 
+Tests run against a real [[canvasapi]] course, wrapped for caching by
+[[canvaslms.hacks.canvasapi]] as in a real run, whose HTTP requests are
+answered by [[responses]]; only the course selection is patched, since it
+would otherwise need the user's course listing answered too.
+<<test [[pages.py]]>>=
+"""Tests for the pages command."""
+import argparse
+from unittest.mock import patch
+
+import canvasapi.course
+import responses
+from canvasapi import Canvas
+
+import canvaslms.hacks.canvasapi
+from canvaslms.cli.pages import *
+
+<<test functions>>
+@
+
 
 \section{Common options for page selection}
 
@@ -619,11 +638,27 @@ if 'editing_roles' in attributes and attributes['editing_roles']:
 try:
   new_page = course.create_page(wiki_page=create_params)
   new_page.course = course
+  <<add the new page to the page cache>>
   logger.info(
       f"Created page: {new_page.title} (url: {new_page.url})")
   <<update new page module membership>>
 except Exception as e:
   canvaslms.cli.err(1, f"Error creating page: {e}")
+@
+
+The course's page listing is cached across runs, and once it has been
+fetched in full the cache answers the next listing without asking Canvas.
+A page created here is not in that listing, so the next command would not
+see it: [[pages list]] says it does not exist, and a script that creates a
+page when it is missing creates it a second time (issue \#568).
+We add the new page to the cache, as the edit path above does for an edited
+page, rather than forgetting the whole listing: Canvas's answer to the
+create is the complete page, so the cache can be correct without another
+request.
+<<add the new page to the page cache>>=
+new_page._fetched_at = datetime.now()
+if hasattr(course, 'page_cache'):
+  course.page_cache[new_page.url] = (new_page, {})
 @
 
 For newly created pages, we also process module membership if specified.
@@ -633,6 +668,50 @@ if 'modules' in attributes:
   added, removed, moved, required = canvaslms.cli.modules.update_item_modules(
       new_page.course, 'Page', new_page.url, module_specs)
   canvaslms.cli.modules.print_module_changes(added, removed, moved, required)
+@
+
+Let's verify that a page created here is listed by the next command that
+uses the cache (issue \#568).
+The course lists its pages once, which makes the listing complete in the
+cache, then the file creates a page, and the course lists its pages again
+without asking Canvas for the listing.
+A listed page has no body, so the cache fetches it on its own when it
+replays the listing; the fake answers that request too.
+<<test functions>>=
+SERVER = "https://canvas.example.invalid"
+API = f"{SERVER}/api/v1"
+
+def page_json(url, title):
+  """Return a page as the page listing sends it (fields from the sandbox)."""
+  return {"url": url, "title": title, "page_id": len(url), "course_id": 1,
+          "created_at": "2026-10-29T12:00:00Z",
+          "updated_at": "2026-10-29T12:00:00Z", "publish_at": None,
+          "published": False, "front_page": False,
+          "hide_from_students": False, "locked_for_user": False,
+          "editing_roles": "teachers", "last_edited_by": {},
+          "html_url": f"{SERVER}/courses/1/pages/{url}"}
+
+@responses.activate
+def test_created_page_is_in_the_cached_listing(tmp_path):
+  listing = responses.get(f"{API}/courses/1/pages",
+                          json=[page_json("old", "Old page")])
+  responses.post(f"{API}/courses/1/pages",
+                 json={**page_json("new-page", "New page"), "body": "<p>x</p>"})
+  responses.get(f"{API}/courses/1/pages/old",
+                json={**page_json("old", "Old page"), "body": "<p>old</p>"})
+  course = canvasapi.course.Course(Canvas(SERVER, "token")._Canvas__requester,
+                                   {"id": 1, "course_code": "SBX101"})
+  assert [page.url for page in course.get_pages()] == ["old"]
+  page_file = tmp_path / "page.md"
+  page_file.write_text("---\ntitle: New page\n---\nx\n")
+  args = argparse.Namespace(file=str(page_file), create=True, html=False,
+                            page=".*", module="", no_link_translation=True,
+                            allow_unresolved_links=False)
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    pages_edit_command({}, None, args)
+  assert sorted(page.url for page in course.get_pages()) == ["new-page", "old"]
+  assert listing.call_count == 1
 @
 
 \subsubsection{Title-based page identification}
