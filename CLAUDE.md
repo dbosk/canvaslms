@@ -949,6 +949,10 @@ When in doubt, bump. Do not write lazy migration shims for old cache layouts.
 
 ### Optional
 - `canvaslms[llm]` - AI summaries for quiz analysis (Python 3.10+)
+- `canvaslms[fbf]` - FeedbackFruits data (PyPI `FeedbackFruits`, import
+  package `fbf`, repo github.com/dbosk/fbf). `cli.nw` adds its `fbf` command
+  lazily in `main()` (fbf imports `canvaslms.cli`), only when installed; test
+  with a stand-in package, not by installing it
 - `pandoc` - System package required by some subcommands
 
 ## Testing and Development

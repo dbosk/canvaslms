@@ -155,6 +155,12 @@ pipx install canvaslms[llm] # recommended
 
 The `[llm]` extra includes the `llm` package and various LLM provider plugins (OpenAI, Anthropic, Gemini, Azure) for AI-powered features like quiz analysis summaries.
 
+The `[fbf]` extra installs [FeedbackFruits](https://github.com/dbosk/fbf), which adds the `canvaslms fbf` command for detailed FeedbackFruits data (peer reviews, grade breakdowns, discussions), fetched through the Canvas LTI launch with your canvaslms login:
+```bash
+pipx install canvaslms[fbf]
+```
+The `fbf` command appears only when the package is installed.
+
 The Python API uses the same credential sources as the command-line tool:
 system keyring, `CANVAS_SERVER`/`CANVAS_TOKEN`, or the config file.
 
