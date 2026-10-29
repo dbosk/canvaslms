@@ -159,7 +159,7 @@ The `[fbf]` extra installs [FeedbackFruits](https://github.com/dbosk/fbf), which
 ```bash
 pipx install canvaslms[fbf]
 ```
-The `fbf` command appears only when the package is installed.
+The `fbf` command appears only when the package is installed. FeedbackFruits cannot be installed together with the unrelated `fbf` package on PyPI, since both provide the import name `fbf`.
 
 The Python API uses the same credential sources as the command-line tool:
 system keyring, `CANVAS_SERVER`/`CANVAS_TOKEN`, or the config file.
