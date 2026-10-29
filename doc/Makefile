@@ -43,6 +43,7 @@ canvaslms.pdf: ${SRC_DIR}/cli/assignments.tex
 canvaslms.pdf: ${SRC_DIR}/cli/submissions.tex
 canvaslms.pdf: ${SRC_DIR}/cli/modules.tex
 canvaslms.pdf: ${SRC_DIR}/cli/pages.tex
+canvaslms.pdf: ${SRC_DIR}/cli/files.tex
 canvaslms.pdf: ${SRC_DIR}/cli/syllabus.tex
 canvaslms.pdf: ${SRC_DIR}/cli/grade.tex
 canvaslms.pdf: ${SRC_DIR}/cli/results.tex

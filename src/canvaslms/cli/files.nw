@@ -1,0 +1,731 @@
+\chapter{The [[files]] command}
+\label{sec:files}
+\chapterprecis{Written by Claude under supervision of Daniel Bosk.}
+
+A course is more than its pages, assignments and modules: it also has
+files, the lecture slides, lab handouts and data sets that pages link to
+and modules list.
+Without a command for them, publishing a handout meant going to the Canvas
+API directly, to upload the file into a folder (creating the folder the
+first time), to replace it with a new version, to lock or hide it for a
+while, and to put it into a module.
+Going around this tool also goes around its cache: a module item for a
+file created through [[canvasapi]] directly was not seen by the cached
+module items, so an \enquote{is it there already?} check passed twice and
+the module got the item twice.
+
+This chapter adds the [[files]] command with three subcommands, in the
+style of [[pages]] and [[assignments]]:
+\begin{minted}{bash}
+canvaslms files list   -c sbx26 --folder "^handouts$"
+canvaslms files upload -c sbx26 --folder handouts lab1.pdf lab2.pdf
+canvaslms files edit   -c sbx26 -f "^handouts/lab2.pdf$" --lock
+\end{minted}
+The fourth task, putting a file into a module, is a new kind of item for
+[[modules add-item]] (\cref{sec:modules-add-item}):
+\begin{minted}{bash}
+canvaslms modules add-item -c sbx26 "^Week 1$" -t file \
+  --content "^handouts/lab1.pdf$" --publish
+\end{minted}
+
+The last piece is linking to a file from a page kept as Markdown, so that
+the link survives being pushed into next year's course instance.
+The course-link translation of \cref{sec:course-links} already has a
+notation for that, the path of the file below the course files root behind
+Canvas's own export placeholder:
+\begin{minted}{markdown}
+See the [lab handout]($IMS-CC-FILEBASE$/handouts/lab1.pdf?canvas_download=1&wrap=1).
+\end{minted}
+[[pages edit]] resolves it against the course it pushes into, and stops
+the push if the course has no such file.
+What was missing is a way to find out what to write, so both [[files list]]
+and [[files upload]] print that link for every file.
+
+
+\section{Module outline}
+
+The module has the shape of the other content commands: functions, then
+[[add_command]] wiring up one parser per subcommand.
+It depends on [[links]] for the file paths and link symbols, so that this
+command and the link translation can never disagree about what a file is
+called; [[links]] depends on nothing here, so there is no cycle.
+<<[[files.py]]>>=
+"""The files command: list, upload and edit course files."""
+
+import csv
+import os
+import re
+import sys
+
+import canvaslms.cli
+import canvaslms.cli.courses
+import canvaslms.cli.links
+import canvaslms.cli.utils
+
+<<constants>>
+<<functions>>
+
+def add_command(subp):
+  """Adds the files command with subcommands to argparse parser"""
+  files_parser = subp.add_parser("files",
+    help="Manage course files",
+    description="Manage files in Canvas courses: list, upload and edit "
+                "(lock or hide) them.")
+  files_subp = files_parser.add_subparsers(
+    title="files commands",
+    dest="files_command",
+    required=True)
+
+  <<add files list subcommand>>
+  <<add files upload subcommand>>
+  <<add files edit subcommand>>
+@
+
+Tests run against a real [[canvasapi]] course whose HTTP requests are
+answered by [[responses]]: the canvasapi code that lists, uploads and
+updates files runs for real, and only the server is replaced.
+The bodies have the fields Canvas sent for a file and a folder in the
+sandbox course (recorded 2026-10-29); the values are synthetic, because a
+real file [[url]] carries a [[verifier]], which is an access token.
+Only the course selection is patched: it lists the user's courses, and
+every command test would otherwise need that listing answered too.
+<<test [[files.py]]>>=
+"""Tests for the files command."""
+import argparse
+import urllib.parse
+from unittest.mock import patch
+
+import pytest
+import responses
+from canvasapi import Canvas
+from canvasapi.course import Course
+
+import canvaslms.cli
+import canvaslms.cli.links
+from canvaslms.cli.files import *
+
+<<test helpers>>
+<<test functions>>
+@
+
+The fake server knows a course with a root folder, a [[handouts]] folder
+with a subfolder, and a folder whose name needs encoding in a link.
+<<test helpers>>=
+SERVER = "https://canvas.example.invalid"
+API = f"{SERVER}/api/v1"
+
+def folder_json(folder_id, full_name, parent_id=None):
+  """Return a folder as Canvas sends it."""
+  return {"id": folder_id, "full_name": full_name,
+          "name": full_name.split("/")[-1], "parent_folder_id": parent_id,
+          "context_id": 1, "context_type": "Course", "files_count": 0,
+          "folders_count": 0, "position": 1, "locked": False,
+          "hidden": None, "hidden_for_user": False, "locked_for_user": False,
+          "lock_at": None, "unlock_at": None, "for_submissions": False,
+          "can_upload": True, "created_at": "2026-10-29T12:00:00Z",
+          "updated_at": "2026-10-29T12:00:00Z",
+          "files_url": f"{API}/folders/{folder_id}/files",
+          "folders_url": f"{API}/folders/{folder_id}/folders",
+          "all_url": f"{API}/folders/{folder_id}/all"}
+
+def file_json(file_id, display_name, folder_id, locked=False, hidden=False):
+  """Return a file as Canvas sends it, with a synthetic url."""
+  return {"id": file_id, "display_name": display_name,
+          "filename": display_name.replace(" ", "+"), "folder_id": folder_id,
+          "locked": locked, "hidden": hidden, "locked_for_user": False,
+          "hidden_for_user": False, "lock_at": None, "unlock_at": None,
+          "size": 10, "content-type": "application/pdf",
+          "mime_class": "pdf", "category": "uncategorized",
+          "upload_status": "success", "visibility_level": "inherit",
+          "media_entry_id": None, "thumbnail_url": None,
+          "created_at": "2026-10-29T12:00:00Z",
+          "updated_at": "2026-10-29T12:00:00Z",
+          "modified_at": "2026-10-29T12:00:00Z",
+          "url": f"{SERVER}/files/{file_id}/download?verifier=SYNTHETIC"}
+
+FOLDERS = [folder_json(1, "course files"),
+           folder_json(2, "course files/handouts", 1),
+           folder_json(3, "course files/old slides", 1),
+           folder_json(4, "course files/handouts/week1", 2)]
+FILES = [file_json(10, "lab1.pdf", 2),
+         file_json(11, "lab2.pdf", 2, locked=True),
+         file_json(12, "intro a.pdf", 3, hidden=True),
+         file_json(13, "syllabus.pdf", 1)]
+
+def canvasapi_course(canvas):
+  """Return course 1 of `canvas`, as the course listing would."""
+  return Course(canvas._Canvas__requester,
+                {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+
+def serve_listing(rsps, files=FILES, folders=FOLDERS):
+  """Answer the course's folder and file listings."""
+  rsps.get(f"{API}/courses/1/folders", json=folders)
+  rsps.get(f"{API}/courses/1/files", json=files)
+
+def run(command, course, **options):
+  """Run a files subcommand with `options` on `course` as the selection."""
+  args = argparse.Namespace(delimiter="\t", **options)
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    command({}, None, args)
+@
+
+
+\section{Naming a file: its path below the course files root}
+
+A file needs a name that a user can type and a regex can match.
+Its display name is not enough: two folders can each hold a
+[[lab1.pdf]], and a course that keeps last year's slides in an archive
+folder has many such pairs.
+The id is unique but means nothing to a reader and changes when a file is
+replaced (\cref{sec:files-upload}).
+We use the path below the course files root, [[handouts/lab1.pdf]]: it is
+unique within the course, it is what a user sees when browsing Files, and
+it is how the link translation names a file (\cref{sec:course-links}), so
+the name in a [[files]] command and the name in a link are the same.
+
+Canvas lists a course's files and folders in two flat listings, each
+paginated, and a file knows only the id of its folder.
+Two listings and a dictionary from folder id to path therefore name every
+file, where asking for each file's folder would cost one request per file.
+The path of a folder comes from [[links.folder_path]], which strips the
+[[course files]] prefix that every folder's full name starts with.
+We keep the path, and the course for the output, on the file object.
+<<functions>>=
+def list_course_files(course):
+  """Return the files of `course`, each with its `path` and `course` set.
+
+  The path is the folder path below the course files root followed by
+  the display name, e.g. `handouts/lab1.pdf`.
+  """
+  folders = {folder.id: canvaslms.cli.links.folder_path(folder)
+             for folder in course.get_folders()}
+  files = []
+  for file in course.get_files():
+    file = canvaslms.cli.utils.ensure_file_attrs(file)
+    file.course = course
+    file.path = join_path(folders.get(file.folder_id, ""),
+                          file.display_name)
+    files.append(file)
+  return files
+
+def join_path(folder, name):
+  """Return the path of `name` in the folder at path `folder`."""
+  return f"{folder}/{name}" if folder else name
+@
+
+A file is selected by a regex on its path or its id, the way modules and
+pages are selected by name or id.
+Matching the path rather than the display name lets one regex select a
+whole folder ([[^handouts/]]) as well as one file in it.
+The [[--folder]] regex narrows by folder alone, which matters when the
+folder name also occurs in file names; both must match when both are given.
+<<functions>>=
+def filter_files(course, regex=".*", folder_regex=None):
+  """Return the files of `course` whose path or id matches `regex`.
+
+  With `folder_regex`, the file's folder path must match it too.
+  """
+  pattern = re.compile(regex)
+  folder_pattern = re.compile(folder_regex) if folder_regex else None
+  result = []
+  for file in list_course_files(course):
+    if not (pattern.search(file.path) or pattern.search(str(file.id))):
+      continue
+    folder = file.path.rpartition("/")[0]
+    if folder_pattern and not folder_pattern.search(folder):
+      continue
+    result.append(file)
+  return result
+@
+
+Let's verify that every file gets its path, root files included, and that
+the two regexes select as described.
+<<test functions>>=
+@responses.activate
+def test_list_course_files_names_files_by_path():
+  serve_listing(responses)
+  paths = [f.path for f in list_course_files(canvasapi_course(
+      Canvas(SERVER, "token")))]
+  assert paths == ["handouts/lab1.pdf", "handouts/lab2.pdf",
+                   "old slides/intro a.pdf", "syllabus.pdf"]
+
+@responses.activate
+def test_filter_files_by_path_id_and_folder():
+  serve_listing(responses)
+  course = canvasapi_course(Canvas(SERVER, "token"))
+  assert [f.id for f in filter_files(course, "^handouts/")] == [10, 11]
+  assert [f.id for f in filter_files(course, "^12$")] == [12]
+  assert [f.id for f in filter_files(course, "pdf$", "^$")] == [13]
+  assert [f.id for f in filter_files(course, "lab", "^old")] == []
+@
+
+
+\section{The link to paste into a page}
+\label{sec:files-link}
+
+Every file the command prints comes with the link a Markdown page should
+use for it.
+The link is built by [[links.file_symbol]], the same function that turns a
+file link into a symbol when a page is pulled out of Canvas, so it is
+exactly what [[pages edit]] resolves on the way back in.
+It names the file by path, not id, and so it stays valid when the file is
+replaced and when the page is pushed into another course that has the same
+file at the same path.
+We append [[?canvas_download=1&wrap=1]], the form Canvas's own editor
+writes for a link to a file: it resolves to [[/files/<id>/download?wrap=1]],
+which shows the file wrapped in the course navigation.
+
+A row has the course, the path, the id, the two flags [[files edit]]
+changes, and the link.
+The id is there for scripts that need the numeric form; the flags are
+spelled as words, as [[pages list]] spells [[published]] and
+[[unpublished]], so that the output reads without a legend.
+<<constants>>=
+LINK_QUERY = "?canvas_download=1&wrap=1"
+<<functions>>=
+def file_link(file):
+  """Return the symbolic link a page should use for `file`."""
+  folder, _, name = file.path.rpartition("/")
+  return canvaslms.cli.links.file_symbol(folder, name) + LINK_QUERY
+
+def file_row(file):
+  """Return the output row for `file`."""
+  return [file.course.course_code, file.path, file.id,
+          "locked" if file.locked else "unlocked",
+          "hidden" if file.hidden else "visible",
+          file_link(file)]
+@
+
+The promise of this section is that what we print resolves to the file it
+was printed for.
+Let's verify it with the link translation itself: the links of the
+[[handouts]] file and of the file in a folder with a space are resolved
+against the fake course, which answers the folder-path lookup that
+resolution makes.
+<<test functions>>=
+@responses.activate
+def test_file_link_resolves_to_the_file():
+  serve_listing(responses)
+  course = canvasapi_course(Canvas(SERVER, "token"))
+  for file in filter_files(course, "lab1|intro"):
+    folder = file.path.rpartition("/")[0]
+    chain = [f for f in FOLDERS if f["full_name"] == "course files"] \
+      + [f for f in FOLDERS if f["full_name"] == f"course files/{folder}"]
+    responses.get(f"{API}/courses/1/folders/by_path/"
+                  + urllib.parse.quote(folder), json=chain)
+    responses.get(f"{API}/folders/{chain[-1]['id']}/files",
+                  json=[f for f in FILES if f["folder_id"] == chain[-1]["id"]])
+    html = f'<a href="{file_link(file)}">x</a>'
+    resolved, problems = canvaslms.cli.links.resolve_links(html, course)
+    assert problems == []
+    assert f'href="/courses/1/files/{file.id}/download?wrap=1"' in resolved
+
+def test_file_link_encodes_the_path():
+  file = argparse.Namespace(path="old slides/intro a.pdf")
+  assert file_link(file) == ("$IMS-CC-FILEBASE$/old%20slides/intro%20a.pdf"
+                             "?canvas_download=1&wrap=1")
+  file = argparse.Namespace(path="syllabus.pdf")
+  assert file_link(file).startswith("$IMS-CC-FILEBASE$/syllabus.pdf?")
+@
+
+
+\section{The [[files list]] subcommand}
+
+[[files list]] prints one row per file, tab-separated like the other list
+commands, and a selection that matches nothing is an empty-list error.
+<<add files list subcommand>>=
+list_parser = files_subp.add_parser("list",
+  help="List files in a course",
+  description="Lists the files of courses. Output: <course> <path> <id> "
+              "<locked|unlocked> <hidden|visible> <link>, where <link> is "
+              "the course-independent link to use in a page's Markdown.")
+list_parser.set_defaults(func=files_list_command)
+add_file_options(list_parser)
+@
+
+The selection options are shared with [[files edit]].
+<<functions>>=
+def add_file_options(parser, required=False):
+  """Add the course and file selection options to `parser`."""
+  canvaslms.cli.courses.add_course_option(parser, required=required)
+  parser.add_argument("-f", "--file", default=".*", required=required,
+    help="Regex matching the file's path below the course files root "
+         "(e.g. handouts/lab1.pdf) or its Canvas ID, default: '.*'")
+  parser.add_argument("--folder", metavar="REGEX",
+    help="Regex matching the path of the file's folder; the root folder's "
+         "path is the empty string")
+
+def process_file_option(canvas, args):
+  """Return the files of the selected courses that match the options."""
+  files = []
+  for course in canvaslms.cli.courses.process_course_option(canvas, args):
+    files.extend(filter_files(course, args.file, args.folder))
+  if not files:
+    raise canvaslms.cli.EmptyListError("No files found matching the criteria")
+  return files
+
+def files_list_command(config, canvas, args):
+  """List the files of courses."""
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  for file in process_file_option(canvas, args):
+    output.writerow(file_row(file))
+@
+
+Let's verify the output format and the empty-list error.
+<<test functions>>=
+@responses.activate
+def test_files_list_prints_rows(capsys):
+  serve_listing(responses)
+  run(files_list_command, canvasapi_course(Canvas(SERVER, "token")),
+      file="^handouts/", folder=None)
+  rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+  assert rows == [
+    ["SBX101", "handouts/lab1.pdf", "10", "unlocked", "visible",
+     "$IMS-CC-FILEBASE$/handouts/lab1.pdf?canvas_download=1&wrap=1"],
+    ["SBX101", "handouts/lab2.pdf", "11", "locked", "visible",
+     "$IMS-CC-FILEBASE$/handouts/lab2.pdf?canvas_download=1&wrap=1"]]
+
+@responses.activate
+def test_files_list_without_match_is_an_empty_list():
+  serve_listing(responses)
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    run(files_list_command, canvasapi_course(Canvas(SERVER, "token")),
+        file="nothing", folder=None)
+@
+
+
+\section{The [[files upload]] subcommand}
+\label{sec:files-upload}
+
+[[files upload]] puts local files into a folder of the course, given as a
+path below the course files root:
+\begin{minted}{bash}
+canvaslms files upload -c sbx26 --folder handouts/week1 lab1.pdf lab2.pdf
+\end{minted}
+Canvas creates the folder, and any folder above it, when it does not
+exist, so the first upload into a folder needs no separate step.
+The folder is required: without one, Canvas puts a course upload into a
+folder called [[unfiled]], which is rarely what anyone wants; [[/]] names
+the root itself.
+
+\subsection{Replacing a file}
+
+Uploading a file whose name is taken in the folder replaces the old file
+by default, which is also Canvas's default.
+Replacing is what a course needs when a handout is corrected: in the
+sandbox course (2026-10-29), the replacement got a new id, yet a module
+item pointing at the old file pointed at the new one afterwards, the
+replacement kept the old file's locked and hidden flags, and the old file
+disappeared from the course's file listing.
+Links in pages moved too: a page pushed with the file's symbolic link,
+which resolved to the old id, linked to the new id after the replacement.
+So replacing breaks no reference and changes nothing the students see
+except the content.
+[[--rename]] keeps the old file instead, and Canvas gives the new one a
+free name ([[lab1-1.pdf]]).
+
+\subsection{Locking and hiding on upload}
+
+A new file is visible to students as soon as it is uploaded, the way
+Canvas's own upload works.
+This differs from [[modules add-item]], whose new items are unpublished
+(\cref{sec:modules-add-item}), and the difference is deliberate: a module
+item is a step in the students' path that the author should read in place
+first, while a file is usually uploaded to be linked from somewhere, and a
+locked file behind a published link is a broken link to the students.
+[[--lock]] and [[--hidden]] set the flags right after the upload, since
+Canvas's upload request does not take them; a replaced file keeps its
+flags anyway, so they matter for new files.
+
+Every uploaded file is printed as [[files list]] prints it, with the link
+to use in a page.
+<<add files upload subcommand>>=
+upload_parser = files_subp.add_parser("upload",
+  help="Upload files to a course folder",
+  description="Uploads files into a folder of courses, creating the folder "
+              "if needed. A file with the same name in the folder is "
+              "replaced: Canvas gives the new version a new ID but points "
+              "module items and page links to it, and it keeps the old "
+              "file's locked and hidden flags. Prints the uploaded files "
+              "in the format of files list, including the link to use in "
+              "a page's Markdown.")
+upload_parser.set_defaults(func=files_upload_command)
+canvaslms.cli.courses.add_course_option(upload_parser, required=True)
+upload_parser.add_argument("--folder", required=True, metavar="PATH",
+  help="Path of the folder below the course files root, e.g. "
+       "handouts/week1; created if missing. Use / for the root.")
+upload_parser.add_argument("--rename", action="store_true",
+  help="Keep an existing file with the same name and let Canvas rename "
+       "the new one (default: replace it)")
+upload_parser.add_argument("--lock", action="store_true",
+  help="Lock the uploaded files (students cannot access them)")
+upload_parser.add_argument("--hidden", action="store_true",
+  help="Hide the uploaded files (only students with the link can see "
+       "them)")
+upload_parser.add_argument("paths", nargs="+", metavar="FILE",
+  help="Local files to upload")
+@
+
+The local files are checked before anything is uploaded, so that a typo
+in the last name does not leave the course with half the batch.
+The folder path is passed as Canvas takes it, without the slashes at the
+ends, so [[/]] becomes the empty path, which Canvas takes as the root.
+<<functions>>=
+def files_upload_command(config, canvas, args):
+  """Upload files into a folder of each selected course."""
+  missing = [path for path in args.paths if not os.path.isfile(path)]
+  if missing:
+    canvaslms.cli.err(1, "No such file: " + ", ".join(missing))
+  folder = args.folder.strip("/")
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  for course in canvaslms.cli.courses.process_course_option(canvas, args):
+    for path in args.paths:
+      file = upload_file(course, path, folder, args)
+      if file is not None:
+        output.writerow(file_row(file))
+@
+
+Canvas answers the upload with the new file.
+We name it from the folder it actually landed in rather than from the
+folder we asked for, because Canvas normalises the path it is given: in
+the sandbox course, [[a//handouts]] landed in [[a/handouts]], and
+[[a/handouts ]] with a trailing space in a new folder [[a/handouts 3]].
+Only the folder Canvas reports gives a path and a link that agree with
+[[files list]].
+A failure is reported per file and the batch goes on, as module item
+changes do.
+<<functions>>=
+def upload_file(course, path, folder, args):
+  """Upload `path` into `folder` of `course`; return the new File or None."""
+  import canvasapi.file
+  try:
+    ok, response = course.upload(
+      path, parent_folder_path=folder,
+      on_duplicate="rename" if args.rename else "overwrite")
+    if not ok:
+      raise RuntimeError(response.get("message", "upload not confirmed"))
+  except Exception as e:
+    canvaslms.cli.warn(f"Could not upload {path} to {course.course_code}: "
+                       f"{e}")
+    return None
+  file = canvasapi.file.File(course._requester, response)
+  <<lock or hide the uploaded file when asked>>
+  file = canvaslms.cli.utils.ensure_file_attrs(file)
+  file.course = course
+  file.path = join_path(
+    canvaslms.cli.links.folder_path(course.get_folder(file.folder_id)),
+    file.display_name)
+  return file
+@
+
+Setting the flags is a second request that can fail on its own, and
+then the file is in the course but not locked or hidden as asked.
+Saying \enquote{could not upload} would be false, and dropping the file
+from the output would hide a visible file from the user, so the warning
+names what failed and the row shows the flags the file really has.
+<<lock or hide the uploaded file when asked>>=
+changes = {}
+if args.lock:
+  changes["locked"] = True
+if args.hidden:
+  changes["hidden"] = True
+if changes:
+  try:
+    file = file.update(**changes)
+  except Exception as e:
+    canvaslms.cli.warn(f"Uploaded {path} to {course.course_code} but could "
+                       f"not lock or hide it: {e}")
+@
+
+Let's verify an upload end to end through canvasapi's two-step upload:
+the request to Canvas names the folder and asks to replace, the file goes
+to the address Canvas returns, and the row printed is the new file's.
+<<test helpers>>=
+def serve_upload(rsps, uploaded):
+  """Answer the two upload requests with `uploaded` as the new file."""
+  rsps.post(f"{API}/courses/1/files",
+            json={"upload_url": "https://upload.example.invalid/x",
+                  "upload_params": {"key": "SYNTHETIC"}})
+  rsps.post("https://upload.example.invalid/x", json=uploaded)
+  rsps.get(f"{API}/courses/1/folders/{uploaded['folder_id']}",
+           json=[f for f in FOLDERS if f["id"] == uploaded["folder_id"]][0])
+
+def preflight(rsps):
+  """Return the parameters of the upload request sent to Canvas."""
+  body = rsps.calls[0].request.body
+  return dict(urllib.parse.parse_qsl(body))
+
+def upload_args(tmp_path, **options):
+  """Return the options of files upload for one local file."""
+  path = tmp_path / "lab1.pdf"
+  path.write_bytes(b"%PDF-1.4\n")
+  defaults = dict(folder="/handouts/", rename=False, lock=False,
+                  hidden=False, paths=[str(path)])
+  return {**defaults, **options}
+<<test functions>>=
+@responses.activate
+def test_upload_replaces_into_the_folder_and_prints_the_row(tmp_path, capsys):
+  serve_upload(responses, file_json(20, "lab1.pdf", 2))
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path))
+  sent = preflight(responses)
+  assert sent["parent_folder_path"] == "handouts"
+  assert sent["on_duplicate"] == "overwrite"
+  assert sent["name"] == "lab1.pdf"
+  assert capsys.readouterr().out.split("\t")[1:3] == ["handouts/lab1.pdf",
+                                                     "20"]
+
+@responses.activate
+def test_upload_names_the_file_by_the_folder_canvas_reports(
+    tmp_path, capsys):
+  serve_upload(responses, file_json(22, "lab1.pdf", 4))
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path, folder="handouts//week1"))
+  assert preflight(responses)["parent_folder_path"] == "handouts//week1"
+  assert capsys.readouterr().out.split("\t")[1] == "handouts/week1/lab1.pdf"
+
+@responses.activate
+def test_upload_lock_alone_sends_only_locked(tmp_path):
+  serve_upload(responses, file_json(23, "lab1.pdf", 2))
+  responses.put(f"{API}/files/23", json=file_json(23, "lab1.pdf", 2,
+                                                  locked=True))
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path, lock=True))
+  update = dict(urllib.parse.parse_qsl(responses.calls[2].request.body))
+  assert update == {"locked": "true"}
+
+@responses.activate
+def test_upload_reports_a_failed_lock_and_prints_the_real_flags(
+    tmp_path, capsys, caplog):
+  serve_upload(responses, file_json(24, "lab1.pdf", 2))
+  responses.put(f"{API}/files/24", status=500)
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path, lock=True))
+  assert "could not lock or hide" in caplog.text
+  assert capsys.readouterr().out.split("\t")[1:4] == [
+    "handouts/lab1.pdf", "24", "unlocked"]
+
+@responses.activate
+def test_upload_can_rename_lock_and_hide(tmp_path, capsys):
+  serve_upload(responses, file_json(21, "lab1-1.pdf", 2))
+  responses.put(f"{API}/files/21",
+                json=file_json(21, "lab1-1.pdf", 2, locked=True, hidden=True))
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **upload_args(tmp_path, rename=True, lock=True, hidden=True))
+  assert preflight(responses)["on_duplicate"] == "rename"
+  update = dict(urllib.parse.parse_qsl(responses.calls[2].request.body))
+  assert update == {"locked": "true", "hidden": "true"}
+  assert capsys.readouterr().out.split("\t")[1:5] == [
+    "handouts/lab1-1.pdf", "21", "locked", "hidden"]
+
+def test_upload_checks_the_local_files_first(tmp_path):
+  with responses.RequestsMock() as rsps:
+    with pytest.raises(SystemExit):
+      run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+          **upload_args(tmp_path, paths=[str(tmp_path / "missing.pdf")]))
+    assert len(rsps.calls) == 0
+
+@responses.activate
+def test_upload_failure_is_reported_and_the_batch_goes_on(
+    tmp_path, capsys, caplog):
+  responses.post(f"{API}/courses/1/files", status=500)
+  second = tmp_path / "lab2.pdf"
+  second.write_bytes(b"%PDF-1.4\n")
+  options = upload_args(tmp_path)
+  run(files_upload_command, canvasapi_course(Canvas(SERVER, "token")),
+      **{**options, "paths": options["paths"] + [str(second)]})
+  assert capsys.readouterr().out == ""
+  assert caplog.text.count("Could not upload") == 2
+@
+
+
+\section{The [[files edit]] subcommand}
+
+[[files edit]] changes the two flags Canvas has for keeping a file from
+students:
+\begin{description}
+\item[ [[--lock]] ] makes the file inaccessible to students; Canvas's file
+  browser calls this \enquote{unpublished}.
+  [[--unlock]] undoes it.
+\item[ [[--hidden]] ] removes the file from the students' file browser but
+  keeps it reachable through links, Canvas's \enquote{only available to
+  students with link}.
+  [[--visible]] undoes it.
+\end{description}
+The two are independent in Canvas, so they are two option pairs rather
+than one state.
+The selection is that of [[files list]], but the file regex is required
+here, so that an edit never applies to every file of a course by default.
+<<add files edit subcommand>>=
+edit_parser = files_subp.add_parser("edit",
+  help="Lock, unlock, hide or show files",
+  description="Changes the locked and hidden flags of the selected files "
+              "and prints them in the format of files list.")
+edit_parser.set_defaults(func=files_edit_command)
+add_file_options(edit_parser, required=True)
+lock_group = edit_parser.add_mutually_exclusive_group()
+lock_group.add_argument("--lock", dest="locked", action="store_const",
+  const=True, help="Lock the files: students cannot access them")
+lock_group.add_argument("--unlock", dest="locked", action="store_const",
+  const=False, help="Unlock the files")
+hidden_group = edit_parser.add_mutually_exclusive_group()
+hidden_group.add_argument("--hidden", dest="hidden", action="store_const",
+  const=True, help="Hide the files: only students with a link see them")
+hidden_group.add_argument("--visible", dest="hidden", action="store_const",
+  const=False, help="Show the files in the students' file browser")
+@
+
+An edit without a flag is an error before any request, since it would
+only list the files.
+Canvas answers an update with the updated file, which keeps the path and
+course we computed for the old one: an edit does not move the file.
+<<functions>>=
+def files_edit_command(config, canvas, args):
+  """Change the locked and hidden flags of the selected files."""
+  changes = {key: value
+             for key, value in [("locked", args.locked),
+                                ("hidden", args.hidden)]
+             if value is not None}
+  if not changes:
+    canvaslms.cli.err(1, "Nothing to change: give --lock, --unlock, "
+                         "--hidden or --visible")
+  output = csv.writer(sys.stdout, delimiter=args.delimiter)
+  for file in process_file_option(canvas, args):
+    try:
+      updated = file.update(**changes)
+    except Exception as e:
+      canvaslms.cli.warn(f"Could not edit {file.path} in "
+                         f"{file.course.course_code}: {e}")
+      continue
+    updated = canvaslms.cli.utils.ensure_file_attrs(updated)
+    updated.course, updated.path = file.course, file.path
+    output.writerow(file_row(updated))
+@
+
+Let's verify that only the given flags are sent, to every selected file,
+and that an edit without flags stops before any request.
+<<test functions>>=
+@responses.activate
+def test_edit_sends_only_the_given_flags(capsys):
+  serve_listing(responses)
+  for file_id, name in [(10, "lab1.pdf"), (11, "lab2.pdf")]:
+    responses.put(f"{API}/files/{file_id}",
+                  json=file_json(file_id, name, 2, locked=False, hidden=True))
+  run(files_edit_command, canvasapi_course(Canvas(SERVER, "token")),
+      file="^handouts/", folder=None, locked=None, hidden=True)
+  updates = [dict(urllib.parse.parse_qsl(call.request.body))
+             for call in responses.calls if call.request.method == "PUT"]
+  assert updates == [{"hidden": "true"}, {"hidden": "true"}]
+  rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+  assert [row[1:5] for row in rows] == [
+    ["handouts/lab1.pdf", "10", "unlocked", "hidden"],
+    ["handouts/lab2.pdf", "11", "unlocked", "hidden"]]
+
+def test_edit_without_flags_is_an_error():
+  with responses.RequestsMock() as rsps:
+    with pytest.raises(SystemExit):
+      run(files_edit_command, canvasapi_course(Canvas(SERVER, "token")),
+          file=".*", folder=None, locked=None, hidden=None)
+    assert len(rsps.calls) == 0
+@
