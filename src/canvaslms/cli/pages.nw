@@ -63,6 +63,7 @@ would otherwise need the user's course listing answered too.
 <<test [[pages.py]]>>=
 """Tests for the pages command."""
 import argparse
+import zlib
 from unittest.mock import patch
 
 import canvasapi.course
@@ -606,6 +607,7 @@ except Exception as e:
 @
 
 \subsubsection{Updating the cache after editing}
+\label{sec:pages-cache-rename}
 
 After successfully editing a page, we must update the cache entry to prevent
 unnecessary re-fetches.
@@ -614,10 +616,58 @@ The Canvas API's [[edit()]] method updates the object in-place, but the
 Without this update, pages originally fetched via bulk [[get_pages()]]
 (which lack the [[body]] attribute) would be re-fetched on every subsequent
 operation, even though they now have complete data from the edit response.
+
+The cache is keyed by the page's URL slug, and an edit can change the slug:
+Canvas derives it from the title, so a new title gives a new slug.
+Storing the page under its new slug would leave the entry under the old one
+in place, and the cached listing would show the page twice (issue \#571).
+That entry would not go away by itself either: a refetch of the listing
+adds and updates entries but never drops one, and refreshing the old key
+fetches the renamed page, since Canvas still answers the old slug.
+We could remember the URL before the edit and drop that key; instead we
+drop every other entry with the same [[page_id]], which stays the same
+across a rename, since that also removes duplicates an earlier rename left
+behind and needs nothing from the two places that edit pages.
+A page without a [[page_id]] matches nothing, rather than every other such
+page.
 <<update page cache after edit>>=
 full_page._fetched_at = datetime.now()
 if hasattr(full_page.course, 'page_cache'):
-  full_page.course.page_cache[full_page.url] = (full_page, {})
+  page_cache = full_page.course.page_cache
+  for url, (page, _) in list(page_cache.items()):
+    if (url != full_page.url and full_page.page_id is not None
+        and page.page_id == full_page.page_id):
+      del page_cache[url]
+  page_cache[full_page.url] = (full_page, {})
+@
+
+Let's verify that renaming a page leaves it once in the cached listing
+(issue \#571).
+The course lists one page, a file with a [[regex]] for it gives it a new
+title, Canvas answers with a new URL slug, and the course lists its pages
+again from the cache.
+<<test functions>>=
+@responses.activate
+def test_renamed_page_is_listed_once(tmp_path):
+  draft = page_json("draft", "Draft", page_id=42)
+  renamed = page_json("renamed", "Renamed", page_id=42)
+  responses.get(f"{API}/courses/1/pages", json=[draft])
+  responses.get(f"{API}/courses/1/pages/draft",
+                json={**draft, "body": "<p>x</p>"})
+  responses.put(f"{API}/courses/1/pages/draft",
+                json={**renamed, "body": "<p>x</p>"})
+  course = canvasapi.course.Course(Canvas(SERVER, "token")._Canvas__requester,
+                                   {"id": 1, "course_code": "SBX101"})
+  assert [page.url for page in course.get_pages()] == ["draft"]
+  page_file = tmp_path / "page.md"
+  page_file.write_text("---\nregex: ^Draft$\ntitle: Renamed\n---\nx\n")
+  args = argparse.Namespace(file=str(page_file), create=False, html=False,
+                            page=".*", module="", no_link_translation=True,
+                            allow_unresolved_links=False)
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    pages_edit_command({}, None, args)
+  assert [page.url for page in course.get_pages()] == ["renamed"]
 @
 
 \subsubsection{Creating new pages}
@@ -681,9 +731,11 @@ replays the listing; the fake answers that request too.
 SERVER = "https://canvas.example.invalid"
 API = f"{SERVER}/api/v1"
 
-def page_json(url, title):
+def page_json(url, title, page_id=None):
   """Return a page as the page listing sends it (fields from the sandbox)."""
-  return {"url": url, "title": title, "page_id": len(url), "course_id": 1,
+  return {"url": url, "title": title,
+          "page_id": page_id or zlib.crc32(url.encode()),
+          "course_id": 1,
           "created_at": "2026-10-29T12:00:00Z",
           "updated_at": "2026-10-29T12:00:00Z", "publish_at": None,
           "published": False, "front_page": False,

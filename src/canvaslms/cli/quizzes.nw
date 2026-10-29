@@ -2926,12 +2926,18 @@ there is both precise and immediate; a TTL can be neither.
 The chapter already contains a function with a similar name and a different
 job, and the two must not be confused.  [[invalidate_quiz_items_cache]]
 (\cref{quiz-items-cache}) drops [[quiz._items_cache]]: the \emph{questions}
-of one quiz, fetched by [[export_new_quiz_items]] and held for minutes within
-a single run.  It answers \enquote{what is in this quiz?}.  The cache we
-clear here answers \enquote{which quizzes are in this course?}, lives on the
-[[Course]] rather than the quiz, and is written to disk.  Replacing a quiz's
-items leaves the course listing correct, and creating a quiz leaves every
-other quiz's items correct, so neither call substitutes for the other.
+of one quiz, fetched by [[export_new_quiz_items]] and kept on the quiz object
+for five minutes, across runs too, since the quiz object is pickled with the
+course.  It answers \enquote{what is in this quiz?}.  The cache we clear
+here answers \enquote{which quizzes are in this course?}, lives on the
+[[Course]] rather than the quiz, and is written to disk.  Creating a quiz
+leaves every other quiz's items correct, and changing a quiz's items
+changes only the listing's numbers for that quiz, its points and question
+count, so neither call substitutes for the other.  Forgetting the listing
+does discard the cached quiz objects, and their items caches with them, so
+it is enough for a later run; within the run that changed the items, the
+quiz object in hand still holds its old items until
+[[invalidate_quiz_items_cache]] drops them.
 
 Forgetting a listing means putting the [[Course]] back in the state it had
 before anything was fetched: an empty dictionary and no \enquote{all
@@ -13538,6 +13544,7 @@ def items_add_command(config, canvas, args):
     questions = content.resolve_tree_for(questions, quiz.course, args)
     success, failed = add_classic_questions(quiz, questions)
 
+  <<forget the cached listings the items changed>>
   print(f"Added {success} question(s), {failed} failed")
 @
 
@@ -14263,6 +14270,7 @@ def items_edit_command(config, canvas, args):
     result = update_classic_question(quiz, item_id, update_data)
 
   if result:
+    <<forget the cached listings the items changed>>
     print(f"Updated question {item_id}")
   else:
     canvaslms.cli.err(1, "Failed to update question")
@@ -14462,6 +14470,7 @@ def items_delete_command(config, canvas, args):
     result = delete_classic_question(quiz, item_id)
 
   if result:
+    <<forget the cached listings the items changed>>
     print(f"Deleted question {item_id}")
   else:
     canvaslms.cli.err(1, "Failed to delete question")
@@ -14485,6 +14494,72 @@ def test_items_delete_reports_api_errors_not_missing_position(
 
   assert "Invalid access token" in caplog.text
   assert "No question found at position" not in caplog.text
+@
+
+\subsection{Keeping the cached listings current}
+
+Adding, editing or deleting questions changes the quiz they belong to:
+its number of questions, and its points, which for a graded quiz are the
+points of its assignment too.
+The course's cached quiz and assignment listings hold those numbers, so
+after any of the three item commands has written something, the listings
+are forgotten as after any other quiz write
+(\cref{sec:quiz-listing-invalidation}, issue \#573).
+The quiz's own cache of its questions (\cref{quiz-items-cache}) is now
+wrong too, so we drop it as well; forgetting the listing would discard it
+for the next run, but not from the quiz object this run still holds.
+Adding forgets them after any attempt, not only a successful one: a
+Classic question group is created before its questions, so Canvas can have
+changed even when every question failed.
+<<forget the cached listings the items changed>>=
+invalidate_quiz_items_cache(quiz)
+invalidate_quiz_listing_cache(quiz.course)
+@
+
+Let's verify that each of the three commands forgets the course's
+listings after a successful write, for both quiz systems.
+The write itself is a request to Canvas, so the function that makes it is
+replaced by one that reports success; everything around it runs.
+<<test functions>>=
+ITEM_WRITES = [
+  ("items_add_command", {"example": False, "position": None}),
+  ("items_edit_command", {"position": None, "id": "5"}),
+  ("items_delete_command", {"position": None, "id": "5", "force": True}),
+]
+WRITERS = {
+  ("items_add_command", "new"): ("add_new_quiz_items", (1, 0)),
+  ("items_edit_command", "new"): ("update_new_quiz_item", True),
+  ("items_delete_command", "new"): ("delete_new_quiz_item", True),
+  ("items_add_command", "classic"): ("add_classic_questions", (1, 0)),
+  ("items_edit_command", "classic"): ("update_classic_question", True),
+  ("items_delete_command", "classic"): ("delete_classic_question", True),
+}
+
+@pytest.mark.parametrize("kind", ["new", "classic"])
+@pytest.mark.parametrize("command, options", ITEM_WRITES)
+def test_item_writes_forget_the_course_listings(
+    monkeypatch, tmp_path, command, options, kind):
+  writer, result = WRITERS[(command, kind)]
+  course = cached_course()
+  quiz = (make_new_quiz(course=course) if kind == "new"
+          else make_classic_quiz(course=course))
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  monkeypatch.setattr(quizzes, "filter_quizzes",
+                      lambda course_list, regex: iter([quiz]))
+  monkeypatch.setattr(quizzes, writer, lambda *args, **kwargs: result)
+  quiz._items_cache = ({"items": []}, "some timestamp")
+  path = tmp_path / "items.json"
+  path.write_text('{"items": [{"item": {}}], "questions": [{}]}')
+  args = argparse.Namespace(course=["c"], assignment="Midterm",
+                            file=str(path), no_link_translation=True,
+                            **options)
+
+  getattr(quizzes, command)({}, MagicMock(), args)
+
+  assert course.new_quiz_all_fetched is None
+  assert course.assignment_all_fetched is None
+  assert quiz._items_cache is None
 @
 
 

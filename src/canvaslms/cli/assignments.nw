@@ -92,7 +92,7 @@ from canvasapi.grading_standard import GradingStandard
 from canvasapi.util import combine_kwargs
 
 from canvaslms.cli.assignments import *
-from canvaslms.cli.utils import parse_date
+from canvaslms.cli.utils import ensure_assignment_attrs, parse_date
 
 <<test functions>>
 @
@@ -2044,10 +2044,67 @@ After successfully editing an assignment, we must update the cache entry to
 prevent unnecessary re-fetches.
 The Canvas API's [[edit()]] method updates the object in-place, but the
 [[_fetched_at]] timestamp (used for staleness checks) isn't automatically set.
+
+An assignment can also be a quiz: a New Quiz \emph{is} an assignment, and a
+graded Classic quiz has one.  Canvas keeps the fields they share, the title
+and the dates, in step, so editing such an assignment edits the quiz, and
+the course's cached quiz listing goes on showing the old title and dates
+(issue \#572).
+Canvas marks these assignments with [[is_quiz_lti_assignment]] and
+[[is_quiz_assignment]], and for them we forget the quiz listing, the
+converse of what a quiz write does to the assignment listing
+(\cref{sec:quiz-listing-invalidation}).
+The [[quizzes]] module imports this one, so we import it when the edit has
+happened rather than when this module loads, which keeps the dependency
+one-way at load time, as [[modules add-item]] does.
+It is bound to a name of its own: a plain [[import canvaslms.cli.quizzes]]
+would make [[canvaslms]] a local name of the whole function this chunk
+ends up in, and its earlier uses of [[canvaslms]] would fail.
 <<update assignment cache after edit>>=
 assignment._fetched_at = datetime.now()
 if hasattr(assignment.course, 'assignment_cache'):
   assignment.course.assignment_cache[assignment.id] = (assignment, {})
+if assignment.is_quiz_assignment or assignment.is_quiz_lti_assignment:
+  import canvaslms.cli.quizzes as quiz_commands
+  quiz_commands.invalidate_quiz_listing_cache(assignment.course)
+@
+
+Let's verify that editing the assignment of a New Quiz or of a graded
+Classic quiz makes the course's quiz listing refetch, and that editing an
+ordinary assignment leaves it alone (issue \#572).
+The course is a real one, wrapped for caching, with requests answered by
+[[responses]]; its quiz listing is marked as fully fetched, as a
+[[quizzes list]] would leave it.
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("quiz_fields, forgets", [
+  ({"is_quiz_lti_assignment": True}, True),
+  ({"is_quiz_assignment": True, "quiz_id": 5}, True),
+  ({}, False)])
+def test_editing_a_quiz_assignment_forgets_the_quiz_listing(
+    tmp_path, quiz_fields, forgets):
+  api = "https://canvas.example.invalid/api/v1"
+  listed = {**assignment_json(8, "Quiz 1"), **quiz_fields}
+  responses.get(f"{api}/courses/1/assignments", json=[listed])
+  responses.put(f"{api}/courses/1/assignments/8",
+                json={**listed, "due_at": "2026-12-01T22:59:00Z"})
+  course = canvasapi.course.Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101"})
+  course.new_quiz_cache = {"8": ("new quiz", {})}
+  course.new_quiz_all_fetched = datetime.now()
+  path = tmp_path / "quiz-1.md"
+  path.write_text("---\nname: Quiz 1\ndue_at: 2026-12-01T22:59:00Z\n---\n"
+                  "\nBody\n")
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "SBX101", "-f",
+                            str(path), "--no-link-translation"])
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]):
+    assignments_edit_command({}, MagicMock(), args)
+  assert any(call.request.method == "PUT" for call in responses.calls)
+  assert (course.new_quiz_all_fetched is None) == forgets
 @
 
 
@@ -2574,6 +2631,8 @@ reach the requester---the last point we own before the request leaves.
 The requester is a [[MagicMock]] because a live write cannot run offline;
 listing the course's assignments is patched to hand over one real
 [[Assignment]], which spares us faking the paginated listing.
+The stand-in normalises the assignment as [[list_assignments]] does, since
+the code after it reads the normalised attributes.
 <<test functions>>=
 def edit_assignment_from_file(tmp_path, front_matter, **assignment_fields):
   """Run `assignments edit -f` on a file; return the form fields sent.
@@ -2605,7 +2664,7 @@ def edit_assignment_from_file(tmp_path, front_matter, **assignment_fields):
   with patch("canvaslms.cli.assignments.courses.process_course_option",
              return_value=[course]), \
        patch("canvaslms.cli.assignments.list_assignments",
-             return_value=[assignment]):
+             return_value=[ensure_assignment_attrs(assignment)]):
     assignments_edit_command({}, MagicMock(), args)
 
   if not requester.request.called:
