@@ -159,6 +159,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 import pytest
 from canvasapi.assignment import Assignment
 from canvasapi.course import Course
+from canvasapi.file import File
 from canvasapi.module import Module, ModuleItem
 from canvasapi.page import Page
 from canvasapi.quiz import Quiz
@@ -687,7 +688,12 @@ canvaslms modules add-item -c prgi26 "^Vecka 3$" -t url \
   --title "Zoom" --url https://kth-se.zoom.us/j/123
 canvaslms modules add-item -c prgi26 "^Vecka 3$" -t page \
   --content "^Övning: vecka 3$" -p 5
+canvaslms modules add-item -c prgi26 "^Vecka 3$" -t file \
+  --content "^handouts/lab3.pdf$"
 \end{minted}
+A file has no front matter of its own either, so [[-t file]] is the only
+way this tool puts a file into a module; the file itself is uploaded with
+[[files upload]] (\cref{sec:files}).
 
 A command like this belongs in a recipe that applies a module's declared
 shape, and a recipe is re-run.
@@ -695,7 +701,7 @@ The command is therefore idempotent by default, the convention
 [[modules create]] set (\cref{sec:modules-create}): an item the module
 already has is not added again, and [[--allow-duplicate]] says otherwise.
 What \enquote{already has} means differs by kind.
-A page, assignment or quiz item points at its content, so it is the same
+A page, assignment, quiz or file item points at its content, so it is the same
 item when it points at the same content, whatever it is titled; a text
 header or a URL has no content behind it, and its title is the only
 identity Canvas gives it.
@@ -707,8 +713,8 @@ it declares instead of leaving early items where they were.
 New items are unpublished unless [[--publish]] says otherwise, for the
 same reason new modules are: the author reads it before the students do.
 <<constants>>=
-ITEM_KINDS = ('subheader', 'url', 'page', 'assignment', 'quiz')
-CONTENT_KINDS = ('page', 'assignment', 'quiz')
+ITEM_KINDS = ('subheader', 'url', 'page', 'assignment', 'quiz', 'file')
+CONTENT_KINDS = ('page', 'assignment', 'quiz', 'file')
 <<functions>>=
 def modules_add_item_command(config, canvas, args):
   """Add an item to each matching module, unless the module has it."""
@@ -742,10 +748,15 @@ resolved once per course because the content behind a page, assignment
 or quiz item is a per-course object.
 A text header and a URL are described entirely by the options.
 A content item is described by the content it points at, found by regex
-in the same way the [[pages]], [[assignments]] and [[quizzes]] commands
-find their objects, and a quiz is placed the way those commands place it:
-a Classic Quiz is a [[Quiz]] item, a New Quiz is an [[Assignment]] item
-(\cref{sec:module-membership}).
+in the same way the [[pages]], [[assignments]], [[quizzes]] and [[files]]
+commands find their objects, and a quiz is placed the way those commands
+place it: a Classic Quiz is a [[Quiz]] item, a New Quiz is an [[Assignment]]
+item (\cref{sec:module-membership}).
+A file item points at the file's id, and its title defaults to the file's
+display name.
+Replacing the file with [[files upload]] gives it a new id, but Canvas
+moves the item to the new file (\cref{sec:files-upload}), so the item
+still matches and a re-run adds nothing.
 The title the user gives for a content item overrides the content's own
 title on the item, which Canvas allows; without one, Canvas uses the
 content's title, which is also what we report.
@@ -777,6 +788,9 @@ if args.type == 'page':
 elif args.type == 'assignment':
   spec = {'type': 'Assignment', 'content_id': content.id}
   title = content.name
+elif args.type == 'file':
+  spec = {'type': 'File', 'content_id': content.id}
+  title = content.display_name
 else:
   import canvaslms.cli.quizzes
   item_type, item_id = canvaslms.cli.quizzes.quiz_module_item(content)
@@ -794,11 +808,12 @@ The match must be unique: an item points at one thing, and a regex that
 matches several pages says nothing about which one was meant.
 <<functions>>=
 def find_unique_content(course, kind, regex):
-  """Return the one page, assignment or quiz of `course` matching `regex`.
+  """Return the one page, assignment, quiz or file of `course` matching `regex`.
 
   No match and several matches both exit with an error naming them.
   """
   import canvaslms.cli.assignments
+  import canvaslms.cli.files
   import canvaslms.cli.pages
   import canvaslms.cli.quizzes
   if kind == 'page':
@@ -808,6 +823,9 @@ def find_unique_content(course, kind, regex):
     matches = list(
         canvaslms.cli.assignments.filter_assignments([course], regex))
     names = [assignment.name for assignment in matches]
+  elif kind == 'file':
+    matches = canvaslms.cli.files.filter_files(course, regex)
+    names = [file.path for file in matches]
   else:
     matches = list(canvaslms.cli.quizzes.filter_quizzes([course], regex))
     names = [quiz.title for quiz in matches]
@@ -889,15 +907,16 @@ courses.add_course_option(add_item_parser, required=True)
 add_item_parser.add_argument("-t", "--type", required=True,
   choices=ITEM_KINDS,
   help="Kind of item: a text header, an external URL, or an existing "
-       "page, assignment or quiz of the course")
+       "page, assignment, quiz or file of the course")
 add_item_parser.add_argument("--title",
   help="Title of the item; required for subheader and url, and overrides "
        "the content's own title for the other kinds")
 add_item_parser.add_argument("--url",
   help="Address of a url item")
 add_item_parser.add_argument("--content", metavar="REGEX",
-  help="Regex matching exactly one page, assignment or quiz of the "
-       "course, by title, URL slug or Canvas ID")
+  help="Regex matching exactly one page, assignment, quiz or file of the "
+       "course: by title, URL slug or Canvas ID, and for a file by its "
+       "path below the course files root (e.g. handouts/lab1.pdf)")
 add_item_parser.add_argument("-p", "--position", type=int,
   help="1-based position within the module (default: last); an item "
        "already in the module is moved there")
@@ -1028,6 +1047,21 @@ def test_add_item_quiz_uses_the_quiz_item_type():
     module = run_modules_add_item([], type="quiz", content="^Quiz 1$")
   module.create_module_item.assert_called_once_with(
       {'type': 'Quiz', 'content_id': 7})
+
+def test_add_item_file_points_at_the_file_and_is_idempotent():
+  file = File(MagicMock(), {"id": 99, "display_name": "lab1.pdf",
+                            "folder_id": 2})
+  file.path = "handouts/lab1.pdf"
+  with patch("canvaslms.cli.files.filter_files", return_value=[file]):
+    module = run_modules_add_item([], type="file",
+                                  content="^handouts/lab1.pdf$")
+    module.create_module_item.assert_called_once_with(
+        {'type': 'File', 'content_id': 99})
+    present = make_module_item(1, title="lab1.pdf", item_type="File",
+                               content_id=99)
+    module = run_modules_add_item([present], type="file",
+                                  content="^handouts/lab1.pdf$")
+    module.create_module_item.assert_not_called()
 
 def test_add_item_refuses_zero_or_several_matches():
   pages = [make_page("a", "Week 1 a"), make_page("b", "Week 1 b")]

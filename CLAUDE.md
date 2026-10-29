@@ -667,6 +667,7 @@ src/canvaslms/
 │   ├── quizzes.nw    # Quiz/survey analysis
 │   ├── fbf.nw        # Feedback functionality
 │   ├── links.nw      # Course link translation (symbolic <-> numeric)
+│   ├── files.nw      # Course files: list, upload, lock/hide; file links
 │   ├── tutorial.nw   # `tutorial` command (embeds pytorial)
 │   └── utils.nw      # Shared utilities
 ├── grades/           # Grading algorithms (.nw sources)
