@@ -171,6 +171,67 @@ def configure_canvas_retry_policy(canvas):
   return canvas
 @
 
+\paragraph{Declaring the urllib3 and requests we rely on.}
+The [[backoff_max]] and [[backoff_jitter]] arguments exist only from
+urllib3~2.0; urllib3~1.26 rejects them with a [[TypeError]].
+We never got urllib3 as a declared dependency: it arrived through canvasapi
+and requests, and both accept urllib3~1.26.
+An environment that already had an old urllib3 therefore kept it when
+canvaslms was installed, and every command, [[login]] included, crashed in this
+function before doing anything (issue \#564).
+Since this module imports [[urllib3]] and [[requests]] itself, we declare them
+ourselves in [[pyproject.toml]] with the floors this code needs: [[urllib3>=2]]
+for the arguments above, and [[requests>=2.30]] because older requests pin
+[[urllib3<1.27]] and would make the urllib3 floor unsatisfiable.
+
+We verify both halves.
+First, the policy really lands on the session with the backoff settings above.
+Constructing a [[Canvas]] makes no request, so this exercises the real
+canvasapi, requests and urllib3 objects without a network; under urllib3~1.26
+it fails with the error from the issue.
+
+<<test functions>>=
+def test_retry_policy_installs_backoff_settings():
+  """The shared retry policy should reach the Canvas session intact."""
+  canvas = cache.create_canvas("https://canvas.example.invalid", "token")
+  session = canvas._Canvas__requester._session
+  for url in ["https://canvas.example.invalid", "http://canvas.example.invalid"]:
+    retry = session.get_adapter(url).max_retries
+    assert retry.total == 10
+    assert retry.backoff_max == 256
+    assert retry.backoff_jitter == 0.3
+    assert 429 in retry.status_forcelist
+@
+
+Second, the installed package metadata must declare the floors, since that is
+what was missing: the test above passes in any environment that happens to
+have urllib3~2, as ours does.
+We test the specifiers against the versions from the bug report rather than
+comparing strings, so any equivalent spelling of the floor passes.
+The metadata comes from the installed distribution, so after editing the
+dependencies in [[pyproject.toml]] we must run [[poetry install]] before this
+test sees the change.
+
+<<test functions>>=
+def test_package_declares_urllib3_and_requests_floors():
+  """canvaslms must require the urllib3 and requests its retry policy needs."""
+  from importlib.metadata import requires
+  from packaging.requirements import Requirement
+
+  declared = {}
+  for line in requires("canvaslms"):
+    requirement = Requirement(line)
+    if requirement.marker is None:
+      declared[requirement.name.lower()] = requirement.specifier
+
+  assert "urllib3" in declared
+  assert not declared["urllib3"].contains("1.26.5")
+  assert declared["urllib3"].contains("2.0")
+  assert "requests" in declared
+  assert not declared["requests"].contains("2.25.1")
+  assert declared["requests"].contains("2.30")
+@
+
 When no encrypted cache is available, we create a fresh [[Canvas]] instance and
 immediately configure it with the shared retry policy.
 
