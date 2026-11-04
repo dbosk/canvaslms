@@ -120,6 +120,7 @@ from canvasapi.user import User
 
 # The errors Canvas raises, for the tests that exercise failing requests.
 import canvasapi.exceptions
+import requests
 
 # This import applies the monkey-patches
 import canvaslms.hacks.canvasapi
@@ -3742,6 +3743,14 @@ class TestRefreshOnRequest:
         assert first.rubric_assessment is None
         requester.request.assert_called_once()
 
+    def test_submission_includes_are_remembered_by_a_fetch(self):
+        assignment, requester, _ = self.submission_from_earlier_run()
+
+        assignment.get_submissions(include=["rubric_assessment"])
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        requester.request.assert_called_once()
+
     def test_submissions_gone_from_canvas_make_no_more_requests(self):
         """Of 5 cached submissions, Canvas lists 1; the rest left the course."""
         response = MagicMock()
@@ -3912,12 +3921,12 @@ class TestRetryAfterMiss:
         """Return an owner of a listing cached `age` ago, with item 1."""
         class TestClass:
             listings = 0
-            fail = False
+            fail = None
             def get_item(self, item_id, **kwargs):
                 return canvas_object(id=item_id)
             def get_items(self, **kwargs):
                 if self.fail:
-                    raise canvasapi.exceptions.CanvasException("Unavailable")
+                    raise self.fail
                 self.listings += 1
                 return [canvas_object(id=each) for each in self.items]
 
@@ -3955,6 +3964,23 @@ class TestRetryAfterMiss:
         assert self.search(owner) == []
         assert owner.listings == 1
 
+    def test_a_connection_error_reports_no_match(self, caplog):
+        """The likeliest outage is not a CanvasException."""
+        owner = self.listing_owner()
+        fetched = owner.item_all_fetched
+        owner.fail = requests.exceptions.ConnectionError("Unreachable")
+
+        with caplog.at_level(logging.WARNING):
+            assert self.search(owner) == []
+
+        assert owner.item_all_fetched == fetched
+        assert "Could not refresh" in caplog.text
+
+    @pytest.mark.parametrize("pattern,expected", [
+        (None, False), ("", False), (".*", False), ("Anna", True)])
+    def test_only_a_given_pattern_names_something(self, pattern, expected):
+        assert pattern_names_something(pattern) is expected
+
     def test_too_many_listings_are_not_fetched(self):
         owners = [self.listing_owner()
                   for _ in range(MISS_REFRESH_MAX_LISTINGS + 1)]
@@ -3983,7 +4009,7 @@ class TestRetryAfterMiss:
     def test_a_failed_refresh_reports_no_match_and_keeps_the_cache(self, caplog):
         owner = self.listing_owner()
         fetched = owner.item_all_fetched
-        owner.fail = True
+        owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
 
         with caplog.at_level(logging.WARNING):
             assert self.search(owner) == []
@@ -6159,11 +6185,12 @@ raises.
 The objection to so broad a catch is that it also swallows systemic failures,
 an expired token say, which the user would rather see at once.  It does not,
 and the reason is structural: only the \emph{re}fresh of data we already have
-is guarded.  The first fetch of an assignment's submissions---the
-[[need_refetch]] branch above---is left unguarded precisely because there is no
-cached answer to fall back on there, so a dead server or a rejected token still
-fails loudly on the first assignment the command touches, long before this code
-could hide it.
+is guarded.  The fetch of an assignment's submissions in the [[need_refetch]]
+branch above is left unguarded.  The first time, there is no cached answer to
+fall back on there, so a dead server or a rejected token still fails loudly on
+the first assignment the command touches, long before this code could hide it.
+Under [[--refresh-cache]] there is a cached answer, but the user has just told us
+not to trust it, so reporting the failure is again the honest thing to do.
 
 Logging and moving on is not enough on its own, because of how the code finds
 its way back here.  [[should_bulk_refresh_submissions]] asks the wrappers
