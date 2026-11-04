@@ -3742,6 +3742,36 @@ class TestRefreshOnRequest:
         assert first.rubric_assessment is None
         requester.request.assert_called_once()
 
+    def test_submissions_gone_from_canvas_make_no_more_requests(self):
+        """Of 5 cached submissions, Canvas lists 1; the rest left the course."""
+        response = MagicMock()
+        response.json.return_value = [{"id": 0, "user_id": 0, "grade": "P"}]
+        response.links = {}
+        requester = MagicMock()
+        requester.request.return_value = response
+        requester.base_url = "https://canvas.example/api/v1/"
+        requester.new_quizzes_url = "https://canvas.example/api/quiz/v1/"
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+        hour_ago = datetime.now() - timedelta(hours=1)
+        single = MagicMock()
+        for user_id in range(5):
+            lazy = LazySubmission(
+                Submission(requester, {"id": user_id, "user_id": user_id,
+                                       "grade": "P"}),
+                assignment, set(), single)
+            object.__setattr__(lazy, "_last_refresh", hour_ago)
+            getattr(assignment, "__cache")[user_id] = lazy
+        setattr(assignment, "__all_fetched", hour_ago)
+        request_refresh()
+
+        for _ in range(3):
+            for submission in assignment.get_submissions(
+                    check_bulk_refresh=True):
+                submission.grade
+
+        requester.request.assert_called_once()
+        single.assert_not_called()
+
     def test_lazy_read_corrects_a_final_grade_once(self):
         def corrected(assignment, user, **kwargs):
             corrected.calls += 1
@@ -6022,6 +6052,7 @@ if need_refetch:
   for raw_submission in get_submissions(self, include=list(all_includes)):
     <<keep [[raw_submission]] in the cache>>
 
+  <<count all cached submissions as just refreshed>>
   self.__all_fetched = datetime.now()
 else:
   cache_age = datetime.now() - self.__all_fetched
@@ -6051,6 +6082,18 @@ else:
   lazy_submission = LazySubmission(raw_submission, self, all_includes,
                                    original_get_submission)
   self.__cache[raw_submission.user_id] = lazy_submission
+@
+
+A fetch of the whole collection answers for every submission in the cache, also
+for the ones Canvas did not return, such as those of students who left the course.
+We asked and it has nothing newer, so those need no request of their own.
+If we left their timestamps alone, every read of them would ask Canvas again, and
+under [[--refresh-cache]], where they would keep predating the refresh for the
+rest of the run, enough of them would also make [[should_bulk_refresh_submissions]]
+fetch the whole collection again on each listing.
+<<count all cached submissions as just refreshed>>=
+for lazy_submission in self.__cache.values():
+  object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
 @
 
 The bulk refresh pre-check logic counts how many submissions would need refresh
