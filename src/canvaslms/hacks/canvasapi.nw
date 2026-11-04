@@ -100,6 +100,9 @@ monkey-patches to canvasapi classes. The patches are applied at import
 time and affect all future instances.
 """
 import logging
+import os
+import subprocess
+import sys
 
 import pytest
 from unittest.mock import MagicMock
@@ -4108,10 +4111,55 @@ That needs no state of its own: the refresh itself updates the [[_all_fetched]]
 timestamp, so a script repeating a typo pays for one listing per interval.
 It also makes the retry do nothing right after [[--refresh-cache]] or under
 [[--no-cache]], when the search just used fresh data.
-And a miss refreshes at most [[MISS_REFRESH_MAX_LISTINGS]] listings: mistyping a
-student's name without [[-c]] searches every course, and is not worth fetching
-every roster for.
-[[--refresh-cache]] is there for the user who means it.
+
+The other limit is on how many listings one miss may fetch, since each of them
+takes at least one request.
+How many is reasonable depends on the search.
+With [[users -c prgi Anna]] the user has picked the courses and expects Anna to
+be in one of them, so the answer is worth waiting for, even if the pattern spans
+many course rounds.
+With [[users Anna]] the search spans every course they have, and mistyping the
+name should not mean fetching every roster.
+A search narrowed with [[-c]] may therefore fetch up to
+[[MISS_REFRESH_MAX_LISTINGS]] listings, a search over all courses up to
+[[MISS_REFRESH_MAX_LISTINGS_ALL_COURSES]].
+Only the command knows which search it is making, so it passes the latter as
+[[max_listings]], using [[miss_refresh_limit]] of the [[courses]] module.
+Passing nothing gives the larger limit, which is right for a library caller, who
+named the courses it searches.
+
+We cannot know how many courses a user has or how long they are willing to wait,
+so 25 and 5 are only defaults, and the environment variables below set them.
+A limit of 0 turns the retry off for that kind of search, for instance for a
+script that would rather have a quick answer.
+[[filter_courses]] searches the course listing with the larger limit, so setting
+[[CANVASLMS_MISS_REFRESH_MAX_LISTINGS]] to 0 stops looking for new courses too.
+
+The limit stands for the cost of the refresh, so it counts the listings that are
+old enough to be fetched and not all that were searched.
+Otherwise a search over 30 courses where 3 rosters are old would be refused,
+although it costs 3 listings.
+It would also complain right after [[--refresh-cache]] or under [[--no-cache]],
+when there is nothing left to fetch and the answer is already based on what
+Canvas says.
+Over the limit nothing is fetched at all.
+Fetching only some of the listings would cost time and still not tell whether
+the name exists, and the user could not know which courses had been looked at.
+
+When the limit stops a refresh, we warn about it.
+This used to be silent, and that was wrong: the command goes on to report that
+nothing matched, in the same words as when it did look, and the user cannot tell
+\enquote{not there} from \enquote{did not look}.
+Only the second calls for doing something, so the warning names both ways to do
+it: [[--refresh-cache]] for this time, and the variable of the limit that
+applied for every time.
+Since it goes through logging it ends up on stderr, away from the TSV on stdout;
+[[-q]] hides it, and a library caller that has not configured logging still gets
+it from Python's handler of last resort.
+A script repeating such a search is warned on every run, because nothing was
+fetched and the listings stay old: its answer is as uncertain every time.
+A limit of 0 is different, there the user has asked for no retry and needs no
+reminder, so we only log that at the [[INFO]] level.
 
 A pattern that matches something is not a miss at all, even when the listing is
 stale, so [[-c prgi]] can still silently leave out a new course that the old one
@@ -4121,15 +4169,20 @@ rather than replacing them.
 <<constants>>=
 MISS_REFRESH_MIN_AGE_MINUTES = env_number(
   "CANVASLMS_MISS_REFRESH_MINUTES", 10, int)
-MISS_REFRESH_MAX_LISTINGS = 5
+MISS_REFRESH_MAX_LISTINGS = env_number(
+  "CANVASLMS_MISS_REFRESH_MAX_LISTINGS", 25, int)
+MISS_REFRESH_MAX_LISTINGS_ALL_COURSES = env_number(
+  "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5, int)
 <<functions>>=
-def retry_after_miss(find, listings):
+def retry_after_miss(find, listings, max_listings=None):
   """Yield from `find()`; if empty, refresh `listings` and try once more.
 
   `find` returns an iterable of matches, and `listings` holds the
   `(owner, attribute)` pairs it searched, such as `(canvas, "course")`. Only a
-  listing that is old enough is refreshed, and none if there are too many. A
-  failed refresh leaves the cache as it was and the result empty.
+  listing that is old enough is refreshed. If more than `max_listings` are, which
+  defaults to `MISS_REFRESH_MAX_LISTINGS`, none is and a warning says so; 0
+  turns the refresh off without a warning. A failed refresh leaves the cache as
+  it was and the result empty.
   """
   found = False
   for match in find():
@@ -4138,9 +4191,12 @@ def retry_after_miss(find, listings):
   if found:
     return
 
-  <<expire the old enough [[listings]]>>
-  if not expired:
+  <<find the [[old_listings]] among [[listings]]>>
+  if not old_listings:
     return
+
+  <<give up unless the limit allows [[old_listings]]>>
+  <<expire the [[old_listings]]>>
 
   try:
     yield from find()
@@ -4163,21 +4219,50 @@ def pattern_names_something(pattern):
 
 We only look at timestamps that are actually [[datetime]]s, since an owner that
 has no such listing, like an assignment group, has nothing to refresh.
-<<expire the old enough [[listings]]>>=
-expired = []
-if len(listings) > MISS_REFRESH_MAX_LISTINGS:
-  logger.info(f"No match, not refreshing {len(listings)} listings; "
-              f"use --refresh-cache to fetch them")
-else:
-  for owner, attribute in listings:
-    name = f"{attribute}_all_fetched"
-    fetched = getattr(owner, name, None)
-    if (isinstance(fetched, datetime)
-        and datetime.now() - fetched
-            >= timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES)):
-      logger.info(f"No match, refreshing listing: {name}")
-      expired.append((owner, name, fetched))
-      setattr(owner, name, None)
+<<find the [[old_listings]] among [[listings]]>>=
+old_listings = []
+for owner, attribute in listings:
+  name = f"{attribute}_all_fetched"
+  fetched = getattr(owner, name, None)
+  if (isinstance(fetched, datetime)
+      and datetime.now() - fetched
+          >= timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES)):
+    old_listings.append((owner, name, fetched))
+@
+
+We look up the default limit here rather than in the signature, where it would
+be fixed when the module is loaded.
+No search can stay within a negative limit, so we take it to mean the same as 0
+rather than warn about being over a limit of $-1$.
+<<give up unless the limit allows [[old_listings]]>>=
+limit = MISS_REFRESH_MAX_LISTINGS if max_listings is None else max_listings
+if limit <= 0:
+  logger.info("No match in the cache; the refresh is turned off "
+              f"(limit {limit})")
+  return
+if len(old_listings) > limit:
+  <<warn that the limit stops the refresh>>
+  return
+@
+
+The variable to name follows from the limit that applied.
+A caller may also pass a limit of its own, which no variable can raise, and then
+the warning must not suggest one.
+<<warn that the limit stops the refresh>>=
+ways_out = "--refresh-cache"
+if max_listings is None:
+  ways_out += ", or raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS"
+elif max_listings == MISS_REFRESH_MAX_LISTINGS_ALL_COURSES:
+  ways_out += ", or raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES"
+logger.warning(f"No match in the cache; not fetching {len(old_listings)} "
+               f"listings as the limit is {limit}.\nUse {ways_out}.")
+@
+
+Clearing the timestamp is what makes the next search fetch the listing.
+<<expire the [[old_listings]]>>=
+for owner, name, _ in old_listings:
+  logger.info(f"No match, refreshing listing: {name}")
+  setattr(owner, name, None)
 @
 
 The refresh is a favour, so failing at it should not make things worse.
@@ -4193,7 +4278,7 @@ What tells us is the timestamp, since a listing that was fetched has a new one.
 That is why this is in a [[finally]] clause and looks at each listing, which also
 keeps what a partly successful retry over several courses did get.
 <<keep the cached listings after a failed refresh>>=
-for owner, name, fetched in expired:
+for owner, name, fetched in old_listings:
   if getattr(owner, name) is None:
     setattr(owner, name, fetched)
 @
@@ -4305,6 +4390,176 @@ class TestRetryAfterMiss:
         assert owner.item_all_fetched == fetched
         assert [obj.id for obj, _ in owner.item_cache.values()] == [1]
         assert "Could not refresh" in caplog.text
+
+    <<test methods for the limit on a miss>>
+@
+
+The limit deserves tests of its own, since most of what can go wrong with it is
+a refresh that does not happen, which looks just like a name that is not there.
+We count what is fetched through the stand-in, and read what the user is told
+from the log.
+Only the listings that are old enough may count: three old ones among thirty
+fit a limit of three.
+<<test methods for the limit on a miss>>=
+def owners(self, old=0, young=0):
+    """Return owners of `old` listings to fetch and `young` ones not to."""
+    return ([self.listing_owner() for _ in range(old)]
+            + [self.listing_owner(age=timedelta(minutes=1))
+               for _ in range(young)])
+
+def search_all(self, owners, **kwargs):
+    """Search the listings of all `owners` for what none of them has."""
+    def find():
+        return [obj for owner in owners for obj in owner.get_items()
+                if obj.id == 3]
+
+    return list(retry_after_miss(
+        find, [(owner, "item") for owner in owners], **kwargs))
+
+def fetched_again(self, owners):
+    return sum(owner.listings - 1 for owner in owners)
+
+def test_only_listings_old_enough_count(self, caplog):
+    owners = self.owners(old=3, young=27)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, max_listings=3)
+
+    assert [owner.listings for owner in owners] == [2] * 3 + [1] * 27
+    assert not caplog.records
+
+def test_nothing_to_fetch_is_no_reason_to_warn(self, caplog):
+    owners = self.owners(young=30)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, max_listings=1)
+
+    assert self.fetched_again(owners) == 0
+    assert not caplog.records
+
+def test_nothing_to_fetch_is_no_reason_to_search_again(self):
+    searches = []
+
+    assert list(retry_after_miss(
+        lambda: searches.append("search") or [],
+        [(owner, "item") for owner in self.owners(young=1)])) == []
+
+    assert len(searches) == 1
+
+def test_over_the_limit_nothing_is_fetched(self):
+    owners = self.owners(old=4)
+    fetched = [owner.item_all_fetched for owner in owners]
+
+    self.search_all(owners, max_listings=3)
+
+    assert self.fetched_again(owners) == 0
+    assert [owner.item_all_fetched for owner in owners] == fetched
+
+def test_the_warning_says_how_many_and_how_to_get_past(self, caplog,
+                                                       monkeypatch):
+    """The default limit is looked up when searching, so this one applies."""
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS", 2)
+    owners = self.owners(old=3)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners)
+
+    assert self.fetched_again(owners) == 0
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "3 listings" in record.message
+    assert "limit is 2" in record.message
+    assert "--refresh-cache" in record.message
+    assert "raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS." in record.message
+
+def test_the_warning_names_the_limit_for_all_courses(self, caplog,
+                                                     monkeypatch):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 2)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(self.owners(old=3), max_listings=2)
+
+    [record] = caplog.records
+    assert ("raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES."
+            in record.message)
+
+def test_a_limit_of_the_callers_own_names_no_variable(self, caplog,
+                                                      monkeypatch):
+    """No setting would raise it, so the warning should not suggest one."""
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(self.owners(old=3), max_listings=2)
+
+    [record] = caplog.records
+    assert "limit is 2" in record.message
+    assert "--refresh-cache" in record.message
+    assert "CANVASLMS" not in record.message
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_no_limit_left_turns_the_retry_off_without_a_warning(self, caplog,
+                                                             limit):
+    owners = self.owners(old=1)
+
+    with caplog.at_level(logging.INFO):
+        self.search_all(owners, max_listings=limit)
+
+    assert self.fetched_again(owners) == 0
+    assert "turned off" in caplog.text
+    assert not [record for record in caplog.records
+                if record.levelno >= logging.WARNING]
+
+def test_a_match_is_no_reason_to_warn(self, caplog):
+    owners = self.owners(old=3)
+
+    with caplog.at_level(logging.WARNING):
+        assert [obj.id for obj in retry_after_miss(
+            lambda: [obj for owner in owners for obj in owner.get_items()],
+            [(owner, "item") for owner in owners], max_listings=1)
+        ] == [1, 1, 1]
+
+    assert not caplog.records
+@
+
+The settings are read when the module is imported, so we import it in a process
+of its own to see what a variable does.
+<<test functions>>=
+MISS_LIMIT_VARIABLES = ("CANVASLMS_MISS_REFRESH_MAX_LISTINGS",
+                        "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES")
+
+def import_with_limits(**variables):
+    """Import the module in a new process with `variables` in its environment.
+
+    Returns the finished process, which printed the two limits.
+    """
+    environment = {name: value for name, value in os.environ.items()
+                   if name not in MISS_LIMIT_VARIABLES}
+    environment.update(variables)
+    return subprocess.run(
+        [sys.executable, "-c",
+         "import canvaslms.hacks.canvasapi as module; "
+         "print(module.MISS_REFRESH_MAX_LISTINGS, "
+         "module.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES)"],
+        env=environment, capture_output=True, text=True, check=True)
+
+@pytest.mark.parametrize("variables,limits", [
+    ({}, "25 5"),
+    ({MISS_LIMIT_VARIABLES[0]: "40"}, "40 5"),
+    ({MISS_LIMIT_VARIABLES[1]: "8"}, "25 8"),
+    ({MISS_LIMIT_VARIABLES[0]: "0", MISS_LIMIT_VARIABLES[1]: "0"}, "0 0"),
+])
+def test_the_limits_come_from_the_environment(variables, limits):
+    assert import_with_limits(**variables).stdout.strip() == limits
+
+@pytest.mark.parametrize("variable", MISS_LIMIT_VARIABLES)
+def test_a_malformed_limit_falls_back_to_the_default(variable):
+    process = import_with_limits(**{variable: "many"})
+
+    assert process.stdout.strip() == "25 5"
+    assert f"{variable}='many'" in process.stderr
 @
 
 \subsection{Diagnosing cache staleness}
