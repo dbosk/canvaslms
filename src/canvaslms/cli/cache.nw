@@ -65,8 +65,10 @@ from urllib3.util.retry import Retry
 from canvaslms import dirs
 import canvaslms.hacks.attachment_cache as attachment_cache
 from canvaslms.hacks.canvasapi import (
+    outdated,
     SUBMISSION_TTL_MINUTES,
     DEFAULT_CACHE_TTL_DAYS,
+    COURSE_CACHE_TTL_DAYS,
     USER_CACHE_TTL_DAYS,
     GROUP_CACHE_TTL_DAYS
 )
@@ -88,8 +90,10 @@ the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
 <<test [[cache.py]]>>=
 """Tests for cache-backed Canvas loading."""
 
+from datetime import datetime, timedelta
 import pathlib
 import pytest
+import responses
 
 import canvaslms.cli.cache as cache
 import canvaslms.cli.login
@@ -291,9 +295,72 @@ def load_configured_canvas(config, use_cache=True):
   if use_cache:
     canvas = load_canvas_cache(token, hostname)
     if canvas:
+      <<expire the listings of the restored [[canvas]]>>
       return canvas, hostname, token
 
   return create_canvas(hostname, token), hostname, token
+@
+
+The periodic refreshes in [[hacks/canvasapi.nw]] all hang off [[outdated]],
+which the listing methods call for each object \emph{in} their cache, so that
+it can expire that object's child listings.
+The [[Canvas]] object is the root of the hierarchy and therefore in no cache:
+nothing ever asked whether its own listing of courses had expired, and a course
+you were added to stayed invisible until the cache was cleared by hand.
+We ask here because this is where the root comes back from disk, once per run,
+and because both clients pass through this loader.
+<<expire the listings of the restored [[canvas]]>>=
+outdated(canvas)
+@
+
+Let's verify this through the real encrypted round trip, since what failed was
+the behaviour of a cache restored from disk.
+The HTTP layer is stubbed with [[responses]] because Canvas's answer must change
+between the run that wrote the cache and the one that reads it, which a recording
+cannot express.
+
+<<test functions>>=
+HOST = "https://canvas.example"
+COURSES_URL = f"{HOST}/api/v1/courses"
+
+@pytest.fixture
+def restored_canvas(tmp_cache_path, monkeypatch):
+  """Return a function that writes a cached course aged `age` and reloads it."""
+  monkeypatch.setattr(
+      canvaslms.cli.login, "load_credentials", lambda config: (HOST, "token"))
+
+  def restore(age):
+    canvas = cache.create_canvas(HOST, "token")
+    responses.get(COURSES_URL, json=[{"id": 1, "name": "Old course"}])
+    course = list(canvas.get_courses())[0]
+    course.assignment_cache["sentinel"] = "subtree"
+    canvas.course_all_fetched = datetime.now() - age
+    cache.save_canvas_cache(canvas, "token", HOST)
+
+    responses.reset()
+    responses.get(COURSES_URL, json=[{"id": 1, "name": "Old course"},
+                                     {"id": 2, "name": "New course"}])
+    return cache.load_configured_canvas({})[0]
+
+  return restore
+
+@responses.activate
+def test_expired_course_listing_is_fetched_again(restored_canvas):
+  canvas = restored_canvas(timedelta(days=365))
+
+  courses = {course.id: course for course in canvas.get_courses()}
+
+  assert set(courses) == {1, 2}
+  assert courses[1].assignment_cache == {"sentinel": "subtree"}
+
+@responses.activate
+def test_recent_course_listing_is_not_fetched_again(restored_canvas):
+  canvas = restored_canvas(timedelta(hours=1))
+
+  courses = {course.id: course for course in canvas.get_courses()}
+
+  assert set(courses) == {1}
+  assert len(responses.calls) == 0
 @
 
 The attachment cache (see [[hacks/attachment_cache.nw]]) encrypts cached
@@ -841,6 +908,8 @@ submissions) encrypted on disk. Objects are refreshed based on their type:
 
 - Submissions (non-passing): {SUBMISSION_TTL_MINUTES} minutes
 
+- The list of courses: {COURSE_CACHE_TTL_DAYS} days
+
 - Users: {USER_CACHE_TTL_DAYS} days
 
 - Groups: {GROUP_CACHE_TTL_DAYS} days
@@ -851,7 +920,7 @@ Submissions with passing grades (A, P, complete) are never refreshed.
 
 These windows can be tuned via environment variables (minutes for submissions,
 days for the rest): CANVASLMS_SUBMISSION_TTL_MINUTES,
-CANVASLMS_USER_CACHE_TTL_DAYS, CANVASLMS_GROUP_CACHE_TTL_DAYS,
+CANVASLMS_COURSE_CACHE_TTL_DAYS, CANVASLMS_USER_CACHE_TTL_DAYS, CANVASLMS_GROUP_CACHE_TTL_DAYS,
 CANVASLMS_QUIZ_CACHE_TTL_DAYS, and CANVASLMS_DEFAULT_CACHE_TTL_DAYS. Raise them
 to reuse the cache across more runs, or lower them to see fresher data sooner.
 
