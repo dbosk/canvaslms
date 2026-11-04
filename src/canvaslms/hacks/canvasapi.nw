@@ -713,8 +713,9 @@ def merge_kwargs(kwargs_list,
                    <<keys to ignore>>
                  ]):
   """
-  Merges a list of keyword arguments dictionaries. Lists are unioned.
-  All non-list keys (usually strings) must be the same in all dictionaries.
+  Merges a list of keyword arguments dictionaries. Lists are unioned, and so are
+  values of `include` given as strings. All other non-list keys (usually strings)
+  must be the same in all dictionaries.
 
   <<doc for keys to ignore>>
   """
@@ -724,7 +725,8 @@ def merge_kwargs(kwargs_list,
     for key, value in kwargs.items():
       if key not in new_kwargs:
         new_kwargs[key] = value
-      elif isinstance(value, list) or isinstance(new_kwargs[key], list):
+      elif (isinstance(value, list) or isinstance(new_kwargs[key], list)
+            or key == "include"):
         # Convert both to lists if either is a list, then union
         prev_val = new_kwargs[key] if isinstance(new_kwargs[key], list) \
                    else [new_kwargs[key]]
@@ -741,8 +743,8 @@ def merge_kwargs(kwargs_list,
 @
 
 We can now define the keys to ignore.
-There are some keys that can be ignored for our purposes, like sorting order, 
-as they don't affect the caching.
+There are some keys that can be ignored for our purposes, like sorting order and
+page size, as they don't affect what the listing contains.
 In those cases, we simply use the last value, as seen in the loop above.
 <<doc for keys to ignore>>=
 By default, we ignore the keys
@@ -753,7 +755,8 @@ as they don't affect the caching.
 <<keys to ignore>>=
 "sort",
 "order",
-"order_by"
+"order_by",
+"per_page"
 @
 
 To check if a key can be ignored, we simply check if it's in the [[ignore_keys]]
@@ -898,6 +901,18 @@ class TestMergeKwargs:
 
         with pytest.raises(ValueError, match="Cannot merge enrollment_type"):
             merge_kwargs([kwargs1, kwargs2])
+
+    def test_merges_includes_given_as_strings(self):
+        """A single include may be given as a string"""
+        result = merge_kwargs([{"include": "user"}, {"include": "email"}])
+
+        assert set(result["include"]) == {"user", "email"}
+
+    def test_allows_conflicting_page_sizes(self):
+        """How the listing is paged says nothing about what is in it"""
+        result = merge_kwargs([{"per_page": 50}, {"per_page": 100}])
+
+        assert result["per_page"] == 100
 
     def test_allows_conflicting_ignored_keys(self):
         """Conflicting values for ignored keys should use last value"""
@@ -1457,6 +1472,8 @@ For example:
 }
 \end{minted}
 <<return cached result or fetch from [[get_attr]]>>=
+<<pass a restricted request for one object through to Canvas>>
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 
 <<let [[id]] be the ID of the object to fetch>>
@@ -3529,7 +3546,8 @@ Only [[--no-cache]], with no entries to merge, could find a TA.
 The cache cannot serve a subset from a listing, or a listing from a subset,
 without knowing what each argument means.
 So it does not try.
-A request with an argument we do not know to be additive goes straight to Canvas
+A request with an argument we do not know to be additive or harmless, as the keys
+for sorting and paging are, goes straight to Canvas
 and leaves the cache alone, so the caller gets the right answer and nobody else
 is affected.
 Callers wanting speed can still fetch the full collection and filter locally,
@@ -3560,6 +3578,18 @@ if restricts_listing(kwargs):
   logger.info(f"Not cached: {display_plural} restricted by {kwargs}")
   yield from get_attrs(self, *args, **kwargs)
   return
+@
+
+The same goes for a single object.
+[[get_assignment(5, all_dates=True)]] asks for something a listing does not have,
+so the answer cannot stand in for the entry.
+And an entry stored with such an argument would make the whole listing count as
+incomplete, as we see next: the listing would be fetched again each time such a
+call had been made.
+<<pass a restricted request for one object through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: {attr_name} restricted by {kwargs}")
+  return get_attr(self, *args, **kwargs)
 @
 
 Caches that already hold such a listing must recover too, and by themselves, as
@@ -3629,6 +3659,7 @@ class TestRequestsForASubset:
         ({}, False),
         ({"include": ["a"]}, False),
         ({"sort": "name", "order": "asc", "order_by": "x"}, False),
+        ({"per_page": 100}, False),
         ({"enrollment_type": ["student"]}, True),
         ({"include": ["a"], "search_term": "x"}, True)])
     def test_what_restricts_a_listing(self, kwargs, restricts):
@@ -3642,6 +3673,31 @@ class TestRequestsForASubset:
         assert [obj.id for obj in subset] == [1]
         assert instance.item_cache == {}
         assert instance.item_all_fetched is None
+
+    def test_a_page_size_is_cached_like_any_listing(self):
+        instance = self.make_instance()
+
+        list(instance.get_items(per_page=50))
+        list(instance.get_items(per_page=100))
+
+        assert len(instance.requests) == 1
+
+    def test_a_restricted_singular_request_is_not_cached(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+
+        for _ in range(2):
+            instance.get_item(1, all_dates=True)
+        list(instance.get_items())
+
+        assert instance.requests == [{}, {"all_dates": True}, {"all_dates": True}]
+        assert instance.item_cache[1][1] == {}
+
+    def test_a_restricted_singular_request_on_an_empty_cache(self):
+        instance = self.make_instance()
+
+        assert instance.get_item(1, all_dates=True).id == 1
+        assert instance.item_cache == {}
 
     def test_a_subset_leaves_a_cached_listing_alone(self):
         instance = self.make_instance()
