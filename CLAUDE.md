@@ -915,6 +915,17 @@ def example_command(config, canvas, args):
 - Raise `canvaslms.cli.EmptyListError` when no results match filters
 - Main CLI catches this and exits with code 1 (suppressed if `-q/--quiet`)
 
+### Cache Freshness
+
+Four mechanisms keep the persisted cache fresh, see the design overview in
+`src/canvaslms/cli/cache.nw`: time to live, invalidation on write, refresh when a
+name matches nothing (`retry_after_miss`) and `--refresh-cache`
+(`request_refresh`). They add and update entries; do not make them discard cached
+children (replace objects through `<<update [[obj]] with cache from [[old_obj]]>>`).
+A new name lookup should use `retry_after_miss` where the name is matched, over
+the whole selection. An empty result is not always a miss, so never retry around
+a command or on `EmptyListError`.
+
 ### Cache Schema Versioning
 
 The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
