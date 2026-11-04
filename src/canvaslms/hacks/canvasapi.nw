@@ -1468,6 +1468,7 @@ except KeyError:
   prev_kwargs = {}
   cache_status = " (not found)"
 old_obj = obj
+refreshing_on_request = False
 
 if obj and must_update(prev_kwargs, kwargs):
   obj = None
@@ -1478,12 +1479,18 @@ elif obj and outdated(obj):
   cache_status = f" (stale: {reason})" if reason else " (stale)"
 elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
   obj = None
+  refreshing_on_request = True
   cache_status = " (refresh requested)"
 
 if not obj:
   fetch_start = time.perf_counter()
   union_kwargs = merge_kwargs([prev_kwargs, kwargs])
-  obj = get_attr(self, *args, **union_kwargs)
+  try:
+    obj = get_attr(self, *args, **union_kwargs)
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    if not refreshing_on_request:
+      raise
+    <<keep [[old_obj]], which Canvas no longer has>>
   fetch_elapsed = time.perf_counter() - fetch_start
   if old_obj:
     <<update [[obj]] with cache from [[old_obj]]>>
@@ -3522,6 +3529,24 @@ so a refresh would behave differently depending on how often a command happens
 to read a listing.
 For the same reason a refresh adds and updates entries, but does not remove any.
 
+That promise has a consequence for the singular method, which does ask Canvas
+about such an entry.
+A student who left a course is still in its cached listing and their submissions
+are still worth showing, but asking Canvas for that student now gives a 404.
+The same read without [[--refresh-cache]] works, from the cache, so the option
+must not turn it into a crash: asking for fresher data cannot make data we have
+unavailable.
+We therefore keep the object, and record that we asked, so that the run does not
+ask again.
+Only a refresh on request gets this treatment.
+A 404 for an object that is not cached, or whose re-fetch the code needs in order
+to get data it lacks, is still the caller's to handle.
+<<keep [[old_obj]], which Canvas no longer has>>=
+logger.info(f"Kept in cache: {attr_name} {cache_key}={id} no longer exists")
+old_obj._fetched_at = datetime.now()
+return old_obj
+@
+
 Let's verify this.
 Each test first ages what it has cached to look like the work of an earlier run,
 because two calls within the same microsecond have the same timestamp, which is
@@ -3616,6 +3641,54 @@ class TestRefreshOnRequest:
 
         assert again == [1, 2]
         assert instance.singles == 0
+
+    def test_singular_keeps_entry_gone_from_canvas_and_asks_once(self):
+        class TestClass:
+            singles = 0
+            def get_items(self, **kwargs):
+                return [canvas_object(id=1)]
+            def get_item(self, item_id, **kwargs):
+                self.singles += 1
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        cached, _ = instance.item_cache[1]
+        cached._fetched_at = datetime.now() - timedelta(hours=1)
+        request_refresh()
+
+        assert instance.get_item(1) is cached
+        assert instance.get_item(1) is cached
+        assert instance.singles == 1
+
+    def test_singular_of_unknown_entry_still_reports_the_404(self):
+        class TestClass:
+            def get_items(self, **kwargs):
+                return []
+            def get_item(self, item_id, **kwargs):
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.ResourceDoesNotExist):
+            TestClass().get_item(1)
+
+    def test_singular_needing_new_kwargs_still_reports_the_404(self):
+        class TestClass:
+            def get_items(self, **kwargs):
+                return [canvas_object(id=1)]
+            def get_item(self, item_id, **kwargs):
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.ResourceDoesNotExist):
+            instance.get_item(1, include=["more"])
 
     def test_failed_refresh_leaves_the_cache_intact(self):
         instance = self.from_earlier_run()
