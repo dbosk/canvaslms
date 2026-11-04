@@ -917,10 +917,10 @@ def example_command(config, canvas, args):
 
 ### Cache Freshness
 
-Four mechanisms keep the persisted cache fresh, see the design overview in
+Five mechanisms keep the persisted cache fresh, see the design overview in
 `src/canvaslms/cli/cache.nw`: time to live, invalidation on write, refresh when a
-name matches nothing (`retry_after_miss`) and `--refresh-cache`
-(`request_refresh`). They add and update entries; do not make them discard cached
+name matches nothing (`retry_after_miss`), `--refresh-cache` (`request_refresh`)
+and repair on read of a listing stored with a restriction. They add and update entries; do not make them discard cached
 children (replace objects through `<<update [[obj]] with cache from [[old_obj]]>>`).
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
@@ -930,7 +930,8 @@ The cache file is shared with programs holding their own, possibly older, copy
 of this library (nytid, fbf), so keep it readable by them: do not bump the schema
 for what can be repaired on read, and leave entries correct in themselves. A
 cached listing is always complete: `CacheGetMethods` only caches `include` and the
-sorting keys, and sends any other argument straight to Canvas uncached.
+sorting and page-size keys, and sends any other argument straight to Canvas
+uncached, for single objects too.
 
 ### Cache Schema Versioning
 
