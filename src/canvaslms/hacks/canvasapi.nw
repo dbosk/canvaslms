@@ -1475,6 +1475,9 @@ elif obj and outdated(obj):
   reason = get_staleness_reason(obj)
   obj = None
   cache_status = f" (stale: {reason})" if reason else " (stale)"
+elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
+  obj = None
+  cache_status = " (refresh requested)"
 
 if not obj:
   fetch_start = time.perf_counter()
@@ -1838,6 +1841,10 @@ immediately after a bulk fetch.
 <<return cached result or fetch from [[get_attrs]]>>=
 attr_cache = getattr(self, f"{attr_name}_cache")
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
+
+if attr_all_fetched and predates_refresh(attr_all_fetched):
+  logger.info(f"Cache invalidation: {display_plural} - refresh requested")
+  attr_all_fetched = None
 
 if attr_all_fetched:
   for _, prev_kwargs in attr_cache.values():
@@ -3449,6 +3456,232 @@ class TestOutdated:
 @
 
 
+\subsection{Refreshing on request}
+\label{sec:refresh-on-request}
+
+The time-to-live intervals are a guess about when things change, and sometimes
+the user knows better: they were just added to a course, or a grade was just
+corrected.
+[[--no-cache]] is no answer to that.
+It starts from an empty [[Canvas]] object and saves nothing, so it shows the
+truth once and leaves the cache as wrong as it was.
+Clearing the cache is no better, since it costs the whole hierarchy to fix one
+listing.
+What we want is the opposite of both: fetch again exactly what this command
+reads, and leave the rest of the cache alone.
+
+The hierarchy makes that almost free to express.
+A command only reaches the listings it actually walks, so the caching methods
+already sit at the right places, and they know how to replace objects without
+losing what is cached below them (\cref{sec:cache-copy-to-new}).
+All they lack is a way to know that their data is too old, whatever its age.
+
+We could set a flag saying \enquote{refresh}, but then each listing would have
+to remember that it has already been refreshed, or a listing read twice by a
+command would be fetched twice.
+Instead we record \emph{when} the refresh was requested.
+Anything fetched before that moment is stale, and anything fetched after it,
+including by this run's own refresh, is not.
+Every cached object already carries that timestamp, so this needs no new state
+in the cache, and the moment itself is not pickled: the next run starts over.
+<<functions>>=
+refresh_since = None
+
+
+def request_refresh():
+  """Treat everything fetched until now as stale, for the rest of this run."""
+  global refresh_since
+  refresh_since = datetime.now()
+
+
+def predates_refresh(fetched_at):
+  """Return True if `fetched_at` is from before a requested refresh.
+
+  A missing timestamp (`None`) counts as before.
+  """
+  if refresh_since is None:
+    return False
+  return fetched_at is None or fetched_at < refresh_since
+@
+
+Four places consult this, one for each way cached data can be returned without
+asking Canvas: the plural and singular methods of [[CacheGetMethods]], and the
+same two for submissions, where the singular case is the lazy refresh.
+That last one checks before it looks at the grade, so that a corrected final
+grade shows up: being final is a statement about what changes on its own, not
+about what the user just told us has changed.
+
+We deliberately do not put the check in [[outdated]], although that looks like
+the natural home.
+A bulk fetch does not remove entries Canvas no longer returns, and those keep
+their old timestamps.
+With the check in [[outdated]], the next listing in the same run would refresh
+each of them with a request of its own, and drop the ones that answer with a 404,
+so a refresh would behave differently depending on how often a command happens
+to read a listing.
+For the same reason a refresh adds and updates entries, but does not remove any.
+
+Let's verify this.
+Each test first ages what it has cached to look like the work of an earlier run,
+because two calls within the same microsecond have the same timestamp, which is
+not older.
+The stand-in class lets Canvas's answer change between the calls, which a
+recording cannot express.
+
+<<test functions>>=
+class TestRefreshOnRequest:
+    """Test what a requested refresh fetches, and what it leaves alone"""
+
+    @pytest.fixture(autouse=True)
+    def no_refresh_requested_yet(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+
+    def from_earlier_run(self):
+        """Return an instance whose item 1 was cached an hour ago."""
+        class TestClass:
+            listing = [1]
+            listings = 0
+            singles = 0
+            fail = False
+            def get_items(self, **kwargs):
+                if self.fail:
+                    raise canvasapi.exceptions.CanvasException("Unavailable")
+                self.listings += 1
+                return [canvas_object(id=each) for each in self.listing]
+            def get_item(self, item_id, **kwargs):
+                self.singles += 1
+                return canvas_object(id=item_id)
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        hour_ago = datetime.now() - timedelta(hours=1)
+        instance.item_all_fetched = hour_ago
+        obj, _ = instance.item_cache[1]
+        obj._fetched_at = hour_ago
+        obj.child_cache = {"sentinel": "subtree"}
+        return instance
+
+    def test_nothing_is_fetched_without_a_request(self):
+        instance = self.from_earlier_run()
+        instance.listing = [1, 2]
+
+        assert [obj.id for obj in instance.get_items()] == [1]
+        instance.get_item(1)
+        assert (instance.listings, instance.singles) == (1, 0)
+
+    def test_listing_is_fetched_once_and_keeps_children(self):
+        instance = self.from_earlier_run()
+        instance.listing = [1, 2]
+        request_refresh()
+
+        first = {obj.id: obj for obj in instance.get_items()}
+        second = list(instance.get_items())
+
+        assert set(first) == {1, 2}
+        assert len(second) == 2
+        assert instance.listings == 2
+        assert first[1].child_cache == {"sentinel": "subtree"}
+
+    def test_singular_is_fetched_once_and_keeps_children(self):
+        instance = self.from_earlier_run()
+        old, _ = instance.item_cache[1]
+        request_refresh()
+
+        first = instance.get_item(1)
+        second = instance.get_item(1)
+
+        assert first is not old
+        assert second is first
+        assert instance.singles == 1
+        assert first.child_cache == {"sentinel": "subtree"}
+
+    def test_singular_after_listing_makes_no_request(self):
+        instance = self.from_earlier_run()
+        request_refresh()
+
+        list(instance.get_items())
+        instance.get_item(1)
+
+        assert instance.singles == 0
+
+    def test_entry_gone_from_canvas_stays_without_extra_requests(self):
+        instance = self.from_earlier_run()
+        instance.listing = [2]
+        request_refresh()
+
+        list(instance.get_items())
+        again = sorted(obj.id for obj in instance.get_items())
+
+        assert again == [1, 2]
+        assert instance.singles == 0
+
+    def test_failed_refresh_leaves_the_cache_intact(self):
+        instance = self.from_earlier_run()
+        fetched = instance.item_all_fetched
+        instance.fail = True
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.CanvasException):
+            list(instance.get_items())
+
+        assert instance.item_all_fetched == fetched
+        assert instance.item_cache[1][0].child_cache == {"sentinel": "subtree"}
+
+    def submission_from_earlier_run(self, refetch=None):
+        """Return an assignment with a final grade cached an hour ago."""
+        response = MagicMock()
+        response.json.return_value = [{"id": 1, "user_id": 1, "grade": "F"}]
+        response.links = {}
+        requester = MagicMock()
+        requester.request.return_value = response
+        requester.base_url = "https://canvas.example/api/v1/"
+        requester.new_quizzes_url = "https://canvas.example/api/quiz/v1/"
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+        lazy = LazySubmission(
+            Submission(requester, {"id": 1, "user_id": 1, "grade": "P"}),
+            assignment, set(), refetch or MagicMock())
+        lazy.ensure_attrs(["rubric_assessment"])
+        lazy.user = "annotation"
+        object.__setattr__(lazy, "_last_refresh",
+                           datetime.now() - timedelta(hours=1))
+        getattr(assignment, "__cache")[1] = lazy
+        setattr(assignment, "__all_fetched",
+                datetime.now() - timedelta(hours=1))
+        return assignment, requester, lazy
+
+    def test_final_grade_stays_cached_without_a_request(self):
+        assignment, requester, lazy = self.submission_from_earlier_run()
+
+        assert assignment.get_submissions()[0].grade == "P"
+        requester.request.assert_not_called()
+
+    def test_submission_listing_corrects_grade_and_keeps_details(self):
+        assignment, requester, _ = self.submission_from_earlier_run()
+        request_refresh()
+
+        first = assignment.get_submissions()[0]
+        assignment.get_submissions()
+
+        assert first.grade == "F"
+        assert first.user == "annotation"
+        assert first.rubric_assessment is None
+        requester.request.assert_called_once()
+
+    def test_lazy_read_corrects_a_final_grade_once(self):
+        def corrected(assignment, user, **kwargs):
+            corrected.calls += 1
+            return Submission(MagicMock(),
+                              {"id": 1, "user_id": 1, "grade": "F"})
+        corrected.calls = 0
+        _, _, lazy = self.submission_from_earlier_run(corrected)
+        request_refresh()
+
+        assert lazy.grade == "F"
+        assert lazy.grade == "F"
+        assert corrected.calls == 1
+@
+
 \subsection{Diagnosing cache staleness}
 
 To make cache behavior transparent and debuggable, we need to log not just
@@ -4122,6 +4355,9 @@ def _needs_refresh(self):
   """Check if the wrapped submission needs refreshing."""
   submission = object.__getattribute__(self, '_submission')
   last_refresh = object.__getattribute__(self, '_last_refresh')
+
+  if predates_refresh(last_refresh):
+    return True
 
   # Never refresh final grades
   if submission.grade in NOREFRESH_GRADES:
@@ -5494,7 +5730,8 @@ else:
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
-need_refetch = self.__all_fetched is None
+need_refetch = (self.__all_fetched is None
+                or predates_refresh(self.__all_fetched))
 
 if not need_refetch:
   for lazy_submission in self.__cache.values():
@@ -5508,10 +5745,9 @@ if need_refetch:
     to_include |= set(lazy_submission._includes)
 
   logger.info(f"Fetching all submissions for assignment id={self.id}")
-  for raw_submission in get_submissions(self, include=list(to_include)):
-    lazy_submission = LazySubmission(raw_submission, self, to_include,
-                                     original_get_submission)
-    self.__cache[raw_submission.user_id] = lazy_submission
+  all_includes = to_include
+  for raw_submission in get_submissions(self, include=list(all_includes)):
+    <<keep [[raw_submission]] in the cache>>
 
   self.__all_fetched = datetime.now()
 else:
@@ -5527,11 +5763,26 @@ else:
 return list(self.__cache.values())
 @
 
+The bulk fetch above and the bulk refresh below both replace submissions that
+may already be cached, so they share one way of storing what they get.
+A cached submission keeps its wrapper and is replaced through
+[[_replace_submission]], so annotations and attribute names survive a bulk fetch
+exactly as they survive a lazy refresh.
+<<keep [[raw_submission]] in the cache>>=
+if raw_submission.user_id in self.__cache:
+  lazy_submission = self.__cache[raw_submission.user_id]
+  lazy_submission._replace_submission(raw_submission)
+  object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+  object.__setattr__(lazy_submission, '_includes', all_includes)
+else:
+  lazy_submission = LazySubmission(raw_submission, self, all_includes,
+                                   original_get_submission)
+  self.__cache[raw_submission.user_id] = lazy_submission
+@
+
 The bulk refresh pre-check logic counts how many submissions would need refresh
 and triggers a bulk fetch if the count exceeds the threshold.
-The fetched submissions replace the wrapped ones through
-[[_replace_submission]], so annotations and attribute names survive a bulk
-refresh exactly as they survive a lazy one.  The fetch is the
+The fetch is the
 one part that can fail, so it is the only part we wrap; what we do when it does
 is the subject of \cref{sec:bulk-refresh-failure} below.
 <<check staleness threshold and bulk refresh if needed>>=
@@ -5549,15 +5800,7 @@ for lazy_submission in self.__cache.values():
 
 try:
   for raw_submission in get_submissions(self, include=list(all_includes)):
-    if raw_submission.user_id in self.__cache:
-      lazy_submission = self.__cache[raw_submission.user_id]
-      lazy_submission._replace_submission(raw_submission)
-      object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
-      object.__setattr__(lazy_submission, '_includes', all_includes)
-    else:
-      lazy_submission = LazySubmission(raw_submission, self, all_includes,
-                                       original_get_submission)
-      self.__cache[raw_submission.user_id] = lazy_submission
+    <<keep [[raw_submission]] in the cache>>
 except canvasapi.exceptions.CanvasException as error:
   <<keep the cached submissions after a failed bulk refresh>>
 else:

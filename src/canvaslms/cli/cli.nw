@@ -78,7 +78,10 @@ import shlex
 import sys
 import textwrap
 
+import responses
+
 import canvaslms.cli
+import canvaslms.hacks.canvasapi
 
 from canvaslms.cli import dirs
 <<modules>>
@@ -463,9 +466,100 @@ Occasionally you want to bypass the cache for a single command,
 for example right after creating or updating objects.
 
 <<add global options to argp>>=
-argp.add_argument("--no-cache",
+cache_use = argp.add_mutually_exclusive_group()
+cache_use.add_argument("--no-cache",
   action="store_true",
   help="Do not read or write the persistent Canvas object cache")
+cache_use.add_argument("--refresh-cache",
+  action="store_true",
+  help="Fetch what this command reads from Canvas again, whatever its age, "
+    "and save it; the rest of the cache is kept")
+@
+
+The two options answer different needs, which is why they exclude each other
+rather than one implying the other.
+[[--no-cache]] is about not touching the cache at all.
+[[--refresh-cache]] is about making the cache right, so the next command, which
+has neither option, gets the fresh data too.
+It only refreshes what the command actually reads, see
+\cref{sec:refresh-on-request}.
+
+Let's verify the whole way there and back, through the real parser, the real
+encrypted file and real [[canvasapi]] objects.
+We stub HTTP with [[responses]], because what we test is what happens when
+Canvas's answer changes between runs, which a recording cannot express.
+An unregistered request fails, so these tests also prove what is \emph{not}
+fetched.
+Each run in a test stands for a process of its own, so it starts without a
+requested refresh.
+
+<<test functions>>=
+CANVAS_HOST = "https://canvas.example"
+CANVAS_API = f"{CANVAS_HOST}/api/v1"
+OLD_COURSE = {"id": 1, "name": "Old course", "course_code": "OLD"}
+NEW_COURSE = {"id": 2, "name": "New course", "course_code": "NEW"}
+LAB = {"id": 5, "name": "Lab", "course_id": 1}
+
+@pytest.fixture
+def run_cli(monkeypatch, tmp_path, capsys):
+  """Return a function running canvaslms as a new process, returning stdout."""
+  monkeypatch.setattr(canvaslms.cli.cache, "get_cache_path",
+                      lambda hostname: str(tmp_path / "cache.enc"))
+  monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
+                      lambda config: (CANVAS_HOST, "token"))
+
+  def run(*arguments):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+    monkeypatch.setattr(sys, "argv", ["canvaslms",
+                                      "--config-file",
+                                      str(tmp_path / "config.json"),
+                                      *arguments])
+    canvaslms.cli.main()
+    return capsys.readouterr().out
+
+  return run
+
+@responses.activate
+def test_refresh_cache_finds_new_course_and_keeps_it(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  run_cli("courses")
+
+  responses.replace(responses.GET, f"{CANVAS_API}/courses",
+                    json=[OLD_COURSE, NEW_COURSE])
+  assert "New course" not in run_cli("courses")
+  assert "New course" in run_cli("--refresh-cache", "courses")
+
+  responses.reset()
+  assert "New course" in run_cli("courses")
+
+@responses.activate
+def test_refresh_cache_keeps_what_the_command_does_not_read(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  assert "Lab" in run_cli("assignments", "-c", "Old")
+
+  responses.reset()
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE, NEW_COURSE])
+  run_cli("--refresh-cache", "courses")
+
+  responses.reset()
+  assert "Lab" in run_cli("assignments", "-c", "Old")
+
+@responses.activate
+def test_refresh_cache_refetches_what_the_command_reads(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  run_cli("assignments", "-c", "Old")
+
+  responses.replace(responses.GET, f"{CANVAS_API}/courses/1/assignments",
+                    json=[LAB, {"id": 6, "name": "Exam", "course_id": 1}])
+  assert "Exam" not in run_cli("assignments", "-c", "Old")
+  assert "Exam" in run_cli("--refresh-cache", "assignments", "-c", "Old")
+
+def test_refresh_cache_excludes_no_cache(run_cli, capsys):
+  with pytest.raises(SystemExit):
+    run_cli("--no-cache", "--refresh-cache", "courses")
+  assert "not allowed with" in capsys.readouterr().err
 @
 
 
@@ -763,6 +857,7 @@ try:
   canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
       config,
       use_cache=not args.no_cache,
+      refresh=args.refresh_cache,
   )
 except canvaslms.cli.cache.CanvasCredentialsError as e:
   err(1, str(e))
