@@ -1466,6 +1466,7 @@ except KeyError:
   obj = None
   prev_kwargs = {}
   cache_status = " (not found)"
+old_obj = obj
 
 if obj and must_update(prev_kwargs, kwargs):
   obj = None
@@ -1477,10 +1478,13 @@ elif obj and outdated(obj):
 
 if not obj:
   fetch_start = time.perf_counter()
-  obj = get_attr(self, *args, **kwargs)
+  union_kwargs = merge_kwargs([prev_kwargs, kwargs])
+  obj = get_attr(self, *args, **union_kwargs)
   fetch_elapsed = time.perf_counter() - fetch_start
+  if old_obj:
+    <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
-  attr_cache[getattr(obj, cache_key)] = (obj, kwargs)
+  attr_cache[getattr(obj, cache_key)] = (obj, union_kwargs)
   logger.info(f"Cache miss{cache_status}: {attr_name} {cache_key}={id} fetched in "
               f"{fetch_elapsed:.2f}s")
 else:
@@ -1995,6 +1999,7 @@ for obj, obj_kwargs in list(attr_cache.values()):
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
     refresh_start = time.perf_counter()
+    old_obj = obj
     try:
       obj = get_attr(self, obj_key, **obj_kwargs)
     except canvasapi.exceptions.ResourceDoesNotExist:
@@ -2002,6 +2007,7 @@ for obj, obj_kwargs in list(attr_cache.values()):
                   f"no longer exists")
       attr_cache.pop(obj_key, None)
       continue
+    <<update [[obj]] with cache from [[old_obj]]>>
     refresh_elapsed = time.perf_counter() - refresh_start
     logger.info(f"Individual refresh: {attr_name} {cache_key}={obj_key} in "
                 f"{refresh_elapsed:.2f}s{reason_str}")
@@ -2500,6 +2506,84 @@ lines~494--495).
 for cache_attr_name in dir(old_obj):
   if cache_attr_name.endswith("_cache") or cache_attr_name.endswith("_all_fetched"):
     setattr(obj, cache_attr_name, getattr(old_obj, cache_attr_name))
+@
+
+The same reasoning holds for every other way an object gets replaced, not only
+the bulk fetch: the singular method and the individual refresh of a listing also
+build a new object from Canvas's answer.
+Those two used to store the new object as it came, which silently threw away
+everything cached below it.
+A single [[canvas.get_course(id, include=["syllabus_body"])]] from the
+[[syllabus]] commands thus forgot that course's assignments, users and
+submissions, though nothing about them had changed.
+All three paths therefore share this chunk.
+
+A re-fetch must not lose the details of the object itself either.
+The cache entry remembers which keyword arguments produced it, and
+[[must_update]] trusts that record: after a plain [[get_item(1)]] has refreshed
+an object fetched with [[include=["a"]]], a later request for [[a]] must not
+find it missing.
+The singular method therefore fetches with the union of the old and new keyword
+arguments, as the bulk fetch already does.
+
+Let's verify both, for each way of replacing an object.
+The stand-in class is enough here: what we test is what the decorator does with
+the objects it receives, and a recording could not express Canvas's answer
+changing between the calls.
+
+<<test functions>>=
+class TestRefetchKeepsCachedDetails:
+    """Test that replacing an object loses nothing cached about it"""
+
+    def make_instance(self, fetches=None):
+        """Return a decorated instance with item 1 listed and given children"""
+        class TestClass:
+            def get_items(self, **kwargs):
+                return [canvas_object(Submission, id=1, grade="F")]
+            def get_item(self, item_id, **kwargs):
+                if fetches is not None:
+                    fetches.append(kwargs)
+                return canvas_object(Submission, id=item_id, grade="F")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        obj, _ = instance.item_cache[1]
+        obj.child_cache = {"sentinel": "subtree"}
+        obj.child_all_fetched = datetime(2026, 1, 1)
+        return instance
+
+    def age(self, obj):
+        """Make obj stale by the submission TTL"""
+        obj._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
+
+    def assert_children_kept(self, obj):
+        assert obj.child_cache == {"sentinel": "subtree"}
+        assert obj.child_all_fetched == datetime(2026, 1, 1)
+
+    def test_singular_refetch_for_new_kwargs_keeps_children(self):
+        instance = self.make_instance()
+        self.assert_children_kept(instance.get_item(1, include=["more"]))
+
+    def test_singular_refetch_of_stale_object_keeps_children(self):
+        instance = self.make_instance()
+        self.age(instance.item_cache[1][0])
+        self.assert_children_kept(instance.get_item(1))
+
+    def test_individual_refresh_in_listing_keeps_children(self):
+        instance = self.make_instance()
+        self.age(instance.item_cache[1][0])
+        self.assert_children_kept(list(instance.get_items())[0])
+
+    def test_stale_refetch_keeps_earlier_includes(self):
+        fetches = []
+        instance = self.make_instance(fetches)
+        instance.get_item(1, include=["a"])
+        self.age(instance.item_cache[1][0])
+        instance.get_item(1)
+        assert fetches[-1] == {"include": ["a"]}
+        assert instance.item_cache[1][1] == {"include": ["a"]}
 @
 
 Now let's verify cache synchronization preserves hierarchical caches.
