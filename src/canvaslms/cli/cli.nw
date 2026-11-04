@@ -77,7 +77,7 @@ import re
 import shlex
 import sys
 import textwrap
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import requests
 import responses
@@ -871,6 +871,297 @@ def test_student_in_one_course_of_many_is_no_miss(
 
   assert requests_to("courses/1/search_users") == 0
   assert requests_to("courses/2/search_users") == 0
+@
+
+How many listings such a search may fetch depends on whether it spans all the
+courses, and going over the limit has to be visible, or the user cannot tell
+that the name was never looked for (\cref{sec:refresh-on-miss}).
+Let's verify this through both lookups that have the limit.
+We leave the rest of the command real too, so that these tests also show how
+many warnings a whole run prints.
+Reading that takes one trick: [[main]] configures logging with [[basicConfig]],
+which does nothing when the root logger already has handlers, as it has under
+pytest.
+We take them away during the run, so that the level and the stream are those of
+a real process, and [[-q]] does what it does there.
+
+<<test functions>>=
+NARROW_LIMIT = "CANVASLMS_MISS_REFRESH_MAX_LISTINGS"
+ALL_COURSES_LIMIT = "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES"
+NOT_FETCHING = "not fetching"
+USER_MISS = (("users",), ("Nobody",), "search_users")
+ASSIGNMENT_MISS = (("assignments", "list"), ("-a", "Nothing"), "assignments")
+
+def add_courses(count):
+  """Add `count` courses to Canvas, each with a student and an assignment."""
+  responses.get(f"{CANVAS_API}/courses",
+                json=[{"id": course_id, "name": f"Course {course_id}",
+                       "course_code": f"C{course_id}"}
+                      for course_id in range(1, count + 1)])
+  for course_id in range(1, count + 1):
+    responses.get(f"{CANVAS_API}/courses/{course_id}/search_users", json=[ANNA])
+    responses.get(f"{CANVAS_API}/courses/{course_id}/assignments",
+                  json=[dict(LAB, id=100 + course_id, course_id=course_id)])
+
+def fetches_of(listing, count):
+  """Return how many of the `count` courses had their `listing` requested."""
+  return sum(requests_to(f"courses/{course_id}/{listing}")
+             for course_id in range(1, count + 1))
+
+def run_miss(run_cli, capsys, *arguments):
+  """Run a command that finds nothing with logging as in a process of its own.
+
+  Returns what the command printed, stdout and stderr.
+  """
+  capsys.readouterr()
+  root = logging.getLogger()
+  handlers, level = root.handlers[:], root.level
+  root.handlers[:] = []
+  try:
+    assert_no_match(run_cli, *arguments)
+  finally:
+    root.handlers[:] = handlers
+    root.setLevel(level)
+  return capsys.readouterr()
+
+@responses.activate
+@pytest.mark.parametrize("command,name,listing", [USER_MISS, ASSIGNMENT_MISS])
+@pytest.mark.parametrize("count,course,limit,variable", [
+  (5, (), 5, None),
+  (6, (), 5, ALL_COURSES_LIMIT),
+  (6, ("-c", ".*"), 5, ALL_COURSES_LIMIT),
+  (6, ("-c", "Course"), 25, None),
+  (25, ("-c", "Course"), 25, None),
+  (26, ("-c", "Course"), 25, NARROW_LIMIT),
+])
+def test_limit_depends_on_what_the_search_spans(
+    run_cli, capsys, any_listing_is_old_enough,
+    command, name, listing, count, course, limit, variable):
+  add_courses(count)
+  run_cli(*command)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, *command, *course, *name)
+
+  if variable:
+    assert fetches_of(listing, count) == 0
+    assert printed.err.count("[WARNING]") == 1
+    assert f"not fetching {count} listings" in printed.err
+    assert f"limit is {limit}" in printed.err
+    assert "--refresh-cache" in printed.err
+    assert f"raise {variable}." in printed.err
+    assert NOT_FETCHING not in printed.out
+  else:
+    assert fetches_of(listing, count) == count
+    assert "[WARNING]" not in printed.err
+
+@
+
+Commands like [[submissions]] and [[results]] look up assignments as well as
+users, yet a run prints at most one warning.
+Each lookup happens once per command, and a name that misses among the
+assignments ends the command with [[EmptyListError]] before it gets to the users.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("arguments,limit", [
+  (("submissions", "list", "-a", "Lab", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("submissions", "list", "-a", "Nothing", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("results", "-a", "Lab", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("results", "-a", "Nothing", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("submissions", "list", "-c", "Course", "-a", "Lab", "-u", "Nobody"),
+   NARROW_LIMIT),
+])
+def test_a_command_with_two_lookups_warns_once(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch, arguments, limit):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS", 5)
+  add_courses(6)
+  run_cli("users")
+  run_cli("assignments", "list")
+
+  printed = run_miss(run_cli, capsys, *arguments)
+
+  assert printed.err.count("[WARNING]") == 1
+  assert f"raise {limit}." in printed.err
+
+@responses.activate
+def test_quiet_hides_the_warning(run_cli, capsys, any_listing_is_old_enough):
+  add_courses(6)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "-q", "users", "Nobody")
+
+  assert printed.err == ""
+  assert fetches_of("search_users", 6) == 0
+
+@responses.activate
+@pytest.mark.parametrize("setting,value,count,course,fetched,limit", [
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 7, 6, (), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 2, 3, (), False, 2),
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0, 3, ("-c", "Course"), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS", 30, 26, ("-c", "Course"), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS", 2, 3, ("-c", "Course"), False, 2),
+  ("MISS_REFRESH_MAX_LISTINGS", 0, 3, (), True, None),
+])
+def test_each_limit_governs_its_kind_of_search(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch,
+    setting, value, count, course, fetched, limit):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, setting, value)
+  add_courses(count)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", *course, "Nobody")
+
+  assert fetches_of("search_users", count) == (count if fetched else 0)
+  assert (f"limit is {limit}" in printed.err) == (limit is not None)
+
+@responses.activate
+@pytest.mark.parametrize("setting,course", [
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", ()),
+  ("MISS_REFRESH_MAX_LISTINGS", ("-c", "Course")),
+])
+def test_zero_turns_the_retry_off_without_a_warning(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch, setting, course):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, setting, 0)
+  add_courses(3)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", *course, "Nobody")
+
+  assert fetches_of("search_users", 3) == 0
+  assert "[WARNING]" not in printed.err
+
+@responses.activate
+def test_zero_also_stops_looking_for_a_new_course(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS", 0)
+  add_courses(1)
+  run_cli("courses")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "courses", "Nothing")
+
+  assert requests_to("courses") == 0
+  assert "[WARNING]" not in printed.err
+@
+
+The limit counts what would be fetched, so the rosters must really differ in
+age.
+We write the ages into the cache file that the next run reads, as the
+[[any_listing_is_old_enough]] fixture would count them all.
+The same rule means that nothing is exceeded when everything was just fetched.
+
+<<test functions>>=
+def make_rosters_old(*course_ids):
+  """Make the cached rosters of the courses an hour old in the cache file."""
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  for course in canvas.get_courses():
+    if course.id in course_ids:
+      course.user_all_fetched = datetime.now() - timedelta(hours=1)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+
+@responses.activate
+def test_a_few_old_rosters_among_many_are_fetched(run_cli, capsys):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(1, 2, 3)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", "Nobody")
+
+  assert fetches_of("search_users", 3) == 3
+  assert fetches_of("search_users", 30) == 3
+  assert "[WARNING]" not in printed.err
+
+@responses.activate
+def test_too_many_old_rosters_among_many_are_counted_and_not_fetched(
+    run_cli, capsys):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(1, 2, 3, 4, 5, 6)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", "Nobody")
+
+  assert fetches_of("search_users", 30) == 0
+  assert "not fetching 6 listings" in printed.err
+
+@responses.activate
+@pytest.mark.parametrize("option", ["--refresh-cache", "--no-cache"])
+def test_no_warning_when_the_search_just_fetched_everything(
+    run_cli, capsys, option):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(*range(1, 31))
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, option, "users", "Nobody")
+
+  assert fetches_of("search_users", 30) == 30
+  assert "[WARNING]" not in printed.err
+@
+
+Library callers name their courses themselves, so they get the larger limit
+without asking for it, and they are told as well when it stops a refresh.
+They have not configured logging, which is why this does not take [[run_miss]].
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("count,fetched", [(25, True), (26, False)])
+def test_library_caller_gets_the_larger_limit(
+    run_cli, monkeypatch, tmp_path, caplog, any_listing_is_old_enough,
+    count, fetched):
+  add_courses(count)
+  run_cli("users")
+  responses.calls.reset()
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+  canvaslms.clear_canvas_state()
+  try:
+    canvas = canvaslms.get_canvas(str(tmp_path / "config.json"))
+    courses = list(canvaslms.cli.courses.filter_courses(canvas, "Course"))
+    with caplog.at_level(logging.WARNING):
+      assert list(canvaslms.cli.users.filter_users(courses, "Nobody")) == []
+  finally:
+    canvaslms.clear_canvas_state()
+
+  assert fetches_of("search_users", count) == (count if fetched else 0)
+  assert (NOT_FETCHING in caplog.text) == (not fetched)
+  assert (f"raise {NARROW_LIMIT}." in caplog.text) == (not fetched)
+@
+
+The shipped [[ungraded.sh]] runs from cron with course patterns that may not
+match yet, and cron mails what it prints on stderr.
+Each of its calls names only a course, and the course listing is a single
+listing, which cannot be over a limit, and a limit of 0 does not warn; the
+assignment and user patterns stay at the default that names nothing.
+So its mail cannot fill up with warnings, whatever the size of the selection.
+Let's pin this with a selection above the limit and every listing old enough:
+all that would be needed for a warning is one more lookup that names something.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("course,group", [
+  ("Course", ".*"), ("Course", "Nothing"), ("Nothing", ".*")])
+def test_a_search_like_that_of_ungraded_sh_never_warns(
+    run_cli, capsys, any_listing_is_old_enough, course, group):
+  add_courses(30)
+  for course_id in range(1, 31):
+    responses.get(f"{CANVAS_API}/courses/{course_id}/assignment_groups",
+                  json=[])
+    responses.get(f"{CANVAS_API}/courses/{course_id}"
+                  f"/assignments/{100 + course_id}/submissions", json=[])
+  run_cli("users")
+  run_cli("assignments", "list")
+
+  printed = run_miss(run_cli, capsys, "submissions", "list",
+                     "-c", course, "-A", group, "-U")
+
+  assert "[WARNING]" not in printed.err
 @
 
 
