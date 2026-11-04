@@ -1485,7 +1485,7 @@ elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
 
 if not obj:
   fetch_start = time.perf_counter()
-  union_kwargs = merge_kwargs([prev_kwargs, kwargs])
+  union_kwargs = merge_kwargs([without_restrictions(prev_kwargs), kwargs])
   try:
     obj = get_attr(self, *args, **union_kwargs)
   except canvasapi.exceptions.ResourceDoesNotExist:
@@ -1848,8 +1848,12 @@ yield all objects once from the bulk fetch, then yield them all again while
 checking for staleness, causing N individual API calls for outdated items
 immediately after a bulk fetch.
 <<return cached result or fetch from [[get_attrs]]>>=
+<<pass a request for a subset through to Canvas>>
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
+
+<<treat a listing cached with a restriction as not fetched>>
 
 if attr_all_fetched and predates_refresh(attr_all_fetched):
   logger.info(f"Cache invalidation: {display_plural} - refresh requested")
@@ -1931,7 +1935,8 @@ bulk_start = time.perf_counter()
 
 original_includes = set(kwargs.get('include', []))
 union_kwargs = merge_kwargs(
-  [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
+  [without_restrictions(kwargs) for _, kwargs in attr_cache.values()]
+  + [kwargs])
 merged_includes = set(union_kwargs.get('include', []))
 
 if merged_includes != original_includes:
@@ -1953,6 +1958,7 @@ for obj in fetched_objs:
     <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj_key] = (obj, union_kwargs)
+<<clear restrictions from entries Canvas did not return>>
 process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
@@ -3236,16 +3242,6 @@ COURSE_CACHE_TTL_DAYS = env_number(
   "CANVASLMS_COURSE_CACHE_TTL_DAYS", 1, int)
 @
 
-Some query arguments are additive, such as [[include]], and fit naturally in a
-generic cache that merges earlier requests into later ones. Restrictive
-arguments such as [[bucket="ungraded"]] behave differently: they describe a
-subset, not a richer version of the same collection.
-
-The generic cache in this module intentionally does not try to model those
-restrictive semantics. Callers that need an ungraded subset must therefore
-fetch the full collection and filter locally, which is what
-[[canvaslms.cli.submissions]] and [[canvaslms.cli.assignments]] now do.
-
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
 flag.
 If we set it to [[None]], then we'll fetch all objects again.
@@ -3464,6 +3460,186 @@ class TestOutdated:
         assert outdated(submission)
 @
 
+
+\subsection{Requests for a subset of a listing}
+\label{sec:subset-listings}
+
+Some query arguments are additive, such as [[include]]: they ask for more about
+the same objects, and fit naturally in a cache that merges earlier requests into
+later ones.
+Others are restrictive, such as [[enrollment_type=["student"]]]: they describe a
+subset of the collection, not a richer version of it.
+
+Treating the second kind like the first is not merely imprecise, it corrupts the
+listing for everyone else.
+Here is how it happened.
+The FeedbackFruits tooling asked a course for
+[[get_users(enrollment_type=["student"], include=["email", "enrollments"])]].
+The cache took the answer for the course's complete roster and stored the
+restriction on each entry.
+From then on [[users]] and [[nytid]] asked for
+[[get_users(include=["enrollments"])]], found that satisfied, and saw no TAs.
+A refresh did not help, because it merges the keyword arguments of the entries
+into its request, so it asked Canvas for students only, again.
+Only [[--no-cache]], with no entries to merge, could find a TA.
+
+The cache cannot serve a subset from a listing, or a listing from a subset,
+without knowing what each argument means.
+So it does not try.
+A request with an argument we do not know to be additive goes straight to Canvas
+and leaves the cache alone, so the caller gets the right answer and nobody else
+is affected.
+Callers wanting speed can still fetch the full collection and filter locally,
+which is what [[canvaslms.cli.users]], [[canvaslms.cli.submissions]] and
+[[canvaslms.cli.assignments]] do.
+
+This protects every user of the library, not only the [[canvaslms]] command,
+since the check is in the decorated method itself.
+The contrast with our other refreshes is deliberate: [[--refresh-cache]] and the
+retry on a miss are things a caller must ask for or pass a pattern to, while a
+correct listing must not depend on how it is reached.
+<<constants>>=
+COMPLETE_LISTING_KEYS = (
+  "include",
+  <<keys to ignore>>
+)
+<<kwargs functions caches>>=
+def restricts_listing(kwargs):
+  """Return True if `kwargs` may ask for only a subset of a listing."""
+  return any(key not in COMPLETE_LISTING_KEYS for key in kwargs)
+
+def without_restrictions(kwargs):
+  """Return `kwargs` with only what applies to a complete listing."""
+  return {key: value for key, value in kwargs.items()
+          if key in COMPLETE_LISTING_KEYS}
+<<pass a request for a subset through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: {display_plural} restricted by {kwargs}")
+  yield from get_attrs(self, *args, **kwargs)
+  return
+@
+
+Caches that already hold such a listing must recover too, and by themselves, as
+a program using the library has no [[--refresh-cache]] to pass.
+A listing with a restriction on any entry is not complete, so we treat it as not
+fetched, and the next reader fetches it properly.
+
+This could look like the kind of migration we otherwise solve by bumping
+[[CACHE_SCHEMA_VERSION]], but it is not one.
+The cache file is shared between programs that each have their own copy of this
+library, [[nytid]] for instance, so a copy older than this code can write such a
+listing at any time.
+A version bump would not stop that, and it would make programs with different
+versions discard each other's cache on every run.
+<<treat a listing cached with a restriction as not fetched>>=
+if attr_all_fetched and any(restricts_listing(prev_kwargs)
+                            for _, prev_kwargs in attr_cache.values()):
+  logger.info(f"Cache invalidation: {display_plural} - cached for a subset")
+  attr_all_fetched = None
+@
+
+The fetch that follows only replaces the entries Canvas returns.
+A student who has left the course would keep the restriction, and the listing
+would then count as incomplete on every read, at the cost of a new fetch each
+time.
+So we clear the restriction from what is left as well.
+<<clear restrictions from entries Canvas did not return>>=
+for obj_key, (obj, obj_kwargs) in list(attr_cache.items()):
+  if restricts_listing(obj_kwargs):
+    attr_cache[obj_key] = (obj, without_restrictions(obj_kwargs))
+@
+
+Let's verify this at the level of the decorator, whoever the caller is.
+A stand-in lets us see the keyword arguments each request carries.
+
+<<test functions>>=
+class TestRequestsForASubset:
+    """Test that a restriction never reaches the cached listing"""
+
+    def make_instance(self):
+        """Return an instance whose listing honours a restriction."""
+        class TestClass:
+            def __init__(self):
+                self.requests = []
+            def get_item(self, item_id, **kwargs):
+                self.requests.append(kwargs)
+                return canvas_object(id=item_id)
+            def get_items(self, **kwargs):
+                self.requests.append(kwargs)
+                ids = [1] if "enrollment_type" in kwargs else [1, 2]
+                return [canvas_object(id=each) for each in ids]
+
+        CacheGetMethods("item")(TestClass)
+        return TestClass()
+
+    def with_restriction_stored(self, *ids):
+        """Return an instance as an older version would have left it."""
+        instance = self.make_instance()
+        for item_id in ids:
+            instance.item_cache[item_id] = (
+                canvas_object(id=item_id),
+                {"enrollment_type": ["student"], "include": ["a"]})
+        instance.item_all_fetched = datetime.now()
+        return instance
+
+    @pytest.mark.parametrize("kwargs,restricts", [
+        ({}, False),
+        ({"include": ["a"]}, False),
+        ({"sort": "name", "order": "asc", "order_by": "x"}, False),
+        ({"enrollment_type": ["student"]}, True),
+        ({"include": ["a"], "search_term": "x"}, True)])
+    def test_what_restricts_a_listing(self, kwargs, restricts):
+        assert restricts_listing(kwargs) is restricts
+
+    def test_a_subset_is_passed_through_and_not_cached(self):
+        instance = self.make_instance()
+
+        subset = list(instance.get_items(enrollment_type=["student"]))
+
+        assert [obj.id for obj in subset] == [1]
+        assert instance.item_cache == {}
+        assert instance.item_all_fetched is None
+
+    def test_a_subset_leaves_a_cached_listing_alone(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+        requests = len(instance.requests)
+
+        list(instance.get_items(enrollment_type=["student"]))
+
+        assert len(instance.requests) == requests + 1
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+        assert len(instance.requests) == requests + 1
+
+    def test_a_stored_restriction_is_fetched_properly_and_only_once(self):
+        instance = self.with_restriction_stored(1)
+
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+
+        assert instance.requests == [{"include": ["a"]}]
+
+    def test_an_entry_canvas_no_longer_lists_does_not_refetch_forever(self):
+        instance = self.with_restriction_stored(1, 99)
+
+        list(instance.get_items())
+        list(instance.get_items())
+
+        assert len(instance.requests) == 1
+        assert instance.item_cache[99][1] == {"include": ["a"]}
+
+    def test_a_stale_singular_does_not_inherit_a_restriction(self):
+        instance = self.with_restriction_stored(1)
+        obj, _ = instance.item_cache[1]
+        obj._fetched_at = datetime.now() - timedelta(hours=1)
+        canvaslms.hacks.canvasapi.request_refresh()
+        try:
+            instance.get_item(1)
+        finally:
+            canvaslms.hacks.canvasapi.refresh_since = None
+
+        assert instance.requests == [{"include": ["a"]}]
+@
 
 \subsection{Refreshing on request}
 \label{sec:refresh-on-request}

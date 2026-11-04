@@ -730,6 +730,98 @@ def test_no_assignments_at_all_is_not_a_miss(run_cli,
   assert requests_to("courses/1/assignments") == 0
 @
 
+A listing narrowed to a subset must not stick to the cache
+(\cref{sec:subset-listings}).
+Our Canvas stand-in answers such a request the way Canvas does, with only the
+students, so a roster that inherited the restriction never shows the TA.
+The first tests start from a cache written by an earlier version, which stored
+the restriction on its entries, as a real cache of ours did.
+The cache file is shared with programs that may have an older copy of this
+library, one that does not know to repair such a listing, so the first test also
+checks that what we leave in the file is correct in itself.
+
+<<test functions>>=
+TOVE = {"id": 8, "name": "Tove Assistant", "login_id": "tove",
+        "enrollments": [{"type": "TaEnrollment"}]}
+
+def add_roster_that_honours_enrollment_type():
+  """Answer the course's roster requests with students only, if asked to."""
+  def roster(request):
+    people = [ANNA] if "enrollment_type" in request.url else [ANNA, TOVE]
+    return (200, {}, json.dumps(people))
+  responses.add_callback(responses.GET,
+                         f"{CANVAS_API}/courses/1/search_users", roster)
+
+def cache_a_narrowed_roster(run_cli):
+  """Leave the cache as a restricted call of an earlier version left it."""
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  add_roster_that_honours_enrollment_type()
+  run_cli("users", "-c", "Old", "Anna")
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+  anna = course.user_cache[7][0]
+  course.user_cache.clear()
+  course.user_cache[7] = (anna, {"enrollment_type": ["student"],
+                                 "include": ["enrollments"]})
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  responses.calls.reset()
+
+@responses.activate
+def test_refresh_cache_undoes_a_narrowed_roster(run_cli):
+  cache_a_narrowed_roster(run_cli)
+
+  assert "Tove" in run_cli("--refresh-cache", "users", "-c", "Old", "Tove")
+
+  responses.reset()
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+  assert set(course.user_cache) == {7, 8}
+  assert not any(
+    canvaslms.hacks.canvasapi.restricts_listing(kwargs)
+    for _, kwargs in course.user_cache.values())
+
+@responses.activate
+def test_miss_undoes_a_narrowed_roster(run_cli, any_listing_is_old_enough):
+  cache_a_narrowed_roster(run_cli)
+
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+
+@responses.activate
+def test_library_caller_gets_the_whole_of_a_narrowed_roster(
+    run_cli, monkeypatch, tmp_path):
+  """As nytid does: no flag, no name to miss, its own matching of the result."""
+  cache_a_narrowed_roster(run_cli)
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+  canvaslms.clear_canvas_state()
+  try:
+    canvas = canvaslms.get_canvas(str(tmp_path / "config.json"))
+    courses = list(canvaslms.cli.courses.filter_courses(canvas, "Old"))
+    users = canvaslms.cli.users.filter_users(courses, ".*")
+
+    assert {user.id for user in users} == {7, 8}
+  finally:
+    canvaslms.clear_canvas_state()
+
+@responses.activate
+def test_a_narrowed_listing_does_not_affect_the_cache(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  add_roster_that_honours_enrollment_type()
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+
+  for _ in range(2):
+    students = course.get_users(enrollment_type=["student"],
+                                include=["enrollments"])
+    assert [student.id for student in students] == [7]
+  assert requests_to("courses/1/search_users") == 2
+  assert course.user_all_fetched is None and not course.user_cache
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+@
+
 A selection of several courses is searched as a whole.
 Without [[-c]] it spans every course, and a name is usually missing from most of
 them, so only a name found in none of them is a miss.

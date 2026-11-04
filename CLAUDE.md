@@ -926,6 +926,12 @@ A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
 a command or on `EmptyListError`.
 
+The cache file is shared with programs holding their own, possibly older, copy
+of this library (nytid, fbf), so keep it readable by them: do not bump the schema
+for what can be repaired on read, and leave entries correct in themselves. A
+cached listing is always complete: `CacheGetMethods` only caches `include` and the
+sorting keys, and sends any other argument straight to Canvas uncached.
+
 ### Cache Schema Versioning
 
 The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
