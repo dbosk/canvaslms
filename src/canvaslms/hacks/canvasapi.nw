@@ -1867,6 +1867,8 @@ if attr_all_fetched:
       attr_all_fetched = None
       break
 
+<<try to refresh an expired course listing>>
+
 if not attr_all_fetched:
   <<log reason for bulk refresh>>
   <<fetch all and populate [[attr_cache]]>>
@@ -3340,15 +3342,56 @@ The refresh, on the other hand, is cheap, since it re-reads only the listing and
 every course keeps its cached contents (\cref{sec:cache-copy-to-new}).
 That imbalance is why [[COURSE_CACHE_TTL_DAYS]] is the shortest of the listing
 intervals, one day by default.
-<<if statements for resetting [[_all_fetched]] for various attributes>>=
-elif attr_name == "course_all_fetched":
-  if not getattr(obj, attr_name):
-    continue
-  elif datetime.now() - getattr(obj, attr_name) > timedelta(days=COURSE_CACHE_TTL_DAYS):
-    age = datetime.now() - getattr(obj, attr_name)
-    logger.info(f"Cache invalidation: course_all_fetched periodic refresh "
-                f"(age: {age.days} days, threshold: {COURSE_CACHE_TTL_DAYS} days)")
-    setattr(obj, attr_name, None)
+
+This one cannot work like the others, for two reasons.
+The others hang off [[outdated]], which the listing methods call for each object
+\emph{in} their cache, so that it can expire that object's child listings.
+The [[Canvas]] object is the root of the hierarchy and therefore in no cache, so
+nothing would ever ask whether its listing had expired.
+
+\label{sec:course-listing-outage}
+The other reason is that nearly every command starts by reading this listing.
+Resetting the timestamp, as the others do, makes the next read fetch or fail, so
+one day after the last fetch every command would crash if Canvas could not be
+reached, although the cache holds what most of them need.
+The refresh is a precaution, not something the command asked for, so its failure
+must not cost the command its answer.
+The method itself therefore checks the age, as it reads the listing, and falls
+back on what it has.
+That only holds when the cached listing would otherwise have been good enough, so
+this comes after the checks for what cannot be served from the cache: a
+restriction left by an older version, a requested refresh or new keyword
+arguments.
+Those still fail loudly, since the cached listing is not what the caller asked for.
+
+Trying again on every read would be slow, as the retry policy of
+[[configure_canvas_retry_policy]] retries a failed connection many times before
+giving up, and a command can read the listing more than once.
+So a failure puts off the next try by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
+interval we already use for how soon looking again is worth it.
+Changing the timestamp does this without new state in the shared cache file, and
+older copies of this library do not expire this listing at all, so its value
+means nothing to them.
+<<try to refresh an expired course listing>>=
+if (attr_name == "course" and attr_all_fetched
+    and datetime.now() - attr_all_fetched
+        > timedelta(days=COURSE_CACHE_TTL_DAYS)):
+  logger.info(f"Cache invalidation: course_all_fetched periodic refresh "
+              f"(fetched: {attr_all_fetched}, "
+              f"threshold: {COURSE_CACHE_TTL_DAYS} days)")
+  try:
+    <<fetch all and populate [[attr_cache]]>>
+  except (canvasapi.exceptions.CanvasException,
+          requests.exceptions.RequestException) as error:
+    logger.warning(f"Could not refresh {display_plural}, "
+                   f"using the cached ones: {error}")
+    attr_all_fetched = (datetime.now()
+                        - timedelta(days=COURSE_CACHE_TTL_DAYS)
+                        + timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+    setattr(self, f"{attr_name}_all_fetched", attr_all_fetched)
+  else:
+    <<yield all objects in [[attr_cache]]>>
+    return
 @
 
 The [[outdated]] function is used by the caching decorator to check if cached
