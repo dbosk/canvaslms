@@ -942,6 +942,10 @@ renaming cache attributes, or changing the shape of cache entries (e.g. the
 `LazySubmission` wrapper). A version mismatch discards the cache (one full
 refetch on the next run); a forgotten bump crashes on users' existing caches.
 When in doubt, bump. Do not write lazy migration shims for old cache layouts.
+The exception is a new attribute that is read with a default and that older
+copies ignore (`__unlisted` on assignments, `_unlisted` on cached objects): it
+needs no bump, and a bump would make programs with different versions discard
+each other's cache, see Cache Freshness.
 
 ## Output Conventions
 
