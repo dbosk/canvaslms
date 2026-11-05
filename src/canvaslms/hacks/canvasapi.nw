@@ -17,6 +17,8 @@ import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
 from canvasapi.user import User
+import collections
+import contextlib
 from datetime import datetime, timedelta
 import functools
 import importlib
@@ -3394,10 +3396,19 @@ restriction left by an older version, a requested refresh or new keyword
 arguments.
 Those still fail loudly, since the cached listing is not what the caller asked for.
 
-Trying again on every read would be slow, as the retry policy of
-[[configure_canvas_retry_policy]] retries a failed connection many times before
-giving up, and a command can read the listing more than once.
-So a failure puts off the next try by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
+Falling back is not enough if it comes late.
+The retry policy of [[configure_canvas_retry_policy]] is made for requests a
+command depends on: it tries a failed connection ten more times, and its waits add
+up to about 17 minutes.
+A command that could have answered from the cache would spend them waiting for
+something it does not need.
+So a precaution gets one try, through [[without_retries]].
+The price is that a passing failure, which the retries would have overcome, skips
+this refresh; the next try comes soon enough.
+
+A host that does not answer at all still takes until the connection times out,
+and a command can read the listing more than once.
+So a failure also puts off the next try by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
 interval we already use for how soon looking again is worth it.
 Changing the timestamp does this without new state in the shared cache file, and
 older copies of this library do not expire this listing at all, so its value
@@ -3410,7 +3421,8 @@ if (attr_name == "course" and attr_all_fetched
               f"(fetched: {attr_all_fetched}, "
               f"threshold: {COURSE_CACHE_TTL_DAYS} days)")
   try:
-    <<fetch all and populate [[attr_cache]]>>
+    with without_retries([self]):
+      <<fetch all and populate [[attr_cache]]>>
   except (canvasapi.exceptions.CanvasException,
           requests.exceptions.RequestException) as error:
     logger.warning(f"Could not refresh {display_plural}, "
@@ -3422,6 +3434,41 @@ if (attr_name == "course" and attr_all_fetched
   else:
     <<yield all objects in [[attr_cache]]>>
     return
+@
+
+The retry policy lives in the adapters of the session, which all objects from one
+client share, so we swap the adapters for as long as the precaution lasts and put
+them back afterwards.
+The session is reached differently from the [[Canvas]] object and from the others,
+and a stand-in in the tests may have none.
+The block must not yield to the caller: whatever the caller did in the meantime
+would lose its retries too.
+<<functions>>=
+@contextlib.contextmanager
+def without_retries(owners):
+  """Make the requests in this block give up at the first failure.
+
+  `owners` are the Canvas objects whose requests are concerned.
+  """
+  sessions = {}
+  for owner in owners:
+    requester = (getattr(owner, "_requester", None)
+                 or getattr(owner, "_Canvas__requester", None))
+    session = getattr(requester, "_session", None)
+    if session is not None:
+      sessions[id(session)] = session
+
+  kept_adapters = [(session, session.adapters)
+                   for session in sessions.values()]
+  try:
+    for session, _ in kept_adapters:
+      session.adapters = collections.OrderedDict()
+      session.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
+      session.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
+    yield
+  finally:
+    for session, adapters in kept_adapters:
+      session.adapters = adapters
 @
 
 The [[outdated]] function is used by the caching decorator to check if cached
@@ -4211,7 +4258,9 @@ def retry_after_miss(find, listings, max_listings=None):
   <<expire the [[old_listings]]>>
 
   try:
-    yield from find()
+    with without_retries(owner for owner, _, _ in old_listings):
+      matches = list(find())
+    yield from matches
   except (canvasapi.exceptions.CanvasException,
           requests.exceptions.RequestException) as error:
     logger.warning(f"Could not refresh after finding no match: {error}")
@@ -4280,6 +4329,8 @@ for owner, name, _ in old_listings:
 The refresh is a favour, so failing at it should not make things worse.
 Without it the user would have been told that nothing matched, and that is still
 what they get, along with a warning, since the answer may now be wrong.
+For the same reason it gets one try (\cref{sec:course-listing-outage}), so the
+user does not wait 17 minutes to hear that nothing matched.
 We restore the timestamps because an expired listing would otherwise be fetched
 by the next command, which might well have found its match in the cache, and
 fail on Canvas being down.
@@ -4710,7 +4761,8 @@ Note that we don't need a TTLCache here, since the [[outdated]] function will
 periodically reset the [[_all_fetched]] flag to trigger a refetch.
 One thing sets this listing apart from all the others: its owner, the [[Canvas]]
 object, is in no cache, so the listing methods never call [[outdated]] on it.
-The cache loader in [[cli/cache.nw]] makes that call when it restores the object.
+The method checks the age of this listing itself instead
+(\cref{sec:course-listing-outage}).
 
 
 \subsection{Caching course contents}
