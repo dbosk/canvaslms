@@ -1936,8 +1936,9 @@ if attr_all_fetched and predates_refresh(attr_all_fetched):
 
 if attr_all_fetched:
   for cached_obj, prev_kwargs in attr_cache.values():
-    if (not getattr(cached_obj, "_unlisted", False)
-        and must_update(prev_kwargs, kwargs)):
+    if (must_update(prev_kwargs, kwargs)
+        and (not getattr(cached_obj, "_unlisted", False)
+             or old_enough_to_ask_again(attr_all_fetched))):
       logger.info(f"Cache invalidation: {display_plural} - new kwargs required "
                   f"(existing: {prev_kwargs}, requested: {kwargs})")
       attr_all_fetched = None
@@ -2605,7 +2606,7 @@ variable throughout the entire [[new_get_attrs]] function, causing an
 lines~494--495).
 <<update [[obj]] with cache from [[old_obj]]>>=
 for cache_attr_name in dir(old_obj):
-  if cache_attr_name.endswith("_cache") or cache_attr_name.endswith("_all_fetched"):
+  if cache_attr_name.endswith(("_cache", "_all_fetched", "__unlisted")):
     setattr(obj, cache_attr_name, getattr(old_obj, cache_attr_name))
 @
 
@@ -3848,19 +3849,31 @@ class TestRequestsForASubset:
 An entry Canvas did not return can also hold a listing back in another way.
 It keeps the includes of the last fetch that returned it, so a student who has
 left the course lacks whatever the listing has been asked for since.
-No fetch of the listing can give them that, since Canvas does not list them, but
-if the check above took them into account, every read asking for more than they
-have would fetch the whole listing again.
+Fetching the listing can't give them that while Canvas doesn't list them, so if
+the check above counted them like any other entry, every read asking for more
+than they have would fetch the whole listing again.
+But we can't stop asking either: Canvas may list them again, for instance when
+an enrollment is reactivated, and only a fetch can tell us that.
 
-So the listing stops asking them: a fetch marks the entries it did not get back,
-and when the plural method compares the keyword arguments, it skips those.
+So a fetch marks the entries it did not get back, and when the plural method
+compares the keyword arguments, a marked entry only counts once the listing is
+old enough, by the same rule as a name that matches nothing
+(\cref{sec:refresh-on-miss}).
+The reasoning is also the same: we asked Canvas recently and that answer still
+holds, so the time of the fetch works as the negative cache and we need no other
+state.
+This costs at most one fetch per [[MISS_REFRESH_MIN_AGE_MINUTES]], for reads that
+ask for something a marked entry lacks.
+Until then, someone who has returned is served without that include.
+
 Clearing a restriction, as above, only removes a claim about the listing.
 Recording the new includes on these entries would add a claim about the object,
 and a false one, since it doesn't have that data.
 A request for that one object would then be served without it, for instance
 [[get_course(id, include=["syllabus_body"])]] for a course that is no longer in
 the listing.
-With the mark, that request still sees what is missing and fetches it.
+With the mark, that request still sees what is missing and asks Canvas, which
+gives it or raises an error if it no longer has the object.
 Their includes still count towards the largest set, as they did when they were
 asked for, and an entry that Canvas returns again is a new object without the
 mark.
@@ -3962,6 +3975,49 @@ class TestIncludesOfAListing:
 
         assert item.email
         assert len(instance.requests) == requests + 1
+
+    def test_an_entry_that_returns_is_found_once_the_listing_is_old_enough(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        instance.listed = [1, 2]
+        instance.item_all_fetched -= timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES)
+        requests = len(instance.requests)
+
+        items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert all(item.email for item in items)
+        assert len(instance.requests) == requests + 1
+        list(instance.get_items(include=["email", "enrollments"]))
+        assert len(instance.requests) == requests + 1
+
+    def test_a_listing_that_once_came_back_empty_recovers(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = []
+        list(instance.get_items(include=["email"]))
+        instance.listed = [1, 2, 3]
+        instance.item_all_fetched -= timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES)
+
+        items = list(instance.get_items(include=["email"]))
+
+        assert {item.id for item in items} == {1, 2, 3}
+        assert all(item.email for item in items)
+
+    def test_an_assignment_replaced_by_a_fetch_keeps_who_was_left_out(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+        old = instance.item_cache[1][0]
+        setattr(old, "__unlisted", {8})
+        instance.item_all_fetched = None
+
+        list(instance.get_items())
+
+        assert instance.item_cache[1][0] is not old
+        assert getattr(instance.item_cache[1][0], "__unlisted") == {8}
 
     def test_a_listed_entry_lacking_an_include_still_causes_a_fetch(self):
         instance = self.make_instance()
@@ -4460,10 +4516,14 @@ old_listings = []
 for owner, attribute in listings:
   name = f"{attribute}_all_fetched"
   fetched = getattr(owner, name, None)
-  if (isinstance(fetched, datetime)
-      and datetime.now() - fetched
-          >= timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES)):
+  if old_enough_to_ask_again(fetched):
     old_listings.append((owner, name, fetched))
+<<functions>>=
+def old_enough_to_ask_again(fetched):
+  """Returns True if a fetch at `fetched` is too long ago to go on trusting."""
+  return (isinstance(fetched, datetime)
+          and datetime.now() - fetched
+              >= timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
 @
 
 We look up the default limit here rather than in the signature, where it would
@@ -6857,7 +6917,9 @@ if not need_refetch:
   unlisted = getattr(self, "__unlisted", set())
   for user_id, lazy_submission in self.__cache.items():
     cached_includes = set(lazy_submission._includes)
-    if user_id not in unlisted and not to_include.issubset(cached_includes):
+    if (not to_include.issubset(cached_includes)
+        and (user_id not in unlisted
+             or old_enough_to_ask_again(self.__all_fetched))):
       need_refetch = True
       break
 
@@ -6956,15 +7018,20 @@ The timestamps above settle when a submission is fresh, but not what it holds.
 A fetch only replaces the submissions Canvas returns, so the submission of a
 student who has left the course keeps the includes of the last fetch that returned
 it.
-If a listing is then asked for an include it lacks, no fetch can give it that,
-since Canvas does not list it, and if the listing kept comparing with it, every
-such read would fetch the whole assignment again.
+If a listing is then asked for an include it lacks, a fetch can't give it that
+while Canvas doesn't list it, and if the listing compared with it like any other,
+every such read would fetch the whole assignment again.
+A student can also return, though, and then only a fetch can tell us.
 
 So [[__unlisted]] holds the users whose submissions the last fetch of the
-collection did not return, and the comparison in
-[[<<return a list of all submissions>>]] skips them.
+collection did not return, and in [[<<return a list of all submissions>>]] those
+only count once that fetch is old enough, by the rule for a name that matches
+nothing (\cref{sec:refresh-on-miss}).
+This costs at most one fetch per [[MISS_REFRESH_MIN_AGE_MINUTES]], and until then
+a student who has returned is served without that include.
 We keep this on the assignment, beside [[__all_fetched]], since it is a fact about
-that fetch and not about the submission.
+that fetch and not about the submission, and it follows the assignment when a
+listing replaces the object, as the caches do.
 It's also why we don't simply keep the includes of the last fetch there and
 compare with those.
 A submission fetched on its own, say of a student who just joined, can hold less
@@ -7226,6 +7293,64 @@ class TestSubmissionsCanvasNoLongerLists:
 
         for _ in range(3):
             assignment.get_submissions(check_bulk_refresh=True)
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_submission_that_returns_is_found_once_the_fetch_is_old_enough(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+        listed.append(2)
+        setattr(assignment, "__all_fetched", datetime.now() - timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+
+        for _ in range(2):
+            submissions = assignment.get_submissions(
+                include=["submission_comments"])
+
+        assert len(requests) == 3
+        cache = getattr(assignment, "__cache")
+        assert "submission_comments" in cache[2]._includes
+        assert len(submissions) == 2
+
+    @responses.activate
+    def test_an_assignment_from_an_earlier_version_can_be_read(self):
+        """Pickles don't run constructors, so it has no record of who left."""
+        assignment, requests = self.assignment([1])
+        assignment.get_submissions(include=["rubric_assessment"])
+        delattr(assignment, "__unlisted")
+
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        assert len(requests) == 1
+
+    @responses.activate
+    def test_a_bulk_refresh_records_who_it_left_out(self):
+        """Only the submission that left lacks what we then ask for."""
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        cache = getattr(assignment, "__cache")
+        object.__setattr__(cache[1], "_includes",
+                           {"rubric_assessment", "submission_comments"})
+        for user_id in range(3, 3 + BULK_REFRESH_MIN_COUNT):
+            cache[user_id] = LazySubmission(
+                Submission(assignment._requester,
+                           {"id": user_id, "user_id": user_id, "grade": "F"}),
+                assignment, {"rubric_assessment", "submission_comments"},
+                MagicMock())
+            listed.append(user_id)
+        listed.remove(2)
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in cache.values():
+            object.__setattr__(each, "_last_refresh", old)
+        assignment.get_submissions(check_bulk_refresh=True)
+        assert len(requests) == 2
+
+        assignment.get_submissions(include=["submission_comments"])
 
         assert len(requests) == 2
 
