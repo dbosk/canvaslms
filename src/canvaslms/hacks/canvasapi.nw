@@ -1931,8 +1931,9 @@ if attr_all_fetched and predates_refresh(attr_all_fetched):
   attr_all_fetched = None
 
 if attr_all_fetched:
-  for _, prev_kwargs in attr_cache.values():
-    if must_update(prev_kwargs, kwargs):
+  for cached_obj, prev_kwargs in attr_cache.values():
+    if (not getattr(cached_obj, "_unlisted", False)
+        and must_update(prev_kwargs, kwargs)):
       logger.info(f"Cache invalidation: {display_plural} - new kwargs required "
                   f"(existing: {prev_kwargs}, requested: {kwargs})")
       attr_all_fetched = None
@@ -2032,6 +2033,7 @@ for obj in fetched_objs:
   obj._fetched_at = datetime.now()
   attr_cache[obj_key] = (obj, union_kwargs)
 <<clear restrictions from entries Canvas did not return>>
+<<mark entries Canvas did not return>>
 process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
@@ -3839,6 +3841,36 @@ class TestRequestsForASubset:
         assert instance.requests == [{"include": ["a"]}]
 @
 
+An entry Canvas did not return can also hold a listing back in another way.
+It keeps the includes of the last fetch that returned it, so a student who has
+left the course lacks whatever the listing has been asked for since.
+No fetch of the listing can give them that, since Canvas does not list them, but
+if the check above took them into account, every read asking for more than they
+have would fetch the whole listing again.
+
+So the listing stops asking them: a fetch marks the entries it did not get back,
+and when the plural method compares the keyword arguments, it skips those.
+Clearing a restriction, as above, only removes a claim about the listing.
+Recording the new includes on these entries would add a claim about the object,
+and a false one, since it doesn't have that data.
+A request for that one object would then be served without it, for instance
+[[get_course(id, include=["syllabus_body"])]] for a course that is no longer in
+the listing.
+With the mark, that request still sees what is missing and fetches it.
+Their includes still count towards the largest set, as they did when they were
+asked for, and an entry that Canvas returns again is a new object without the
+mark.
+
+A cache written by an earlier version has no marks, so it costs one more fetch,
+after which it has them.
+
+<<mark entries Canvas did not return>>=
+fetched_keys = {getattr(fetched, cache_key) for fetched in fetched_objs}
+for obj_key, (cached_obj, _) in attr_cache.items():
+  if obj_key not in fetched_keys:
+    cached_obj._unlisted = True
+@
+
 Now let's verify that a listing asks for what is missing, once.
 
 <<test functions>>=
@@ -3890,6 +3922,53 @@ class TestIncludesOfAListing:
         assert instance.requests[-1] == {"enrollments", "avatar_url", "email"}
         instance.get_item(1, include=["avatar_url"])
         assert len(instance.requests) == 2
+
+    def test_an_entry_canvas_no_longer_lists_costs_one_fetch(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+
+        for _ in range(3):
+            items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert len(instance.requests) == 2
+        assert {item.id for item in items} == {1, 2}
+
+    def test_an_entry_canvas_no_longer_lists_still_adds_to_the_largest_set(self):
+        """Only the entry that left is left holding `avatar_url` here."""
+        instance = self.make_instance()
+        list(instance.get_items(include=["avatar_url"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email"]))
+        instance.item_cache[1] = (instance.item_cache[1][0], {"include": ["email"]})
+
+        list(instance.get_items(include=["enrollments"]))
+
+        assert instance.requests[-1] == {"avatar_url", "email", "enrollments"}
+
+    def test_one_object_canvas_no_longer_lists_is_still_asked_for(self):
+        """It really lacks what the listing got since, so it must not hide that."""
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        requests = len(instance.requests)
+
+        item = instance.get_item(2, include=["email"])
+
+        assert item.email
+        assert len(instance.requests) == requests + 1
+
+    def test_a_listed_entry_lacking_an_include_still_causes_a_fetch(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        requests = len(instance.requests)
+
+        list(instance.get_items(include=["avatar_url"]))
+
+        assert len(instance.requests) == requests + 1
 @
 
 \subsection{Refreshing on request}
