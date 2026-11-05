@@ -915,6 +915,24 @@ def example_command(config, canvas, args):
 - Raise `canvaslms.cli.EmptyListError` when no results match filters
 - Main CLI catches this and exits with code 1 (suppressed if `-q/--quiet`)
 
+### Cache Freshness
+
+Five mechanisms keep the persisted cache fresh, see the design overview in
+`src/canvaslms/cli/cache.nw`: time to live, invalidation on write, refresh when a
+name matches nothing (`retry_after_miss`), `--refresh-cache` (`request_refresh`)
+and repair on read of a listing stored with a restriction. They add and update entries; do not make them discard cached
+children (replace objects through `<<update [[obj]] with cache from [[old_obj]]>>`).
+A new name lookup should use `retry_after_miss` where the name is matched, over
+the whole selection. An empty result is not always a miss, so never retry around
+a command or on `EmptyListError`.
+
+The cache file is shared with programs holding their own, possibly older, copy
+of this library (nytid, fbf), so keep it readable by them: do not bump the schema
+for what can be repaired on read, and leave entries correct in themselves. A
+cached listing is always complete: `CacheGetMethods` only caches `include` and the
+sorting and page-size keys, and sends any other argument straight to Canvas
+uncached, for single objects too.
+
 ### Cache Schema Versioning
 
 The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
@@ -924,6 +942,10 @@ renaming cache attributes, or changing the shape of cache entries (e.g. the
 `LazySubmission` wrapper). A version mismatch discards the cache (one full
 refetch on the next run); a forgotten bump crashes on users' existing caches.
 When in doubt, bump. Do not write lazy migration shims for old cache layouts.
+The exception is a new attribute that is read with a default and that older
+copies ignore (`__unlisted` on assignments, `_unlisted` on cached objects): it
+needs no bump, and a bump would make programs with different versions discard
+each other's cache, see Cache Freshness.
 
 ## Output Conventions
 

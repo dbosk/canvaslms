@@ -25,6 +25,10 @@ import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
+from canvaslms.hacks.canvasapi import (
+    pattern_names_something,
+    retry_after_miss,
+)
 import csv
 import operator
 import re
@@ -47,6 +51,7 @@ appear after their corresponding functionality:
 """Tests for user caching and role filtering"""
 
 import argparse
+from datetime import datetime, timedelta
 import pytest
 from unittest.mock import Mock, MagicMock, create_autospec
 from canvasapi import Canvas
@@ -55,6 +60,7 @@ from canvasapi.group import Group, GroupCategory
 from canvasapi.user import User
 import canvaslms.cli.utils
 import canvaslms.cli.users as users_module
+import canvaslms.hacks.canvasapi
 
 <<canvas test doubles>>
 <<test user fixtures>>
@@ -210,7 +216,8 @@ def make_user_rows(canvas, args, roles):
   users = filter_users(
     course_list,
     args.regex,
-    roles)
+    roles,
+    max_listings=courses.miss_refresh_limit(args))
 
   for user in users:
     try:
@@ -355,7 +362,7 @@ def split_name_rows(monkeypatch, sortable_name):
     monkeypatch.setattr(users_module.courses, "process_course_option",
                         lambda canvas, args: [course])
     monkeypatch.setattr(users_module, "filter_users",
-                        lambda course_list, regex, roles: [user])
+                        lambda course_list, regex, roles, **kwargs: [user])
 
     return list(users_module.make_user_rows(Mock(), args, ["student"]))
 
@@ -526,10 +533,14 @@ for every group would re-walk the entire cached user list (and re-log the
 cache traversal) once per group.
 We therefore filter each course's roster once and share the result across
 its groups.
+Here we search one course at a time, so we use [[filter_users_by_regex]] directly.
+[[filter_users]] would refresh the roster of every course that lacks the student
+(\cref{sec:refresh-on-miss}), although finding them in one of the courses is all
+we expect.
 <<look up role-filtered [[users]] of [[course]]>>=
 if course.id not in users_by_course:
   users_by_course[course.id] = list(
-    filter_users([course], args.regex, roles))
+    filter_users_by_regex(list_users([course], roles), args.regex))
 users = users_by_course[course.id]
 @
 
@@ -540,6 +551,27 @@ we found the correct members, but the role filter never saw their course
 enrollments.
 
 <<test functions>>=
+def test_grouped_rows_do_not_refresh_rosters_on_a_miss(monkeypatch):
+    """A student is expected in only one of the groups' courses."""
+    course = Course(MagicMock(), {"id": 1, "name": "Programmeringsteknik",
+                                  "course_code": "DD1390/91 prosam 25/26"})
+    stub_canvas_method(course, "get_users", [])
+    course.user_all_fetched = datetime.now() - timedelta(days=1)
+    group = listed_group(name="mentorsgrupp 7-9", members_count=1)
+    group.course = course
+    group.get_users.return_value = [member(100)]
+    args = Mock()
+    args.regex = "Nobody"
+    monkeypatch.setattr(users_module, "process_group_options",
+                        lambda canvas, args: [group])
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+
+    assert list(users_module.make_user_rows_w_groups(
+        Mock(), args, ["student"])) == []
+
+    assert course.get_users.call_count == 1
+
 def test_make_user_rows_w_groups_filters_roles_in_course(monkeypatch):
     """Grouped rows should use course enrollments for role filtering."""
     course = Course(MagicMock(), {"id": 1, "name": "Programmeringsteknik",
@@ -1316,13 +1348,29 @@ def filter_users_by_regex(user_list, regex):
   for user in user_list:
     <<yield [[user]] if match>>
 
-def filter_users(course_list, regex, roles=[]):
+def filter_users(course_list, regex, roles=[], max_listings=None):
   """
   Filter users in courses with roles based on regex, see
-  filter_users_by_regex for how regex is matched.
+  filter_users_by_regex for how regex is matched. If no one matches, look at
+  the rosters once more, see retry_after_miss for `max_listings`.
   """
-  return filter_users_by_regex(list_users(course_list, roles), regex)
+  course_list = list(course_list)
+  listings = []
+  if pattern_names_something(regex):
+    listings = [(course, "user") for course in course_list]
+
+  return retry_after_miss(
+    lambda: filter_users_by_regex(list_users(course_list, roles), regex),
+    listings,
+    max_listings)
 @
+
+Students are added during a course, so a name that matches no one makes the
+search look at the rosters once more (\cref{sec:refresh-on-miss}).
+It considers all the selected courses together: a student is expected in one of
+them, so the other courses not having them is no reason to fetch their rosters.
+Only the commands know whether the user narrowed down the courses, so they pass
+on the limit that follows from [[-c]].
 
 Now to check if the user matches, we want to match some things by regular 
 expression, but other things exactly.
@@ -1581,7 +1629,8 @@ def process_user_option(canvas, args):
   user_list = list(filter_users(
     courses.process_course_option(canvas, args),
     args.user,
-    roles=roles_list))
+    roles=roles_list,
+    max_listings=courses.miss_refresh_limit(args)))
   if not user_list:
     raise canvaslms.cli.EmptyListError("No users found matching the criteria")
   return user_list

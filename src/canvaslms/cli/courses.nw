@@ -12,6 +12,7 @@ import arrow
 import canvaslms.cli
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
+from canvaslms.hacks.canvasapi import pattern_names_something, retry_after_miss
 import csv
 import datetime
 import re
@@ -58,6 +59,7 @@ These tests verify the core course filtering logic used throughout
 the canvaslms tool. The add_course_option/process_course_option
 pattern is fundamental to many commands.
 """
+import argparse
 import pytest
 import re
 from unittest.mock import MagicMock
@@ -68,8 +70,10 @@ from canvaslms.cli import EmptyListError
 from canvaslms.cli.courses import (
     filter_courses,
     is_current_course,
+    miss_refresh_limit,
     process_course_option
 )
+import canvaslms.hacks.canvasapi
 
 <<test functions>>
 @
@@ -237,11 +241,23 @@ We provide the function~[[filter_courses]] that will filter the list of courses
 based on a regular expression~[[regex]].
 <<functions>>=
 def filter_courses(canvas, regex):
-  courses = canvas.get_courses()
-  p = re.compile(regex)
-  for course in courses:
-    <<yield course matching regex>>
+  """Return an iterator over the courses matching `regex`.
+
+  If none does, look at Canvas once more before giving up.
+  """
+  def matching_courses():
+    courses = canvas.get_courses()
+    p = re.compile(regex)
+    for course in courses:
+      <<yield course matching regex>>
+
+  return retry_after_miss(matching_courses, [(canvas, "course")])
 @
+
+The retry (\cref{sec:refresh-on-miss}) is why being added to a course needs no
+action from the user: the name of a new course is not in the cached listing, so
+the search looks at Canvas once more.
+Since every command selects its courses through this function, they all get this.
 
 We normalize each course before matching.
 That turns omitted Canvas fields into explicit [[None]] values, so the
@@ -512,6 +528,48 @@ When we check for either of these arguments, we set up a list of courses,
 <<process options for selecting courses>>=
 course_list = filter_courses(canvas, args.course)
 @ We use the [[filter_courses]] from \cref{filter-courses}.
+
+What [[-c]] selected also decides how many listings a search in those courses
+may fetch when a name matches nothing (\cref{sec:refresh-on-miss}): a search the
+user narrowed is worth more waiting than one over everything.
+Both lookups that search many courses need this choice, the one of users and the
+one of assignments, and this module is the one that knows about [[-c]].
+Here it does not matter that an explicit [[-c '.*']] looks like the default: it
+selects the same courses, so a mistyped name in that search costs the same.
+Some commands have no [[-c]], and nothing narrows their search either.
+[[filter_courses]] itself has no use for this, since it searches a single
+listing.
+<<functions>>=
+def miss_refresh_limit(args):
+  """Return the `max_listings` for a search in the courses that `args` selects.
+
+  Pass it to `retry_after_miss`. It is the limit for all courses if the course
+  pattern names nothing, otherwise None for the default limit.
+  """
+  if pattern_names_something(getattr(args, "course", None)):
+    return None
+  return canvaslms.hacks.canvasapi.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES
+@
+
+Let's verify that it tells the two kinds of search apart.
+
+<<test functions>>=
+@pytest.mark.parametrize("arguments,all_courses", [
+    ({}, True),
+    ({"course": None}, True),
+    ({"course": ""}, True),
+    ({"course": ".*"}, True),
+    ({"course": "prgi"}, False),
+])
+def test_only_searching_all_courses_gets_the_smaller_limit(arguments,
+                                                           all_courses):
+    limit = miss_refresh_limit(argparse.Namespace(**arguments))
+    if all_courses:
+        assert limit == (
+            canvaslms.hacks.canvasapi.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES)
+    else:
+        assert limit is None
+@
 
 \subsection{Verifying [[process_course_option]]}
 
