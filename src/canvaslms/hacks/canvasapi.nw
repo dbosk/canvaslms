@@ -680,15 +680,32 @@ This means that we need two functions to support the caching:
 \item [[must_update(prev_kwargs, kwargs)]] takes the old keyword 
 arguments ([[prev_kwargs]]) to check if they're a superset of the new keyword 
 arguments ([[kwargs]]).
-If not, the cache doesn't have all necessary information and we must fetch it.
+If not, the cache doesn't have all necessary information and we must fetch it,
+with the largest set of what has been asked for so far.
 \item [[merge_kwargs]] will take a list of keyword arguments dictionaries and 
 merge them.
 Most of the time these contain only the key [[include]] whose value is a list 
 of things to include.
 So essentially, we want to take the union of all these sets.
 \end{description}
+Superset means that every item asked for is among those the cache has.
+It's not enough that the new list has more items than the old one.
+A roster cached with [[["enrollments", "avatar_url"]]] has no email addresses,
+although [[["email", "enrollments"]]] is not a superset of it either, and each
+list has something the other lacks.
+Since the fetch asks for the union, the next request for either list finds
+everything in the cache, so two callers wanting different things don't take
+turns fetching.
+
+Canvas accepts a single value as well as a list, so we count a string as a list
+of one item.
+
 We can thus start with the following defaults:
 <<kwargs functions caches>>=
+def as_list(value):
+  """Returns `value` if it's a list, otherwise a list holding it."""
+  return value if isinstance(value, list) else [value]
+
 def must_update(prev_kwargs, new_kwargs,
                 ignore_keys=[
                   <<keys to ignore>>
@@ -705,11 +722,8 @@ def must_update(prev_kwargs, new_kwargs,
 
     if key not in prev_kwargs:
       return True
-    elif isinstance(value, list):
-      if set(value) > set(prev_kwargs[key]):
-        return True
-    elif isinstance(prev_kwargs[key], list):
-      if value not in prev_kwargs[key]:
+    elif isinstance(value, list) or isinstance(prev_kwargs[key], list):
+      if not set(as_list(value)) <= set(as_list(prev_kwargs[key])):
         return True
     elif value != prev_kwargs[key]:
       return True
@@ -816,6 +830,31 @@ class TestMustUpdate:
         new = {"include": ["user", "enrollments"]}
 
         assert must_update(prev, new)
+
+    def test_update_when_lists_only_overlap(self):
+        """An item the cache lacks counts, whatever else the cache has"""
+        prev = {"include": ["enrollments", "avatar_url"]}
+        new = {"include": ["email", "enrollments"]}
+
+        assert must_update(prev, new)
+
+    def test_update_when_lists_share_nothing(self):
+        prev = {"include": ["enrollments"]}
+        new = {"include": ["email"]}
+
+        assert must_update(prev, new)
+
+    def test_no_update_for_the_same_items_in_another_order(self):
+        prev = {"include": ["email", "enrollments"]}
+        new = {"include": ["enrollments", "email"]}
+
+        assert not must_update(prev, new)
+
+    def test_a_cached_string_counts_as_one_item(self):
+        prev = {"include": "email"}
+
+        assert not must_update(prev, {"include": ["email"]})
+        assert must_update(prev, {"include": ["avatar_url"]})
 
     def test_update_when_non_list_value_differs(self):
         """Different non-list value should trigger update"""
@@ -3798,6 +3837,59 @@ class TestRequestsForASubset:
             canvaslms.hacks.canvasapi.refresh_since = None
 
         assert instance.requests == [{"include": ["a"]}]
+@
+
+Now let's verify that a listing asks for what is missing, once.
+
+<<test functions>>=
+class TestIncludesOfAListing:
+    """Test that missing includes cause one fetch, with the largest set"""
+
+    def make_instance(self):
+        """Return an instance with a listing that sends what it is asked for."""
+        class TestClass:
+            def __init__(self):
+                self.requests = []
+                self.listed = [1, 2]
+            def fetched(self, item_id, kwargs):
+                self.requests.append(set(kwargs.get("include", [])))
+                return canvas_object(
+                    id=item_id, **{key: True for key in kwargs.get("include", [])})
+            def get_item(self, item_id, **kwargs):
+                return self.fetched(item_id, kwargs)
+            def get_items(self, **kwargs):
+                self.requests.append(set(kwargs.get("include", [])))
+                return [canvas_object(
+                          id=each,
+                          **{key: True for key in kwargs.get("include", [])})
+                        for each in self.listed]
+
+        CacheGetMethods("item")(TestClass)
+        return TestClass()
+
+    def test_overlapping_includes_fetch_the_largest_set_once(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments", "avatar_url"]))
+
+        items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert all(item.email and item.avatar_url for item in items)
+        assert instance.requests[-1] == {"enrollments", "avatar_url", "email"}
+        assert len(instance.requests) == 2
+        list(instance.get_items(include=["enrollments", "avatar_url"]))
+        list(instance.get_items(include=["email"]))
+        assert len(instance.requests) == 2
+
+    def test_overlapping_includes_of_one_object_fetch_the_largest_set_once(self):
+        instance = self.make_instance()
+        instance.get_item(1, include=["enrollments", "avatar_url"])
+
+        item = instance.get_item(1, include=["email", "enrollments"])
+
+        assert item.email and item.avatar_url
+        assert instance.requests[-1] == {"enrollments", "avatar_url", "email"}
+        instance.get_item(1, include=["avatar_url"])
+        assert len(instance.requests) == 2
 @
 
 \subsection{Refreshing on request}
