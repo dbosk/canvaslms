@@ -101,12 +101,16 @@ IMPORTANT: These tests import canvaslms.hacks.canvasapi, which applies
 monkey-patches to canvasapi classes. The patches are applied at import
 time and affect all future instances.
 """
+import json
 import logging
 import os
 import subprocess
 import sys
+import urllib.parse
 
+import canvasapi
 import pytest
+import responses
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 
@@ -6780,6 +6784,7 @@ This follows the same pattern as [[CacheGetMethods]], which uses [[None]] for
 \enquote{not fetched} and [[datetime.now()]] for \enquote{last fetch time}.
 <<extend class constructor for decorators>>=
 self.__all_fetched = None
+self.__unlisted = set()
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 
@@ -6849,9 +6854,10 @@ need_refetch = (self.__all_fetched is None
                 or predates_refresh(self.__all_fetched))
 
 if not need_refetch:
-  for lazy_submission in self.__cache.values():
+  unlisted = getattr(self, "__unlisted", set())
+  for user_id, lazy_submission in self.__cache.items():
     cached_includes = set(lazy_submission._includes)
-    if not to_include.issubset(cached_includes):
+    if user_id not in unlisted and not to_include.issubset(cached_includes):
       need_refetch = True
       break
 
@@ -6861,10 +6867,13 @@ if need_refetch:
 
   logger.info(f"Fetching all submissions for assignment id={self.id}")
   all_includes = to_include
+  returned = set()
   for raw_submission in get_submissions(self, include=list(all_includes)):
     <<keep [[raw_submission]] in the cache>>
+    returned.add(raw_submission.user_id)
 
   <<count all cached submissions as just refreshed>>
+  self.__unlisted = set(self.__cache) - returned
   self.__all_fetched = datetime.now()
 else:
   cache_age = datetime.now() - self.__all_fetched
@@ -6903,6 +6912,7 @@ If we left their timestamps alone, every read of them would ask Canvas again, an
 under [[--refresh-cache]], where they would keep predating the refresh for the
 rest of the run, enough of them would also make [[should_bulk_refresh_submissions]]
 fetch the whole collection again on each listing.
+Both ways of fetching the collection need this.
 <<count all cached submissions as just refreshed>>=
 for lazy_submission in self.__cache.values():
   object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
@@ -6926,14 +6936,49 @@ all_includes = set(to_include)
 for lazy_submission in self.__cache.values():
   all_includes |= set(lazy_submission._includes)
 
+returned = set()
 try:
   for raw_submission in get_submissions(self, include=list(all_includes)):
     <<keep [[raw_submission]] in the cache>>
+    returned.add(raw_submission.user_id)
 except canvasapi.exceptions.CanvasException as error:
   <<keep the cached submissions after a failed bulk refresh>>
 else:
+  <<count all cached submissions as just refreshed>>
+  self.__unlisted = set(self.__cache) - returned
   self.__all_fetched = datetime.now()
 @
+
+\subsubsection{Submissions Canvas no longer lists}
+\label{sec:unlisted-submissions}
+
+The timestamps above settle when a submission is fresh, but not what it holds.
+A fetch only replaces the submissions Canvas returns, so the submission of a
+student who has left the course keeps the includes of the last fetch that returned
+it.
+If a listing is then asked for an include it lacks, no fetch can give it that,
+since Canvas does not list it, and if the listing kept comparing with it, every
+such read would fetch the whole assignment again.
+
+So [[__unlisted]] holds the users whose submissions the last fetch of the
+collection did not return, and the comparison in
+[[<<return a list of all submissions>>]] skips them.
+We keep this on the assignment, beside [[__all_fetched]], since it is a fact about
+that fetch and not about the submission.
+It's also why we don't simply keep the includes of the last fetch there and
+compare with those.
+A submission fetched on its own, say of a student who just joined, can hold less
+than the listing asked for, and must still make the next listing fetch it.
+
+We also can't record the new includes on these wrappers.
+[[_includes]] says what the wrapper really holds, and a request for that one
+submission relies on it to see what it must fetch.
+What these submissions do hold still counts towards the largest set, since
+[[need_refetch]] takes the union over the whole cache.
+
+An assignment from a cache written by an earlier version has no [[__unlisted]].
+It behaves as if all submissions were listed, costs one more fetch and then has
+it.
 
 \subsubsection{When the bulk refresh fails}
 \label{sec:bulk-refresh-failure}
@@ -7079,6 +7124,124 @@ class TestBulkRefreshFailureKeepsCache:
 
         requester.request.assert_called_once()
         refetch.assert_not_called()
+@
+
+Submissions that Canvas no longer lists must not make a listing fetch again and
+again (\cref{sec:unlisted-submissions}).
+Here the scenario spans several requests in which Canvas changes its answer,
+which a recording of one state cannot express, so [[responses]] stands in for
+Canvas and everything above the HTTP layer is real.
+
+<<test functions>>=
+class TestSubmissionsCanvasNoLongerLists:
+    """A submission missing from the listing costs one fetch, not one per read"""
+
+    URL = "https://canvas.example.org"
+    LISTING = f"{URL}/api/v1/courses/1/assignments/2/submissions"
+
+    def assignment(self, listed):
+        """Return an assignment and the requests its listing has received."""
+        requests = []
+
+        def answer(request):
+            query = urllib.parse.urlsplit(request.url).query
+            requests.append(set(urllib.parse.parse_qs(query).get("include[]", [])))
+            return (200, {}, json.dumps(
+                [{"id": each, "user_id": each, "assignment_id": 2, "grade": "F"}
+                 for each in listed]))
+
+        responses.add_callback(responses.GET, self.LISTING, callback=answer)
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        return (Assignment(canvas._Canvas__requester,
+                           {"id": 2, "course_id": 1}),
+                requests)
+
+    @responses.activate
+    def test_it_costs_one_fetch_with_a_wider_include(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+
+        for _ in range(3):
+            submissions = assignment.get_submissions(
+                include=["submission_comments"])
+
+        assert len(requests) == 2
+        assert requests[-1] == {"rubric_assessment", "submission_comments"}
+        assert len(submissions) == 2
+
+    @responses.activate
+    def test_one_submission_no_longer_listed_is_still_asked_for(self):
+        """It really lacks what the listing got since, so it must not hide that."""
+        listed = [1, 2]
+        assignment, _ = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+        responses.get(f"{self.LISTING}/2",
+                      json={"id": 2, "user_id": 2, "assignment_id": 2})
+        calls = len(responses.calls)
+
+        assignment.get_submission(2, include=["submission_comments"])
+
+        assert len(responses.calls) == calls + 1
+
+    @responses.activate
+    def test_a_listed_submission_lacking_an_include_still_causes_a_fetch(self):
+        """Fetched on its own, a new student's has less than the others have."""
+        assignment, requests = self.assignment([1])
+        assignment.get_submissions(include=["rubric_assessment"])
+        responses.get(f"{self.LISTING}/3",
+                      json={"id": 3, "user_id": 3, "assignment_id": 2})
+        assignment.get_submission(3)
+
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_new_include_after_that_still_causes_a_fetch(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+
+        assignment.get_submissions(include=["submission_history"])
+
+        assert len(requests) == 3
+        assert requests[-1] == {"rubric_assessment", "submission_comments",
+                                "submission_history"}
+
+    @responses.activate
+    def test_a_bulk_refresh_does_not_repeat_over_those_canvas_left_out(self):
+        listed = list(range(5))
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions()
+        del listed[1:]
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in getattr(assignment, "__cache").values():
+            object.__setattr__(each, "_last_refresh", old)
+
+        for _ in range(3):
+            assignment.get_submissions(check_bulk_refresh=True)
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_new_include_after_a_bulk_refresh_still_causes_a_fetch(self):
+        assignment, requests = self.assignment(list(range(5)))
+        assignment.get_submissions()
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in getattr(assignment, "__cache").values():
+            object.__setattr__(each, "_last_refresh", old)
+        assignment.get_submissions(check_bulk_refresh=True)
+        assert len(requests) == 2
+
+        assignment.get_submissions(include=["submission_comments"])
+
+        assert len(requests) == 3
 @
 
 A successful bulk refresh must keep what a lazy one keeps.  We give the
