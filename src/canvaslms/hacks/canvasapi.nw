@@ -1035,7 +1035,8 @@ class CacheGetMethods:
   <<notes in [[CacheGetMethods]] doc>>
   """
   def __init__(self, attribute_name, cache=None, include_plural=True,
-               include_singular=True, plural_name=None, cache_key='id'):
+               include_singular=True, plural_name=None, cache_key='id',
+               forget_unlisted=False):
     """No parameters required"""
     self.__attribute_name = attribute_name
     self.__include_plural = include_plural
@@ -1043,6 +1044,7 @@ class CacheGetMethods:
     self.__plural_name = plural_name
     self.__cache = cache if cache else {}
     self.__cache_key = cache_key
+    self.__forget_unlisted = forget_unlisted
 
   def __call__(self, cls):
     """Applies the decorator to the class cls"""
@@ -1344,6 +1346,7 @@ else:
   display_plural = f"{self.__attribute_name}s"
 get_attrs = getattr(cls, plural_name)
 cache_key = self.__cache_key
+forget_unlisted = self.__forget_unlisted
 
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
@@ -1516,6 +1519,9 @@ Parameters:
   cache_key: The attribute name to use as cache key (default: 'id'). For
              objects identified by URL instead of numeric ID (like pages),
              use cache_key='url'.
+  forget_unlisted: Whether a complete fetch of the listing removes the
+             cached entries Canvas did not return (default: False, they are
+             kept and marked).
 @
 
 This allows us to specify how the cache is structured.
@@ -2047,6 +2053,7 @@ for obj in fetched_objs:
   attr_cache[obj_key] = (obj, obj_kwargs)
 <<clear restrictions from entries Canvas did not return>>
 <<mark entries Canvas did not return>>
+<<forget entries Canvas did not return, if the listing may>>
 process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_kwargs", union_kwargs)
@@ -4409,6 +4416,199 @@ class TestPrecautionForEntriesThatLeft:
             list(instance.get_items(include=["avatar_url"]))
 @
 
+\subsection{Forgetting what Canvas no longer lists}
+\label{sec:forget-unlisted}
+
+Marking an entry Canvas did not return keeps it in the cache, and so far that was
+the rule for every listing: a fetch added and updated entries but never removed
+any.
+A course you have left, or an assignment deleted in Canvas, thus stayed, and the
+listings went on yielding it, also right after [[--refresh-cache]], which a user
+does not expect from a flag with that name (issue~\#589).
+Only [[--no-cache]] or [[cache clear]] showed what Canvas has now.
+Such entries also add to the cache file that every command loads and saves, and
+they lack whatever the listing has been asked for since, which costs the fetches
+described above.
+
+Whether to remove them depends on the kind of object.
+A student who has left a course still has results that count, and [[results]]
+must find them, so users keep their entries, and so do submissions
+(\cref{sec:unlisted-submissions}); they are marked, as above.
+A course you no longer have access to, or an assignment that has been deleted,
+has no such use: commands work on what is in Canvas.
+So the decorator takes [[forget_unlisted]], and the course and assignment
+listings set it.
+
+Removing is only safe when we know that Canvas did not return the entry, not
+merely that we did not see it.
+That holds after a complete fetch of the listing.
+We only get here once every page has been read: a page that fails raises from
+the fetch, before anything is replaced or removed.
+The fetch is also unrestricted: a request with a restriction never reaches it, it
+goes to Canvas uncached (\cref{sec:subset-listings}), and a listing that an older
+copy of the library stored with a restriction is fetched properly before it is
+trusted.
+That older copy does not remove anything itself, and the entries it adds or
+keeps are correct in themselves, so the two copies can share the cache file.
+A positional argument we can't judge either way, so we leave the entries alone
+then, although the listings that set [[forget_unlisted]] take none.
+
+An empty answer is the one complete fetch we don't act on.
+For a user who has courses, an empty course listing is more likely a passing
+state than the truth, a token with fewer rights or a hiccup in Canvas, and
+removing every course would cost the whole cache below them, which takes many
+requests to rebuild.
+The same goes for a course whose assignments all vanish at once.
+Keeping them costs little: they stay marked, as before, until a listing that
+returns anything at all removes them.
+
+A removed course or assignment takes its cached children with it, the users,
+assignments and submissions in its own caches.
+Nothing else holds on to one in a way that would break.
+A [[LazySubmission]] refers to its assignment, but it lives in that assignment's
+cache and goes with it.
+Module items and quizzes refer to an assignment by its ID, and fetch it through
+the singular method, which then asks Canvas, as it does for any assignment not
+cached.
+The commands that change assignments add to or remove from the cache with
+defaults, so they don't depend on an entry being there.
+The individual refresh of a stale object already removed one on a 404
+(\cref{sec:cache-copy-to-new}), and this is the same answer from Canvas, given
+for a whole listing at once.
+<<forget entries Canvas did not return, if the listing may>>=
+if forget_unlisted and fetched_objs and not args:
+  for obj_key in list(attr_cache):
+    if obj_key not in fetched_keys:
+      logger.info(f"Dropped from cache: {attr_name} {cache_key}={obj_key} "
+                  f"no longer listed")
+      del attr_cache[obj_key]
+@
+
+Let's verify this through the real [[Canvas]] client, with [[responses]] in place
+of Canvas, since what we test is a listing whose answer changes between fetches,
+which a recording of one state cannot express.
+We fetch again in the two ways a user would cause it: the time to live of the
+listing running out, and [[--refresh-cache]].
+
+<<test functions>>=
+class TestForgettingWhatCanvasNoLongerLists:
+    """A complete listing removes courses and assignments, not users"""
+
+    URL = "https://canvas.example.org"
+    COURSES = f"{URL}/api/v1/courses"
+
+    @pytest.fixture(autouse=True)
+    def no_refresh_requested_yet(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+
+    def listing(self, url, ids, pages=None):
+        """Let Canvas list `ids` at `url`; `pages` gives a page per request."""
+        def answer(request):
+            if pages:
+                return pages.pop(0)
+            return (200, {}, json.dumps([{"id": each, "name": str(each)}
+                                         for each in ids]))
+        responses.add_callback(responses.GET, url, callback=answer)
+
+    def refetch(self, owner, attribute, how):
+        """Make the next read of the listing fetch it, as a user would."""
+        if how == "refresh":
+            owner_fetched = getattr(owner, f"{attribute}_all_fetched")
+            setattr(owner, f"{attribute}_all_fetched",
+                    owner_fetched - timedelta(seconds=1))
+            request_refresh()
+        else:
+            setattr(owner, f"{attribute}_all_fetched", None)
+
+    def course(self):
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        return Course(canvas._Canvas__requester, {"id": 1})
+
+    @responses.activate
+    @pytest.mark.parametrize("how", ["ttl", "refresh"])
+    def test_a_course_gone_from_canvas_is_gone(self, how):
+        listed = [1, 2]
+        self.listing(self.COURSES, listed)
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        list(canvas.get_courses())
+        listed.remove(2)
+        if how == "ttl":
+            canvas.course_all_fetched -= timedelta(days=COURSE_CACHE_TTL_DAYS + 1)
+        else:
+            self.refetch(canvas, "course", how)
+
+        assert [course.id for course in canvas.get_courses()] == [1]
+        assert set(canvas.course_cache) == {1}
+
+    @responses.activate
+    @pytest.mark.parametrize("how", ["ttl", "refresh"])
+    def test_an_assignment_gone_from_canvas_is_gone(self, how):
+        listed = [10, 11]
+        self.listing(f"{self.COURSES}/1/assignments", listed)
+        course = self.course()
+        list(course.get_assignments())
+        listed.remove(11)
+        self.refetch(course, "assignment", how)
+
+        assert [each.id for each in course.get_assignments()] == [10]
+        assert set(course.assignment_cache) == {10}
+
+    @responses.activate
+    def test_a_user_who_left_stays(self):
+        listed = [7, 8]
+        self.listing(f"{self.COURSES}/1/search_users", listed)
+        course = self.course()
+        list(course.get_users())
+        listed.remove(8)
+        self.refetch(course, "user", "refresh")
+
+        assert sorted(user.id for user in course.get_users()) == [7, 8]
+        assert course.user_cache[8][0]._unlisted
+
+    @responses.activate
+    def test_a_fetch_failing_halfway_removes_nothing(self):
+        url = f"{self.COURSES}/1/assignments"
+        page_one = json.dumps([{"id": 10, "name": "10"}])
+        pages = [(200, {"Link": f'<{url}?page=2>; rel="next"'}, page_one),
+                 (500, {}, json.dumps({"errors": [{"message": "Error"}]}))]
+        self.listing(url, [10, 11])
+        course = self.course()
+        list(course.get_assignments())
+        responses.reset()
+        self.listing(url, [], pages)
+        course.assignment_all_fetched = None
+
+        with pytest.raises(canvasapi.exceptions.CanvasException):
+            list(course.get_assignments())
+
+        assert pages == []
+        assert set(course.assignment_cache) == {10, 11}
+
+    @responses.activate
+    def test_an_empty_listing_removes_nothing(self):
+        listed = [1, 2]
+        self.listing(self.COURSES, listed)
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        list(canvas.get_courses())
+        listed.clear()
+        canvas.course_all_fetched = None
+
+        assert sorted(course.id for course in canvas.get_courses()) == [1, 2]
+        assert all(course._unlisted for course, _ in canvas.course_cache.values())
+
+    @responses.activate
+    def test_a_restricted_listing_removes_nothing(self):
+        self.listing(self.COURSES, [1, 2])
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        list(canvas.get_courses())
+        responses.reset()
+        self.listing(self.COURSES, [1])
+
+        assert [course.id for course in canvas.get_courses(
+            enrollment_state="active")] == [1]
+        assert set(canvas.course_cache) == {1, 2}
+@
+
 \subsection{Refreshing on request}
 \label{sec:refresh-on-request}
 
@@ -4466,13 +4666,16 @@ about what the user just told us has changed.
 
 We deliberately do not put the check in [[outdated]], although that looks like
 the natural home.
-A bulk fetch does not remove entries Canvas no longer returns, and those keep
-their old timestamps.
+A bulk fetch keeps most entries Canvas no longer returns, all but the courses and
+assignments (\cref{sec:forget-unlisted}), and those it keeps have their old
+timestamps.
 With the check in [[outdated]], the next listing in the same run would refresh
 each of them with a request of its own, and drop the ones that answer with a 404,
 so a refresh would behave differently depending on how often a command happens
 to read a listing.
-For the same reason a refresh adds and updates entries, but does not remove any.
+For the same reason a refresh adds and updates entries, and removes only what a
+complete listing of courses or assignments did not return, as any fetch of those
+listings does.
 
 That promise has a consequence for the singular method, which does ask Canvas
 about such an entry.
@@ -5364,10 +5567,12 @@ at any time, so the listing has a time-to-live of [[COURSE_CACHE_TTL_DAYS]] days
 We use the [[CacheGetMethods]] decorator to add caching to the [[Canvas]] class
 for its [[get_course]] and [[get_courses]] methods.
 The decorator takes the attribute name [[course]] as argument.
+A course Canvas no longer lists is forgotten (\cref{sec:forget-unlisted}).
 <<functions>>=
 def make_canvas_courses_cacheable():
   import canvasapi.canvas
-  canvasapi.canvas.Canvas = CacheGetMethods("course")(canvasapi.canvas.Canvas)
+  canvasapi.canvas.Canvas = CacheGetMethods("course", forget_unlisted=True)(
+    canvasapi.canvas.Canvas)
 @
 
 Note that we don't need a TTLCache here, since the [[outdated]] function will
@@ -5388,10 +5593,12 @@ Users are added at the beginning and occasionally during the course.
 
 We use [[CacheGetMethods]] to cache both [[assignment]] and [[user]] attributes
 of the [[Course]] class.
+An assignment Canvas no longer lists is forgotten, while a user who has left is
+kept, since their results still count (\cref{sec:forget-unlisted}).
 <<functions>>=
 def make_course_contents_cacheable():
   import canvasapi.course
-  canvasapi.course.Course = CacheGetMethods("assignment")(
+  canvasapi.course.Course = CacheGetMethods("assignment", forget_unlisted=True)(
     canvasapi.course.Course)
   canvasapi.course.Course = CacheGetMethods("user")(
     canvasapi.course.Course)

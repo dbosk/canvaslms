@@ -920,8 +920,16 @@ def example_command(config, canvas, args):
 Five mechanisms keep the persisted cache fresh, see the design overview in
 `src/canvaslms/cli/cache.nw`: time to live, invalidation on write, refresh when a
 name matches nothing (`retry_after_miss`), `--refresh-cache` (`request_refresh`)
-and repair on read of a listing stored with a restriction. They add and update entries; do not make them discard cached
-children (replace objects through `<<update [[obj]] with cache from [[old_obj]]>>`).
+and repair on read of a listing stored with a restriction. They add and update
+entries; do not make them discard cached children (replace objects through
+`<<update [[obj]] with cache from [[old_obj]]>>`). The one exception: a complete,
+unrestricted fetch of a listing decorated with `forget_unlisted=True` (only
+`Canvas.get_courses` and `Course.get_assignments`) that returns at least one
+entry removes the entries Canvas did not return, children and all; a 404 on an
+individual refresh removes that one object. Users and submissions are never
+removed, only marked `_unlisted`, since `results` needs students who have left.
+What was asked of one object (`get_course(id, include=[...])`) stays on that
+entry; the listing refetches with its own record, `{attr}_all_kwargs`.
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
 a command or on `EmptyListError`.
