@@ -6714,28 +6714,19 @@ We can only get submission from an assignment object.
 We can either get all submissions, or one specific submission if we specify the
 user.
 
-Canvas's [[get_submissions()]] method accepts a [[bucket]] parameter to filter
-submissions server-side (e.g., [[bucket="ungraded"]]).
-However, this caching implementation does not track the [[bucket]] parameter in
-the cache key.
-
-This is intentional: tracking [[bucket]] would require separate caches for
-different bucket values, complicating the cache hierarchy and potentially
-causing inconsistencies.
+The cache holds an assignment's complete collection of submissions, and only
+that.
+Canvas's [[get_submissions()]] also accepts arguments that filter submissions
+server-side, such as [[bucket="ungraded"]], but we keep no cache per filter.
+Separate caches for different [[bucket]] values would hold the same
+submissions more than once, each refreshed on its own, so they could disagree,
+and the cache hierarchy (course caches contain assignment caches contain
+submission caches) would no longer have one place for each submission.
 Instead, client code (particularly [[submissions.nw]] and [[assignments.nw]])
-performs local filtering on the complete submission list.
-
-This design ensures:
-\begin{itemize}
-\item Cache keys are unambiguous (based only on user ID).
-\item Lazy loading works correctly (submissions refresh based on staleness, not
-bucket parameter).
-\item Cache hierarchy is preserved (course caches contain assignment caches
-contain submission caches).
-\end{itemize}
-
-See \cref{SubmissionsFiltering} in [[submissions.nw]] for the local filtering
-implementation.
+fetches the complete collection and filters it locally, see
+\cref{SubmissionsFiltering} in [[submissions.nw]].
+A library caller who passes such an argument gets what it asked for, but
+straight from Canvas and uncached, as \cref{sec:submission-arguments} explains.
 
 Now we combine the caching mechanism with lazy loading.
 The cache stores [[LazySubmission]] wrappers instead of raw submissions.
@@ -6824,6 +6815,7 @@ elif isinstance(user, int):
 else:
   raise TypeError(f"user must be User or int")
 
+<<pass a restricted request for one submission through to Canvas>>
 <<let [[to_include]] be the includes asked for>>
 
 if uid in self.__cache:
@@ -6913,10 +6905,11 @@ def should_bulk_refresh_submissions(cache, student_ids=None):
 
 Then the collection getter can choose whether to run that pre-check.
 <<return a list of all submissions>>=
-<<let [[to_include]] be the includes asked for>>
-
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
+<<pass a request for some submissions through to Canvas>>
+<<let [[to_include]] be the includes asked for>>
+
 need_refetch = (self.__all_fetched is None
                 or predates_refresh(self.__all_fetched))
 
@@ -7595,4 +7588,106 @@ def test_one_submission_sends_a_string_include_whole(self):
 
     assert [query["include[]"] for query in sent] == [["user"]]
     assert submission._includes == {"user"}
+@
+
+A caller can pass the listing other arguments too, and some of them ask for
+part of the collection, [[bucket="ungraded"]] for instance, which is meant to
+leave out what is graded, or ask for it in another shape, as [[grouped]] does
+for group assignments.
+The cache cannot answer such a call.
+It holds the complete collection, and the answer to such a call is not one.
+Sending only the includes, as the listing used to, gave a caller who asked for
+the ungraded submissions every submission, with no sign that [[bucket]] was
+ignored.
+Storing the answer would be worse.
+For submissions the cache records only the includes, so nothing would mark the
+answer as a part, and every later listing would be served the ungraded
+submissions as if they were all of them.
+That holds for the older copies of this library that share the cache file
+([[nytid]], for instance) as much as for us.
+It is the problem \cref{sec:subset-listings} describes for a course's users.
+
+So the submission getters follow the rule [[CacheGetMethods]] follows, and use
+its test, [[restricts_listing]]: a call with any argument other than
+[[include]] and the keys for sorting and page size goes straight to Canvas, with
+all its arguments, and leaves the cache alone.
+The answer is [[canvasapi]]'s own submissions, not [[LazySubmission]] wrappers,
+since there is no cache entry for them to refresh.
+We return them as a list, as the cached path does, so that the caller can, for
+instance, take its length whichever path answered.
+<<pass a request for some submissions through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: submissions of assignment id={self.id} "
+              f"restricted by {kwargs}")
+  return list(get_submissions(self, *args, **kwargs))
+@
+
+The listing has two keyword arguments of its own, [[check_bulk_refresh]] and
+[[student_ids]], which are not Canvas's.
+The listing takes them out of [[kwargs]] before this test, so they never count
+as a restriction and are never sent to Canvas.
+Canvas's endpoint for the submissions of several assignments has a
+[[student_ids]] parameter too, but this one is ours: it only scopes the decision
+on a bulk refresh to the users a filtered listing will read.
+
+Canvas documents only [[include]] for a single submission, but the rule is the
+same: whatever else a caller passes reaches Canvas, and the answer does not
+replace the cached submission.
+<<pass a restricted request for one submission through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: submission user_id={uid} restricted by {kwargs}")
+  return get_submission(self, user, **kwargs)
+@
+
+None of canvaslms's own commands passes such an argument.
+They fetch the complete collection and filter it locally
+(\cref{SubmissionsFiltering}), so they keep what the cache saves them.
+
+Let's verify that a restricted call reaches Canvas with all its arguments,
+returns what Canvas returned and leaves the cache as it was: empty, so that the
+next plain listing fetches the whole collection, or full, so that it is still
+served from the cache.
+<<submission arguments test methods>>=
+@responses.activate
+def test_a_restricted_listing_is_sent_whole_and_not_cached(self):
+    assignment, sent = self.assignment()
+
+    ungraded = assignment.get_submissions(bucket="ungraded", include=["user"])
+
+    assert sent[0]["bucket"] == ["ungraded"]
+    assert sent[0]["include[]"] == ["user"]
+    assert [each.id for each in ungraded] == [3]
+    assert getattr(assignment, "__cache") == {}
+    assert getattr(assignment, "__all_fetched") is None
+
+    assignment.get_submissions()
+
+    assert len(sent) == 2
+    assert "bucket" not in sent[1]
+
+@responses.activate
+def test_a_restricted_listing_leaves_a_cached_listing_alone(self):
+    assignment, sent = self.assignment()
+    [cached] = assignment.get_submissions()
+
+    [ungraded] = assignment.get_submissions(bucket="ungraded")
+
+    assert len(sent) == 2
+    assert sent[1]["bucket"] == ["ungraded"]
+    assert ungraded is not cached
+    assert assignment.get_submissions()[0] is cached
+    assert len(sent) == 2
+
+@responses.activate
+def test_a_restricted_request_for_one_submission_is_not_cached(self):
+    assignment, sent = self.assignment()
+    cached = assignment.get_submission(3)
+
+    other = assignment.get_submission(3, include=["user"], extra="value")
+
+    assert sent[1] == {"include[]": ["user"], "extra": ["value"]}
+    assert other.id == 3
+    assert other is not cached
+    assert assignment.get_submission(3) is cached
+    assert len(sent) == 2
 @
