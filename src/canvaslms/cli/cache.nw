@@ -112,6 +112,7 @@ logger = logging.getLogger(__name__)
 <<classes and exceptions>>
 <<functions>>
 <<count the requests sent to Canvas>>
+<<leave the recent responses out of the pickle>>
 @
 
 \section{Testing}
@@ -131,6 +132,9 @@ import pathlib
 import pytest
 import requests
 import responses
+from cryptography.fernet import Fernet
+import io
+import pickle
 import socket
 import sys
 import time
@@ -1300,6 +1304,124 @@ def test_no_cache_neither_reads_nor_writes(run_canvaslms, tmp_cache_path):
 
   assert len(responses.calls) == 1
   assert stored(tmp_cache_path) == before
+@
+
+
+\subsection{Leaving the recent responses out of the file}
+
+The [[Requester]] that [[canvasapi]] attaches to every object keeps the last
+five responses it received in its [[_cache]] attribute.
+Neither [[canvasapi]] nor we ever read them again, but they are part of the
+object graph, so every cache file carried five [[Response]] objects with their
+full bodies and the requests that produced them.
+In the synthetic cache of \cref{sec:skip-unchanged-save} these are 250~kB of
+bodies, yet leaving them out makes the pickle 2.8~MB smaller, from 72.7 to
+69.9~MB, and the file 3.5~MiB, from 92.5 to 88.9~MiB, or 4\,\%.
+The rest is how [[pickle]] refers to an object it has already written: by its
+index in a memo, in 2 bytes for the first 256 objects and in 5 bytes after
+that.
+The requester comes early in the graph, so its responses took about 260 of the
+cheap places from objects that are referred to again and again.
+In a cache a sixth of that size, 134\,000 references became 3 bytes longer.
+The time to save and load should drop in proportion, a few per cent, which is
+less than the noise of our measurements.
+
+We leave them out by giving [[Requester]] a [[__getstate__]], the hook
+[[pickle]] asks for the state to store.
+It returns the requester's attributes with [[_cache]] replaced by an empty
+list.
+Replaced and not removed, because of the copies of this library that share the
+file: unpickling sets the stored attributes without running [[__init__]], and
+their [[Requester.request]] starts with [[len(self._cache)]].
+A requester without the attribute would fail at its first request, while one
+with an empty list is exactly what [[__init__]] would have made.
+Nothing else changes in the layout, so the schema version stays the same.
+In the other direction, a file written by an older copy still has the
+responses; we load them as before, and our next save leaves them out.
+
+The hook lives here, next to the request counter, rather than with the other
+patches of [[canvasapi]] in [[hacks/canvasapi.nw]].
+Pickling is this module's business: the cache file is the only place these
+objects are pickled.
+<<functions>>=
+def requester_state(requester):
+  """Return the state to pickle for a `Requester`, without recent responses."""
+  state = requester.__dict__.copy()
+  state["_cache"] = []
+  return state
+<<leave the recent responses out of the pickle>>=
+canvasapi.requester.Requester.__getstate__ = requester_state
+@
+
+Let's verify that a saved cache holds no [[Response]] at all, that it still
+answers offline, and that its requester still works the way an older copy's
+code uses it.
+We look into the file by unpickling it with an [[Unpickler]] that records every
+class the file names, since a [[Response]] could sit anywhere in the graph.
+
+<<test functions>>=
+def classes_in_cache_file(path):
+  """Return the (module, name) of every class the cache file at path names."""
+  pickled = Fernet(cache.derive_key("token", HOST)).decrypt(path.read_bytes())
+  classes = set()
+
+  class RecordingUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+      classes.add((module, name))
+      return super().find_class(module, name)
+
+  RecordingUnpickler(io.BytesIO(pickled)).load()
+  return classes
+
+RESPONSE_CLASS = ("requests.models", "Response")
+
+@responses.activate
+def test_a_saved_cache_holds_no_responses(run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+  run_canvaslms("assignments", "-c", "Old")
+
+  assert RESPONSE_CLASS not in classes_in_cache_file(tmp_cache_path)
+
+  responses.reset()
+  assert "Lab" in run_canvaslms("assignments", "-c", "Old")
+
+@responses.activate
+def test_a_loaded_requester_still_sends_requests(run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("courses")
+  canvas = cache.load_canvas_cache("token", HOST)
+  assert canvas._Canvas__requester._cache == []
+
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+  course = list(canvas.get_courses())[0]
+
+  assert [each.name for each in course.get_assignments()] == ["Lab"]
+@
+
+A file written by an older copy, which kept the responses, must load and work
+too.
+We stand in for that copy by taking our hook away while the file is written,
+and check that the file really has a [[Response]] in it, or the test would
+prove nothing.
+
+<<test functions>>=
+@responses.activate
+def test_a_cache_with_responses_from_an_older_copy_loads(
+    run_canvaslms, tmp_cache_path, monkeypatch):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+  with monkeypatch.context() as older_copy:
+    older_copy.delattr(canvasapi.requester.Requester, "__getstate__")
+    run_canvaslms("assignments", "-c", "Old")
+  assert RESPONSE_CLASS in classes_in_cache_file(tmp_cache_path)
+
+  responses.reset()
+  assert "Lab" in run_canvaslms("assignments", "-c", "Old")
+
+  canvas = cache.load_canvas_cache("token", HOST)
+  cache.save_canvas_cache(canvas, "token", HOST, force=True)
+  assert RESPONSE_CLASS not in classes_in_cache_file(tmp_cache_path)
 @
 
 
