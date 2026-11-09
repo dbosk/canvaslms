@@ -16,6 +16,7 @@ We do this as follows:
 import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
+import canvasapi.util
 from canvasapi.user import User
 from canvasapi.util import is_multivalued
 import collections
@@ -708,20 +709,15 @@ turns fetching.
 
 Canvas accepts a single value as well as a list, so we count a string as a list
 of one item.
-Any other collection counts as several values, a tuple or a set as much as a
-list: we ask [[canvasapi.util.is_multivalued]], which is what [[canvasapi]] itself
-uses to decide how to send an argument.
-Testing for [[list]] alone made [[include=("term",)]] one value, the tuple, which
-Canvas never sees: [[canvasapi]] sends its items.
-[[values_of]] reads a value the same way for both functions, and the merge
-stores the items as a list.
-The list matters beyond this code: the cache file is shared with older copies of
-the library, which only know lists.
-<<kwargs functions caches>>=
-def values_of(value):
-  """Return the items of a multivalued `value`, else a list holding `value`."""
-  return list(value) if is_multivalued(value) else [value]
-@
+What counts as several values is for [[canvasapi]] to say, since it is what
+builds the request: its [[is_multivalued]] takes any iterable except a string or
+bytes as several values, a tuple, a set or a generator as much as a list.
+We read values the same way, with [[as_list]] below, so that what we compare
+and record is what [[canvasapi]] sends.
+Taking only a list as several would make a tuple of includes one include, the
+tuple itself, which is not what Canvas gets.
+The merge stores the items as a list, which matters beyond this code: the cache
+file is shared with older copies of the library, which only know lists.
 
 A generator is multivalued too, but it can be read only once.
 Comparing it with what is cached would use it up, and the request would then
@@ -742,8 +738,12 @@ def with_iterators_read(kwargs):
 We can thus start with the following defaults:
 <<kwargs functions caches>>=
 def as_list(value):
-  """Returns `value` if it's a list, otherwise a list holding it."""
-  return value if isinstance(value, list) else [value]
+  """Returns the values in `value` as a list, the way canvasapi reads them.
+
+  An iterable other than a string or bytes is several values; anything else,
+  `None` included, is a list of one.
+  """
+  return list(value) if canvasapi.util.is_multivalued(value) else [value]
 
 def must_update(prev_kwargs, new_kwargs,
                 ignore_keys=[
@@ -762,7 +762,7 @@ def must_update(prev_kwargs, new_kwargs,
     if key not in prev_kwargs:
       return True
     elif is_multivalued(value) or is_multivalued(prev_kwargs[key]):
-      if not set(values_of(value)) <= set(values_of(prev_kwargs[key])):
+      if not set(as_list(value)) <= set(as_list(prev_kwargs[key])):
         return True
     elif value != prev_kwargs[key]:
       return True
@@ -788,8 +788,8 @@ def merge_kwargs(kwargs_list,
         new_kwargs[key] = list(value) if is_multivalued(value) else value
       elif (is_multivalued(value) or is_multivalued(new_kwargs[key])
             or key == "include"):
-        new_kwargs[key] = list(set(values_of(new_kwargs[key]))
-                               | set(values_of(value)))
+        new_kwargs[key] = list(set(as_list(new_kwargs[key]))
+                               | set(as_list(value)))
       else:
         <<if [[key]] can be ignored>>:
           new_kwargs[key] = value
@@ -1366,6 +1366,7 @@ cache_key = self.__cache_key
 
 @functools.wraps(get_attr)
 def new_get_attr(self, *args, **kwargs):
+  report_setting_problems()
   <<return cached result or fetch from [[get_attr]]>>
 
 setattr(cls, singular_name, new_get_attr)
@@ -1383,6 +1384,7 @@ confirm_unlisted = self.__confirm_unlisted
 
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
+  report_setting_problems()
   <<return cached result or fetch from [[get_attrs]]>>
 
 setattr(cls, plural_name, new_get_attrs)
@@ -3629,12 +3631,52 @@ A tuning knob must not be able to brick the CLI, so we read these values
 through a helper that falls back to the default with a warning instead.
 The helper tangles into the module before the constants (see the module
 outline), since the constants call it at import time.
+
+\subsection{When to report a malformed setting}
+
+The warning has two audiences with opposing needs.
+A command-line user must be able to silence it with [[-q]], and this is
+decisive for [[ungraded.sh]], which runs from cron: cron mails everything on
+stderr, so a single malformed setting would send mail on every run and
+[[-q]] would be no remedy.
+A library caller, on the other hand, never runs [[main]] and still deserves
+to hear about the typo.
+
+Logging the warning at import, where the constants are computed, serves
+neither.
+[[main]] configures logging only after it has parsed the command line,
+which is after this module was imported, so [[-q]] has no say yet and Python's
+handler of last resort prints the message bare, without the [[WARNING]] tag
+that the other messages carry.
+
+We considered the opposite design, in which the settings are read when they
+are used, so that logging has been configured by then.
+We rejected it because these settings are module constants with many use sites
+(the cache help, [[outdated]], [[retry_after_miss]], the bulk refresh), and the
+tests replace them with [[monkeypatch.setattr]].
+Turning them into function calls would touch all of that for no other gain.
+
+So [[env_number]] only \emph{records} the problem, keyed by variable name
+(a variable is therefore reported at most once), and a second function reports
+what has been recorded.
+It is called from the two places where logging is known to be settled:
+[[main]], right after it has configured logging, and the wrappers that
+[[CacheGetMethods]] puts around every cached [[get_*]] method.
+The latter is the first use of the cache by a library caller; for a command
+line the report has long been made by then, and finding nothing to report is a
+single test of an empty dictionary.
+A command that exits during argument parsing, such as [[--help]], comes before
+either and reports nothing; the help shows the default that is in effect.
 <<environment helpers>>=
+SETTING_PROBLEMS = {}
+
 def env_number(name, default, parse):
   """Read the numeric setting `name` from the environment.
 
-  Converts with `parse` (int or float); falls back to `default`,
-  with a warning, if the variable is set but doesn't parse.
+  Converts with `parse` (int or float); falls back to `default` if the
+  variable is set but doesn't parse. The problem is not logged here but
+  recorded for `report_setting_problems`, since logging may not be
+  configured yet when this runs at import.
   """
   value = os.environ.get(name)
   if value is None:
@@ -3642,12 +3684,21 @@ def env_number(name, default, parse):
   try:
     return parse(value)
   except ValueError:
-    logger.warning(f"ignoring {name}={value!r}: "
-                   f"not a number, using default {default}")
+    SETTING_PROBLEMS[name] = (f"ignoring {name}={value!r}: "
+                              f"not a number, using default {default}")
     return default
+
+def report_setting_problems():
+  """Log each recorded malformed setting once, as a warning."""
+  while SETTING_PROBLEMS:
+    _, message = SETTING_PROBLEMS.popitem()
+    logger.warning(message)
 @
 
-Let's verify the three cases: unset, well-formed and malformed.
+Let's verify the three cases of [[env_number]], and that reporting is separate
+from reading and happens once.
+The test for the malformed value no longer expects a log record: that moved to
+[[report_setting_problems]].
 
 <<test functions>>=
 def test_env_number_defaults_when_unset(monkeypatch):
@@ -3661,10 +3712,93 @@ def test_env_number_parses_set_value(monkeypatch):
 
 
 def test_env_number_falls_back_on_malformed_value(monkeypatch, caplog):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "SETTING_PROBLEMS", {})
   monkeypatch.setenv("CANVASLMS_TEST_KNOB", "off")
   with caplog.at_level(logging.WARNING):
     assert env_number("CANVASLMS_TEST_KNOB", 20, int) == 20
-  assert "CANVASLMS_TEST_KNOB" in caplog.text
+  assert "CANVASLMS_TEST_KNOB" not in caplog.text
+
+
+def test_malformed_setting_is_reported_once(monkeypatch, caplog):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "SETTING_PROBLEMS", {})
+  monkeypatch.setenv("CANVASLMS_TEST_KNOB", "off")
+  env_number("CANVASLMS_TEST_KNOB", 20, int)
+  env_number("CANVASLMS_TEST_KNOB", 20, int)
+  with caplog.at_level(logging.WARNING):
+    canvaslms.hacks.canvasapi.report_setting_problems()
+    canvaslms.hacks.canvasapi.report_setting_problems()
+  assert caplog.text.count("CANVASLMS_TEST_KNOB") == 1
+@
+
+\subsection{Verifying the reports of a malformed setting}
+
+The tests above show the mechanism; what matters is that the promised outcomes
+hold from the outside.
+We run the real entry point in a subprocess, as cron does, because the order
+of import, logging configuration and warning is exactly what is under test and
+cannot be reproduced within pytest's own process.
+The command [[cache clear-attachments]] needs no network and no credentials,
+and it runs past argument parsing; the home directories point into
+[[tmp_path]] so that it cannot touch the user's own caches.
+We set a malformed setting and compare three runs.
+
+<<test functions>>=
+def run_in_subprocess(tmp_path, code, *args):
+  """Run `code` with a malformed setting; return the completed process."""
+  import subprocess
+  env = dict(os.environ)
+  env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "c"),
+             XDG_CACHE_HOME=str(tmp_path / "k"),
+             XDG_DATA_HOME=str(tmp_path / "d"),
+             PYTHONPATH=os.pathsep.join(sys.path),
+             CANVASLMS_COURSE_CACHE_TTL_DAYS="abc")
+  return subprocess.run([sys.executable, "-c", code, *args], env=env,
+                        capture_output=True, text=True, timeout=120)
+
+
+CLI_ENTRY = "import canvaslms.cli; canvaslms.cli.main()"
+CLEAR_ATTACHMENTS = ["cache", "clear-attachments", "--older-than-days", "9999"]
+
+
+def test_cli_warns_once_about_malformed_setting(tmp_path):
+  result = run_in_subprocess(tmp_path, CLI_ENTRY, *CLEAR_ATTACHMENTS)
+  assert result.returncode == 0
+  lines = [line for line in result.stderr.splitlines()
+           if "CANVASLMS_COURSE_CACHE_TTL_DAYS" in line]
+  assert len(lines) == 1
+  assert lines[0].startswith("[WARNING] ")
+
+
+def test_cli_quiet_hides_malformed_setting_warning(tmp_path):
+  result = run_in_subprocess(tmp_path, CLI_ENTRY, "-q", *CLEAR_ATTACHMENTS)
+  assert result.returncode == 0
+  assert result.stderr == ""
+
+
+def test_library_caller_is_warned_on_first_cached_get(tmp_path):
+  """A program that never runs main still hears about the setting"""
+  code = """
+import logging, sys
+import canvaslms.hacks.canvasapi as c
+logging.basicConfig(format='[%(levelname)s] %(message)s')
+
+@c.CacheGetMethods("widget")
+class Holder:
+  def get_widget(self, widget_id, **kwargs):
+    return widget_id
+
+  def get_widgets(self, **kwargs):
+    return []
+
+list(Holder().get_widgets())
+list(Holder().get_widgets())
+"""
+  result = run_in_subprocess(tmp_path, code)
+  assert result.returncode == 0, result.stderr
+  lines = [line for line in result.stderr.splitlines()
+           if "CANVASLMS_COURSE_CACHE_TTL_DAYS" in line]
+  assert len(lines) == 1
+  assert lines[0].startswith("[WARNING] ")
 @
 
 Instinctively, we might want to use all passing grades as the grades that don't
@@ -5884,6 +6018,8 @@ def test_a_failure_stops_the_refresh(self, caplog):
 
 The settings are read when the module is imported, so we import it in a process
 of its own to see what a variable does.
+Since a malformed value is only recorded then, the process also reports the
+recorded problems, as [[main]] and the cached [[get_*]] methods do.
 <<test functions>>=
 MISS_LIMIT_VARIABLES = ("CANVASLMS_MISS_REFRESH_MAX_LISTINGS",
                         "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES")
@@ -5899,6 +6035,7 @@ def import_with_limits(**variables):
     return subprocess.run(
         [sys.executable, "-c",
          "import canvaslms.hacks.canvasapi as module; "
+         "module.report_setting_problems(); "
          "print(module.MISS_REFRESH_MAX_LISTINGS, "
          "module.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES)"],
         env=environment, capture_output=True, text=True, check=True)
@@ -6787,10 +6924,11 @@ omits the assessment of a never-assessed submission even when
 [[include[]=rubric_assessment]] is given, from both the single-submission and
 the list endpoint---we checked against the sandbox course.
 
-Two code paths swap the wrapped submission: this lazy refresh, and the bulk
-refresh of a whole assignment (\cref{sec:bulk-refresh}).  Both must keep the
-annotations and the attribute names, so the swap is a method of its own rather
-than two copies that could drift apart.
+Several code paths swap the wrapped submission: this lazy refresh, the bulk
+refresh of a whole assignment (\cref{sec:bulk-refresh}), and a fetch of one
+submission with an include it lacked.  All must keep the annotations and the
+attribute names, so the swap is a method of its own rather than copies that
+could drift apart.
 <<LazySubmission methods>>=
 def _replace_submission(self, fresh_submission):
   """Swap in `fresh_submission`, keeping what the old one had beyond it.
@@ -7769,28 +7907,19 @@ We can only get submission from an assignment object.
 We can either get all submissions, or one specific submission if we specify the
 user.
 
-Canvas's [[get_submissions()]] method accepts a [[bucket]] parameter to filter
-submissions server-side (e.g., [[bucket="ungraded"]]).
-However, this caching implementation does not track the [[bucket]] parameter in
-the cache key.
-
-This is intentional: tracking [[bucket]] would require separate caches for
-different bucket values, complicating the cache hierarchy and potentially
-causing inconsistencies.
+The cache holds an assignment's complete collection of submissions, and only
+that.
+Canvas's [[get_submissions()]] also accepts arguments that filter submissions
+server-side, such as [[bucket="ungraded"]], but we keep no cache per filter.
+Separate caches for different [[bucket]] values would hold the same
+submissions more than once, each refreshed on its own, so they could disagree,
+and the cache hierarchy (course caches contain assignment caches contain
+submission caches) would no longer have one place for each submission.
 Instead, client code (particularly [[submissions.nw]] and [[assignments.nw]])
-performs local filtering on the complete submission list.
-
-This design ensures:
-\begin{itemize}
-\item Cache keys are unambiguous (based only on user ID).
-\item Lazy loading works correctly (submissions refresh based on staleness, not
-bucket parameter).
-\item Cache hierarchy is preserved (course caches contain assignment caches
-contain submission caches).
-\end{itemize}
-
-See \cref{SubmissionsFiltering} in [[submissions.nw]] for the local filtering
-implementation.
+fetches the complete collection and filters it locally, see
+\cref{SubmissionsFiltering} in [[submissions.nw]].
+A library caller who passes such an argument gets what it asked for, but
+straight from Canvas and uncached, as \cref{sec:submission-arguments} explains.
 
 Now we combine the caching mechanism with lazy loading.
 The cache stores [[LazySubmission]] wrappers instead of raw submissions.
@@ -7868,6 +7997,8 @@ The lazy path only fetches when a submission is missing from the cache or when a
 caller requests additional [[include]] data.
 We keep the cache-hit diagnostics from [[master]], but we leave the staleness
 policy itself to [[LazySubmission._needs_refresh()]].
+Both getters read the includes asked for in the same way, which
+\cref{sec:submission-arguments} explains.
 <<return submission of user>>=
 # canvasapi allows either User object or user ID.
 if isinstance(user, User):
@@ -7877,10 +8008,8 @@ elif isinstance(user, int):
 else:
   raise TypeError(f"user must be User or int")
 
-if "include" in kwargs:
-  to_include = set(kwargs["include"])
-else:
-  to_include = set()
+<<pass a restricted request for one submission through to Canvas>>
+<<let [[to_include]] be the includes asked for>>
 
 if uid in self.__cache:
   lazy_submission = self.__cache[uid]
@@ -7895,10 +8024,24 @@ else:
   logger.info(f"Cache miss (not found): submission user_id={uid}")
 
 raw_submission = get_submission(self, user, include=list(to_include))
-lazy_submission = LazySubmission(raw_submission, self, to_include,
-                                 original_get_submission)
-self.__cache[uid] = lazy_submission
+<<keep the single [[raw_submission]] in the cache>>
 return lazy_submission
+@
+
+A submission already in the cache was handed to some caller, who may hold it
+and may have annotated it, as the listing commands do with [[user]].
+A new [[LazySubmission]] in its place would leave that caller with an object
+the cache no longer updates, and the next call would return one without the
+annotations.
+So we store what we fetched in the way the bulk fetch below does, with the
+same chunk: a cached submission keeps its wrapper, which swaps in the fresh
+one through [[_replace_submission]] and records the includes, and only a
+submission not cached yet gets a new wrapper.
+That chunk calls what was asked for [[all_includes]] and leaves the wrapper in
+[[lazy_submission]].
+<<keep the single [[raw_submission]] in the cache>>=
+all_includes = to_include
+<<keep [[raw_submission]] in the cache>>
 @
 
 Now we can deal with [[get_submissions]].
@@ -7969,13 +8112,11 @@ def should_bulk_refresh_submissions(cache, student_ids=None):
 
 Then the collection getter can choose whether to run that pre-check.
 <<return a list of all submissions>>=
-if "include" in kwargs:
-  to_include = set(kwargs["include"])
-else:
-  to_include = set()
-
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
+<<pass a request for some submissions through to Canvas>>
+<<let [[to_include]] be the includes asked for>>
+
 need_refetch = (self.__all_fetched is None
                 or predates_refresh(self.__all_fetched))
 
@@ -8017,7 +8158,8 @@ return list(self.__cache.values())
 @
 
 The bulk fetch above and the bulk refresh below both replace submissions that
-may already be cached, so they share one way of storing what they get.
+may already be cached, as does the single getter when asked for a new include,
+so they share one way of storing what they get.
 A cached submission keeps its wrapper and is replaced through
 [[_replace_submission]], so annotations and attribute names survive a bulk fetch
 exactly as they survive a lazy refresh.
@@ -8573,4 +8715,277 @@ class TestFilteredBulkRefreshScope:
         # Three stale users in scope: threshold = max(int(3*0.2), 3) = 3.
         assert should_bulk_refresh_submissions(
             cache, student_ids={0, 1, 2}) is True
+@
+
+\subsubsection{What a caller asks for}
+\label{sec:submission-arguments}
+
+The two getters above read their keyword arguments themselves instead of
+handing them on to [[canvasapi]], and so they must read them the way
+[[canvasapi]] would, since that is what Canvas would have received.
+
+Canvas accepts [[include]] as a single value as well as a list, and so does
+[[canvasapi]], which makes [[include="user"]] a correct call, as is a tuple or a
+set of includes.
+Turned into a set as it stands, the string becomes the set of its letters,
+[[{"u", "s", "e", "r"}]], so the caller gets no user and no error.
+Worse, the letters become the submission's [[_includes]], the record of what
+the cache holds, so they are sent again with every later fetch of the
+assignment.
+We therefore read the value through [[as_list]], as [[must_update]] does.
+It takes a value apart the way [[canvasapi]] does, so a string counts as a list
+of one and any other iterable as its items.
+An [[include=None]] asks for nothing, as it does in [[canvasapi]], whose
+request leaves out a parameter whose value is [[None]].
+Read through [[as_list]] alone it would be the include [[None]], recorded in
+[[_includes]] as if the submission held it, so we read it as no list at all.
+<<let [[to_include]] be the includes asked for>>=
+to_include = set(as_list(kwargs.get("include") or []))
+@
+
+Let's verify both getters through the real wrapper on a real [[Assignment]].
+What we must see is the query each one sends, so [[responses]] stands in for
+Canvas at the HTTP layer and records it; everything above that layer runs as
+in production.
+We collect the tests in the [[<<submission arguments test methods>>]] bucket
+chunk.
+<<test functions>>=
+class TestSubmissionArguments:
+    """The submission getters send Canvas what the caller asked for"""
+
+    URL = "https://canvas.example.org"
+    LISTING = f"{URL}/api/v1/courses/1/assignments/2/submissions"
+    SUBMISSION = {"id": 3, "user_id": 3, "assignment_id": 2}
+
+    def assignment(self):
+        """Return an assignment and the query of each request it sends."""
+        sent = []
+
+        def answer(body):
+            def callback(request):
+                query = urllib.parse.urlsplit(request.url).query
+                sent.append(urllib.parse.parse_qs(query))
+                return (200, {}, json.dumps(body))
+            return callback
+
+        responses.add_callback(responses.GET, self.LISTING,
+                               callback=answer([self.SUBMISSION]))
+        responses.add_callback(responses.GET, f"{self.LISTING}/3",
+                               callback=answer(self.SUBMISSION))
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        return (Assignment(canvas._Canvas__requester,
+                           {"id": 2, "course_id": 1}),
+                sent)
+
+    <<submission arguments test methods>>
+@
+
+A string is one include for both getters, and since the cache then records
+what it really holds, asking again costs no request.
+Likewise [[None]] is no include, sent or recorded.
+<<submission arguments test methods>>=
+@responses.activate
+def test_the_listing_sends_a_string_include_whole(self):
+    assignment, sent = self.assignment()
+
+    for _ in range(2):
+        submissions = assignment.get_submissions(include="user")
+
+    assert [query["include[]"] for query in sent] == [["user"]]
+    assert submissions[0]._includes == {"user"}
+
+@responses.activate
+def test_one_submission_sends_a_string_include_whole(self):
+    assignment, sent = self.assignment()
+
+    for _ in range(2):
+        submission = assignment.get_submission(3, include="user")
+
+    assert [query["include[]"] for query in sent] == [["user"]]
+    assert submission._includes == {"user"}
+
+@responses.activate
+def test_include_none_asks_for_no_include(self):
+    """Nothing is sent, and nothing is recorded as held."""
+    assignment, sent = self.assignment()
+
+    single = assignment.get_submission(3, include=None)
+    [listed] = assignment.get_submissions(include=None)
+
+    assert len(sent) == 2
+    assert all("include[]" not in query for query in sent)
+    assert single._includes == set()
+    assert listed._includes == set()
+@
+
+Asking a single submission for an include it lacks fetches it again, and the
+answer must update the submission the caller already holds, not replace it in
+the cache, as the prose on the single getter explains.
+A caller that has annotated the submission, as the listing commands do with
+[[user]], must find the annotation on what the second call returns, and that
+must be the very object it holds.
+<<submission arguments test methods>>=
+@responses.activate
+def test_a_new_include_updates_the_submission_held(self):
+    assignment, sent = self.assignment()
+    held = assignment.get_submission(3)
+    user = object()
+    held.user = user
+
+    again = assignment.get_submission(3, include=["submission_comments"])
+
+    assert len(sent) == 2
+    assert sent[1]["include[]"] == ["submission_comments"]
+    assert again is held
+    assert again.user is user
+    assert again._includes == {"submission_comments"}
+@
+
+Several includes need not come as a list.
+[[canvasapi]] sends any iterable other than a string as several values, so a
+tuple, a set and a generator must each reach Canvas as one [[include[]]] per
+item and be recorded as a set of strings, by both getters.
+<<submission arguments test methods>>=
+INCLUDES = ("user", "submission_comments")
+SEVERAL = pytest.mark.parametrize(
+    "several", [tuple, set, lambda values: (each for each in values)],
+    ids=["tuple", "set", "generator"])
+
+@SEVERAL
+@responses.activate
+def test_the_listing_reads_several_includes_as_canvasapi_does(self, several):
+    assignment, sent = self.assignment()
+
+    [submission] = assignment.get_submissions(include=several(self.INCLUDES))
+
+    [query] = sent
+    assert sorted(query["include[]"]) == sorted(self.INCLUDES)
+    assert "include[][]" not in query
+    assert submission._includes == set(self.INCLUDES)
+
+@SEVERAL
+@responses.activate
+def test_one_submission_reads_several_includes_as_canvasapi_does(
+        self, several):
+    assignment, sent = self.assignment()
+
+    submission = assignment.get_submission(3, include=several(self.INCLUDES))
+
+    [query] = sent
+    assert sorted(query["include[]"]) == sorted(self.INCLUDES)
+    assert "include[][]" not in query
+    assert submission._includes == set(self.INCLUDES)
+@
+
+Since [[must_update]] reads its values through the same [[as_list]], a tuple
+of includes the cache already holds no longer counts as something new, and a
+cache recorded with a tuple is still read as its items.
+<<test functions>>=
+@pytest.mark.parametrize("prev,new", [
+    ({"include": ["user", "submission_comments"]}, {"include": ("user",)}),
+    ({"include": ("user", "submission_comments")}, {"include": ["user"]})])
+def test_must_update_reads_a_tuple_as_its_items(prev, new):
+    assert not must_update(prev, new)
+@
+
+A caller can pass the listing other arguments too, and some of them ask for
+part of the collection, [[bucket="ungraded"]] for instance, which is meant to
+leave out what is graded, or ask for it in another shape, as [[grouped]] does
+for group assignments.
+The cache cannot answer such a call.
+It holds the complete collection, and the answer to such a call is not one.
+Sending only the includes, as the listing used to, gave a caller who asked for
+the ungraded submissions every submission, with no sign that [[bucket]] was
+ignored.
+Storing the answer would be worse.
+For submissions the cache records only the includes, so nothing would mark the
+answer as a part, and every later listing would be served the ungraded
+submissions as if they were all of them.
+That holds for the older copies of this library that share the cache file
+([[nytid]], for instance) as much as for us.
+It is the problem \cref{sec:subset-listings} describes for a course's users.
+
+So the submission getters follow the rule [[CacheGetMethods]] follows, and use
+its test, [[restricts_listing]]: a call with any argument other than
+[[include]] and the keys for sorting and page size goes straight to Canvas, with
+all its arguments, and leaves the cache alone.
+The answer is [[canvasapi]]'s own submissions, not [[LazySubmission]] wrappers,
+since there is no cache entry for them to refresh.
+We return them as a list, as the cached path does, so that the caller can, for
+instance, take its length whichever path answered.
+<<pass a request for some submissions through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: submissions of assignment id={self.id} "
+              f"restricted by {kwargs}")
+  return list(get_submissions(self, *args, **kwargs))
+@
+
+The listing has two keyword arguments of its own, [[check_bulk_refresh]] and
+[[student_ids]], which are not Canvas's.
+The listing takes them out of [[kwargs]] before this test, so they never count
+as a restriction and are never sent to Canvas.
+Canvas's endpoint for the submissions of several assignments has a
+[[student_ids]] parameter too, but this one is ours: it only scopes the decision
+on a bulk refresh to the users a filtered listing will read.
+
+Canvas documents only [[include]] for a single submission, but the rule is the
+same: whatever else a caller passes reaches Canvas, and the answer does not
+replace the cached submission.
+<<pass a restricted request for one submission through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: submission user_id={uid} restricted by {kwargs}")
+  return get_submission(self, user, **kwargs)
+@
+
+None of canvaslms's own commands passes such an argument.
+They fetch the complete collection and filter it locally
+(\cref{SubmissionsFiltering}), so they keep what the cache saves them.
+
+Let's verify that a restricted call reaches Canvas with all its arguments,
+returns what Canvas returned and leaves the cache as it was: empty, so that the
+next plain listing fetches the whole collection, or full, so that it is still
+served from the cache.
+<<submission arguments test methods>>=
+@responses.activate
+def test_a_restricted_listing_is_sent_whole_and_not_cached(self):
+    assignment, sent = self.assignment()
+
+    ungraded = assignment.get_submissions(bucket="ungraded", include=["user"])
+
+    assert sent[0]["bucket"] == ["ungraded"]
+    assert sent[0]["include[]"] == ["user"]
+    assert [each.id for each in ungraded] == [3]
+    assert getattr(assignment, "__cache") == {}
+    assert getattr(assignment, "__all_fetched") is None
+
+    assignment.get_submissions()
+
+    assert len(sent) == 2
+    assert "bucket" not in sent[1]
+
+@responses.activate
+def test_a_restricted_listing_leaves_a_cached_listing_alone(self):
+    assignment, sent = self.assignment()
+    [cached] = assignment.get_submissions()
+
+    [ungraded] = assignment.get_submissions(bucket="ungraded")
+
+    assert len(sent) == 2
+    assert sent[1]["bucket"] == ["ungraded"]
+    assert ungraded is not cached
+    assert assignment.get_submissions()[0] is cached
+    assert len(sent) == 2
+
+@responses.activate
+def test_a_restricted_request_for_one_submission_is_not_cached(self):
+    assignment, sent = self.assignment()
+    cached = assignment.get_submission(3)
+
+    other = assignment.get_submission(3, include=["user"], extra="value")
+
+    assert sent[1] == {"include[]": ["user"], "extra": ["value"]}
+    assert other.id == 3
+    assert other is not cached
+    assert assignment.get_submission(3) is cached
+    assert len(sent) == 2
 @

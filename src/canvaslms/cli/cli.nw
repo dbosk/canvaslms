@@ -314,7 +314,15 @@ net_verbosity = args.verbose - args.quiet
 
 <<determine logging level from net verbosity>>
 logging.basicConfig(level=level, format='[%(levelname)s] %(message)s')
+canvaslms.hacks.canvasapi.report_setting_problems()
 @
+
+Only now can the warnings about malformed [[CANVASLMS_*]] settings be shown.
+They were found while importing the modules that read the settings, before
+the verbosity was known, so [[env_number]] merely recorded them.
+Reporting them here, through the logger we have just configured, lets [[-q]]
+silence them and gives them the [[WARNING]] tag that other warnings carry
+(see the section on the settings in [[hacks/canvasapi.nw]]).
 
 We extract the level determination logic into a reusable chunk:
 <<determine logging level from net verbosity>>=
@@ -675,7 +683,8 @@ def test_command_works_from_the_cache_when_canvas_is_down(run_cli):
   canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
   canvas.course_all_fetched -= timedelta(
       days=canvaslms.hacks.canvasapi.COURSE_CACHE_TTL_DAYS + 1)
-  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST,
+                                        force=True)
   responses.replace(responses.GET, f"{CANVAS_API}/courses",
                     body=requests.exceptions.ConnectionError("Unreachable"))
 
@@ -779,7 +788,8 @@ def cache_a_narrowed_roster(run_cli):
   course.user_cache.clear()
   course.user_cache[7] = (anna, {"enrollment_type": ["student"],
                                  "include": ["enrollments"]})
-  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST,
+                                        force=True)
   responses.calls.reset()
 
 @responses.activate
@@ -1119,6 +1129,9 @@ The limit counts what would be fetched, so the rosters must really differ in
 age.
 We write the ages into the cache file that the next run reads, as the
 [[any_listing_is_old_enough]] fixture would count them all.
+Changing the cache without a request is what [[force]] is for, since otherwise
+the save is skipped (\cref{sec:skip-unchanged-save}); the other tests that age
+or narrow a cached listing by hand force their save for the same reason.
 The same rule means that nothing is exceeded when everything was just fetched.
 
 <<test functions>>=
@@ -1128,7 +1141,8 @@ def make_rosters_old(*course_ids):
   for course in canvas.get_courses():
     if course.id in course_ids:
       course.user_all_fetched = datetime.now() - timedelta(hours=1)
-  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST,
+                                        force=True)
 
 @responses.activate
 def test_a_few_old_rosters_among_many_are_fetched(run_cli, capsys):
@@ -1347,6 +1361,7 @@ class TestGlobalOptionsAreNotShadowed:
 
     <<shadowing test helpers>>
     <<shadowing test>>
+    <<help layout test>>
 @
 
 We build the tree the way [[main]] does, with the global options on [[argp]]
@@ -1410,6 +1425,60 @@ def test_no_subcommand_redeclares_a_global_option(self):
     assert not offenders, (
         "these subcommands redeclare global options, so their defaults "
         f"silently overwrite the global values: {offenders}")
+@
+
+The same tree answers a question about the help texts.
+argparse reflows a description unless the parser has
+[[RawDescriptionHelpFormatter]], and a reflowed list runs its items and the
+paragraphs around them together (\cref{cache-help-layout} shows the
+consequence for [[cache]]).
+Rather than rely on remembering that, we require every parser whose description
+contains a list item, at the start of a line, to keep its layout.
+A description with such a line was clearly written as laid-out text.
+
+<<help layout test>>=
+def test_a_description_with_a_list_keeps_its_layout(self):
+    """Parsers whose description has list items use the raw formatter"""
+    item = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+\S")
+    argp = self.build_parser()
+
+    offenders = [
+        path
+        for path, subparser in self.walk_subparsers(argp)
+        if any(item.match(line)
+               for line in (subparser.description or "").splitlines())
+        and not issubclass(subparser.formatter_class,
+                           argparse.RawDescriptionHelpFormatter)
+    ]
+
+    assert not offenders, (
+        "these descriptions contain a list that argparse would run "
+        f"together; give them RawDescriptionHelpFormatter: {offenders}")
+@
+
+A raw description is printed exactly as it is, so it must not carry any
+indentation of its own: the lines after the first, which noweb indents when the
+text sits in a chunk, would all be indented in the help.
+[[dedent_description]] removes it, and we check that every raw description has
+nothing left to remove.
+
+<<help layout test>>=
+def test_a_raw_description_has_no_common_indentation(self):
+    """Continuation lines of raw descriptions start in column 0"""
+    argp = self.build_parser()
+
+    offenders = [
+        path
+        for path, subparser in self.walk_subparsers(argp)
+        if issubclass(subparser.formatter_class,
+                      argparse.RawDescriptionHelpFormatter)
+        and (lambda rest: textwrap.dedent(rest) != rest)(
+            (subparser.description or "").partition("\n")[2])
+    ]
+
+    assert not offenders, (
+        "these descriptions are indented as a whole, which a raw formatter "
+        f"prints; pass them through dedent_description: {offenders}")
 @
 
 
@@ -1598,6 +1667,9 @@ a substantial part of the cache, and saving preserves that warm-up.
 
 We still skip saving when no Canvas object was used (e.g. the [[login]]
 command) or when the user explicitly passed [[--no-cache]].
+When the command sent no request to Canvas, [[save_canvas_cache]] itself skips
+the save, since the file already holds what the command read
+(\cref{sec:skip-unchanged-save}).
 
 Note that [[hostname]] and [[token]] are only assigned real values together
 with [[canvas]] in [[<<create canvas object>>]].
