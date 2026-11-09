@@ -45,6 +45,7 @@ import sys
 import pytest
 import requests
 import responses
+import yaml
 from unittest.mock import MagicMock, create_autospec
 
 from canvasapi.assignment import Assignment, AssignmentGroup
@@ -4156,7 +4157,8 @@ def build_new_quiz_api_params(quiz_params):
     quiz_params: Dictionary with quiz parameters, may include nested dicts
 
   Returns:
-    Dictionary suitable for passing to requester.request()
+    Dictionary from the documented bracketed parameter names to values,
+    which new_quiz_json_body nests into the request body
   """
   params = {}
 
@@ -4339,9 +4341,15 @@ encodings.
 [[canvasapi]]'s requester has no JSON body for anything but GraphQL, so we
 make the request with its session.  That keeps what [[canvaslms]] has
 configured on the session, such as the retry policy
-(\cref{sec:retry-policy}).  We raise a [[CanvasException]] for an error
-status, as [[requester.request]] does, so the callers' error handling is
-unchanged.
+(\cref{sec:retry-policy}).  The rest of what [[requester.request]] does we do
+ourselves:
+\begin{itemize}
+\item it sends the token and its [[User-Agent]];
+\item it logs the request and the response status at [[INFO]] and the body at
+[[DEBUG]], which is what [[canvaslms -v]] shows when a write goes wrong;
+\item it raises a [[CanvasException]] for an error status, so the callers'
+error handling is unchanged.
+\end{itemize}
 <<functions>>=
 def new_quizzes_json_request(requester, method, endpoint, params):
   """Send `params` to the New Quizzes API `endpoint` as a JSON body
@@ -4351,24 +4359,51 @@ def new_quizzes_json_request(requester, method, endpoint, params):
   url = f"{requester.new_quizzes_url}{endpoint}"
   logger.info(f"Request: {method} {url}")
   response = requester._session.request(
-    method, url, json=new_quiz_json_body(params),
-    headers={"Authorization": f"Bearer {requester.access_token}"})
+    method, url,
+    data=json.dumps(new_quiz_json_body(params), default=json_date),
+    headers={"Authorization": f"Bearer {requester.access_token}",
+             "Content-Type": "application/json",
+             "User-Agent": f"python-canvasapi/{canvasapi.__version__}"})
+  logger.info(f"Response: {method} {url} {response.status_code}")
+  logger.debug(f"Data: {response.text}")
   if not response.ok:
     raise CanvasException(f"{response.status_code} {response.reason}: "
                           f"{response.text[:500]}")
   return response
 @
 
+A date can reach us as a Python object rather than a string.  YAML reads an
+unquoted [[due_at: 2026-11-27T23:59:00Z]], in a file or in the editor's front
+matter, as a [[datetime]], and [[2026-11-20]] as a [[date]].  The form
+encoding sent them as ISO 8601 strings, since [[canvasapi]] converted a
+[[datetime]] and [[requests]] wrote a [[date]] with [[str]].  [[json]]
+refuses both, which made the whole request fail, so we give them as the same
+ISO strings.
+<<functions>>=
+def json_date(value):
+  """Return a date or time as its ISO 8601 string, for json.dumps"""
+  if hasattr(value, 'isoformat'):
+    return value.isoformat()
+  raise TypeError(f"{type(value).__name__} is not JSON serializable")
+@
+
 Canvas has accepted settings with a success status before and then not
 applied them, and this setting decides who can take an exam.  So we compare
 the ranges in Canvas's answer with those we sent, and warn when they differ.
 Ranges are compared as pairs of strings, since that is what Canvas returns.
-<<functions>>=
+An answer we cannot read, [[None]] here, cannot show the ranges either, so it
+gets a warning of its own rather than one claiming that the ranges are gone.
+<<constants>>=
 IP_RANGES_PARAM = 'quiz[quiz_settings][filters][ips]'
-
+<<functions>>=
 def warn_unless_ip_ranges_arrived(params, quiz):
   """Warn if the IP ranges in `params` are not those in `quiz`, as returned"""
   if IP_RANGES_PARAM not in params:
+    return
+  if quiz is None:
+    canvaslms.cli.warn("Canvas's answer did not show the quiz, so the IP "
+                       "ranges could not be checked; check "
+                       "quiz_settings.filters.ips with quizzes export")
     return
   sent = [list(map(str, pair)) for pair in params[IP_RANGES_PARAM] or []]
   stored = ((quiz or {}).get('quiz_settings') or {}).get('filters') or {}
@@ -4411,8 +4446,11 @@ def test_create_sends_the_ip_ranges_as_json_pairs(caplog):
                                  exam_settings(EXAM_RANGES))
 
   assert quiz['id'] == 7
-  body = json.loads(posted.calls[0].request.body)
-  assert body == {'quiz': exam_settings(EXAM_RANGES)}
+  request = posted.calls[0].request
+  assert json.loads(request.body) == {'quiz': exam_settings(EXAM_RANGES)}
+  assert request.headers['Authorization'] == 'Bearer token'
+  assert request.headers['Content-Type'] == 'application/json'
+  assert request.headers['User-Agent'].startswith('python-canvasapi/')
   assert 'IP ranges' not in caplog.text
 
 @responses.activate
@@ -4440,6 +4478,17 @@ def test_edit_replaces_the_ranges_and_warns_if_canvas_differs(caplog):
   assert 'sent IP ranges' in caplog.text
 
 @responses.activate
+def test_an_update_without_an_answer_still_succeeds(caplog):
+  responses.patch(f"{NEW_QUIZZES_API}/courses/1/quizzes/7", status=204)
+  course = wrapped_course()
+
+  assert quizzes.update_new_quiz(course, 7, course._requester,
+                                 {'title': 'Exam'})
+  assert quizzes.update_new_quiz(course, 7, course._requester,
+                                 exam_settings(EXAM_RANGES))
+  assert 'could not be checked' in caplog.text
+
+@responses.activate
 def test_a_failed_update_is_reported_as_a_failure(caplog):
   responses.patch(f"{NEW_QUIZZES_API}/courses/1/quizzes/7", status=500,
                   json={'errors': ['boom']})
@@ -4451,8 +4500,24 @@ def test_a_failed_update_is_reported_as_a_failure(caplog):
 @
 
 The other settings must reach Canvas as the same JSON values the form used to
-carry, with the time limit still translated:
+carry, with the time limit still translated, and dates that YAML read as
+Python objects as ISO 8601 strings:
 <<test functions>>=
+@responses.activate
+def test_unquoted_yaml_dates_reach_canvas_as_iso_strings():
+  posted = responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes",
+                          json={'id': 7})
+  course = wrapped_course()
+  settings = yaml.safe_load("title: Exam\n"
+                            "due_at: 2026-11-27T23:59:00Z\n"
+                            "unlock_at: 2026-11-20\n")
+
+  assert quizzes.create_new_quiz(course, course._requester, settings)
+
+  sent = json.loads(posted.calls[0].request.body)['quiz']
+  assert sent['due_at'] == '2026-11-27T23:59:00+00:00'
+  assert sent['unlock_at'] == '2026-11-20'
+
 def test_json_body_nests_the_documented_parameter_names():
   params = quizzes.build_new_quiz_api_params(
     {'title': 'Exam', 'time_limit': 1800, 'lock_at': '',
@@ -7537,7 +7602,8 @@ def quiz_on_own_requester(quiz_type):
 def sent_to_quiz(quiz_requester):
   """What reached the quiz: a Classic Quiz's form, a New Quiz's JSON body."""
   if quiz_requester._session.request.called:
-    return quiz_requester._session.request.call_args.kwargs['json']
+    return json.loads(
+      quiz_requester._session.request.call_args.kwargs['data'])
   request = quiz_requester.request.call_args.kwargs
   return {**request, **dict(request.get('_kwargs', []))}
 
@@ -7704,8 +7770,10 @@ the list therefore needs a spelling that survives and that Canvas reads as
 instance, one key at a time.  [[time_limit]] needs no new spelling: the
 parameters that clear it exist already, and the tests below exercise them.
 The dates are spelt as the empty string, as for assignments
-(\cref{clearing-a-date}), which survives both encoders as [[quiz[due_at]=]];
-the loop translates their null, and an empty string the user wrote, into it.
+(\cref{clearing-a-date}), which survives both encoders: a Classic Quiz's form
+carries it as [[quiz[due_at]=]], and a New Quiz's JSON body as
+[[{"quiz": {"due_at": ""}}]] (\cref{sec:new-quiz-json-body}).
+The loop translates their null, and an empty string the user wrote, into it.
 Issue~\#527 showed that a date could not be removed from a file at all
 before, and Canvas was observed to clear a Classic Quiz's date and a New
 Quiz's date on receiving the empty string.
@@ -8005,8 +8073,21 @@ def update_new_quiz(course, assignment_id, requester, quiz_params):
     canvaslms.cli.warn(f"Failed to update New Quiz: {e}")
     return False
 
-  warn_unless_ip_ranges_arrived(params, response.json())
+  if IP_RANGES_PARAM in params:
+    warn_unless_ip_ranges_arrived(params, json_or_none(response))
   return True
+@
+
+Before the check, the update never read Canvas's answer, so the check must not
+make a successful update fail.  Canvas returns the quiz, but an empty or
+unreadable answer is read as no answer.
+<<functions>>=
+def json_or_none(response):
+  """Return the JSON of response, None if it has none"""
+  try:
+    return response.json()
+  except ValueError:
+    return None
 @
 
 Like creation, the update goes out as a JSON body
