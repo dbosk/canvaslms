@@ -31,7 +31,9 @@ The cache persistence mechanism works as follows:
 \item When creating a Canvas object, we first check if a cached version exists.
 \item If it does, we decrypt and unpickle it using the Canvas token as the key.
 \item If not, we create a new Canvas object from the API.
-\item After each command completes, we save the Canvas object to the cache.
+\item After each command completes, we save the Canvas object to the cache,
+unless the command sent no request to Canvas, since then the file already
+holds what we have (\cref{sec:skip-unchanged-save}).
 \item The cache is stored in the user's cache directory, which we take from
 the package-level [[dirs]] instance (\cref{sec:shared-appdirs}) so that this
 cache and the attachment store share one directory.
@@ -75,15 +77,18 @@ longer lists stays in the cache.
 
 import base64
 from canvasapi import Canvas
+import canvasapi.requester
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet, InvalidToken
+import functools
 import hashlib
 import logging
 import os
 import pickle
 import pathlib
 import time
+import weakref
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -106,6 +111,7 @@ logger = logging.getLogger(__name__)
 <<constants>>
 <<classes and exceptions>>
 <<functions>>
+<<count the requests sent to Canvas>>
 @
 
 \section{Testing}
@@ -126,6 +132,7 @@ import pytest
 import requests
 import responses
 import socket
+import sys
 import time
 
 import canvaslms.cli.cache as cache
@@ -734,9 +741,21 @@ unpicklable object in the graph is enough), the cache silently stops
 updating and every future run pays full API cost---a failure mode that is
 undiagnosable without a log message.
 We therefore log a warning and continue.
+
+Before any of this, we check whether the save is needed at all: a command that
+sent no request to Canvas has nothing new to store, and the save is the most
+expensive thing such a command does.
+How we know, and why [[force]] exists, is the subject of
+\cref{sec:skip-unchanged-save}.
 <<functions>>=
-def save_canvas_cache(canvas, token, hostname):
-  """Saves the Canvas object to encrypted cache"""
+def save_canvas_cache(canvas, token, hostname, force=False):
+  """Saves the Canvas object to encrypted cache.
+
+  The save is skipped when no request was sent to Canvas since `canvas` was
+  loaded from or saved to the cache file. Pass `force=True` after changing
+  `canvas` by hand, without a request, to save it anyway.
+  """
+  <<skip the save if nothing was sent to Canvas>>
   try:
     save_start = time.perf_counter()
 
@@ -763,6 +782,7 @@ def save_canvas_cache(canvas, token, hostname):
     write_start = time.perf_counter()
     <<write [[encrypted]] atomically to [[cache_path]]>>
     write_elapsed = time.perf_counter() - write_start
+    remember_as_stored(canvas)
 
     save_elapsed = time.perf_counter() - save_start
     logger.info(f"Canvas cache save: {save_elapsed:.2f}s total "
@@ -864,6 +884,7 @@ def load_canvas_cache(token, hostname):
     unpickle_elapsed = time.perf_counter() - unpickle_start
 
     <<discard [[payload]] on schema mismatch>>
+    remember_as_stored(payload["canvas"])
 
     load_elapsed = time.perf_counter() - load_start
     logger.info(f"Canvas cache load: {load_elapsed:.2f}s total "
@@ -970,6 +991,315 @@ def test_saved_cache_is_user_only(tmp_cache_path):
   cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
 
   assert tmp_cache_path.stat().st_mode & 0o777 == 0o600
+@
+
+
+\subsection{Saving only when something was sent to Canvas}
+\label{sec:skip-unchanged-save}
+
+A command that answers from the cache alone used to cost about as much as one
+that fetched: with a 96~MB cache file, [[courses]] for one course took 14~s, of
+which loading the cache took 5~s and saving it again 5~s (issue \#586).
+The save wrote back the bytes it had read, re-encrypted.
+
+\paragraph{Where the time goes.}
+To see what skipping the save could gain, we built a cache of the same size
+offline: 262 courses with 10 assignments and 60 students each, fetched through
+the real wrappers from a stand-in Canvas, which gives a 69~MiB pickle and a
+92~MiB encrypted file.
+\Cref{tab:cache-save-load-times} shows how long each step took.
+The machine was busy, so the seconds are about five times those of the issue;
+the shares are what we go by.
+\begin{table}
+\centering
+\begin{tabular}{lrl}
+\toprule
+Step & Time & Share \\
+\midrule
+Pickle & 15.3~s & 71\,\% of the save \\
+Encrypt & 6.2~s & 29\,\% of the save \\
+Write (with [[fsync]]) & 0.1~s & under 1\,\% of the save \\
+\midrule
+Read & 0.2~s & under 1\,\% of the load \\
+Decrypt & 5.4~s & 19\,\% of the load \\
+Unpickle & 22.2~s & 80\,\% of the load \\
+\midrule
+Key derivation & 0.2~s & once for each \\
+SHA-256 of the pickle & 1.8~s & \\
+BLAKE2b of the pickle & 0.7~s & \\
+\bottomrule
+\end{tabular}
+\caption{Time spent saving and loading a synthetic cache with a 69~MiB pickle,
+step by step.}
+\label{tab:cache-save-load-times}
+\end{table}
+
+\paragraph{Two ways to tell that nothing changed.}
+The first is to compare contents: pickle the object as before, and compare a
+digest of the bytes with one taken of the decrypted bytes at load.
+It cannot be wrong, since equal bytes are an equal cache, but it still pays for
+the pickling, which is 71\,\% of the save, and the digest itself; it saves about
+a quarter of the save.
+It gains even less than that: a freshly fetched object graph does not pickle to
+the bytes it pickles to once reloaded (fresh objects share strings that
+unpickled ones do not), so the first command after each one that fetched would
+save again.
+We measured that later round trips are byte for byte stable.
+
+The second is to keep a flag that says the cache changed, and skip the whole
+save, pickling included, when it is not set.
+Its risk is a place that changes the cache without setting the flag: the
+change is lost, silently.
+Setting the flag in each mechanism that stores something, the wrappers, the
+[[LazySubmission]] refresh, the invalidations on write and so on, would make
+that risk grow with every mechanism someone adds later.
+
+\paragraph{One place to set the flag: the request.}
+We use the flag, but set it in one place.
+Everything in the cache came from Canvas, so the cache learns something only
+by asking Canvas: a fetch that stores, a refresh of a stale submission, a
+refresh on a miss or on [[--refresh-cache]], a 404 that drops an entry, and a
+write that is followed by an invalidation all send a request first.
+We therefore count the requests, and save only when the count has changed since
+the object was loaded.
+
+What changes without a request is worth losing.
+The time to live in [[outdated]] clears the timestamp of an expired listing,
+[[LazySubmission.ensure_attrs]] fills in missing attributes with [[None]], and
+commands decorate objects for their own output.
+The next run recomputes each of them from what the file holds, since time only
+moves forward and the file is the same.
+
+We count each request when it is sent, not when it succeeds, because a failed
+request changes the cache too: an expired course listing that Canvas did not
+answer is given a new timestamp, so that the next command does not wait for
+Canvas again (\cref{sec:course-listing-outage}).
+
+\paragraph{Where to count.}
+Every request [[canvasapi]] makes goes through [[Requester.request]], and so do
+the requests our own code sends directly, for instance for New Quizzes.
+Wrapping that method is one site for all of them, and a mechanism added later
+is covered without anyone having to remember this section.
+The few requests that bypass it are plain [[requests.get]] downloads of files,
+which do not store anything in the Canvas object.
+
+We keep the count on the wrapper rather than in a module variable, so that
+re-importing this module (as tests may) neither wraps the method twice nor
+leaves us reading a counter that the wrapper no longer increments.
+The count is for the whole process and all [[Canvas]] objects; a request for one
+object makes us save any other, which errs on the side of saving.
+<<functions>>=
+def count_requests(request):
+  """Return `request` wrapped to count the requests it sends."""
+  @functools.wraps(request)
+  def counted_request(*args, **kwargs):
+    counted_request.requests_sent += 1
+    return request(*args, **kwargs)
+
+  counted_request.requests_sent = 0
+  return counted_request
+
+def requests_sent():
+  """Return the number of requests sent to Canvas by this process so far."""
+  return getattr(canvasapi.requester.Requester.request, "requests_sent", 0)
+<<count the requests sent to Canvas>>=
+if not hasattr(canvasapi.requester.Requester.request, "requests_sent"):
+  canvasapi.requester.Requester.request = count_requests(
+    canvasapi.requester.Requester.request)
+@
+
+\paragraph{What the file holds.}
+For each [[Canvas]] object we remember the count at the moment it matched the
+file: when it was loaded, and again after each save, since the package-level
+[[canvaslms.save_canvas]] may save before the save at exit.
+A [[Canvas]] object we never loaded, one created because there was no usable
+cache file, is not remembered and is always saved, as it must replace that file.
+
+The record lives in this module and not on the object, since anything on the
+object would be pickled into the file that older copies of this library share.
+It holds the objects weakly, so that a program loading the cache repeatedly does
+not keep each old copy alive.
+An object that cannot be referenced weakly, such as the dictionaries that stand
+in for a [[Canvas]] in some tests, is not remembered either, and so is saved:
+when we cannot tell, we save.
+<<functions>>=
+def remember_as_stored(canvas):
+  """Note that `canvas` matches the cache file as of the requests sent so far."""
+  try:
+    stored_at_request[canvas] = requests_sent()
+  except TypeError:
+    pass
+
+def unchanged_since_stored(canvas):
+  """Return True if no request was sent since `canvas` matched the file."""
+  try:
+    return stored_at_request.get(canvas) == requests_sent()
+  except TypeError:
+    return False
+<<constants>>=
+stored_at_request = weakref.WeakKeyDictionary()
+@
+
+A program that changes the object by hand, without a request, would lose that
+change, so [[save_canvas_cache]] takes [[force]] for it.
+The tests that age a listing in the file to set up a scenario are such callers.
+The check comes before the key derivation, so a skipped save costs nothing.
+One consequence is that the modification time of the cache file now tells when
+something was last fetched, not when the cache was last used.
+<<skip the save if nothing was sent to Canvas>>=
+if not force and unchanged_since_stored(canvas):
+  logger.info("Canvas cache save skipped: no request sent to Canvas since "
+              "the cache was loaded or saved")
+  return
+@
+
+Let's verify this through the real command line and the real encrypted file, as
+the user meets it.
+Canvas is stubbed with [[responses]], since its answers must change between runs.
+Fernet encrypts with a fresh random IV each time, and [[os.replace]] gives the
+file a new inode, so a rewrite shows in the bytes and the inode, even when the
+content is the same.
+
+<<test functions>>=
+OLD_COURSE = {"id": 1, "name": "Old course", "course_code": "OLD"}
+NEW_COURSE = {"id": 2, "name": "New course", "course_code": "NEW"}
+LAB = {"id": 5, "name": "Lab", "course_id": 1}
+
+@pytest.fixture
+def run_canvaslms(tmp_cache_path, tmp_path, monkeypatch, capsys):
+  """Return a function running canvaslms as a new process, returning stdout."""
+  monkeypatch.setattr(
+      canvaslms.cli.login, "load_credentials", lambda config: (HOST, "token"))
+
+  def run(*arguments):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+    monkeypatch.setattr(sys, "argv", [
+        "canvaslms", "--config-file", str(tmp_path / "config.json"),
+        *arguments])
+    canvaslms.cli.main()
+    return capsys.readouterr().out
+
+  return run
+
+def stored(path):
+  """Return what tells one write of the cache file from another."""
+  return path.stat().st_ino, path.read_bytes()
+
+@responses.activate
+def test_a_run_answered_from_the_cache_leaves_the_file(
+    run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("courses")
+  before = stored(tmp_cache_path)
+  responses.calls.reset()
+
+  assert "Old course" in run_canvaslms("courses")
+
+  assert len(responses.calls) == 0
+  assert stored(tmp_cache_path) == before
+@
+
+The other side is that every way of learning something from Canvas still
+reaches the file: a listing read for the first time, [[--refresh-cache]] and a
+refresh after a miss.
+After each, a run without the option must find the new data in the file, with
+Canvas no longer answering at all.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("arguments, found", [
+    (["assignments", "-c", "Old"], "Lab"),
+    (["--refresh-cache", "courses"], "New course"),
+    (["courses", "New"], "New course")],
+    ids=["new listing", "refresh on request", "refresh on a miss"])
+def test_a_run_that_fetches_saves(
+    run_canvaslms, tmp_cache_path, monkeypatch, arguments, found):
+  monkeypatch.setattr(
+      canvaslms.hacks.canvasapi, "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("courses")
+  before = stored(tmp_cache_path)
+  responses.replace(responses.GET, COURSES_URL, json=[OLD_COURSE, NEW_COURSE])
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+
+  run_canvaslms(*arguments)
+
+  assert stored(tmp_cache_path) != before
+  responses.reset()
+  assert found in run_canvaslms(
+      *[each for each in arguments if each != "--refresh-cache"])
+@
+
+A request that fails counts as well.
+Here the course listing has expired and Canvas does not answer: the run must
+save the new timestamp, or the next run would try Canvas again.
+We age the listing by hand, which is the change without a request that
+[[force]] is for.
+
+<<test functions>>=
+@responses.activate
+def test_a_failed_request_is_saved(run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("courses")
+  canvas = cache.load_canvas_cache("token", HOST)
+  canvas.course_all_fetched -= timedelta(days=cache.COURSE_CACHE_TTL_DAYS + 1)
+  cache.save_canvas_cache(canvas, "token", HOST, force=True)
+  responses.replace(responses.GET, COURSES_URL,
+                    body=requests.exceptions.ConnectionError("Unreachable"))
+  responses.calls.reset()
+  before = stored(tmp_cache_path)
+
+  assert "Old course" in run_canvaslms("courses")
+  assert stored(tmp_cache_path) != before
+
+  assert "Old course" in run_canvaslms("courses")
+  assert len(responses.calls) == 1
+@
+
+The record is kept after a save too, so a second save with no request in
+between is skipped, while a change by hand is saved only when forced.
+
+<<test functions>>=
+def test_saving_again_without_a_request_leaves_the_file(tmp_cache_path):
+  canvas = cache.create_canvas(HOST, "token")
+  cache.save_canvas_cache(canvas, "token", HOST)
+  before = stored(tmp_cache_path)
+
+  cache.save_canvas_cache(canvas, "token", HOST)
+
+  assert stored(tmp_cache_path) == before
+
+def test_a_change_by_hand_is_saved_only_when_forced(tmp_cache_path):
+  cache.save_canvas_cache(cache.create_canvas(HOST, "token"), "token", HOST)
+  canvas = cache.load_canvas_cache("token", HOST)
+  canvas.course_all_fetched = datetime(2026, 1, 1)
+
+  cache.save_canvas_cache(canvas, "token", HOST)
+  assert cache.load_canvas_cache("token", HOST).course_all_fetched is None
+
+  cache.save_canvas_cache(canvas, "token", HOST, force=True)
+  assert (cache.load_canvas_cache("token", HOST).course_all_fetched
+          == datetime(2026, 1, 1))
+@
+
+Finally, [[--no-cache]] must still neither read the file nor write it, now that
+whether to write depends on what was read.
+
+<<test functions>>=
+@responses.activate
+def test_no_cache_neither_reads_nor_writes(run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("--no-cache", "courses")
+  assert not tmp_cache_path.exists()
+
+  run_canvaslms("courses")
+  before = stored(tmp_cache_path)
+  responses.calls.reset()
+
+  run_canvaslms("--no-cache", "courses")
+
+  assert len(responses.calls) == 1
+  assert stored(tmp_cache_path) == before
 @
 
 
@@ -1129,6 +1459,10 @@ to reuse the cache across more runs, or lower them to see fresher data sooner.
 CANVASLMS_MISS_REFRESH_MAX_LISTINGS and
 CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES set the two limits on listings;
 0 turns the fetching off, without a warning, for that kind of search.
+
+The cache file is written only by a command that sent a request to Canvas. A
+command answered from the cache alone leaves the file as it was, so its
+modification time tells when something was last fetched.
 
 The attachment cache stores downloaded submission files using content-addressed
 storage. Files not accessed in 90 days can be cleaned with clear-attachments.
