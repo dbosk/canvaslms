@@ -42,6 +42,7 @@ import json
 import logging
 import sys
 import urllib.parse
+from datetime import datetime, timedelta
 
 import pytest
 import requests
@@ -481,6 +482,7 @@ import sys
 import time
 import uuid
 import zipfile
+import requests
 import yaml
 from collections import defaultdict, Counter
 from html.parser import HTMLParser
@@ -4380,9 +4382,28 @@ def new_quizzes_json_request(requester, method, endpoint, body):
   logger.info(f"Response: {method} {url} {response.status_code}")
   logger.debug(f"Data: {response.text}")
   if not response.ok:
-    raise CanvasException(f"{response.status_code} {response.reason}: "
-                          f"{canvas_error_message(response)}")
+    error_class = CANVAS_ERRORS_BY_STATUS.get(response.status_code,
+                                              CanvasException)
+    raise error_class(f"{response.status_code} {response.reason}: "
+                      f"{canvas_error_message(response)}")
   return response
+@
+
+The exception says what kind of refusal it is, with the classes
+[[requester.request]] raises for the same statuses, so that a caller can tell
+a request Canvas found wrong from one it was not allowed to make.
+[[quizzes accommodations]] depends on that
+(\cref{sec:sending-accommodations}).
+<<constants>>=
+CANVAS_ERRORS_BY_STATUS = {
+  400: canvasapi.exceptions.BadRequest,
+  401: canvasapi.exceptions.Unauthorized,
+  403: canvasapi.exceptions.Forbidden,
+  404: canvasapi.exceptions.ResourceDoesNotExist,
+  409: canvasapi.exceptions.Conflict,
+  422: canvasapi.exceptions.UnprocessableEntity,
+  429: canvasapi.exceptions.RateLimitExceeded,
+}
 @
 
 A date can reach us as a Python object rather than a string.  YAML reads an
@@ -8473,11 +8494,9 @@ Example:
 The combinations Canvas does not offer are refused before any request, so
 that nothing is half set: extra attempts at the course level, sessions in
 progress at the quiz level, and an extra time outside the documented range.
-Reduced choices on a Classic Quiz are only known once the quizzes are
-selected, so that is reported per student instead.
-<<functions>>=
+<<constants>>=
 MAX_EXTRA_TIME_MINUTES = 10080
-
+<<functions>>=
 def requested_accommodation(args):
   """Return the accommodation fields the options ask for, or exit"""
   fields = {}
@@ -8507,54 +8526,86 @@ def requested_accommodation(args):
 
 \subsection{Running the command}
 
-The command walks the selected courses, and in each one the students that
-[[-u]] matches and the quizzes that [[-a]] matches.  Students are selected per
-course, since the same pattern names different people in different courses,
-and each target gets all of them in one request, as the endpoints take a list.
-Nothing matched at all is an empty list, as elsewhere; a course where nothing
-matched is just skipped, since [[-c]] may select several.
+The command first works out everything it will send, and only then sends
+it, so that a selection Canvas cannot take is refused before anything is set.
+
+The students are found as every [[-u]] lookup finds them, by one search over
+all the selected courses (\cref{sec:users-option}), so that a student found in
+one course does not count as a miss in the others and make their rosters be
+fetched again, and so that a search over all courses keeps its own limit.
+Each course then gets the students found in it, with the quizzes that [[-a]]
+matches there; a course without such a student is not even asked for its
+quizzes.  Each target gets all its students in one request, as the endpoints
+take a list.
 <<functions>>=
 def accommodations_command(config, canvas, args):
   """Give the students matching -u accommodations on quizzes"""
   fields = requested_accommodation(args)
+  course_list = courses.process_course_option(canvas, args)
+  students = list(users.filter_users(
+    course_list, args.user, roles=[args.role],
+    max_listings=courses.miss_refresh_limit(args)))
+  if not students:
+    raise canvaslms.cli.EmptyListError("No users found matching the criteria")
+
+  plan = accommodation_plan(course_list, students, args.assignment)
+  <<refuse a plan that Canvas cannot carry out>>
+
   requester = canvas._Canvas__requester
   writer = csv.writer(sys.stdout, delimiter=args.delimiter)
-  failures = students_found = targets_found = 0
+  failures = 0
+  for course, name, quiz, course_students in plan:
+    for student, error in accommodate(requester, course, quiz,
+                                      course_students, fields,
+                                      args.in_progress):
+      writer.writerow([course.course_code, name, users.get_uid(student),
+                       error or "ok"])
+      failures += bool(error)
 
-  for course in courses.process_course_option(canvas, args):
-    students = list(users.filter_users([course], args.user,
-                                       roles=[args.role]))
-    students_found += len(students)
-    if not students:
-      continue
-    for name, quiz in accommodation_targets(course, args.assignment):
-      targets_found += 1
-      for student, error in accommodate(requester, course, quiz, students,
-                                        fields, args.in_progress):
-        writer.writerow([course.course_code, name, users.get_uid(student),
-                         error or "ok"])
-        failures += bool(error)
-
-  <<report what [[accommodations_command]] did not find or set>>
+  if failures:
+    canvaslms.cli.err(1, f"{failures} accommodation(s) failed")
 @
 
+The plan is a list of targets, each with its course and its students.  A
+student carries the course it was found in, which [[list_users]] sets.
+<<functions>>=
+def accommodation_plan(course_list, students, regex):
+  """Return (course, name, quiz, students) for each target to accommodate"""
+  plan = []
+  for course in course_list:
+    course_students = [student for student in students
+                       if student.course.id == course.id]
+    if not course_students:
+      continue
+    for name, quiz in accommodation_targets(course, regex):
+      plan.append((course, name, quiz, course_students))
+  return plan
+@
+
+Nothing to accommodate is an empty list, as elsewhere, and its message says
+where we looked, since a quiz in a course where [[-u]] matched no one is not
+looked for.  Reduced choices are refused when a Classic Quiz is among the
+targets, naming those quizzes, since Classic Quizzes have no such
+accommodation and the user would otherwise get it on some quizzes only.
 A failure is an exit status of 1, as for the delete commands: a script that
 prepares an exam must be able to tell that a student was left out.
-<<report what [[accommodations_command]] did not find or set>>=
-if not students_found:
-  raise canvaslms.cli.EmptyListError("No users found matching the criteria")
-if not targets_found:
+<<refuse a plan that Canvas cannot carry out>>=
+if not plan:
   raise canvaslms.cli.EmptyListError(
-    "No quizzes found matching the criteria" + STALE_LISTING_HINT)
-if failures:
-  canvaslms.cli.err(1, f"{failures} accommodation(s) failed")
+    "No quizzes found matching the criteria in the courses of the matching "
+    "students" + STALE_LISTING_HINT)
+classic = [name for _, name, quiz, _ in plan
+           if quiz is not None and not is_new_quiz(quiz)]
+if 'reduce_choices_enabled' in fields and classic:
+  canvaslms.cli.err(1, "Classic Quizzes have no reduced choices: "
+                       + ", ".join(classic) + "; narrow -a")
 @
 
 Without [[-a]] the course itself is the one target, named for the output by
 what it covers.
-<<functions>>=
+<<constants>>=
 COURSE_LEVEL_TARGET = "all New Quizzes"
-
+<<functions>>=
 def accommodation_targets(course, regex):
   """Yield (name, quiz) for each target in course; quiz None for the course"""
   if regex is None:
@@ -8565,10 +8616,10 @@ def accommodation_targets(course, regex):
 @
 
 \subsection{Sending the accommodations}
+\label{sec:sending-accommodations}
 
 Each target is sent its own fields: the course level has no extra attempts
-but may extend sessions in progress, and a Classic Quiz has no reduced
-choices.  The New Quizzes endpoints read a JSON array, which
+but may extend sessions in progress.  The New Quizzes endpoints read a JSON array, which
 [[new_quizzes_json_request]] sends (\cref{sec:new-quiz-json-body}); the Classic
 one is a form that [[canvasapi]] encodes.
 <<functions>>=
@@ -8585,30 +8636,41 @@ def accommodate(requester, course, quiz, students, fields, in_progress):
     endpoint = f"courses/{course.id}/quizzes/{quiz.id}/accommodations"
     send = lambda batch: send_new_quiz_accommodations(
       requester, endpoint, batch, fields)
-  elif 'reduce_choices_enabled' in fields:
-    return [(student, "Classic Quizzes have no reduced choices")
-            for student in students]
   else:
     send = lambda batch: send_quiz_extensions(quiz, batch, fields)
 
   return results_of_batch(send, students)
 @
 
-A refused request says nothing about the students in it but one, as with the
-student who is not a participant above.  So when Canvas refuses a request for
-several students, we ask again for each student alone: the others get their
-time, and the report names the one Canvas refused, with its reason.  A refusal
-of one student is final.
+A refused request may be about one student in it, as with the student who
+is not a participant above, which Canvas answers with 404, or 400 for a body
+it finds wrong.  So when Canvas refuses a request for several students in
+that way, we ask again for each student alone: the others get their time, and
+the report names the one Canvas refused, with its reason.  A refusal of one
+student is final.
+
+Any other failure is about the request as a whole: a token that is not
+accepted, a missing permission, Canvas being down or answering with
+something that is not JSON.  Asking again per student would only repeat it,
+so every student of the request gets that error.  It is reported like a
+refusal rather than raised, so that the other targets are still sent and the
+count of failures, and the exit status, stay right.
+<<constants>>=
+REFUSALS_OF_A_STUDENT = (canvasapi.exceptions.BadRequest,
+                         canvasapi.exceptions.ResourceDoesNotExist)
 <<functions>>=
 def results_of_batch(send, students):
   """Return send(students), or each student's own result if it is refused"""
   try:
     return send(students)
-  except CanvasException as error:
+  except REFUSALS_OF_A_STUDENT as error:
     if len(students) == 1:
       return [(students[0], str(error))]
     return [result for student in students
             for result in results_of_batch(send, [student])]
+  except (CanvasException, requests.RequestException, ValueError) as error:
+    return [(student, str(error) or type(error).__name__)
+            for student in students]
 @
 
 A New Quizzes answer lists the students it processed and those it did not,
@@ -8654,12 +8716,16 @@ def send_quiz_extensions(quiz, students, fields):
 Let's verify the command against a real course whose requests [[responses]]
 answers, since what matters is what reaches Canvas and what we make of each
 answer.  The answers are shaped as the sandbox gave them.  The course has two
-students, a New Quiz and a Classic Quiz.
+students and a teaching assistant, whom [[-u '.*']] also matches but the
+default role leaves out, a New Quiz and a Classic Quiz.
 <<test functions>>=
 STUDENTS = [{"id": 5, "name": "Student Five", "login_id": "s5@example.invalid",
              "enrollments": [{"type": "StudentEnrollment"}]},
             {"id": 6, "name": "Student Six", "login_id": "s6@example.invalid",
-             "enrollments": [{"type": "StudentEnrollment"}]}]
+             "enrollments": [{"type": "StudentEnrollment"}]},
+            {"id": 7, "name": "Assistant Seven",
+             "login_id": "ta7@example.invalid",
+             "enrollments": [{"type": "TaEnrollment"}]}]
 QUIZ_ACCOMMODATIONS = f"{NEW_QUIZZES_API}/courses/1/quizzes/7/accommodations"
 
 def course_with_students_and_quizzes():
@@ -8671,16 +8737,16 @@ def course_with_students_and_quizzes():
                 json=[{"id": 9, "title": "Classic exam", "course_id": 1}])
   return wrapped_course()
 
-def run_accommodations(course, *options):
-  """Run quizzes accommodations on course with the command-line options"""
+def run_accommodations(course, *options, also=()):
+  """Run quizzes accommodations on course, and the courses in `also`"""
   parser = argparse.ArgumentParser()
   parser.add_argument("-d", "--delimiter", default="\t")
   quizzes.add_accommodations_command(parser.add_subparsers())
-  args = parser.parse_args(["accommodations", "-c", "SBX101", *options])
+  args = parser.parse_args(["accommodations", "-c", "SBX", *options])
   canvas = MagicMock()
   canvas._Canvas__requester = course._requester
   with patch("canvaslms.cli.courses.process_course_option",
-             return_value=[course]):
+             return_value=[course, *also]):
     args.func({}, canvas, args)
 
 def accommodation_answer(successful=(), failed=()):
@@ -8787,14 +8853,91 @@ def test_a_classic_quiz_gets_quiz_extensions(capsys):
     "SBX101\tClassic exam\ts5@example.invalid\tok"]
 
 @responses.activate
-def test_a_classic_quiz_cannot_reduce_choices(capsys):
+def test_reduced_choices_are_refused_if_a_classic_quiz_is_selected(caplog):
+  """Before anything is sent, also to the New Quiz that could take them."""
   course = course_with_students_and_quizzes()
 
   with pytest.raises(SystemExit):
-    run_accommodations(course, "-a", "^Classic", "-u", "^s5@",
-                       "--reduce-choices")
+    run_accommodations(course, "-a", "xam", "-u", "^s5@",
+                       "--extra-time", "30", "--reduce-choices")
 
-  assert "no reduced choices" in capsys.readouterr().out
+  assert not [call for call in responses.calls
+              if call.request.method == "POST"]
+  assert "no reduced choices: Classic exam" in caplog.text
+@
+
+A batch Canvas refuses as a whole, for a missing permission or because it is
+down, is not asked again per student, and an answer that is not JSON is a
+failure like any other rather than a traceback:
+<<test functions>>=
+@responses.activate
+def test_a_forbidden_batch_is_not_asked_again_per_student(capsys):
+  course = course_with_students_and_quizzes()
+  posted = responses.post(QUIZ_ACCOMMODATIONS, status=403, json={
+    "status": "unauthorized",
+    "errors": [{"message": "user not authorised to perform that action"}]})
+
+  with pytest.raises(SystemExit) as exit_info:
+    run_accommodations(course, "-a", "^Exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert exit_info.value.code == 1
+  assert posted.call_count == 1
+  out = capsys.readouterr().out.splitlines()
+  assert len(out) == 2
+  assert all(line.endswith("\t403 Forbidden: user not authorised to perform "
+                           "that action") for line in out)
+
+@responses.activate
+def test_an_answer_that_is_not_json_is_a_failure(capsys):
+  course = course_with_students_and_quizzes()
+  responses.post(QUIZ_ACCOMMODATIONS, body="<html>ok</html>")
+
+  with pytest.raises(SystemExit) as exit_info:
+    run_accommodations(course, "-a", "^Exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert exit_info.value.code == 1
+  assert len(capsys.readouterr().out.splitlines()) == 2
+@
+
+Students are found by one search over all the selected courses.  A student
+in one course is then no miss in another, so that course's roster is not
+fetched again even when it is old enough for a miss to refresh it.
+<<test functions>>=
+@responses.activate
+def test_a_student_found_in_one_course_refreshes_no_other_roster(capsys):
+  course = course_with_students_and_quizzes()
+  other = Course(course._requester,
+                  {"id": 2, "course_code": "SBX102"})
+  other_roster = responses.get(
+    f"{CACHE_API}/courses/2/search_users",
+    json=[{"id": 8, "name": "Student Eight", "login_id": "s8@example.invalid",
+           "enrollments": [{"type": "StudentEnrollment"}]}])
+  for each in (course, other):
+    list(each.get_users(include=["enrollments"]))
+    each.user_all_fetched = datetime.now() - timedelta(hours=1)
+  responses.post(QUIZ_ACCOMMODATIONS, json=accommodation_answer(successful=[5]))
+
+  run_accommodations(course, "-a", "^Exam$", "-u", "^s5@",
+                     "--extra-time", "30", also=[other])
+
+  assert other_roster.call_count == 1
+  assert capsys.readouterr().out.splitlines() == [
+    "SBX101\tExam\ts5@example.invalid\tok"]
+@
+
+Nothing to accommodate is an empty list, whichever part matched nothing:
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("options, message", [
+  (["-a", "^No such quiz$", "-u", ".*"], "No quizzes found"),
+  (["-a", "^Exam$", "-u", "^nobody@"], "No users found"),
+])
+def test_nothing_to_accommodate_is_an_empty_list(options, message):
+  course = course_with_students_and_quizzes()
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError, match=message):
+    run_accommodations(course, *options, "--extra-time", "30")
 @
 
 The combinations Canvas does not offer stop the command before it asks
@@ -8807,6 +8950,8 @@ was not registered.
   ["-u", ".*", "--extra-attempts", "1"],
   ["-u", ".*", "-a", "Exam", "--extra-time", "5", "--in-progress"],
   ["-u", ".*", "-a", "Exam", "--extra-time", "10081"],
+  ["-u", ".*", "-a", "Exam", "--extra-time", "-1"],
+  ["-u", ".*", "-a", "Exam", "--extra-attempts", "-1"],
 ])
 def test_what_canvas_does_not_offer_is_refused_up_front(options):
   with pytest.raises(SystemExit) as exit_info:
