@@ -38,6 +38,7 @@ access.
 """Tests for canvaslms.cli.quizzes."""
 
 import argparse
+import json
 import logging
 import sys
 
@@ -3133,6 +3134,9 @@ ADVANCED SETTINGS FOR NEW QUIZZES (in settings.quiz_settings, same API):
   result_view_settings: display_item_correct_answer, display_item_feedback, etc.
   one_at_a_time_type, allow_backtracking: one question per page, going back
   require_student_access_code, student_access_code: an access code
+  filter_ip_address, filters: {"ips": [["first", "last"], ...]}: the IP
+    address ranges the quiz can be taken from; a list replaces the quiz's
+    ranges, and leaving filters out keeps them
   has_time_limit, session_time_limit_in_seconds: the time limit as Canvas
     stores it; a top-level time_limit, when present, overrides both
 
@@ -4026,28 +4030,26 @@ def create_new_quiz(course, requester, quiz_params):
     Dictionary with created quiz data, or None on failure
   """
   endpoint = f"courses/{course.id}/quizzes"
-
-  # Build the request parameters, handling nested quiz_settings
   params = build_new_quiz_api_params(quiz_params)
 
   try:
-    response = requester.request(
-      method='POST',
-      endpoint=endpoint,
-      _url="new_quizzes",
-      **params
-    )
-    data = response.json()
-
-    return data
+    data = new_quizzes_json_request(requester, 'POST', endpoint, params).json()
   except Exception as e:
     canvaslms.cli.warn(f"Failed to create New Quiz: {e}")
     return None
+
+  warn_unless_ip_ranges_arrived(params, data)
+  return data
 @
 
-The [[build_new_quiz_api_params]] function handles the conversion of our
-nested dictionary structure into the flat parameter format required by the
-Canvas API.  It recursively processes [[quiz_settings]] and its sub-structures.
+The parameters are sent as a JSON body rather than as a form, and Canvas's
+answer is checked for the IP ranges; \cref{sec:new-quiz-json-body} explains
+both.
+
+The [[build_new_quiz_api_params]] function names each parameter the way the
+New Quizzes API documentation does, as a path of bracketed keys such as
+[[quiz[quiz_settings][has_time_limit]]].  It walks [[quiz_settings]] and the
+settings nested in it, such as [[multiple_attempts]].
 
 Keys the function does not recognise become top-level quiz parameters.  That
 default is right for [[title]] and [[due_at]], and wrong for exactly one key.
@@ -4267,6 +4269,200 @@ def test_hand_written_quiz_settings_time_limit_is_left_alone():
 
   assert params['quiz[quiz_settings][session_time_limit_in_seconds]'] == 900
   assert params['quiz[quiz_settings][has_time_limit]'] is True
+@
+
+\subsubsection{Sending the parameters as JSON}
+\label{sec:new-quiz-json-body}
+
+The IP ranges of an exam are a setting that a form cannot carry.  A New Quiz
+keeps them as a list of pairs, each a first and a last address:
+\begin{verbatim}
+"quiz_settings": {"filter_ip_address": true,
+  "filters": {"ips": [["130.237.61.10", "130.237.61.29"],
+                      ["130.237.62.166", "130.237.62.247"]]}}
+\end{verbatim}
+We used to send our parameters as a form, through [[requester.request]].
+[[canvasapi]] passes each value to [[requests]] as it is, so the
+[[filters]] mapping became [[quiz[quiz_settings][filters]=ips]], its key
+without its value.  [[quizzes create]] and [[quizzes edit]] reported success,
+and the quiz came back with IP filtering switched on and no ranges at all
+(issue~\#595).
+
+There is no form encoding to fall back on either.  We tried the two that
+Rails-style parameter parsing suggests in our sandbox (November 2026).
+Indexed pairs, [[quiz[quiz_settings][filters][ips][0][]=...]], were accepted
+with a success status and emptied the list.  The nested empty brackets that
+[[canvasapi]]'s [[combine_kwargs]] would produce,
+[[quiz[quiz_settings][filters][ips][][]=...]], gave a server error.  A JSON
+body did what was asked for:
+\begin{itemize}
+\item a quiz created with two ranges had those two ranges;
+\item an update with one range left the quiz with that one range, so a new
+list replaces the old one rather than adding to it;
+\item an update that did not mention [[filters]] left the ranges as they
+were, both as JSON and as a form;
+\item [[filter_ip_address: false]] with an empty list cleared them.
+\end{itemize}
+
+So both [[create_new_quiz]] and [[update_new_quiz]] send JSON.  We send every
+parameter that way, not just the ranges, because one request cannot be both
+a form and a JSON body, and two requests would leave the quiz half-written if
+the second one failed.
+
+[[build_new_quiz_api_params]] still decides what is sent, and its bracketed
+names are still the documented ones, so the time limit and every other
+translation stay in one place.  The JSON body nests them again: each
+bracketed key is one level of the object.
+<<functions>>=
+def new_quiz_json_body(params):
+  """Return the JSON body for the bracketed parameter names in `params`
+
+  'quiz[quiz_settings][has_time_limit]': True becomes
+  {'quiz': {'quiz_settings': {'has_time_limit': True}}}.
+  """
+  body = {}
+  for name, value in params.items():
+    *path, last = re.findall(r'[^\[\]]+', name)
+    node = body
+    for key in path:
+      node = node.setdefault(key, {})
+    node[last] = value
+  return body
+@
+
+A cleared date reaches Canvas as an empty string, as it did in the form.
+Canvas reads that as no date in JSON too; we verified this through
+[[quizzes edit]] in the sandbox.  We keep the empty string rather than
+translate it to [[null]], so that the parameters mean the same in both
+encodings.
+
+[[canvasapi]]'s requester has no JSON body for anything but GraphQL, so we
+make the request with its session.  That keeps what [[canvaslms]] has
+configured on the session, such as the retry policy
+(\cref{sec:retry-policy}).  We raise a [[CanvasException]] for an error
+status, as [[requester.request]] does, so the callers' error handling is
+unchanged.
+<<functions>>=
+def new_quizzes_json_request(requester, method, endpoint, params):
+  """Send `params` to the New Quizzes API `endpoint` as a JSON body
+
+  Returns the response; raises CanvasException on an error status.
+  """
+  url = f"{requester.new_quizzes_url}{endpoint}"
+  logger.info(f"Request: {method} {url}")
+  response = requester._session.request(
+    method, url, json=new_quiz_json_body(params),
+    headers={"Authorization": f"Bearer {requester.access_token}"})
+  if not response.ok:
+    raise CanvasException(f"{response.status_code} {response.reason}: "
+                          f"{response.text[:500]}")
+  return response
+@
+
+Canvas has accepted settings with a success status before and then not
+applied them, and this setting decides who can take an exam.  So we compare
+the ranges in Canvas's answer with those we sent, and warn when they differ.
+Ranges are compared as pairs of strings, since that is what Canvas returns.
+<<functions>>=
+IP_RANGES_PARAM = 'quiz[quiz_settings][filters][ips]'
+
+def warn_unless_ip_ranges_arrived(params, quiz):
+  """Warn if the IP ranges in `params` are not those in `quiz`, as returned"""
+  if IP_RANGES_PARAM not in params:
+    return
+  sent = [list(map(str, pair)) for pair in params[IP_RANGES_PARAM] or []]
+  stored = ((quiz or {}).get('quiz_settings') or {}).get('filters') or {}
+  stored = [list(map(str, pair)) for pair in stored.get('ips') or []]
+  if sent != stored:
+    canvaslms.cli.warn(
+      f"New Quiz {(quiz or {}).get('title', '')}: sent IP ranges {sent}, "
+      f"Canvas has {stored}; check quiz_settings.filters.ips")
+@
+
+Let's verify the requests as they reach the wire, through the real
+[[canvasapi]] requester and [[responses]].  Canvas's handling of the encodings
+is what the sandbox showed; [[responses]] cannot tell a form that loses the
+ranges from one that keeps them, so the tests pin down the JSON body we send,
+and what we do with each answer.
+<<test functions>>=
+NEW_QUIZZES_API = "https://canvas.example.invalid/api/quiz/v1"
+EXAM_RANGES = [["130.237.61.10", "130.237.61.29"],
+               ["130.237.62.166", "130.237.62.247"]]
+
+def exam_settings(ranges):
+  """Quiz settings with IP filtering on for `ranges`."""
+  return {'title': 'Exam',
+          'quiz_settings': {'filter_ip_address': True,
+                            'filters': {'ips': ranges}}}
+
+def answer_with_ranges(ranges):
+  """Canvas's answer: the quiz with `ranges`."""
+  return {'id': 7, 'title': 'Exam',
+          'quiz_settings': {'filter_ip_address': True,
+                            'filters': {'ips': ranges}}}
+
+@responses.activate
+def test_create_sends_the_ip_ranges_as_json_pairs(caplog):
+  posted = responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes",
+                          json=answer_with_ranges(EXAM_RANGES))
+  course = wrapped_course()
+
+  quiz = quizzes.create_new_quiz(course, course._requester,
+                                 exam_settings(EXAM_RANGES))
+
+  assert quiz['id'] == 7
+  body = json.loads(posted.calls[0].request.body)
+  assert body == {'quiz': exam_settings(EXAM_RANGES)}
+  assert 'IP ranges' not in caplog.text
+
+@responses.activate
+def test_create_warns_when_canvas_drops_the_ip_ranges(caplog):
+  responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes",
+                 json=answer_with_ranges([]))
+  course = wrapped_course()
+
+  assert quizzes.create_new_quiz(course, course._requester,
+                                 exam_settings(EXAM_RANGES))
+  assert 'sent IP ranges' in caplog.text
+
+@responses.activate
+def test_edit_replaces_the_ranges_and_warns_if_canvas_differs(caplog):
+  patched = responses.patch(f"{NEW_QUIZZES_API}/courses/1/quizzes/7",
+                            json=answer_with_ranges([]))
+  course = wrapped_course()
+
+  assert quizzes.update_new_quiz(course, 7, course._requester,
+                                 exam_settings(EXAM_RANGES[:1]))
+
+  body = json.loads(patched.calls[0].request.body)
+  assert body['quiz']['quiz_settings']['filters'] == {
+    'ips': EXAM_RANGES[:1]}
+  assert 'sent IP ranges' in caplog.text
+
+@responses.activate
+def test_a_failed_update_is_reported_as_a_failure(caplog):
+  responses.patch(f"{NEW_QUIZZES_API}/courses/1/quizzes/7", status=500,
+                  json={'errors': ['boom']})
+  course = wrapped_course()
+
+  assert not quizzes.update_new_quiz(course, 7, course._requester,
+                                     exam_settings(EXAM_RANGES))
+  assert 'Failed to update New Quiz' in caplog.text
+@
+
+The other settings must reach Canvas as the same JSON values the form used to
+carry, with the time limit still translated:
+<<test functions>>=
+def test_json_body_nests_the_documented_parameter_names():
+  params = quizzes.build_new_quiz_api_params(
+    {'title': 'Exam', 'time_limit': 1800, 'lock_at': '',
+     'quiz_settings': {'multiple_attempts': {'max_attempts': 2}}})
+
+  assert quizzes.new_quiz_json_body(params) == {'quiz': {
+    'title': 'Exam', 'lock_at': '',
+    'quiz_settings': {'multiple_attempts': {'max_attempts': 2},
+                      'has_time_limit': True,
+                      'session_time_limit_in_seconds': 1800}}}
 @
 
 
@@ -7338,6 +7534,13 @@ def quiz_on_own_requester(quiz_type):
     quiz.course = course
   return quiz, quiz_requester, assignment_requester
 
+def sent_to_quiz(quiz_requester):
+  """What reached the quiz: a Classic Quiz's form, a New Quiz's JSON body."""
+  if quiz_requester._session.request.called:
+    return quiz_requester._session.request.call_args.kwargs['json']
+  request = quiz_requester.request.call_args.kwargs
+  return {**request, **dict(request.get('_kwargs', []))}
+
 @pytest.mark.parametrize("quiz_type", ["classic", "new"])
 def test_edit_sends_the_assignment_settings_to_the_assignment(quiz_type):
   quiz, quiz_requester, assignment_requester = quiz_on_own_requester(
@@ -7347,12 +7550,10 @@ def test_edit_sends_the_assignment_settings_to_the_assignment(quiz_type):
 
   assert quizzes.apply_quiz_edit(quiz, attributes, '', quiz_requester)
 
-  request = quiz_requester.request.call_args.kwargs
-  sent_to_quiz = {**request, **dict(request.get('_kwargs', []))}
-  assert sent_to_quiz
-  assert not [key for key in sent_to_quiz
-              if 'assignment' in str(key)
-              or 'omit_from_final_grade' in str(key)]
+  sent = json.dumps(sent_to_quiz(quiz_requester), default=str)
+  assert 'Survey' in sent
+  assert 'assignment' not in sent
+  assert 'omit_from_final_grade' not in sent
   assert sent_to_assignment(assignment_requester) == {
     'assignment[omit_from_final_grade]': True}
   assert 'assignment' in attributes
@@ -7796,22 +7997,23 @@ def update_new_quiz(course, assignment_id, requester, quiz_params):
     True on success, False on failure
   """
   endpoint = f"courses/{course.id}/quizzes/{assignment_id}"
-
-  # Build the request parameters, handling nested quiz_settings
   params = build_new_quiz_api_params(quiz_params)
 
   try:
-    requester.request(
-      method='PATCH',
-      endpoint=endpoint,
-      _url="new_quizzes",
-      **params
-    )
-    return True
+    response = new_quizzes_json_request(requester, 'PATCH', endpoint, params)
   except Exception as e:
     canvaslms.cli.warn(f"Failed to update New Quiz: {e}")
     return False
+
+  warn_unless_ip_ranges_arrived(params, response.json())
+  return True
 @
+
+Like creation, the update goes out as a JSON body
+(\cref{sec:new-quiz-json-body}).  A file that states IP ranges replaces the
+quiz's ranges with exactly those: Canvas stores the list it is sent, rather
+than adding to it.  A file that leaves [[filters]] out keeps the ranges the
+quiz has (sandbox, November 2026).
 
 
 \subsection{Updating a Classic Quiz}
