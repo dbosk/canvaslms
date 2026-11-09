@@ -66,9 +66,14 @@ A request with a restriction skips all of this: it goes straight to Canvas and i
 not stored.
 All of them replace objects without losing what is cached below them
 (\cref{sec:cache-copy-to-new}).
-The time to live and the two refreshes add and update entries, and only a 404 on
-the individual refresh of a stale object removes one, so an entry that Canvas no
-longer lists stays in the cache.
+The time to live and the two refreshes add and update entries.
+They remove only what Canvas says is gone: an object whose individual refresh
+gets a 404, and a course or an assignment that a complete, unrestricted listing
+with at least one entry did not return, along with what is cached below it
+(\cref{sec:forget-unlisted}); a course only once Canvas answers 404 or 403
+for it as well.
+Users and submissions Canvas no longer lists stay in the cache, marked, since
+the results of a student who has left still count.
 
 \section{Implementation}
 
@@ -130,6 +135,7 @@ the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
 from datetime import datetime, timedelta
 import argparse
 import canvasapi.course
+import canvasapi.user
 import logging
 import pathlib
 import pytest
@@ -535,6 +541,48 @@ def test_refresh_of_a_roster_does_not_wait_for_retries(unreachable_canvas):
 
   assert sleeps == []
   assert retries_in_place(canvas)
+
+def test_a_roster_with_someone_who_left_does_not_wait_for_retries(
+    unreachable_canvas, caplog):
+  """Everyone still listed has the email, only the one who left lacks it."""
+  canvas, sleeps = unreachable_canvas
+  course = canvas.course_cache[1][0]
+  requester = canvas._Canvas__requester
+  listed = canvasapi.user.User(requester, {"id": 7, "email": "x@example.org"})
+  left = canvasapi.user.User(requester, {"id": 8})
+  left._unlisted = True
+  course.user_cache = {7: (listed, {"include": ["email"]}), 8: (left, {})}
+  course.user_all_fetched = datetime.now() - timedelta(hours=1)
+
+  with caplog.at_level(logging.WARNING):
+    users = list(course.get_users(include=["email"]))
+
+  assert sorted(user.id for user in users) == [7, 8]
+  assert sleeps == []
+  assert retries_in_place(canvas)
+  assert "Could not refresh" in caplog.text
+
+@responses.activate
+def test_asking_about_a_course_no_longer_listed_gets_one_try():
+  """The listing answers here, so we look at the retries of the single request."""
+  canvas = cache.create_canvas(HOST, "token")
+  session = canvas._Canvas__requester._session
+  responses.get(COURSES_URL, json=[{"id": 1, "name": "One"},
+                                   {"id": 2, "name": "Two"}])
+  list(canvas.get_courses())
+  responses.replace(responses.GET, COURSES_URL, json=[{"id": 1, "name": "One"}])
+  retries = []
+
+  def gone(request):
+    retries.append(session.get_adapter(HOST).max_retries.total)
+    return (404, {}, '{"errors": [{"message": "Not Found"}]}')
+
+  responses.add_callback(responses.GET, f"{COURSES_URL}/2", callback=gone)
+  canvas.course_all_fetched = None
+
+  assert [course.id for course in canvas.get_courses()] == [1]
+  assert retries == [0]
+  assert session.get_adapter(HOST).max_retries.total == 10
 
 def test_a_real_search_does_not_wait_for_retries(unreachable_canvas):
   """filter_courses is a generator, so it reads the listing only when consumed."""
@@ -1649,16 +1697,28 @@ when all submissions of the assignment are fetched, or by canvaslms
 
 A course, user or assignment name that matches nothing also fetches that
 listing again, unless it is younger than
-{count_unit(MISS_REFRESH_MIN_AGE_MINUTES, "minute")}. If more than
-{MISS_REFRESH_MAX_LISTINGS} listings are older than that, or more than
+{count_unit(MISS_REFRESH_MIN_AGE_MINUTES, "minute")}. Over several courses, a
+warning says how many listings may be fetched; for a user the rosters are
+fetched one at a time, in the order of the courses, until one has the name. If
+more than {MISS_REFRESH_MAX_LISTINGS} listings are older than that, or more than
 {MISS_REFRESH_MAX_LISTINGS_ALL_COURSES} in a search over all courses (no -c, or
 -c '.*'), none is fetched and a warning says so. User lookups with groups
 (-G, -C) don't do this. To fetch what a command reads right away, use
 canvaslms --refresh-cache; the rest of the cache is kept.
 
+When the list of courses or of a course's assignments is fetched, the courses
+and assignments Canvas no longer returns are removed from the cache, unless it
+returned none at all; a course only if Canvas, asked about it alone, answers
+that it does not exist or that the user may not read it. Users who have left a
+course are kept, since their results still count.
+
 The same interval decides how soon a listing is fetched again when a read asks
 for something that only someone Canvas no longer lists lacks. Raising it
 delays finding someone who has returned, and 0 means every such read fetches.
+Each such fetch is of the whole listing, so a program that always asks for
+something, such as email addresses, fetches a roster once per interval for as
+long as someone who has left is in it. If Canvas can't be reached, the cached
+listing is used, with a warning.
 
 These windows can be tuned via environment variables (minutes for submissions
 and name misses, days for the rest):
