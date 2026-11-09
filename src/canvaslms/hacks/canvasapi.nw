@@ -6813,6 +6813,8 @@ The lazy path only fetches when a submission is missing from the cache or when a
 caller requests additional [[include]] data.
 We keep the cache-hit diagnostics from [[master]], but we leave the staleness
 policy itself to [[LazySubmission._needs_refresh()]].
+Both getters read the includes asked for in the same way, which
+\cref{sec:submission-arguments} explains.
 <<return submission of user>>=
 # canvasapi allows either User object or user ID.
 if isinstance(user, User):
@@ -6822,10 +6824,7 @@ elif isinstance(user, int):
 else:
   raise TypeError(f"user must be User or int")
 
-if "include" in kwargs:
-  to_include = set(kwargs["include"])
-else:
-  to_include = set()
+<<let [[to_include]] be the includes asked for>>
 
 if uid in self.__cache:
   lazy_submission = self.__cache[uid]
@@ -6914,10 +6913,7 @@ def should_bulk_refresh_submissions(cache, student_ids=None):
 
 Then the collection getter can choose whether to run that pre-check.
 <<return a list of all submissions>>=
-if "include" in kwargs:
-  to_include = set(kwargs["include"])
-else:
-  to_include = set()
+<<let [[to_include]] be the includes asked for>>
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
@@ -7518,4 +7514,85 @@ class TestFilteredBulkRefreshScope:
         # Three stale users in scope: threshold = max(int(3*0.2), 3) = 3.
         assert should_bulk_refresh_submissions(
             cache, student_ids={0, 1, 2}) is True
+@
+
+\subsubsection{What a caller asks for}
+\label{sec:submission-arguments}
+
+The two getters above read their keyword arguments themselves instead of
+handing them on to [[canvasapi]], and so they must read them the way Canvas
+does.
+
+Canvas accepts [[include]] as a single value as well as a list, and so does
+[[canvasapi]], which makes [[include="user"]] a correct call.
+Turned into a set as it stands, the string becomes the set of its letters,
+[[{"u", "s", "e", "r"}]], so the caller gets no user and no error.
+Worse, the letters become the submission's [[_includes]], the record of what
+the cache holds, so they are sent again with every later fetch of the
+assignment.
+We therefore read the value through [[as_list]], as [[must_update]] does, so a
+string counts as a list of one.
+<<let [[to_include]] be the includes asked for>>=
+to_include = set(as_list(kwargs.get("include", [])))
+@
+
+Let's verify both getters through the real wrapper on a real [[Assignment]].
+What we must see is the query each one sends, so [[responses]] stands in for
+Canvas at the HTTP layer and records it; everything above that layer runs as
+in production.
+We collect the tests in the [[<<submission arguments test methods>>]] bucket
+chunk.
+<<test functions>>=
+class TestSubmissionArguments:
+    """The submission getters send Canvas what the caller asked for"""
+
+    URL = "https://canvas.example.org"
+    LISTING = f"{URL}/api/v1/courses/1/assignments/2/submissions"
+    SUBMISSION = {"id": 3, "user_id": 3, "assignment_id": 2}
+
+    def assignment(self):
+        """Return an assignment and the query of each request it sends."""
+        sent = []
+
+        def answer(body):
+            def callback(request):
+                query = urllib.parse.urlsplit(request.url).query
+                sent.append(urllib.parse.parse_qs(query))
+                return (200, {}, json.dumps(body))
+            return callback
+
+        responses.add_callback(responses.GET, self.LISTING,
+                               callback=answer([self.SUBMISSION]))
+        responses.add_callback(responses.GET, f"{self.LISTING}/3",
+                               callback=answer(self.SUBMISSION))
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        return (Assignment(canvas._Canvas__requester,
+                           {"id": 2, "course_id": 1}),
+                sent)
+
+    <<submission arguments test methods>>
+@
+
+A string is one include for both getters, and since the cache then records
+what it really holds, asking again costs no request.
+<<submission arguments test methods>>=
+@responses.activate
+def test_the_listing_sends_a_string_include_whole(self):
+    assignment, sent = self.assignment()
+
+    for _ in range(2):
+        submissions = assignment.get_submissions(include="user")
+
+    assert [query["include[]"] for query in sent] == [["user"]]
+    assert submissions[0]._includes == {"user"}
+
+@responses.activate
+def test_one_submission_sends_a_string_include_whole(self):
+    assignment, sent = self.assignment()
+
+    for _ in range(2):
+        submission = assignment.get_submission(3, include="user")
+
+    assert [query["include[]"] for query in sent] == [["user"]]
+    assert submission._includes == {"user"}
 @
