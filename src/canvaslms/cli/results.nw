@@ -1086,6 +1086,79 @@ def test_results_survive_submissions_without_history(capsys, caplog):
   assert single_fetch.call_count == 1
 @
 
+Two more cases test the edges of that fallback, each with a single student who
+has left.
+We set up that course once.
+Both listings are registered here, in the order they will be asked for:
+[[responses]] would answer with the first of two registrations for the same URL
+until it is used, so a listing a test registered later would come too late.
+<<test functions>>=
+def departed_student_course(single_fetch_status):
+  """
+  Return a course and its assignment whose only student, 3, has left after a
+  listing without the history. Canvas answers the single request for that
+  student's submission with `single_fetch_status`.
+  """
+  responses.get(f"{API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1,
+                       "assignment_group_id": 1, "published": True,
+                       "due_at": None}])
+  responses.get(f"{API}/courses/1/search_users", json=[student_json(3)])
+  responses.get(f"{API}/courses/1/users/91",
+                json={"id": 91, "name": "Grader B", "login_id": "graderb"})
+  responses.get(f"{API}/courses/1/assignments/7/submissions",
+                json=[graded_submission_json(3, 91)])
+  responses.get(f"{API}/courses/1/assignments/7/submissions", json=[])
+  responses.get(f"{API}/courses/1/assignments/7/submissions/3",
+                status=single_fetch_status,
+                json={"errors": [{"message": "Canvas error"}]})
+
+  course = canvasapi.course.Course(
+    Canvas(SERVER, "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+  assignment, = course.get_assignments()
+  assignment.course = course
+  list(assignment.get_submissions())
+  return course, assignment
+@
+
+The fallback is meant for the one answer that is about the student, the 404.
+Any other error, a 500 from an overloaded Canvas here, must still stop the
+report, rather than be warned about as if this student had left.
+<<test functions>>=
+@responses.activate
+def test_results_report_other_errors_of_the_single_fetch(caplog):
+  course, _ = departed_student_course(500)
+
+  parser = argparse.ArgumentParser()
+  results_module.add_command(parser.add_subparsers())
+  args = parser.parse_args(["results", "-c", "SBX101", "-a", "Lab"])
+  args.delimiter = "\t"
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]), \
+       pytest.raises(canvasapi.exceptions.CanvasException):
+    results_module.results_command({}, None, args)
+
+  assert "no submission history" not in caplog.text
+@
+
+The grading modules call [[all_graders]] on submissions they fetched
+themselves, with the [[assignment]] set but no [[user]].
+That is the path where the warning can only name the student by Canvas user ID,
+so we test it as they use it.
+<<test functions>>=
+@responses.activate
+def test_all_graders_names_a_student_without_user_by_id(caplog):
+  _, assignment = departed_student_course(404)
+  submission, = assignment.get_submissions()
+  submission.assignment = assignment
+
+  graders = results_module.all_graders(submission)
+
+  assert [grader.id for grader in graders] == [91]
+  assert "user id 3" in caplog.text
+@
+
 
 \section{Summarizing assignment group results}
 
