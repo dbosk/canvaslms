@@ -16,6 +16,7 @@ We do this as follows:
 import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
+import canvasapi.util
 from canvasapi.user import User
 import collections
 import contextlib
@@ -703,12 +704,23 @@ turns fetching.
 
 Canvas accepts a single value as well as a list, so we count a string as a list
 of one item.
+What counts as several values is for [[canvasapi]] to say, since it is what
+builds the request: its [[is_multivalued]] takes any iterable except a string or
+bytes as several values, a tuple, a set or a generator as much as a list.
+We read values the same way, so that what we compare and record is what
+[[canvasapi]] sends.
+Taking only a list as several would make a tuple of includes one include, the
+tuple itself, which is not what Canvas gets.
 
 We can thus start with the following defaults:
 <<kwargs functions caches>>=
 def as_list(value):
-  """Returns `value` if it's a list, otherwise a list holding it."""
-  return value if isinstance(value, list) else [value]
+  """Returns the values in `value` as a list, the way canvasapi reads them.
+
+  An iterable other than a string or bytes is several values; anything else,
+  `None` included, is a list of one.
+  """
+  return list(value) if canvasapi.util.is_multivalued(value) else [value]
 
 def must_update(prev_kwargs, new_kwargs,
                 ignore_keys=[
@@ -7529,18 +7541,20 @@ class TestFilteredBulkRefreshScope:
 \label{sec:submission-arguments}
 
 The two getters above read their keyword arguments themselves instead of
-handing them on to [[canvasapi]], and so they must read them the way Canvas
-does.
+handing them on to [[canvasapi]], and so they must read them the way
+[[canvasapi]] would, since that is what Canvas would have received.
 
 Canvas accepts [[include]] as a single value as well as a list, and so does
-[[canvasapi]], which makes [[include="user"]] a correct call.
+[[canvasapi]], which makes [[include="user"]] a correct call, as is a tuple or a
+set of includes.
 Turned into a set as it stands, the string becomes the set of its letters,
 [[{"u", "s", "e", "r"}]], so the caller gets no user and no error.
 Worse, the letters become the submission's [[_includes]], the record of what
 the cache holds, so they are sent again with every later fetch of the
 assignment.
-We therefore read the value through [[as_list]], as [[must_update]] does, so a
-string counts as a list of one.
+We therefore read the value through [[as_list]], as [[must_update]] does.
+It takes a value apart the way [[canvasapi]] does, so a string counts as a list
+of one and any other iterable as its items.
 An [[include=None]] asks for nothing, as it does in [[canvasapi]], whose
 request leaves out a parameter whose value is [[None]].
 Read through [[as_list]] alone it would be the include [[None]], recorded in
@@ -7645,6 +7659,53 @@ def test_a_new_include_updates_the_submission_held(self):
     assert again is held
     assert again.user is user
     assert again._includes == {"submission_comments"}
+@
+
+Several includes need not come as a list.
+[[canvasapi]] sends any iterable other than a string as several values, so a
+tuple, a set and a generator must each reach Canvas as one [[include[]]] per
+item and be recorded as a set of strings, by both getters.
+<<submission arguments test methods>>=
+INCLUDES = ("user", "submission_comments")
+SEVERAL = pytest.mark.parametrize(
+    "several", [tuple, set, lambda values: (each for each in values)],
+    ids=["tuple", "set", "generator"])
+
+@SEVERAL
+@responses.activate
+def test_the_listing_reads_several_includes_as_canvasapi_does(self, several):
+    assignment, sent = self.assignment()
+
+    [submission] = assignment.get_submissions(include=several(self.INCLUDES))
+
+    [query] = sent
+    assert sorted(query["include[]"]) == sorted(self.INCLUDES)
+    assert "include[][]" not in query
+    assert submission._includes == set(self.INCLUDES)
+
+@SEVERAL
+@responses.activate
+def test_one_submission_reads_several_includes_as_canvasapi_does(
+        self, several):
+    assignment, sent = self.assignment()
+
+    submission = assignment.get_submission(3, include=several(self.INCLUDES))
+
+    [query] = sent
+    assert sorted(query["include[]"]) == sorted(self.INCLUDES)
+    assert "include[][]" not in query
+    assert submission._includes == set(self.INCLUDES)
+@
+
+Since [[must_update]] reads its values through the same [[as_list]], a tuple
+of includes the cache already holds no longer counts as something new, and a
+cache recorded with a tuple is still read as its items.
+<<test functions>>=
+@pytest.mark.parametrize("prev,new", [
+    ({"include": ["user", "submission_comments"]}, {"include": ("user",)}),
+    ({"include": ("user", "submission_comments")}, {"include": ["user"]})])
+def test_must_update_reads_a_tuple_as_its_items(prev, new):
+    assert not must_update(prev, new)
 @
 
 A caller can pass the listing other arguments too, and some of them ask for
