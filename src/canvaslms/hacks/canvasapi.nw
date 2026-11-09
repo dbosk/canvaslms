@@ -1036,7 +1036,7 @@ class CacheGetMethods:
   """
   def __init__(self, attribute_name, cache=None, include_plural=True,
                include_singular=True, plural_name=None, cache_key='id',
-               forget_unlisted=False):
+               forget_unlisted=False, confirm_unlisted=False):
     """No parameters required"""
     self.__attribute_name = attribute_name
     self.__include_plural = include_plural
@@ -1045,6 +1045,7 @@ class CacheGetMethods:
     self.__cache = cache if cache else {}
     self.__cache_key = cache_key
     self.__forget_unlisted = forget_unlisted
+    self.__confirm_unlisted = confirm_unlisted
 
   def __call__(self, cls):
     """Applies the decorator to the class cls"""
@@ -1347,6 +1348,7 @@ else:
 get_attrs = getattr(cls, plural_name)
 cache_key = self.__cache_key
 forget_unlisted = self.__forget_unlisted
+confirm_unlisted = self.__confirm_unlisted
 
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
@@ -1522,6 +1524,8 @@ Parameters:
   forget_unlisted: Whether a complete fetch of the listing removes the
              cached entries Canvas did not return (default: False, they are
              kept and marked).
+  confirm_unlisted: With forget_unlisted, remove such an entry only if the
+             singular method then gets a 404 for it (default: False).
 @
 
 This allows us to specify how the cache is structured.
@@ -4478,10 +4482,64 @@ for a whole listing at once.
 <<forget entries Canvas did not return, if the listing may>>=
 if forget_unlisted and fetched_objs and not args:
   for obj_key in list(attr_cache):
-    if obj_key not in fetched_keys:
+    if (obj_key not in fetched_keys
+        and (not confirm_unlisted
+             or canvas_says_it_is_gone(get_attr, self, obj_key))):
       logger.info(f"Dropped from cache: {attr_name} {cache_key}={obj_key} "
                   f"no longer listed")
       del attr_cache[obj_key]
+@
+
+For courses, not being listed is not enough.
+What [[get_courses]] lists by default depends on the user's role in each course:
+according to Canvas's documentation of the [[state]] argument, a student sees
+only available courses, while teachers also see completed ones.
+So a course of an earlier round, which someone took as a student or a TA, may
+drop out of the listing while it still exists and they still can read it.
+Removing it would not only cost its cache: a pattern like [[-c oldround]] would
+then find nothing at all, since the listing doesn't have it either.
+We could not check against Canvas which courses its listing leaves out.
+
+So the course listing sets [[confirm_unlisted]] as well, and asks Canvas about
+each course it did not get back, with the singular method.
+Only a 404, which [[canvasapi]] raises as [[ResourceDoesNotExist]], says that the
+course is gone, and only then do we remove it.
+A course that Canvas still gives us is kept, marked like any entry the listing
+did not return.
+Any other answer, an error from Canvas or none at all, tells us nothing about
+the course, so it is kept too.
+That includes a refusal: if Canvas answers a course we have lost access to with
+401 or 403 rather than 404, that course stays in the cache, marked.
+The request is a precaution like those of \cref{sec:course-listing-outage}, so
+it gets one try.
+It costs one request per course that has vanished from the listing, which is
+rare, and the course is not asked about again once it is removed.
+A course that is kept is asked about at each fetch of the listing, which for the
+course listing means once a day.
+Assignments don't need this: a teacher's listing of a course's assignments has
+all of them, so one missing from it has been deleted.
+<<functions>>=
+def canvas_says_it_is_gone(get_one, owner, key):
+  """Return True if Canvas answers 404 when `get_one` asks `owner` for `key`.
+
+  `get_one` is a singular get method that is not cached, or None, in which case
+  nothing can be asked and the answer is False. The request gets one try, and
+  any other failure also gives False.
+  """
+  if get_one is None:
+    return False
+  try:
+    with without_retries([owner]):
+      get_one(owner, key)
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    return True
+  except (canvasapi.exceptions.CanvasException,
+          requests.exceptions.RequestException) as error:
+    logger.info(f"Kept in cache: {key} no longer listed, but Canvas did not "
+                f"say it is gone: {error}")
+    return False
+  logger.info(f"Kept in cache: {key} no longer listed, but Canvas has it")
+  return False
 @
 
 Let's verify this through the real [[Canvas]] client, with [[responses]] in place
@@ -4524,11 +4582,15 @@ class TestForgettingWhatCanvasNoLongerLists:
         canvas = canvasapi.Canvas(self.URL, "a token")
         return Course(canvas._Canvas__requester, {"id": 1})
 
-    @responses.activate
-    @pytest.mark.parametrize("how", ["ttl", "refresh"])
-    def test_a_course_gone_from_canvas_is_gone(self, how):
+    def course_no_longer_listed(self, how, **answer):
+        """Return a canvas whose course 2 left the listing; Canvas gives `answer`.
+
+        `answer` is what Canvas sends when asked for course 2 alone, as the
+        keyword arguments of `responses.get`.
+        """
         listed = [1, 2]
         self.listing(self.COURSES, listed)
+        responses.get(f"{self.COURSES}/2", **answer)
         canvas = canvasapi.Canvas(self.URL, "a token")
         list(canvas.get_courses())
         listed.remove(2)
@@ -4536,9 +4598,37 @@ class TestForgettingWhatCanvasNoLongerLists:
             canvas.course_all_fetched -= timedelta(days=COURSE_CACHE_TTL_DAYS + 1)
         else:
             self.refetch(canvas, "course", how)
+        return canvas
+
+    def requests_for_course_2(self):
+        return [call for call in responses.calls
+                if urllib.parse.urlsplit(call.request.url).path.endswith("/2")]
+
+    @responses.activate
+    @pytest.mark.parametrize("how", ["ttl", "refresh"])
+    def test_a_course_gone_from_canvas_is_gone(self, how):
+        canvas = self.course_no_longer_listed(
+            how, status=404, json={"errors": [{"message": "Not Found"}]})
 
         assert [course.id for course in canvas.get_courses()] == [1]
         assert set(canvas.course_cache) == {1}
+        assert len(self.requests_for_course_2()) == 1
+
+    @responses.activate
+    @pytest.mark.parametrize("answer", [
+        {"json": {"id": 2, "name": "2"}},
+        {"status": 500, "json": {"errors": [{"message": "Error"}]}},
+        {"status": 401, "json": {"errors": [{"message": "Unauthorized"}]}},
+        {"body": requests.exceptions.ConnectionError("Unreachable")}])
+    def test_a_course_canvas_does_not_call_gone_is_kept(self, answer):
+        """Not as a precaution, which would hide an error escaping the check."""
+        canvas = self.course_no_longer_listed("refresh", **answer)
+
+        courses = {course.id: course for course in canvas.get_courses()}
+
+        assert set(courses) == {1, 2}
+        assert courses[2]._unlisted
+        assert len(self.requests_for_course_2()) == 1
 
     @responses.activate
     @pytest.mark.parametrize("how", ["ttl", "refresh"])
@@ -5668,12 +5758,14 @@ at any time, so the listing has a time-to-live of [[COURSE_CACHE_TTL_DAYS]] days
 We use the [[CacheGetMethods]] decorator to add caching to the [[Canvas]] class
 for its [[get_course]] and [[get_courses]] methods.
 The decorator takes the attribute name [[course]] as argument.
-A course Canvas no longer lists is forgotten (\cref{sec:forget-unlisted}).
+A course Canvas no longer lists is forgotten if Canvas also answers 404 for it
+(\cref{sec:forget-unlisted}).
 <<functions>>=
 def make_canvas_courses_cacheable():
   import canvasapi.canvas
-  canvasapi.canvas.Canvas = CacheGetMethods("course", forget_unlisted=True)(
-    canvasapi.canvas.Canvas)
+  canvasapi.canvas.Canvas = CacheGetMethods(
+    "course", forget_unlisted=True, confirm_unlisted=True)(
+      canvasapi.canvas.Canvas)
 @
 
 Note that we don't need a TTLCache here, since the [[outdated]] function will

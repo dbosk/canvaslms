@@ -925,8 +925,9 @@ entries; do not make them discard cached children (replace objects through
 `<<update [[obj]] with cache from [[old_obj]]>>`). The one exception: a complete,
 unrestricted fetch of a listing decorated with `forget_unlisted=True` (only
 `Canvas.get_courses` and `Course.get_assignments`) that returns at least one
-entry removes the entries Canvas did not return, children and all; a 404 on an
-individual refresh removes that one object. Users and submissions are never
+entry removes the entries Canvas did not return, children and all (a course only
+after a one-try `get_course` for it gets a 404, `confirm_unlisted=True`); a 404
+on an individual refresh removes that one object. Users and submissions are never
 removed, only marked `_unlisted`, since `results` needs students who have left.
 What was asked of one object (`get_course(id, include=[...])`) stays on that
 entry; the listing refetches with its own record, `{attr}_all_kwargs`.
