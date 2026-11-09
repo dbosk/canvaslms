@@ -1331,6 +1331,7 @@ cache_key = self.__cache_key
 
 @functools.wraps(get_attr)
 def new_get_attr(self, *args, **kwargs):
+  report_setting_problems()
   <<return cached result or fetch from [[get_attr]]>>
 
 setattr(cls, singular_name, new_get_attr)
@@ -1346,6 +1347,7 @@ cache_key = self.__cache_key
 
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
+  report_setting_problems()
   <<return cached result or fetch from [[get_attrs]]>>
 
 setattr(cls, plural_name, new_get_attrs)
@@ -3238,12 +3240,52 @@ A tuning knob must not be able to brick the CLI, so we read these values
 through a helper that falls back to the default with a warning instead.
 The helper tangles into the module before the constants (see the module
 outline), since the constants call it at import time.
+
+\subsection{When to report a malformed setting}
+
+The warning has two audiences with opposing needs.
+A command-line user must be able to silence it with [[-q]], and this is
+decisive for [[ungraded.sh]], which runs from cron: cron mails everything on
+stderr, so a single malformed setting would send mail on every run and
+[[-q]] would be no remedy.
+A library caller, on the other hand, never runs [[main]] and still deserves
+to hear about the typo.
+
+Logging the warning at import, where the constants are computed, serves
+neither.
+[[main]] configures logging only after it has parsed the command line,
+which is after this module was imported, so [[-q]] has no say yet and Python's
+handler of last resort prints the message bare, without the [[WARNING]] tag
+that the other messages carry.
+
+We considered the opposite design, in which the settings are read when they
+are used, so that logging has been configured by then.
+We rejected it because these settings are module constants with many use sites
+(the cache help, [[outdated]], [[retry_after_miss]], the bulk refresh), and the
+tests replace them with [[monkeypatch.setattr]].
+Turning them into function calls would touch all of that for no other gain.
+
+So [[env_number]] only \emph{records} the problem, keyed by variable name
+(a variable is therefore reported at most once), and a second function reports
+what has been recorded.
+It is called from the two places where logging is known to be settled:
+[[main]], right after it has configured logging, and the wrappers that
+[[CacheGetMethods]] puts around every cached [[get_*]] method.
+The latter is the first use of the cache by a library caller; for a command
+line the report has long been made by then, and finding nothing to report is a
+single test of an empty dictionary.
+A command that exits during argument parsing, such as [[--help]], comes before
+either and reports nothing; the help shows the default that is in effect.
 <<environment helpers>>=
+SETTING_PROBLEMS = {}
+
 def env_number(name, default, parse):
   """Read the numeric setting `name` from the environment.
 
-  Converts with `parse` (int or float); falls back to `default`,
-  with a warning, if the variable is set but doesn't parse.
+  Converts with `parse` (int or float); falls back to `default` if the
+  variable is set but doesn't parse. The problem is not logged here but
+  recorded for `report_setting_problems`, since logging may not be
+  configured yet when this runs at import.
   """
   value = os.environ.get(name)
   if value is None:
@@ -3251,12 +3293,21 @@ def env_number(name, default, parse):
   try:
     return parse(value)
   except ValueError:
-    logger.warning(f"ignoring {name}={value!r}: "
-                   f"not a number, using default {default}")
+    SETTING_PROBLEMS[name] = (f"ignoring {name}={value!r}: "
+                              f"not a number, using default {default}")
     return default
+
+def report_setting_problems():
+  """Log each recorded malformed setting once, as a warning."""
+  while SETTING_PROBLEMS:
+    _, message = SETTING_PROBLEMS.popitem()
+    logger.warning(message)
 @
 
-Let's verify the three cases: unset, well-formed and malformed.
+Let's verify the three cases of [[env_number]], and that reporting is separate
+from reading and happens once.
+The test for the malformed value no longer expects a log record: that moved to
+[[report_setting_problems]].
 
 <<test functions>>=
 def test_env_number_defaults_when_unset(monkeypatch):
@@ -3270,10 +3321,93 @@ def test_env_number_parses_set_value(monkeypatch):
 
 
 def test_env_number_falls_back_on_malformed_value(monkeypatch, caplog):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "SETTING_PROBLEMS", {})
   monkeypatch.setenv("CANVASLMS_TEST_KNOB", "off")
   with caplog.at_level(logging.WARNING):
     assert env_number("CANVASLMS_TEST_KNOB", 20, int) == 20
-  assert "CANVASLMS_TEST_KNOB" in caplog.text
+  assert "CANVASLMS_TEST_KNOB" not in caplog.text
+
+
+def test_malformed_setting_is_reported_once(monkeypatch, caplog):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "SETTING_PROBLEMS", {})
+  monkeypatch.setenv("CANVASLMS_TEST_KNOB", "off")
+  env_number("CANVASLMS_TEST_KNOB", 20, int)
+  env_number("CANVASLMS_TEST_KNOB", 20, int)
+  with caplog.at_level(logging.WARNING):
+    canvaslms.hacks.canvasapi.report_setting_problems()
+    canvaslms.hacks.canvasapi.report_setting_problems()
+  assert caplog.text.count("CANVASLMS_TEST_KNOB") == 1
+@
+
+\subsection{Verifying the reports of a malformed setting}
+
+The tests above show the mechanism; what matters is that the promised outcomes
+hold from the outside.
+We run the real entry point in a subprocess, as cron does, because the order
+of import, logging configuration and warning is exactly what is under test and
+cannot be reproduced within pytest's own process.
+The command [[cache clear-attachments]] needs no network and no credentials,
+and it runs past argument parsing; the home directories point into
+[[tmp_path]] so that it cannot touch the user's own caches.
+We set a malformed setting and compare three runs.
+
+<<test functions>>=
+def run_in_subprocess(tmp_path, code, *args):
+  """Run `code` with a malformed setting; return the completed process."""
+  import subprocess
+  env = dict(os.environ)
+  env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "c"),
+             XDG_CACHE_HOME=str(tmp_path / "k"),
+             XDG_DATA_HOME=str(tmp_path / "d"),
+             PYTHONPATH=os.pathsep.join(sys.path),
+             CANVASLMS_COURSE_CACHE_TTL_DAYS="abc")
+  return subprocess.run([sys.executable, "-c", code, *args], env=env,
+                        capture_output=True, text=True, timeout=120)
+
+
+CLI_ENTRY = "import canvaslms.cli; canvaslms.cli.main()"
+CLEAR_ATTACHMENTS = ["cache", "clear-attachments", "--older-than-days", "9999"]
+
+
+def test_cli_warns_once_about_malformed_setting(tmp_path):
+  result = run_in_subprocess(tmp_path, CLI_ENTRY, *CLEAR_ATTACHMENTS)
+  assert result.returncode == 0
+  lines = [line for line in result.stderr.splitlines()
+           if "CANVASLMS_COURSE_CACHE_TTL_DAYS" in line]
+  assert len(lines) == 1
+  assert lines[0].startswith("[WARNING] ")
+
+
+def test_cli_quiet_hides_malformed_setting_warning(tmp_path):
+  result = run_in_subprocess(tmp_path, CLI_ENTRY, "-q", *CLEAR_ATTACHMENTS)
+  assert result.returncode == 0
+  assert result.stderr == ""
+
+
+def test_library_caller_is_warned_on_first_cached_get(tmp_path):
+  """A program that never runs main still hears about the setting"""
+  code = """
+import logging, sys
+import canvaslms.hacks.canvasapi as c
+logging.basicConfig(format='[%(levelname)s] %(message)s')
+
+@c.CacheGetMethods("widget")
+class Holder:
+  def get_widget(self, widget_id, **kwargs):
+    return widget_id
+
+  def get_widgets(self, **kwargs):
+    return []
+
+list(Holder().get_widgets())
+list(Holder().get_widgets())
+"""
+  result = run_in_subprocess(tmp_path, code)
+  assert result.returncode == 0, result.stderr
+  lines = [line for line in result.stderr.splitlines()
+           if "CANVASLMS_COURSE_CACHE_TTL_DAYS" in line]
+  assert len(lines) == 1
+  assert lines[0].startswith("[WARNING] ")
 @
 
 Instinctively, we might want to use all passing grades as the grades that don't
@@ -4835,6 +4969,8 @@ def test_a_match_is_no_reason_to_warn(self, caplog):
 
 The settings are read when the module is imported, so we import it in a process
 of its own to see what a variable does.
+Since a malformed value is only recorded then, the process also reports the
+recorded problems, as [[main]] and the cached [[get_*]] methods do.
 <<test functions>>=
 MISS_LIMIT_VARIABLES = ("CANVASLMS_MISS_REFRESH_MAX_LISTINGS",
                         "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES")
@@ -4850,6 +4986,7 @@ def import_with_limits(**variables):
     return subprocess.run(
         [sys.executable, "-c",
          "import canvaslms.hacks.canvasapi as module; "
+         "module.report_setting_problems(); "
          "print(module.MISS_REFRESH_MAX_LISTINGS, "
          "module.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES)"],
         env=environment, capture_output=True, text=True, check=True)
