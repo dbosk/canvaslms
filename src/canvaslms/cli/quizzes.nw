@@ -41,12 +41,13 @@ import argparse
 import json
 import logging
 import sys
+import urllib.parse
 
 import pytest
 import requests
 import responses
 import yaml
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock, create_autospec, patch
 
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.content_migration import ContentMigration, MigrationIssue
@@ -454,6 +455,8 @@ subcommands:
 \item[ [[add_create_command()]] ] Registers the [[quizzes create]] subcommand
 \item[ [[add_edit_command()]] ] Registers the [[quizzes edit]] subcommand
 \item[ [[add_delete_command()]] ] Registers the [[quizzes delete]] subcommand
+\item[ [[add_accommodations_command()]] ] Registers the
+  [[quizzes accommodations]] subcommand
 \item[ [[add_export_command()]] ] Registers the [[quizzes export]] subcommand
 \item[ [[add_import_command()]] ] Registers the [[quizzes import]] subcommand
 \item[ [[add_import_status_command()]] ] Registers the
@@ -496,6 +499,7 @@ import canvasapi.exceptions
 import canvaslms.cli
 import canvaslms.cli.courses as courses
 import canvaslms.cli.assignments as assignments
+import canvaslms.cli.users as users
 import canvaslms.cli.content as content
 import canvaslms.cli.links
 import canvaslms.cli.modules as modules
@@ -530,6 +534,10 @@ def add_delete_command(subp):
   """Adds the quizzes delete subcommand to argparse parser subp"""
   <<add quizzes delete command to subp>>
 
+def add_accommodations_command(subp):
+  """Adds the quizzes accommodations subcommand to argparse parser subp"""
+  <<add quizzes accommodations command to subp>>
+
 def add_export_command(subp):
   """Adds the quizzes export subcommand to argparse parser subp"""
   <<add quizzes export command to subp>>
@@ -562,7 +570,8 @@ The subcommands are organized by workflow:
 \item[Analysis] [[analyse]] provides statistical summaries and AI-generated
   insights for quiz/survey responses.
 \item[Management] [[create]], [[edit]], [[delete]], and [[export]] handle quiz
-  lifecycle, including backup and migration; [[import]] and
+  lifecycle, including backup and migration; [[accommodations]] gives
+  students extra time or attempts (\cref{sec:quizzes-accommodations}); [[import]] and
   [[import-status]] bring in quizzes written elsewhere as QTI packages
   (\cref{sec:quiz-qti-import}).
 \item[Items] [[items]] and [[banks]] manage individual questions and item banks.
@@ -584,6 +593,7 @@ add_view_command(quizzes_subp)
 add_create_command(quizzes_subp)
 add_edit_command(quizzes_subp)
 add_delete_command(quizzes_subp)
+add_accommodations_command(quizzes_subp)
 add_export_command(quizzes_subp)
 add_import_command(quizzes_subp)
 add_import_status_command(quizzes_subp)
@@ -4034,7 +4044,8 @@ def create_new_quiz(course, requester, quiz_params):
   params = build_new_quiz_api_params(quiz_params)
 
   try:
-    data = new_quizzes_json_request(requester, 'POST', endpoint, params).json()
+    data = new_quizzes_json_request(requester, 'POST', endpoint,
+                                    new_quiz_json_body(params)).json()
   except Exception as e:
     canvaslms.cli.warn(f"Failed to create New Quiz: {e}")
     return None
@@ -4350,9 +4361,11 @@ ourselves:
 \item it raises a [[CanvasException]] for an error status, so the callers'
 error handling is unchanged.
 \end{itemize}
+The helper takes the body ready-made, since not every New Quizzes request is a
+quiz: the accommodations of \cref{sec:quizzes-accommodations} are a list.
 <<functions>>=
-def new_quizzes_json_request(requester, method, endpoint, params):
-  """Send `params` to the New Quizzes API `endpoint` as a JSON body
+def new_quizzes_json_request(requester, method, endpoint, body):
+  """Send `body` to the New Quizzes API `endpoint` as JSON
 
   Returns the response; raises CanvasException on an error status.
   """
@@ -4360,7 +4373,7 @@ def new_quizzes_json_request(requester, method, endpoint, params):
   logger.info(f"Request: {method} {url}")
   response = requester._session.request(
     method, url,
-    data=json.dumps(new_quiz_json_body(params), default=json_date),
+    data=json.dumps(body, default=json_date),
     headers={"Authorization": f"Bearer {requester.access_token}",
              "Content-Type": "application/json",
              "User-Agent": f"python-canvasapi/{canvasapi.__version__}"})
@@ -4368,7 +4381,7 @@ def new_quizzes_json_request(requester, method, endpoint, params):
   logger.debug(f"Data: {response.text}")
   if not response.ok:
     raise CanvasException(f"{response.status_code} {response.reason}: "
-                          f"{response.text[:500]}")
+                          f"{canvas_error_message(response)}")
   return response
 @
 
@@ -4385,6 +4398,41 @@ def json_date(value):
   if hasattr(value, 'isoformat'):
     return value.isoformat()
   raise TypeError(f"{type(value).__name__} is not JSON serializable")
+@
+
+Canvas explains a refusal in JSON, as [[{"error": "..."}]] from the New Quizzes
+service, or [[{"errors": [{"message": "..."}]}]] elsewhere.  We pass on the
+explanation rather than the JSON around it, since it ends up in a line of our
+output, and fall back to the start of the body when there is none.
+<<functions>>=
+def canvas_error_message(response):
+  """Return the explanation in an error response from Canvas"""
+  try:
+    answer = response.json()
+  except ValueError:
+    return response.text[:500]
+  if isinstance(answer, dict) and isinstance(answer.get('error'), str):
+    return answer['error']
+  if isinstance(answer, dict) and isinstance(answer.get('errors'), list):
+    return "; ".join(str(error.get('message', error))
+                     if isinstance(error, dict) else str(error)
+                     for error in answer['errors'])
+  return response.text[:500]
+@
+
+The three shapes, and a body that is not JSON at all:
+<<test functions>>=
+@pytest.mark.parametrize("body, message", [
+  (b'{"error": "not participants"}', "not participants"),
+  (b'{"errors": [{"message": "bad id"}, {"message": "bad time"}]}',
+   "bad id; bad time"),
+  (b'{"errors": ["plain"]}', "plain"),
+  (b'<html>Not found</html>', "<html>Not found</html>"),
+])
+def test_canvas_error_message_is_the_explanation(body, message):
+  response = requests.Response()
+  response.status_code, response._content = 404, body
+  assert quizzes.canvas_error_message(response) == message
 @
 
 Canvas has accepted settings with a success status before and then not
@@ -8068,7 +8116,8 @@ def update_new_quiz(course, assignment_id, requester, quiz_params):
   params = build_new_quiz_api_params(quiz_params)
 
   try:
-    response = new_quizzes_json_request(requester, 'PATCH', endpoint, params)
+    response = new_quizzes_json_request(requester, 'PATCH', endpoint,
+                                        new_quiz_json_body(params))
   except Exception as e:
     canvaslms.cli.warn(f"Failed to update New Quiz: {e}")
     return False
@@ -8300,6 +8349,464 @@ def delete_classic_quiz(quiz):
   except Exception as e:
     canvaslms.cli.warn(f"Failed to delete Classic Quiz: {e}")
     return False
+@
+
+
+\section{The [[quizzes accommodations]] subcommand}
+\label{sec:quizzes-accommodations}
+
+Exams often give some students more time than the others, 90 minutes instead
+of 60 for instance, and sometimes an extra attempt.  In the web interface that
+is set student by student, quiz by quiz, through Moderate, and a student who
+was missed is only noticed during the exam.  [[quizzes accommodations]] sets
+it for every student that [[-u]] matches, on every quiz that [[-a]] matches,
+and lists each student with the outcome, so the list can be checked before the
+exam rather than during it.
+\begin{verbatim}
+canvaslms quizzes accommodations -c "DD1317 LAB2" -a Exam \
+  -u '^(student1|student2)@' --extra-time 30
+\end{verbatim}
+
+\subsection{Three endpoints for one idea}
+
+Canvas has three ways to give a student extra time, depending on the kind of
+quiz and on how widely it should apply.
+\begin{description}
+\item[One New Quiz] [[POST /api/quiz/v1/courses/:course_id/quizzes/]]%
+[[:assignment_id/accommodations]] takes extra time in minutes, extra
+attempts, and [[reduce_choices_enabled]], which removes one wrong answer from
+multiple-choice questions with four options or more.
+\item[Every New Quiz in a course] [[POST /api/quiz/v1/courses/]]%
+[[:course_id/accommodations]] takes extra time and reduced choices, but not
+extra attempts, which belong to a quiz.  It can also extend sessions in
+progress, through [[apply_to_in_progress_quiz_sessions]].
+\item[One Classic Quiz] [[POST /api/v1/courses/:course_id/quizzes/]]%
+[[:id/extensions]] takes extra time and extra attempts, through
+[[canvasapi]]'s [[Quiz.set_extensions]].
+\end{description}
+(\url{https://developerdocs.instructure.com/services/canvas/resources/new_quizzes_accommodations}
+and \url{https://canvas.instructure.com/doc/api/quiz_extensions.html}.)
+
+The command chooses for the user: [[-a]] selects quizzes, each of which gets
+the endpoint of its kind, and leaving [[-a]] out means every New Quiz in the
+course.  The course level suits a student whose accommodation holds for the
+whole course, and a course that is one exam room, where it also covers a quiz
+added later.  Classic Quizzes have nothing at the course level, so they need
+[[-a]].
+
+What we learnt in our sandbox (November 2026), where the documentation is
+silent or misleading:
+\begin{itemize}
+\item The quiz-level endpoint accepts a student who has not started the quiz.
+The documentation's example failure, \enquote{User is not in any
+in-progress quiz sessions}, made that doubtful.
+\item The documentation's [[curl]] examples use [[/api/v1/]], which answers
+404; the path is [[/api/quiz/v1/]].
+\item Nothing reads accommodations back: a [[GET]] on either path answers 404.
+So the command can only report what Canvas says it processed, and it cannot
+show the values a quiz already has.
+\item A student who is not a participant of the quiz makes Canvas refuse the
+whole request with a 404, \enquote{Users with IDs \dots\ are not participants
+in this assignment}, rather than list that student under [[failed]].
+\end{itemize}
+We have not found out whether a quiz-level accommodation adds to a course-level
+one or replaces it, so the help says neither.
+
+\subsection{The options}
+
+[[-u]] is required, as a slip that selected every student would hand out
+extra time to the whole course.  The role defaults to students, as for other
+commands that take [[-u]].  Each accommodation is an option of its own, and
+only those given are sent, so that setting extra time leaves a student's extra
+attempts alone; [[--extra-time 0]] takes extra time away.
+<<add quizzes accommodations command to subp>>=
+accommodations_parser = subp.add_parser("accommodations",
+    help="Give students extra time or attempts on quizzes",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    description=ACCOMMODATIONS_DESCRIPTION)
+accommodations_parser.set_defaults(func=accommodations_command)
+
+try:
+  courses.add_course_option(accommodations_parser, required=True)
+except argparse.ArgumentError:
+  pass
+
+accommodations_parser.add_argument("-a", "--assignment", default=None,
+    help="Regex matching quiz title or Canvas ID; without it, the "
+         "accommodation applies to every New Quiz in the course")
+users.add_user_option_wo_depends(accommodations_parser, required=True)
+accommodations_parser.add_argument("--extra-time", type=int,
+    metavar="MINUTES",
+    help="Minutes added to the time limit, 0 to 10080; 0 takes it away")
+accommodations_parser.add_argument("--extra-attempts", type=int,
+    metavar="N", help="Attempts beyond the quiz's limit; needs -a")
+accommodations_parser.add_argument("--reduce-choices",
+    action=argparse.BooleanOptionalAction, default=None,
+    help="New Quizzes: remove one wrong answer from multiple-choice "
+         "questions with four options or more")
+accommodations_parser.add_argument("--in-progress", action="store_true",
+    help="Without -a: also extend New Quiz sessions already in progress")
+<<constants>>=
+ACCOMMODATIONS_DESCRIPTION = """\
+Give the students matching -u extra time, extra attempts or reduced choices,
+on the quizzes matching -a. Without -a, the accommodation applies to every
+New Quiz in the course (Classic Quizzes need -a). Only the accommodations
+given are sent; --extra-time 0 takes extra time away.
+
+Prints one line per student and quiz: course, quiz, student and "ok" or
+Canvas's reason. Exits 1 if any student was not accommodated. Canvas offers
+no way to read accommodations back, so the output is what Canvas says it
+processed.
+
+Example:
+  canvaslms quizzes accommodations -c "DD1317 LAB2" -a Exam \\
+    -u '^(student1|student2)@' --extra-time 30
+"""
+@
+
+The combinations Canvas does not offer are refused before any request, so
+that nothing is half set: extra attempts at the course level, sessions in
+progress at the quiz level, and an extra time outside the documented range.
+Reduced choices on a Classic Quiz are only known once the quizzes are
+selected, so that is reported per student instead.
+<<functions>>=
+MAX_EXTRA_TIME_MINUTES = 10080
+
+def requested_accommodation(args):
+  """Return the accommodation fields the options ask for, or exit"""
+  fields = {}
+  if args.extra_time is not None:
+    if not 0 <= args.extra_time <= MAX_EXTRA_TIME_MINUTES:
+      canvaslms.cli.err(1, "--extra-time must be 0 to "
+                           f"{MAX_EXTRA_TIME_MINUTES} minutes")
+    fields['extra_time'] = args.extra_time
+  if args.extra_attempts is not None:
+    if args.extra_attempts < 0:
+      canvaslms.cli.err(1, "--extra-attempts must be 0 or more")
+    fields['extra_attempts'] = args.extra_attempts
+  if args.reduce_choices is not None:
+    fields['reduce_choices_enabled'] = args.reduce_choices
+
+  if not fields:
+    canvaslms.cli.err(1, "Nothing to set: give --extra-time, "
+                         "--extra-attempts or --reduce-choices")
+  if args.assignment is None and 'extra_attempts' in fields:
+    canvaslms.cli.err(1, "Extra attempts are set per quiz: select the "
+                         "quizzes with -a")
+  if args.assignment is not None and args.in_progress:
+    canvaslms.cli.err(1, "--in-progress applies to the whole course: "
+                         "leave out -a")
+  return fields
+@
+
+\subsection{Running the command}
+
+The command walks the selected courses, and in each one the students that
+[[-u]] matches and the quizzes that [[-a]] matches.  Students are selected per
+course, since the same pattern names different people in different courses,
+and each target gets all of them in one request, as the endpoints take a list.
+Nothing matched at all is an empty list, as elsewhere; a course where nothing
+matched is just skipped, since [[-c]] may select several.
+<<functions>>=
+def accommodations_command(config, canvas, args):
+  """Give the students matching -u accommodations on quizzes"""
+  fields = requested_accommodation(args)
+  requester = canvas._Canvas__requester
+  writer = csv.writer(sys.stdout, delimiter=args.delimiter)
+  failures = students_found = targets_found = 0
+
+  for course in courses.process_course_option(canvas, args):
+    students = list(users.filter_users([course], args.user,
+                                       roles=[args.role]))
+    students_found += len(students)
+    if not students:
+      continue
+    for name, quiz in accommodation_targets(course, args.assignment):
+      targets_found += 1
+      for student, error in accommodate(requester, course, quiz, students,
+                                        fields, args.in_progress):
+        writer.writerow([course.course_code, name, users.get_uid(student),
+                         error or "ok"])
+        failures += bool(error)
+
+  <<report what [[accommodations_command]] did not find or set>>
+@
+
+A failure is an exit status of 1, as for the delete commands: a script that
+prepares an exam must be able to tell that a student was left out.
+<<report what [[accommodations_command]] did not find or set>>=
+if not students_found:
+  raise canvaslms.cli.EmptyListError("No users found matching the criteria")
+if not targets_found:
+  raise canvaslms.cli.EmptyListError(
+    "No quizzes found matching the criteria" + STALE_LISTING_HINT)
+if failures:
+  canvaslms.cli.err(1, f"{failures} accommodation(s) failed")
+@
+
+Without [[-a]] the course itself is the one target, named for the output by
+what it covers.
+<<functions>>=
+COURSE_LEVEL_TARGET = "all New Quizzes"
+
+def accommodation_targets(course, regex):
+  """Yield (name, quiz) for each target in course; quiz None for the course"""
+  if regex is None:
+    yield COURSE_LEVEL_TARGET, None
+    return
+  for quiz in filter_quizzes([course], regex):
+    yield quiz.title, quiz
+@
+
+\subsection{Sending the accommodations}
+
+Each target is sent its own fields: the course level has no extra attempts
+but may extend sessions in progress, and a Classic Quiz has no reduced
+choices.  The New Quizzes endpoints read a JSON array, which
+[[new_quizzes_json_request]] sends (\cref{sec:new-quiz-json-body}); the Classic
+one is a form that [[canvasapi]] encodes.
+<<functions>>=
+def accommodate(requester, course, quiz, students, fields, in_progress):
+  """Accommodate students on quiz (None: the course); list (student, error)"""
+  if quiz is None:
+    endpoint = f"courses/{course.id}/accommodations"
+    fields = dict(fields)
+    if in_progress:
+      fields['apply_to_in_progress_quiz_sessions'] = True
+    send = lambda batch: send_new_quiz_accommodations(
+      requester, endpoint, batch, fields)
+  elif is_new_quiz(quiz):
+    endpoint = f"courses/{course.id}/quizzes/{quiz.id}/accommodations"
+    send = lambda batch: send_new_quiz_accommodations(
+      requester, endpoint, batch, fields)
+  elif 'reduce_choices_enabled' in fields:
+    return [(student, "Classic Quizzes have no reduced choices")
+            for student in students]
+  else:
+    send = lambda batch: send_quiz_extensions(quiz, batch, fields)
+
+  return results_of_batch(send, students)
+@
+
+A refused request says nothing about the students in it but one, as with the
+student who is not a participant above.  So when Canvas refuses a request for
+several students, we ask again for each student alone: the others get their
+time, and the report names the one Canvas refused, with its reason.  A refusal
+of one student is final.
+<<functions>>=
+def results_of_batch(send, students):
+  """Return send(students), or each student's own result if it is refused"""
+  try:
+    return send(students)
+  except CanvasException as error:
+    if len(students) == 1:
+      return [(students[0], str(error))]
+    return [result for student in students
+            for result in results_of_batch(send, [student])]
+@
+
+A New Quizzes answer lists the students it processed and those it did not,
+each failure with its reason, and its status is 200 even when every student
+failed.  A student it does not mention at all is reported too, rather than
+taken for a success.
+<<functions>>=
+def send_new_quiz_accommodations(requester, endpoint, students, fields):
+  """POST fields for each student to a New Quizzes accommodations endpoint"""
+  body = [{'user_id': student.id, **fields} for student in students]
+  answer = new_quizzes_json_request(requester, 'POST', endpoint, body).json()
+  failed = {str(entry.get('user_id')): entry.get('error') or "failed"
+            for entry in answer.get('failed') or []}
+  processed = {str(entry.get('user_id'))
+               for entry in answer.get('successful') or []}
+  return [(student, accommodation_error(student, processed, failed))
+          for student in students]
+
+def accommodation_error(student, processed, failed):
+  """The error for student, None if Canvas processed it"""
+  if str(student.id) in failed:
+    return failed[str(student.id)]
+  if str(student.id) in processed:
+    return None
+  return "not reported by Canvas"
+@
+
+A Classic Quiz answers with the extensions it holds, so the students it
+returns are those it processed.  Extra time and extra attempts have the same
+names there.
+<<functions>>=
+def send_quiz_extensions(quiz, students, fields):
+  """Set fields as quiz extensions on a Classic Quiz for each student"""
+  extensions = quiz.set_extensions(
+    [{'user_id': student.id, **fields} for student in students])
+  processed = {str(extension.user_id) for extension in extensions}
+  return [(student, accommodation_error(student, processed, {}))
+          for student in students]
+@
+
+\subsection{Verifying the command}
+
+Let's verify the command against a real course whose requests [[responses]]
+answers, since what matters is what reaches Canvas and what we make of each
+answer.  The answers are shaped as the sandbox gave them.  The course has two
+students, a New Quiz and a Classic Quiz.
+<<test functions>>=
+STUDENTS = [{"id": 5, "name": "Student Five", "login_id": "s5@example.invalid",
+             "enrollments": [{"type": "StudentEnrollment"}]},
+            {"id": 6, "name": "Student Six", "login_id": "s6@example.invalid",
+             "enrollments": [{"type": "StudentEnrollment"}]}]
+QUIZ_ACCOMMODATIONS = f"{NEW_QUIZZES_API}/courses/1/quizzes/7/accommodations"
+
+def course_with_students_and_quizzes():
+  """A real course with STUDENTS, New Quiz 7 'Exam' and Classic Quiz 9"""
+  responses.get(f"{CACHE_API}/courses/1/search_users", json=STUDENTS)
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes",
+                json=[{"id": "7", "title": "Exam"}])
+  responses.get(f"{CACHE_API}/courses/1/quizzes",
+                json=[{"id": 9, "title": "Classic exam", "course_id": 1}])
+  return wrapped_course()
+
+def run_accommodations(course, *options):
+  """Run quizzes accommodations on course with the command-line options"""
+  parser = argparse.ArgumentParser()
+  parser.add_argument("-d", "--delimiter", default="\t")
+  quizzes.add_accommodations_command(parser.add_subparsers())
+  args = parser.parse_args(["accommodations", "-c", "SBX101", *options])
+  canvas = MagicMock()
+  canvas._Canvas__requester = course._requester
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    args.func({}, canvas, args)
+
+def accommodation_answer(successful=(), failed=()):
+  """The New Quizzes accommodations answer for these user ids"""
+  return {"message": "Accommodations processed",
+          "successful": [{"user_id": uid} for uid in successful],
+          "failed": [{"user_id": uid, "error": "nope"} for uid in failed]}
+
+@responses.activate
+def test_extra_time_reaches_every_student_on_the_new_quiz(capsys):
+  course = course_with_students_and_quizzes()
+  posted = responses.post(QUIZ_ACCOMMODATIONS,
+                          json=accommodation_answer(successful=[5, 6]))
+
+  run_accommodations(course, "-a", "^Exam$", "-u", ".*", "--extra-time", "30")
+
+  assert json.loads(posted.calls[0].request.body) == [
+    {"user_id": 5, "extra_time": 30}, {"user_id": 6, "extra_time": 30}]
+  assert capsys.readouterr().out.splitlines() == [
+    "SBX101\tExam\ts5@example.invalid\tok",
+    "SBX101\tExam\ts6@example.invalid\tok"]
+
+@responses.activate
+def test_a_failed_student_is_named_and_the_command_fails(capsys):
+  course = course_with_students_and_quizzes()
+  responses.post(QUIZ_ACCOMMODATIONS,
+                 json=accommodation_answer(successful=[5], failed=[6]))
+
+  with pytest.raises(SystemExit) as exit_info:
+    run_accommodations(course, "-a", "^Exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert exit_info.value.code == 1
+  assert "SBX101\tExam\ts6@example.invalid\tnope" in capsys.readouterr().out
+
+@responses.activate
+def test_a_student_canvas_does_not_mention_is_not_a_success(capsys):
+  course = course_with_students_and_quizzes()
+  responses.post(QUIZ_ACCOMMODATIONS, json=accommodation_answer(successful=[5]))
+
+  with pytest.raises(SystemExit):
+    run_accommodations(course, "-a", "^Exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert ("SBX101\tExam\ts6@example.invalid\tnot reported by Canvas"
+          in capsys.readouterr().out)
+@
+
+A request Canvas refuses must not cost the students it could accommodate.
+[[responses]] gives its answers to one URL in the order they were registered:
+the refused request for both students, then one answer per student.
+<<test functions>>=
+@responses.activate
+def test_a_refused_request_is_asked_again_per_student(capsys):
+  course = course_with_students_and_quizzes()
+  for status, answer in [(404, {"error": "not participants"}),
+                         (200, accommodation_answer(successful=[5])),
+                         (404, {"error": "not participants"})]:
+    responses.post(QUIZ_ACCOMMODATIONS, status=status, json=answer)
+
+  with pytest.raises(SystemExit):
+    run_accommodations(course, "-a", "^Exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  out = capsys.readouterr().out.splitlines()
+  assert out == ["SBX101\tExam\ts5@example.invalid\tok",
+                 "SBX101\tExam\ts6@example.invalid\t"
+                 "404 Not Found: not participants"]
+@
+
+Without [[-a]] the course-level endpoint is used, with the flag for sessions
+in progress when asked for; a Classic Quiz gets its extensions as a form, and
+cannot reduce choices.
+<<test functions>>=
+@responses.activate
+def test_without_a_quiz_the_course_level_is_used(capsys):
+  course = course_with_students_and_quizzes()
+  posted = responses.post(f"{NEW_QUIZZES_API}/courses/1/accommodations",
+                          json=accommodation_answer(successful=[5]))
+
+  run_accommodations(course, "-u", "^s5@", "--extra-time", "15",
+                     "--in-progress")
+
+  assert json.loads(posted.calls[0].request.body) == [
+    {"user_id": 5, "extra_time": 15,
+     "apply_to_in_progress_quiz_sessions": True}]
+  assert capsys.readouterr().out.splitlines() == [
+    "SBX101\tall New Quizzes\ts5@example.invalid\tok"]
+
+@responses.activate
+def test_a_classic_quiz_gets_quiz_extensions(capsys):
+  course = course_with_students_and_quizzes()
+  posted = responses.post(
+    f"{CACHE_API}/courses/1/quizzes/9/extensions",
+    json={"quiz_extensions": [{"user_id": 5, "extra_attempts": 1}]})
+
+  run_accommodations(course, "-a", "^Classic", "-u", "^s5@",
+                     "--extra-attempts", "1")
+
+  sent = urllib.parse.parse_qs(posted.calls[0].request.body)
+  assert sent == {"quiz_extensions[][user_id]": ["5"],
+                  "quiz_extensions[][extra_attempts]": ["1"]}
+  assert capsys.readouterr().out.splitlines() == [
+    "SBX101\tClassic exam\ts5@example.invalid\tok"]
+
+@responses.activate
+def test_a_classic_quiz_cannot_reduce_choices(capsys):
+  course = course_with_students_and_quizzes()
+
+  with pytest.raises(SystemExit):
+    run_accommodations(course, "-a", "^Classic", "-u", "^s5@",
+                       "--reduce-choices")
+
+  assert "no reduced choices" in capsys.readouterr().out
+@
+
+The combinations Canvas does not offer stop the command before it asks
+Canvas anything, which [[responses]] confirms by refusing every request that
+was not registered.
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("options", [
+  ["-u", ".*"],
+  ["-u", ".*", "--extra-attempts", "1"],
+  ["-u", ".*", "-a", "Exam", "--extra-time", "5", "--in-progress"],
+  ["-u", ".*", "-a", "Exam", "--extra-time", "10081"],
+])
+def test_what_canvas_does_not_offer_is_refused_up_front(options):
+  with pytest.raises(SystemExit) as exit_info:
+    run_accommodations(wrapped_course(), *options)
+  assert exit_info.value.code == 1
+  assert not responses.calls
 @
 
 
