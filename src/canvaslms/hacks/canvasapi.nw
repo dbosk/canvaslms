@@ -5045,15 +5045,17 @@ MISS_REFRESH_MAX_LISTINGS = env_number(
 MISS_REFRESH_MAX_LISTINGS_ALL_COURSES = env_number(
   "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5, int)
 <<functions>>=
-def retry_after_miss(find, listings, max_listings=None):
-  """Yield from `find()`; if empty, refresh `listings` and try once more.
+def retry_after_miss(find, listings, max_listings=None, pattern=None):
+  """Yield from `find()`; if empty, refresh `listings` until it finds something.
 
   `find` returns an iterable of matches, and `listings` holds the
   `(owner, attribute)` pairs it searched, such as `(canvas, "course")`. Only a
-  listing that is old enough is refreshed. If more than `max_listings` are, which
-  defaults to `MISS_REFRESH_MAX_LISTINGS`, none is and a warning says so; 0
-  turns the refresh off without a warning. A failed refresh leaves the cache as
-  it was and the result empty.
+  listing that is old enough is refreshed, one at a time in the order given,
+  searching again after each and stopping at the first that gives a match. If
+  more than `max_listings` are old enough, which defaults to
+  `MISS_REFRESH_MAX_LISTINGS`, none is refreshed and a warning says so; 0 turns
+  the refresh off without a warning. `pattern`, what was searched for, is only
+  used in the messages. A failed refresh leaves that listing as it was cached.
   """
   found = False
   for match in find():
@@ -5067,17 +5069,22 @@ def retry_after_miss(find, listings, max_listings=None):
     return
 
   <<give up unless the limit allows [[old_listings]]>>
-  <<expire the [[old_listings]]>>
+  <<say that the refresh may take a while>>
 
-  try:
-    with without_retries(owner for owner, _, _ in old_listings):
-      matches = list(find())
-    yield from matches
-  except (canvasapi.exceptions.CanvasException,
-          requests.exceptions.RequestException) as error:
-    logger.warning(f"Could not refresh after finding no match: {error}")
-  finally:
-    <<keep the cached listings after a failed refresh>>
+  for owner, name, fetched in old_listings:
+    <<expire the listing of [[owner]]>>
+    try:
+      with without_retries([owner]):
+        matches = list(find())
+    except (canvasapi.exceptions.CanvasException,
+            requests.exceptions.RequestException) as error:
+      logger.warning(f"Could not refresh after finding no match: {error}")
+      return
+    finally:
+      <<keep the cached listing of [[owner]] after a failed refresh>>
+    if matches:
+      yield from matches
+      return
 @
 
 The default pattern of an option, [[.*]], does not name anything, so a search
@@ -5135,11 +5142,43 @@ logger.warning(f"No match in the cache; not fetching {len(old_listings)} "
                f"listings as the limit is {limit}.\nUse {ways_out}.")
 @
 
+We refresh the listings one at a time and search again after each, rather than
+refreshing all of them and searching once (issue~\#583).
+A refresh costs a request or more per listing; the issue measured roughly 7 to
+16~seconds per roster on one account, a few runs and not a benchmark.
+A student who is new in one of 12 courses is then found after the refresh of
+their course, and the rosters after it are not fetched at all.
+The cost is that the search runs once per refreshed listing, but apart from the
+listing just expired it reads the cache and makes no request.
+Only a name that is really absent, or a typo, still refreshes every listing,
+up to the limit; we have no way to tell that from a name Canvas has but the
+cache lacks.
+The order is the caller's, which is the order of the courses as the command
+selected them.
+
 Clearing the timestamp is what makes the next search fetch the listing.
-<<expire the [[old_listings]]>>=
-for owner, name, _ in old_listings:
-  logger.info(f"No match, refreshing listing: {name}")
-  setattr(owner, name, None)
+The others are left as they are, so the search reads them from the cache.
+<<expire the listing of [[owner]]>>=
+logger.info(f"No match, refreshing listing: {name}")
+setattr(owner, name, None)
+@
+
+A refresh of several listings can take minutes, and until now the command said
+nothing while it waited, which looks like a hang.
+So when more than one listing may be fetched, we say so first, with the pattern
+and the number.
+That is a warning, since it explains a delay the user will notice, and it goes
+through the logger like the warning about the limit: on stderr, away from the
+output, and hidden by [[-q]], as a script run by [[cron]] wants.
+We say \enquote{up to} because the search stops at the first match.
+A single listing is quick enough to go without a word, and that is the case of
+the course listing, which every command reads through [[filter_courses]].
+<<say that the refresh may take a while>>=
+if len(old_listings) > 1:
+  what = f" for '{pattern}'" if pattern else ""
+  kind = old_listings[0][1].removesuffix("_all_fetched")
+  logger.warning(f"No match{what} in the cache; checking up to "
+                 f"{len(old_listings)} listings of {kind}s in Canvas")
 @
 
 The refresh is a favour, so failing at it should not make things worse.
@@ -5147,19 +5186,22 @@ Without it the user would have been told that nothing matched, and that is still
 what they get, along with a warning, since the answer may now be wrong.
 For the same reason it gets one try (\cref{sec:course-listing-outage}), so the
 user does not wait 17 minutes to hear that nothing matched.
-We restore the timestamps because an expired listing would otherwise be fetched
+A failure we see stops the refresh: Canvas is then most likely down, and trying
+each of the remaining listings would cost a try each to learn the same.
+We restore the timestamp because an expired listing would otherwise be fetched
 by the next command, which might well have found its match in the cache, and
 fail on Canvas being down.
 
 We cannot rely on seeing the exception to know that a refresh failed:
 [[list_users]] catches [[CanvasException]] itself, to go on with the other courses.
 What tells us is the timestamp, since a listing that was fetched has a new one.
-That is why this is in a [[finally]] clause and looks at each listing, which also
-keeps what a partly successful retry over several courses did get.
-<<keep the cached listings after a failed refresh>>=
-for owner, name, fetched in old_listings:
-  if getattr(owner, name) is None:
-    setattr(owner, name, fetched)
+That is why this is in a [[finally]] clause.
+Such a failure, of one course's roster, does not stop the refresh, just as
+[[list_users]] itself goes on with the other courses, and the listings refreshed
+before it keep what they got.
+<<keep the cached listing of [[owner]] after a failed refresh>>=
+if getattr(owner, name) is None:
+  setattr(owner, name, fetched)
 @
 
 Let's verify the behaviour, again with a stand-in whose listing can change
@@ -5271,6 +5313,7 @@ class TestRetryAfterMiss:
         assert "Could not refresh" in caplog.text
 
     <<test methods for the limit on a miss>>
+    <<test methods for refreshing one listing at a time>>
 @
 
 The limit deserves tests of its own, since most of what can go wrong with it is
@@ -5305,7 +5348,7 @@ def test_only_listings_old_enough_count(self, caplog):
         self.search_all(owners, max_listings=3)
 
     assert [owner.listings for owner in owners] == [2] * 3 + [1] * 27
-    assert not caplog.records
+    assert "not fetching" not in caplog.text
 
 def test_nothing_to_fetch_is_no_reason_to_warn(self, caplog):
     owners = self.owners(young=30)
@@ -5401,6 +5444,64 @@ def test_a_match_is_no_reason_to_warn(self, caplog):
         ] == [1, 1, 1]
 
     assert not caplog.records
+@
+
+The refresh goes one listing at a time and stops at the first match, so we count
+which listings were fetched again, and in what order.
+The stand-in owners let one listing gain the name when it is fetched again.
+<<test methods for refreshing one listing at a time>>=
+def test_the_refresh_stops_at_the_listing_with_the_name(self):
+    owners = self.owners(old=3)
+    owners[1].items = [3]
+
+    assert [obj.id for obj in self.search_all(owners)] == [3]
+    assert [owner.listings for owner in owners] == [2, 2, 1]
+
+def test_without_a_match_every_old_listing_is_fetched(self):
+    owners = self.owners(old=3, young=1)
+
+    assert self.search_all(owners) == []
+    assert [owner.listings for owner in owners] == [2, 2, 2, 1]
+
+def test_the_limit_holds_with_one_at_a_time(self):
+    owners = self.owners(old=3)
+    owners[0].items = [3]
+
+    assert self.search_all(owners, max_listings=2) == []
+    assert self.fetched_again(owners) == 0
+
+def test_more_than_one_listing_to_fetch_is_announced(self, caplog):
+    owners = self.owners(old=3)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, pattern="Anna")
+
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "'Anna'" in record.message
+    assert "up to 3 listings of items" in record.message
+
+def test_one_listing_to_fetch_is_not_announced(self, caplog):
+    owners = self.owners(old=1, young=2)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, pattern="Anna")
+
+    assert self.fetched_again(owners) == 1
+    assert not caplog.records
+
+def test_a_failure_stops_the_refresh(self, caplog):
+    owners = self.owners(old=3)
+    fetched = [owner.item_all_fetched for owner in owners]
+    owners[1].fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+    with caplog.at_level(logging.WARNING):
+        assert self.search_all(owners) == []
+
+    assert [owner.listings for owner in owners] == [2, 1, 1]
+    assert [owner.item_all_fetched for owner in owners][1:] == fetched[1:]
+    assert owners[0].item_all_fetched > fetched[0]
+    assert "Could not refresh" in caplog.text
 @
 
 The settings are read when the module is imported, so we import it in a process
