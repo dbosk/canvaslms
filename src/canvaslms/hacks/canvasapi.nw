@@ -27,6 +27,7 @@ import importlib
 import inspect
 import logging
 import os
+import re
 import requests
 import time
 import sys
@@ -4654,6 +4655,20 @@ existing course the user is not in gave 403 with the message
 gave 404, and a public course gave 200.
 A rule of 404 alone would thus never have removed a course we left, which is the
 commonest way a course leaves the listing.
+
+But a 403 is not always about the course.
+Canvas also throttles with a 403, whose message is \enquote{Rate Limit
+Exceeded}, and [[canvasapi]] raises [[Forbidden]] for every 403 and
+[[RateLimitExceeded]], a subclass of it, for a 429.
+Counting every [[Forbidden]] would let a throttled check delete a course and
+everything cached below it.
+So a 403 counts only if it is not [[RateLimitExceeded]] and its message says
+that the user is not authorised, as the answer above did, in any spelling or
+case; [[NOT_AUTHORISED]] matches that.
+Any other refusal, a throttle among them, keeps the course.
+For a 429 [[canvasapi]] makes the message itself, from the rate limit, so it
+never matches; the test of the class only states the rule where a reader looks
+for it, and holds should that message change.
 A course that Canvas still gives us is kept, marked like any entry the listing
 did not return.
 Any other answer tells us nothing about the course, so it is kept too.
@@ -4671,21 +4686,28 @@ Assignments don't need this: a teacher's listing of a course's assignments has
 all of them, so one missing from it has been deleted.
 <<functions>>=
 def canvas_says_it_is_gone(get_one, owner, key):
-  """Return True if Canvas answers 404 or 403 when `get_one` asks for `key`.
+  """Return True if Canvas says that `key` is gone when `get_one` asks for it.
 
-  That is, the object does not exist, or exists but is closed to us. `get_one`
-  is a singular get method of `owner` that is not cached, or None, in which case
-  nothing can be asked and the answer is False. The request gets one try, and
-  any other failure, a 401 included, also gives False.
+  That is a 404, the object does not exist, or a 403 saying that the user is not
+  authorised, it exists but is closed to us; a 403 for throttling is not.
+  `get_one` is a singular get method of `owner` that is not cached, or None, in
+  which case nothing can be asked and the answer is False. The request gets one
+  try, and any other failure, a 401 included, also gives False.
   """
   if get_one is None:
     return False
   try:
     with without_retries([owner]):
       get_one(owner, key)
-  except (canvasapi.exceptions.ResourceDoesNotExist,
-          canvasapi.exceptions.Forbidden):
+  except canvasapi.exceptions.ResourceDoesNotExist:
     return True
+  except canvasapi.exceptions.Forbidden as error:
+    if (not isinstance(error, canvasapi.exceptions.RateLimitExceeded)
+        and NOT_AUTHORISED.search(str(error))):
+      return True
+    logger.info(f"Kept in cache: {key} no longer listed, but Canvas refused "
+                f"for another reason: {error}")
+    return False
   except (canvasapi.exceptions.CanvasException,
           requests.exceptions.RequestException) as error:
     logger.info(f"Kept in cache: {key} no longer listed, but Canvas did not "
@@ -4693,6 +4715,8 @@ def canvas_says_it_is_gone(get_one, owner, key):
     return False
   logger.info(f"Kept in cache: {key} no longer listed, but Canvas has it")
   return False
+<<constants>>=
+NOT_AUTHORISED = re.compile(r"unauthori[sz]ed|not authori[sz]ed", re.IGNORECASE)
 @
 
 Let's verify this through the real [[Canvas]] client, with [[responses]] in place
@@ -4762,8 +4786,11 @@ class TestForgettingWhatCanvasNoLongerLists:
     @pytest.mark.parametrize("answer", [
         {"status": 404, "json": {"errors": [{"message": "Not Found"}]}},
         {"status": 403, "json": {"status": "unauthorized", "errors": [{
-            "message": "user not authorised to perform that action"}]}}],
-        ids=["not found", "left"])
+            "message": "user not authorised to perform that action"}]}},
+        {"status": 403, "json": {"errors": [{
+            "message": "user not authorised to perform that action"}]}},
+        {"status": 403, "json": {"errors": [{"message": "User Not Authorized"}]}}],
+        ids=["not found", "left", "left, British only", "left, capitalised"])
     def test_a_course_gone_from_canvas_is_gone(self, how, answer):
         """A 403 is what KTH's Canvas gave for a course one is not in."""
         canvas = self.course_no_longer_listed(how, **answer)
@@ -4779,7 +4806,12 @@ class TestForgettingWhatCanvasNoLongerLists:
         {"status": 401, "json": {"errors": [{"message": "Unauthorized"}]}},
         {"status": 401, "headers": {"WWW-Authenticate": "Bearer"},
          "json": {"errors": [{"message": "Invalid access token."}]}},
-        {"body": requests.exceptions.ConnectionError("Unreachable")}])
+        {"status": 403, "json": {"errors": [{"message": "Rate Limit Exceeded"}]}},
+        {"status": 403, "json": {"errors": [{"message": "Insufficient scope"}]}},
+        {"status": 429, "json": {"errors": [{"message": "Rate Limit Exceeded"}]}},
+        {"body": requests.exceptions.ConnectionError("Unreachable")}],
+        ids=["listed", "error", "unauthorized", "invalid token", "throttled",
+             "other refusal", "too many requests", "no answer"])
     def test_a_course_canvas_does_not_call_gone_is_kept(self, answer):
         """Not as a precaution, which would hide an error escaping the check."""
         canvas = self.course_no_longer_listed("refresh", **answer)
