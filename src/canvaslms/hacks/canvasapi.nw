@@ -28,6 +28,7 @@ import os
 import requests
 import time
 import sys
+import weakref
 
 logger = logging.getLogger(__name__)
 
@@ -1922,6 +1923,14 @@ The [[else]] is critical to avoid the double-yield bug: without it, we would
 yield all objects once from the bulk fetch, then yield them all again while
 checking for staleness, causing N individual API calls for outdated items
 immediately after a bulk fetch.
+
+Between the two sits a bulk fetch that the caller could do without, a
+\emph{precaution}: the cached listing would answer the call, but it may be
+missing something.
+That is the case when the course listing has expired, and when the only entries
+lacking what is asked for are ones Canvas no longer lists.
+Such a fetch gets one try, and if it fails the cached listing is used instead
+(\cref{sec:course-listing-outage}).
 <<return cached result or fetch from [[get_attrs]]>>=
 <<pass a request for a subset through to Canvas>>
 
@@ -1934,17 +1943,13 @@ if attr_all_fetched and predates_refresh(attr_all_fetched):
   logger.info(f"Cache invalidation: {display_plural} - refresh requested")
   attr_all_fetched = None
 
+precaution = False
 if attr_all_fetched:
-  for cached_obj, prev_kwargs in attr_cache.values():
-    if (must_update(prev_kwargs, kwargs)
-        and (not getattr(cached_obj, "_unlisted", False)
-             or old_enough_to_ask_again(attr_all_fetched))):
-      logger.info(f"Cache invalidation: {display_plural} - new kwargs required "
-                  f"(existing: {prev_kwargs}, requested: {kwargs})")
-      attr_all_fetched = None
-      break
+  <<find out whether the cached entries have what is asked for>>
 
-<<try to refresh an expired course listing>>
+<<see whether the course listing has expired>>
+if precaution:
+  <<refresh as a precaution, or keep the cached listing>>
 
 if not attr_all_fetched:
   <<log reason for bulk refresh>>
@@ -3646,10 +3651,20 @@ back on what it has.
 That only holds when the cached listing would otherwise have been good enough, so
 this comes after the checks for what cannot be served from the cache: a
 restriction left by an older version, a requested refresh or new keyword
-arguments.
+arguments that an entry Canvas still lists lacks.
 Those still fail loudly, since the cached listing is not what the caller asked for.
-That includes a fetch caused only by an entry Canvas no longer lists
-(\cref{sec:subset-listings}), as it did before we started marking them.
+An entry Canvas no longer lists is different: the fetch it causes is a precaution
+too (\cref{sec:subset-listings}), so it takes the same path as this one.
+<<see whether the course listing has expired>>=
+course_listing_expired = (
+  attr_name == "course" and attr_all_fetched
+  and datetime.now() - attr_all_fetched > timedelta(days=COURSE_CACHE_TTL_DAYS))
+if course_listing_expired:
+  logger.info(f"Cache invalidation: course_all_fetched periodic refresh "
+              f"(fetched: {attr_all_fetched}, "
+              f"threshold: {COURSE_CACHE_TTL_DAYS} days)")
+  precaution = True
+@
 
 Falling back is not enough if it comes late.
 The retry policy of [[configure_canvas_retry_policy]] is made for requests a
@@ -3660,35 +3675,56 @@ something it does not need.
 So a precaution gets one try, through [[without_retries]].
 The price is that a passing failure, which the retries would have overcome, skips
 this refresh; the next try comes soon enough.
+We catch the errors of an outage, the [[CanvasException]]s of an answer and the
+[[RequestException]]s of no answer, and nothing else, so that a bug in our own
+code still shows.
+<<refresh as a precaution, or keep the cached listing>>=
+try:
+  with without_retries([self]):
+    <<fetch all and populate [[attr_cache]]>>
+except (canvasapi.exceptions.CanvasException,
+        requests.exceptions.RequestException) as error:
+  logger.warning(f"Could not refresh {display_plural}, "
+                 f"using the cached ones: {error}")
+  <<put off the next precaution>>
+else:
+  <<yield all objects in [[attr_cache]]>>
+  return
+@
 
 A host that does not answer at all still takes until the connection times out,
 and a command can read the listing more than once.
-So a failure also puts off the next try by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
+So a failure also puts off the next try.
+For the course listing it is put off by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
 interval we already use for how soon looking again is worth it.
 Changing the timestamp does this without new state in the shared cache file, and
 older copies of this library do not expire this listing at all, so its value
 means nothing to them.
-<<try to refresh an expired course listing>>=
-if (attr_name == "course" and attr_all_fetched
-    and datetime.now() - attr_all_fetched
-        > timedelta(days=COURSE_CACHE_TTL_DAYS)):
-  logger.info(f"Cache invalidation: course_all_fetched periodic refresh "
-              f"(fetched: {attr_all_fetched}, "
-              f"threshold: {COURSE_CACHE_TTL_DAYS} days)")
-  try:
-    with without_retries([self]):
-      <<fetch all and populate [[attr_cache]]>>
-  except (canvasapi.exceptions.CanvasException,
-          requests.exceptions.RequestException) as error:
-    logger.warning(f"Could not refresh {display_plural}, "
-                   f"using the cached ones: {error}")
-    attr_all_fetched = (datetime.now()
-                        - timedelta(days=COURSE_CACHE_TTL_DAYS)
-                        + timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
-    setattr(self, f"{attr_name}_all_fetched", attr_all_fetched)
-  else:
-    <<yield all objects in [[attr_cache]]>>
-    return
+
+That trick does not work for the other precaution, the one for entries Canvas no
+longer lists.
+It is due once the listing is [[MISS_REFRESH_MIN_AGE_MINUTES]] old, so putting it
+off by as much would mean dating the listing to now, and the listing's own
+time to live would then count from a fetch that failed.
+So we remember the failure instead, for the rest of the run, in
+[[failed_precautions]]: per kind of listing, the owners whose precaution failed.
+A later read in the same run then serves the cache without a word, and so the
+user is warned once.
+The next run tries again, once, which is what a run started after Canvas came
+back needs.
+The set is weak, so it keeps no owner alive and an owner that is gone can't be
+mistaken for a new one; it is not pickled, so it ends with the run.
+A failed course refresh is remembered there as well, or the read after it would
+try the listing again for an entry that left.
+<<put off the next precaution>>=
+failed_precautions[attr_name].add(self)
+if course_listing_expired:
+  attr_all_fetched = (datetime.now()
+                      - timedelta(days=COURSE_CACHE_TTL_DAYS)
+                      + timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+  setattr(self, f"{attr_name}_all_fetched", attr_all_fetched)
+<<functions>>=
+failed_precautions = collections.defaultdict(weakref.WeakSet)
 @
 
 The retry policy lives in the adapters of the session, which all objects from one
@@ -4077,11 +4113,47 @@ What this saves is the repeated fetches of a burst of reads, not the fetches
 themselves.
 Someone who has left for good goes on lacking the include, so a program asking
 for it pays for one fetch per [[MISS_REFRESH_MIN_AGE_MINUTES]], and so for one
-per run if its runs are further apart than that.
+per run if its runs are further apart than that (issue~\#588).
+A program like [[fbf]], which always asks for email addresses, thus gets no help
+from the cache in a course that someone has left.
 A single-object fetch that Canvas answers also replaces the entry and with it the
 mark, so the next read asking for more can cost one more fetch within the interval.
 We accept these costs since the alternative is to serve someone who has returned
 without what was asked for.
+A cheaper way would be to ask Canvas about the marked entries alone, one request
+per person who left and include, with an occasional listing to find those who
+return.
+That trades one listing for several requests and needs a record of what was
+asked of whom, so we have not done it.
+
+Such a fetch is also not something the caller needs: everyone Canvas still lists
+has what was asked for, so the cached listing answers the call, and the fetch is
+only a precaution in case someone has returned.
+So it is treated like the refresh of an expired course listing
+(\cref{sec:course-listing-outage}): it gets one try, and if Canvas can't be
+reached the cached listing is used, with a warning.
+Without this, Canvas being down turned a command that could have answered from
+the cache into 17~minutes of retries and a failure.
+A failure is remembered for the rest of the run, so later reads don't try again.
+An entry Canvas still lists that lacks what is asked for is another matter, and
+then the fetch is needed and gets the full retry policy, as before.
+<<find out whether the cached entries have what is asked for>>=
+lacking = [(cached_obj, prev_kwargs)
+           for cached_obj, prev_kwargs in attr_cache.values()
+           if must_update(prev_kwargs, kwargs)]
+listed_lacking = [(cached_obj, prev_kwargs)
+                  for cached_obj, prev_kwargs in lacking
+                  if not getattr(cached_obj, "_unlisted", False)]
+if listed_lacking:
+  logger.info(f"Cache invalidation: {display_plural} - new kwargs required "
+              f"(existing: {listed_lacking[0][1]}, requested: {kwargs})")
+  attr_all_fetched = None
+elif (lacking and old_enough_to_ask_again(attr_all_fetched)
+      and self not in failed_precautions[attr_name]):
+  logger.info(f"Cache invalidation: {display_plural} - {len(lacking)} entries "
+              f"Canvas no longer listed lack {kwargs}")
+  precaution = True
+@
 
 Clearing a restriction, as above, only removes a claim about the listing.
 Recording the new includes on these entries would add a claim about the object,
@@ -4247,6 +4319,94 @@ class TestIncludesOfAListing:
         list(instance.get_items(include=["avatar_url"]))
 
         assert len(instance.requests) == requests + 1
+@
+
+Now let's verify that this precaution, unlike a fetch the caller needs, gives way
+when Canvas can't be reached.
+The stand-in fails the way an unreachable host does; that the failure comes
+after one try, without the waits of the retry policy, the tests of the [[cache]]
+module show with the real client.
+
+<<test functions>>=
+class TestPrecautionForEntriesThatLeft:
+    """Canvas being down costs a warning, not the answer from the cache"""
+
+    def make_instance(self):
+        """Return an instance whose item 2 left, the listing old enough."""
+        class TestClass:
+            def __init__(self):
+                self.requests = 0
+                self.listed = [1, 2]
+                self.fail = None
+            def get_item(self, item_id, **kwargs):
+                return canvas_object(id=item_id)
+            def get_items(self, **kwargs):
+                self.requests += 1
+                if self.fail:
+                    raise self.fail
+                return [canvas_object(
+                          id=each,
+                          **{key: True for key in kwargs.get("include", [])})
+                        for each in self.listed]
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        instance.listed = [1]
+        list(instance.get_items(include=["email"]))
+        instance.item_all_fetched -= timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES)
+        instance.fail = requests.exceptions.ConnectionError("Unreachable")
+        instance.requests = 0
+        return instance
+
+    @pytest.mark.parametrize("failure", [
+        requests.exceptions.ConnectionError("Unreachable"),
+        canvasapi.exceptions.CanvasException("Unavailable")])
+    def test_the_cache_is_served_with_a_warning(self, caplog, failure):
+        instance = self.make_instance()
+        instance.fail = failure
+
+        with caplog.at_level(logging.WARNING):
+            items = list(instance.get_items(include=["email"]))
+
+        assert sorted(item.id for item in items) == [1, 2]
+        assert instance.requests == 1
+        assert "Could not refresh" in caplog.text
+
+    def test_a_failure_is_tried_and_told_once_per_run(self, caplog):
+        instance = self.make_instance()
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                list(instance.get_items(include=["email"]))
+
+        assert instance.requests == 1
+        assert len(caplog.records) == 1
+
+    def test_the_listing_keeps_its_date(self):
+        instance = self.make_instance()
+        fetched = instance.item_all_fetched
+
+        list(instance.get_items(include=["email"]))
+
+        assert instance.item_all_fetched == fetched
+
+    def test_a_listing_that_answers_is_fetched_as_before(self):
+        instance = self.make_instance()
+        instance.fail = None
+        instance.listed = [1, 2]
+
+        items = list(instance.get_items(include=["email"]))
+
+        assert all(item.email for item in items)
+        assert instance.requests == 1
+
+    def test_a_listed_entry_lacking_an_include_still_fails(self):
+        instance = self.make_instance()
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            list(instance.get_items(include=["avatar_url"]))
 @
 
 \subsection{Refreshing on request}
