@@ -133,6 +133,7 @@ import pytest
 import requests
 import responses
 from cryptography.fernet import Fernet
+import functools
 import io
 import pickle
 import socket
@@ -1087,25 +1088,49 @@ is covered without anyone having to remember this section.
 The few requests that bypass it are plain [[requests.get]] downloads of files,
 which do not store anything in the Canvas object.
 
-We keep the count on the wrapper rather than in a module variable, so that
-re-importing this module (as tests may) neither wraps the method twice nor
+We find the count through [[Requester.request]] itself, as an attribute of
+whatever function is there, rather than in a module variable.
+Re-importing this module (as tests may) then neither wraps the method twice nor
 leaves us reading a counter that the wrapper no longer increments.
+
+That makes us depend on what others do to [[Requester.request]] after us, and a
+wrong count fails the dangerous way: a count that stands still makes every later
+save look unneeded, and what was fetched is lost.
+Two cases matter.
+Someone may wrap the method again with [[functools.wraps]], which copies the
+attributes of our wrapper onto theirs; a plain number would be copied once and
+then stand still on the outer function, while ours counted on.
+So the attribute is a one-element list, the counter's cell, which the copy shares
+instead of duplicating.
+Someone may also wrap it without [[functools.wraps]], so that the attribute is
+gone; we then do not know the count, [[requests_sent]] says [[None]], and
+[[unchanged_since_stored]] below takes that as a reason to save.
+
 The count is for the whole process and all [[Canvas]] objects; a request for one
 object makes us save any other, which errs on the side of saving.
 <<functions>>=
 def count_requests(request):
   """Return `request` wrapped to count the requests it sends."""
+  sent = [0]
+
   @functools.wraps(request)
   def counted_request(*args, **kwargs):
-    counted_request.requests_sent += 1
+    sent[0] += 1
     return request(*args, **kwargs)
 
-  counted_request.requests_sent = 0
+  counted_request.requests_sent = sent
   return counted_request
 
 def requests_sent():
-  """Return the number of requests sent to Canvas by this process so far."""
-  return getattr(canvasapi.requester.Requester.request, "requests_sent", 0)
+  """Return the number of requests sent to Canvas by this process so far.
+
+  Returns None when the count cannot be found, because `Requester.request`
+  was replaced by something that does not carry it.
+  """
+  sent = getattr(canvasapi.requester.Requester.request, "requests_sent", None)
+  if isinstance(sent, list):
+    return sent[0]
+  return None
 <<count the requests sent to Canvas>>=
 if not hasattr(canvasapi.requester.Requester.request, "requests_sent"):
   canvasapi.requester.Requester.request = count_requests(
@@ -1126,6 +1151,7 @@ not keep each old copy alive.
 An object that cannot be referenced weakly, such as the dictionaries that stand
 in for a [[Canvas]] in some tests, is not remembered either, and so is saved:
 when we cannot tell, we save.
+The same goes for an unknown count: two unknown counts must not compare equal.
 <<functions>>=
 def remember_as_stored(canvas):
   """Note that `canvas` matches the cache file as of the requests sent so far."""
@@ -1136,8 +1162,11 @@ def remember_as_stored(canvas):
 
 def unchanged_since_stored(canvas):
   """Return True if no request was sent since `canvas` matched the file."""
+  sent = requests_sent()
+  if sent is None:
+    return False
   try:
-    return stored_at_request.get(canvas) == requests_sent()
+    return stored_at_request.get(canvas) == sent
   except TypeError:
     return False
 <<constants>>=
@@ -1284,6 +1313,39 @@ def test_a_change_by_hand_is_saved_only_when_forced(tmp_cache_path):
   cache.save_canvas_cache(canvas, "token", HOST, force=True)
   assert (cache.load_canvas_cache("token", HOST).course_all_fetched
           == datetime(2026, 1, 1))
+@
+
+The counter must survive someone else wrapping [[Requester.request]] after us,
+as a library caller or a test might, with [[functools.wraps]] or without it.
+A fetch made through such a wrapper must still be saved.
+
+<<test functions>>=
+def wrap_once_more(keep_attributes):
+  """Return `Requester.request` wrapped as another program might wrap it."""
+  request = canvasapi.requester.Requester.request
+
+  def logged_request(*args, **kwargs):
+    return request(*args, **kwargs)
+
+  if keep_attributes:
+    logged_request = functools.wraps(request)(logged_request)
+  return logged_request
+
+@responses.activate
+@pytest.mark.parametrize("keep_attributes", [True, False],
+                         ids=["functools.wraps", "plain wrapper"])
+def test_a_fetch_is_saved_under_another_wrapper(
+    run_canvaslms, tmp_cache_path, monkeypatch, keep_attributes):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  run_canvaslms("courses")
+  monkeypatch.setattr(canvasapi.requester.Requester, "request",
+                      wrap_once_more(keep_attributes))
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+  before = stored(tmp_cache_path)
+
+  run_canvaslms("assignments", "-c", "Old")
+
+  assert stored(tmp_cache_path) != before
 @
 
 Finally, [[--no-cache]] must still neither read the file nor write it, now that
