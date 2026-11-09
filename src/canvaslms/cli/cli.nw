@@ -77,8 +77,13 @@ import re
 import shlex
 import sys
 import textwrap
+from datetime import datetime, timedelta
+
+import requests
+import responses
 
 import canvaslms.cli
+import canvaslms.hacks.canvasapi
 
 from canvaslms.cli import dirs
 <<modules>>
@@ -463,9 +468,762 @@ Occasionally you want to bypass the cache for a single command,
 for example right after creating or updating objects.
 
 <<add global options to argp>>=
-argp.add_argument("--no-cache",
+cache_use = argp.add_mutually_exclusive_group()
+cache_use.add_argument("--no-cache",
   action="store_true",
   help="Do not read or write the persistent Canvas object cache")
+cache_use.add_argument("--refresh-cache",
+  action="store_true",
+  help="Fetch what this command reads from Canvas again, whatever its age, "
+    "and save it; the rest of the cache is kept")
+@
+
+The two options answer different needs, which is why they exclude each other
+rather than one implying the other.
+[[--no-cache]] is about not touching the cache at all.
+[[--refresh-cache]] is about making the cache right, so the next command, which
+has neither option, gets the fresh data too.
+It only refreshes what the command actually reads, see
+\cref{sec:refresh-on-request}.
+
+Let's verify the whole way there and back, through the real parser, the real
+encrypted file and real [[canvasapi]] objects.
+We stub HTTP with [[responses]], because what we test is what happens when
+Canvas's answer changes between runs, which a recording cannot express.
+An unregistered request fails, so these tests also prove what is \emph{not}
+fetched.
+Each run in a test stands for a process of its own, so it starts without a
+requested refresh.
+
+<<test functions>>=
+CANVAS_HOST = "https://canvas.example"
+CANVAS_API = f"{CANVAS_HOST}/api/v1"
+OLD_COURSE = {"id": 1, "name": "Old course", "course_code": "OLD"}
+NEW_COURSE = {"id": 2, "name": "New course", "course_code": "NEW"}
+LAB = {"id": 5, "name": "Lab", "course_id": 1}
+
+@pytest.fixture
+def run_cli(monkeypatch, tmp_path, capsys):
+  """Return a function running canvaslms as a new process, returning stdout."""
+  monkeypatch.setattr(canvaslms.cli.cache, "get_cache_path",
+                      lambda hostname: str(tmp_path / "cache.enc"))
+  monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
+                      lambda config: (CANVAS_HOST, "token"))
+
+  def run(*arguments):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+    monkeypatch.setattr(sys, "argv", ["canvaslms",
+                                      "--config-file",
+                                      str(tmp_path / "config.json"),
+                                      *arguments])
+    canvaslms.cli.main()
+    return capsys.readouterr().out
+
+  return run
+
+@responses.activate
+def test_refresh_cache_finds_new_course_and_keeps_it(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  run_cli("courses")
+
+  responses.replace(responses.GET, f"{CANVAS_API}/courses",
+                    json=[OLD_COURSE, NEW_COURSE])
+  assert "New course" not in run_cli("courses")
+  assert "New course" in run_cli("--refresh-cache", "courses")
+
+  responses.reset()
+  assert "New course" in run_cli("courses")
+
+@responses.activate
+def test_refresh_cache_keeps_what_the_command_does_not_read(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  assert "Lab" in run_cli("assignments", "-c", "Old")
+
+  responses.reset()
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE, NEW_COURSE])
+  run_cli("--refresh-cache", "courses")
+
+  responses.reset()
+  assert "Lab" in run_cli("assignments", "-c", "Old")
+
+@responses.activate
+def test_refresh_cache_refetches_what_the_command_reads(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  run_cli("assignments", "-c", "Old")
+
+  responses.replace(responses.GET, f"{CANVAS_API}/courses/1/assignments",
+                    json=[LAB, {"id": 6, "name": "Exam", "course_id": 1}])
+  assert "Exam" not in run_cli("assignments", "-c", "Old")
+  assert "Exam" in run_cli("--refresh-cache", "assignments", "-c", "Old")
+
+@responses.activate
+def test_refresh_cache_still_shows_student_who_left(run_cli):
+  submission = {"id": 9, "user_id": 7, "assignment_id": 5, "grade": "P",
+                "score": 1, "workflow_state": "graded", "attempt": 1,
+                "submitted_at": "2026-01-01T10:00:00Z",
+                "graded_at": "2026-01-01T11:00:00Z",
+                "submission_type": "online_text_entry", "body": "text",
+                "grader_id": None, "preview_url": f"{CANVAS_HOST}/preview"}
+  student = {"id": 7, "name": "Anna Andersson", "login_id": "anna",
+             "enrollments": [{"type": "StudentEnrollment"}]}
+  gone = {"json": {"errors": [{"message": "Not found"}]}, "status": 404}
+  course = f"{CANVAS_API}/courses/1"
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{course}/assignments", json=[LAB])
+  responses.get(f"{course}/search_users", json=[student])
+  responses.get(f"{course}/assignments/5/submissions", json=[submission])
+  responses.get(f"{course}/assignments/5/submissions/7", json=submission)
+  responses.get(f"{course}/users/7", json=student)
+  view = ("submissions", "view", "-c", "Old", "-a", "Lab", "-u", "Anna")
+  run_cli(*view)
+
+  responses.reset()
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{course}/assignments", json=[LAB])
+  responses.get(f"{course}/search_users", json=[])
+  responses.get(f"{course}/assignments/5/submissions", json=[])
+  responses.get(f"{course}/assignments/5/submissions/7", **gone)
+  responses.get(f"{course}/users/7", **gone)
+
+  assert "Lab" in run_cli("--refresh-cache", *view)
+
+def test_refresh_cache_excludes_no_cache(run_cli, capsys):
+  with pytest.raises(SystemExit):
+    run_cli("--no-cache", "--refresh-cache", "courses")
+  assert "not allowed with" in capsys.readouterr().err
+@
+
+Without either option, a name that matches nothing makes the search look at
+Canvas once more (\cref{sec:refresh-on-miss}).
+Let's verify that this finds what is new on all three kinds of listing, and that
+it stays out of the way when the empty answer is the right one.
+The tests that expect a refresh pretend that any listing is old enough, since
+they run right after the one that filled the cache.
+
+<<test functions>>=
+ANNA = {"id": 7, "name": "Anna Andersson", "login_id": "anna",
+        "enrollments": [{"type": "StudentEnrollment"}]}
+
+def requests_to(path):
+  """Return the number of requests made to the path below the API"""
+  return sum(call.request.url.split("?")[0] == f"{CANVAS_API}/{path}"
+             for call in responses.calls)
+
+def assert_no_match(run_cli, *arguments):
+  """Check that the command reports finding nothing, not a usage error."""
+  with pytest.raises(SystemExit) as exit_info:
+    run_cli(*arguments)
+  assert exit_info.value.code == 1
+
+@pytest.fixture
+def any_listing_is_old_enough(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+
+@responses.activate
+def test_miss_finds_new_course(run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  run_cli("courses")
+  responses.replace(responses.GET, f"{CANVAS_API}/courses",
+                    json=[OLD_COURSE, NEW_COURSE])
+
+  assert "New course" in run_cli("courses", "New")
+  assert "New course" in run_cli("courses", "New")
+  assert requests_to("courses") == 2
+
+@responses.activate
+def test_miss_finds_new_student(run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/search_users", json=[])
+  assert_no_match(run_cli, "users", "-c", "Old", "Anna")
+  responses.replace(responses.GET, f"{CANVAS_API}/courses/1/search_users",
+                    json=[ANNA])
+
+  assert "Anna" in run_cli("users", "-c", "Old", "Anna")
+
+@responses.activate
+def test_miss_finds_new_assignment(run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  run_cli("assignments", "-c", "Old")
+  responses.replace(responses.GET, f"{CANVAS_API}/courses/1/assignments",
+                    json=[LAB, {"id": 6, "name": "Exam", "course_id": 1}])
+
+  assert "Exam" in run_cli("assignments", "-c", "Old", "-a", "Exam")
+
+@responses.activate
+def test_failed_roster_refresh_keeps_the_cached_answer(
+    run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/search_users", json=[ANNA])
+  assert "Anna" in run_cli("users", "-c", "Old", "Anna")
+
+  responses.replace(responses.GET, f"{CANVAS_API}/courses/1/search_users",
+                    json={"errors": [{"message": "Rate Limit Exceeded"}]},
+                    status=403)
+  assert_no_match(run_cli, "users", "-c", "Old", "Nobody")
+
+  assert "Anna" in run_cli("users", "-c", "Old", "Anna")
+
+@responses.activate
+def test_command_works_from_the_cache_when_canvas_is_down(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  run_cli("assignments", "-c", "Old")
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  canvas.course_all_fetched -= timedelta(
+      days=canvaslms.hacks.canvasapi.COURSE_CACHE_TTL_DAYS + 1)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  responses.replace(responses.GET, f"{CANVAS_API}/courses",
+                    body=requests.exceptions.ConnectionError("Unreachable"))
+
+  assert "Lab" in run_cli("assignments", "-c", "Old")
+
+@responses.activate
+def test_repeated_miss_lists_once_per_interval(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  for _ in range(2):
+    assert_no_match(run_cli, "courses", "Nothing")
+
+  assert requests_to("courses") == 1
+
+@responses.activate
+def test_miss_right_after_a_refresh_lists_once(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  run_cli("courses")
+  responses.calls.reset()
+  assert_no_match(run_cli, "--refresh-cache", "courses", "Nothing")
+
+  assert requests_to("courses") == 1
+
+@responses.activate
+def test_miss_under_no_cache_lists_once(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  assert_no_match(run_cli, "--no-cache", "courses", "Nothing")
+
+  assert requests_to("courses") == 1
+
+@responses.activate
+def test_nothing_ungraded_is_not_a_miss(run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  responses.get(f"{CANVAS_API}/courses/1/assignments/5/submissions", json=[])
+  run_cli("assignments", "-c", "Old")
+  responses.calls.reset()
+
+  assert_no_match(run_cli, "assignments", "list", "-c", "Old", "-a", "Lab", "-U")
+
+  assert requests_to("courses/1/assignments") == 0
+
+@responses.activate
+def test_no_one_with_a_role_is_not_a_miss(run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/search_users", json=[ANNA])
+  run_cli("users", "-c", "Old")
+  responses.calls.reset()
+
+  assert_no_match(run_cli, "users", "-c", "Old", "-a")
+
+  assert requests_to("courses/1/search_users") == 0
+@
+
+The same goes for assignments: a course without any is an answer, and no name was
+missed.
+
+<<test functions>>=
+@responses.activate
+def test_no_assignments_at_all_is_not_a_miss(run_cli,
+                                             any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[])
+  assert_no_match(run_cli, "assignments", "list", "-c", "Old")
+  responses.calls.reset()
+
+  assert_no_match(run_cli, "assignments", "list", "-c", "Old")
+
+  assert requests_to("courses/1/assignments") == 0
+@
+
+A listing narrowed to a subset must not stick to the cache
+(\cref{sec:subset-listings}).
+Our Canvas stand-in answers such a request the way Canvas does, with only the
+students, so a roster that inherited the restriction never shows the TA.
+The first tests start from a cache written by an earlier version, which stored
+the restriction on its entries, as a real cache of ours did.
+The cache file is shared with programs that may have an older copy of this
+library, one that does not know to repair such a listing, so the first test also
+checks that what we leave in the file is correct in itself.
+
+<<test functions>>=
+TOVE = {"id": 8, "name": "Tove Assistant", "login_id": "tove",
+        "enrollments": [{"type": "TaEnrollment"}]}
+
+def add_roster_that_honours_enrollment_type():
+  """Answer the course's roster requests with students only, if asked to."""
+  def roster(request):
+    people = [ANNA] if "enrollment_type" in request.url else [ANNA, TOVE]
+    return (200, {}, json.dumps(people))
+  responses.add_callback(responses.GET,
+                         f"{CANVAS_API}/courses/1/search_users", roster)
+
+def cache_a_narrowed_roster(run_cli):
+  """Leave the cache as a restricted call of an earlier version left it."""
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  add_roster_that_honours_enrollment_type()
+  run_cli("users", "-c", "Old", "Anna")
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+  anna = course.user_cache[7][0]
+  course.user_cache.clear()
+  course.user_cache[7] = (anna, {"enrollment_type": ["student"],
+                                 "include": ["enrollments"]})
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  responses.calls.reset()
+
+@responses.activate
+def test_refresh_cache_undoes_a_narrowed_roster(run_cli):
+  cache_a_narrowed_roster(run_cli)
+
+  assert "Tove" in run_cli("--refresh-cache", "users", "-c", "Old", "Tove")
+
+  responses.reset()
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+  assert set(course.user_cache) == {7, 8}
+  assert not any(
+    canvaslms.hacks.canvasapi.restricts_listing(kwargs)
+    for _, kwargs in course.user_cache.values())
+
+@responses.activate
+def test_miss_undoes_a_narrowed_roster(run_cli, any_listing_is_old_enough):
+  cache_a_narrowed_roster(run_cli)
+
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+
+@responses.activate
+def test_library_caller_gets_the_whole_of_a_narrowed_roster(
+    run_cli, monkeypatch, tmp_path):
+  """As nytid does: no flag, no name to miss, its own matching of the result."""
+  cache_a_narrowed_roster(run_cli)
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+  canvaslms.clear_canvas_state()
+  try:
+    canvas = canvaslms.get_canvas(str(tmp_path / "config.json"))
+    courses = list(canvaslms.cli.courses.filter_courses(canvas, "Old"))
+    users = canvaslms.cli.users.filter_users(courses, ".*")
+
+    assert {user.id for user in users} == {7, 8}
+  finally:
+    canvaslms.clear_canvas_state()
+
+@responses.activate
+def test_a_narrowed_listing_does_not_affect_the_cache(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  add_roster_that_honours_enrollment_type()
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+
+  for _ in range(2):
+    students = course.get_users(enrollment_type=["student"],
+                                include=["enrollments"])
+    assert [student.id for student in students] == [7]
+  assert requests_to("courses/1/search_users") == 2
+  assert course.user_all_fetched is None and not course.user_cache
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+
+  assert "Tove" in run_cli("users", "-c", "Old", "Tove")
+@
+
+Someone who has left a course stays in the cache, with the includes of the last
+fetch that returned them.
+This must hold across runs too, since it is the cache file that remembers them:
+a program that wants more than the commands ask for, and runs several times in
+short order, pays for one fetch and not for one each run.
+Runs further apart than the interval do pay for one each.
+
+<<test functions>>=
+@responses.activate
+def test_someone_who_left_does_not_refetch_the_roster_in_a_burst_of_runs(run_cli):
+  people = [ANNA, TOVE]
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.add_callback(responses.GET,
+                         f"{CANVAS_API}/courses/1/search_users",
+                         lambda request: (200, {}, json.dumps(people)))
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  course = list(canvas.get_courses())[0]
+  list(course.get_users(include=["enrollments"]))
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+  people.remove(TOVE)
+
+  for _ in range(3):
+    canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+    course = list(canvas.get_courses())[0]
+    users = list(course.get_users(include=["email", "enrollments"]))
+    canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+
+  assert {user.id for user in users} == {7, 8}
+  assert requests_to("courses/1/search_users") == 2
+@
+
+The same goes for the submissions of someone who has left, which the cache file
+also has to remember between runs.
+
+<<test functions>>=
+@responses.activate
+def test_a_submission_no_longer_listed_does_not_refetch_in_a_burst_of_runs(run_cli):
+  people = [7, 8]
+  listing = f"{CANVAS_API}/courses/1/assignments/5/submissions"
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  responses.add_callback(
+    responses.GET, listing,
+    lambda request: (200, {}, json.dumps(
+      [{"id": each, "user_id": each, "assignment_id": 5} for each in people])))
+
+  def read(include):
+    canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+    course = list(canvas.get_courses())[0]
+    assignment = list(course.get_assignments())[0]
+    submissions = assignment.get_submissions(include=include)
+    canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+    return submissions
+
+  read(["rubric_assessment"])
+  people.remove(8)
+  for _ in range(3):
+    assert len(read(["submission_comments"])) == 2
+
+  assert requests_to("courses/1/assignments/5/submissions") == 2
+@
+
+A selection of several courses is searched as a whole.
+Without [[-c]] it spans every course, and a name is usually missing from most of
+them, so only a name found in none of them is a miss.
+
+<<test functions>>=
+@responses.activate
+def test_assignment_in_one_course_of_many_is_no_miss(
+    run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE, NEW_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[])
+  responses.get(f"{CANVAS_API}/courses/2/assignments",
+                json=[dict(LAB, course_id=2)])
+  run_cli("assignments", "list")
+  responses.calls.reset()
+
+  assert "Lab" in run_cli("assignments", "list", "-a", "Lab")
+
+  assert requests_to("courses/1/assignments") == 0
+  assert requests_to("courses/2/assignments") == 0
+
+@responses.activate
+def test_student_in_one_course_of_many_is_no_miss(
+    run_cli, any_listing_is_old_enough):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE, NEW_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/search_users", json=[])
+  responses.get(f"{CANVAS_API}/courses/2/search_users", json=[ANNA])
+  run_cli("users")
+  responses.calls.reset()
+
+  assert "Anna" in run_cli("users", "Anna")
+
+  assert requests_to("courses/1/search_users") == 0
+  assert requests_to("courses/2/search_users") == 0
+@
+
+How many listings such a search may fetch depends on whether it spans all the
+courses, and going over the limit has to be visible, or the user cannot tell
+that the name was never looked for (\cref{sec:refresh-on-miss}).
+Let's verify this through both lookups that have the limit.
+We leave the rest of the command real too, so that these tests also show how
+many warnings a whole run prints.
+Reading that takes one trick: [[main]] configures logging with [[basicConfig]],
+which does nothing when the root logger already has handlers, as it has under
+pytest.
+We take them away during the run, so that the level and the stream are those of
+a real process, and [[-q]] does what it does there.
+
+<<test functions>>=
+NARROW_LIMIT = "CANVASLMS_MISS_REFRESH_MAX_LISTINGS"
+ALL_COURSES_LIMIT = "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES"
+NOT_FETCHING = "not fetching"
+USER_MISS = (("users",), ("Nobody",), "search_users")
+ASSIGNMENT_MISS = (("assignments", "list"), ("-a", "Nothing"), "assignments")
+
+def add_courses(count):
+  """Add `count` courses to Canvas, each with a student and an assignment."""
+  responses.get(f"{CANVAS_API}/courses",
+                json=[{"id": course_id, "name": f"Course {course_id}",
+                       "course_code": f"C{course_id}"}
+                      for course_id in range(1, count + 1)])
+  for course_id in range(1, count + 1):
+    responses.get(f"{CANVAS_API}/courses/{course_id}/search_users", json=[ANNA])
+    responses.get(f"{CANVAS_API}/courses/{course_id}/assignments",
+                  json=[dict(LAB, id=100 + course_id, course_id=course_id)])
+
+def fetches_of(listing, count):
+  """Return how many of the `count` courses had their `listing` requested."""
+  return sum(requests_to(f"courses/{course_id}/{listing}")
+             for course_id in range(1, count + 1))
+
+def run_miss(run_cli, capsys, *arguments):
+  """Run a command that finds nothing with logging as in a process of its own.
+
+  Returns what the command printed, stdout and stderr.
+  """
+  capsys.readouterr()
+  root = logging.getLogger()
+  handlers, level = root.handlers[:], root.level
+  root.handlers[:] = []
+  try:
+    assert_no_match(run_cli, *arguments)
+  finally:
+    root.handlers[:] = handlers
+    root.setLevel(level)
+  return capsys.readouterr()
+
+@responses.activate
+@pytest.mark.parametrize("command,name,listing", [USER_MISS, ASSIGNMENT_MISS])
+@pytest.mark.parametrize("count,course,limit,variable", [
+  (5, (), 5, None),
+  (6, (), 5, ALL_COURSES_LIMIT),
+  (6, ("-c", ".*"), 5, ALL_COURSES_LIMIT),
+  (6, ("-c", "Course"), 25, None),
+  (25, ("-c", "Course"), 25, None),
+  (26, ("-c", "Course"), 25, NARROW_LIMIT),
+])
+def test_limit_depends_on_what_the_search_spans(
+    run_cli, capsys, any_listing_is_old_enough,
+    command, name, listing, count, course, limit, variable):
+  add_courses(count)
+  run_cli(*command)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, *command, *course, *name)
+
+  if variable:
+    assert fetches_of(listing, count) == 0
+    assert printed.err.count("[WARNING]") == 1
+    assert f"not fetching {count} listings" in printed.err
+    assert f"limit is {limit}" in printed.err
+    assert "--refresh-cache" in printed.err
+    assert f"raise {variable}." in printed.err
+    assert NOT_FETCHING not in printed.out
+  else:
+    assert fetches_of(listing, count) == count
+    assert "[WARNING]" not in printed.err
+
+@
+
+Commands like [[submissions]] and [[results]] look up assignments as well as
+users, yet a run prints at most one warning.
+Each lookup happens once per command, and a name that misses among the
+assignments ends the command with [[EmptyListError]] before it gets to the users.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("arguments,limit", [
+  (("submissions", "list", "-a", "Lab", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("submissions", "list", "-a", "Nothing", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("results", "-a", "Lab", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("results", "-a", "Nothing", "-u", "Nobody"), ALL_COURSES_LIMIT),
+  (("submissions", "list", "-c", "Course", "-a", "Lab", "-u", "Nobody"),
+   NARROW_LIMIT),
+])
+def test_a_command_with_two_lookups_warns_once(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch, arguments, limit):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS", 5)
+  add_courses(6)
+  run_cli("users")
+  run_cli("assignments", "list")
+
+  printed = run_miss(run_cli, capsys, *arguments)
+
+  assert printed.err.count("[WARNING]") == 1
+  assert f"raise {limit}." in printed.err
+
+@responses.activate
+def test_quiet_hides_the_warning(run_cli, capsys, any_listing_is_old_enough):
+  add_courses(6)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "-q", "users", "Nobody")
+
+  assert printed.err == ""
+  assert fetches_of("search_users", 6) == 0
+
+@responses.activate
+@pytest.mark.parametrize("setting,value,count,course,fetched,limit", [
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 7, 6, (), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 2, 3, (), False, 2),
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0, 3, ("-c", "Course"), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS", 30, 26, ("-c", "Course"), True, None),
+  ("MISS_REFRESH_MAX_LISTINGS", 2, 3, ("-c", "Course"), False, 2),
+  ("MISS_REFRESH_MAX_LISTINGS", 0, 3, (), True, None),
+])
+def test_each_limit_governs_its_kind_of_search(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch,
+    setting, value, count, course, fetched, limit):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, setting, value)
+  add_courses(count)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", *course, "Nobody")
+
+  assert fetches_of("search_users", count) == (count if fetched else 0)
+  assert (f"limit is {limit}" in printed.err) == (limit is not None)
+
+@responses.activate
+@pytest.mark.parametrize("setting,course", [
+  ("MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", ()),
+  ("MISS_REFRESH_MAX_LISTINGS", ("-c", "Course")),
+])
+def test_zero_turns_the_retry_off_without_a_warning(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch, setting, course):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, setting, 0)
+  add_courses(3)
+  run_cli("users")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", *course, "Nobody")
+
+  assert fetches_of("search_users", 3) == 0
+  assert "[WARNING]" not in printed.err
+
+@responses.activate
+def test_zero_also_stops_looking_for_a_new_course(
+    run_cli, capsys, any_listing_is_old_enough, monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS", 0)
+  add_courses(1)
+  run_cli("courses")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "courses", "Nothing")
+
+  assert requests_to("courses") == 0
+  assert "[WARNING]" not in printed.err
+@
+
+The limit counts what would be fetched, so the rosters must really differ in
+age.
+We write the ages into the cache file that the next run reads, as the
+[[any_listing_is_old_enough]] fixture would count them all.
+The same rule means that nothing is exceeded when everything was just fetched.
+
+<<test functions>>=
+def make_rosters_old(*course_ids):
+  """Make the cached rosters of the courses an hour old in the cache file."""
+  canvas = canvaslms.cli.cache.load_configured_canvas({})[0]
+  for course in canvas.get_courses():
+    if course.id in course_ids:
+      course.user_all_fetched = datetime.now() - timedelta(hours=1)
+  canvaslms.cli.cache.save_canvas_cache(canvas, "token", CANVAS_HOST)
+
+@responses.activate
+def test_a_few_old_rosters_among_many_are_fetched(run_cli, capsys):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(1, 2, 3)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", "Nobody")
+
+  assert fetches_of("search_users", 3) == 3
+  assert fetches_of("search_users", 30) == 3
+  assert "[WARNING]" not in printed.err
+
+@responses.activate
+def test_too_many_old_rosters_among_many_are_counted_and_not_fetched(
+    run_cli, capsys):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(1, 2, 3, 4, 5, 6)
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "users", "Nobody")
+
+  assert fetches_of("search_users", 30) == 0
+  assert "not fetching 6 listings" in printed.err
+
+@responses.activate
+@pytest.mark.parametrize("option", ["--refresh-cache", "--no-cache"])
+def test_no_warning_when_the_search_just_fetched_everything(
+    run_cli, capsys, option):
+  add_courses(30)
+  run_cli("users")
+  make_rosters_old(*range(1, 31))
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, option, "users", "Nobody")
+
+  assert fetches_of("search_users", 30) == 30
+  assert "[WARNING]" not in printed.err
+@
+
+Library callers name their courses themselves, so they get the larger limit
+without asking for it, and they are told as well when it stops a refresh.
+They have not configured logging, which is why this does not take [[run_miss]].
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("count,fetched", [(25, True), (26, False)])
+def test_library_caller_gets_the_larger_limit(
+    run_cli, monkeypatch, tmp_path, caplog, any_listing_is_old_enough,
+    count, fetched):
+  add_courses(count)
+  run_cli("users")
+  responses.calls.reset()
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+  canvaslms.clear_canvas_state()
+  try:
+    canvas = canvaslms.get_canvas(str(tmp_path / "config.json"))
+    courses = list(canvaslms.cli.courses.filter_courses(canvas, "Course"))
+    with caplog.at_level(logging.WARNING):
+      assert list(canvaslms.cli.users.filter_users(courses, "Nobody")) == []
+  finally:
+    canvaslms.clear_canvas_state()
+
+  assert fetches_of("search_users", count) == (count if fetched else 0)
+  assert (NOT_FETCHING in caplog.text) == (not fetched)
+  assert (f"raise {NARROW_LIMIT}." in caplog.text) == (not fetched)
+@
+
+The shipped [[ungraded.sh]] runs from cron with course patterns that may not
+match yet, and cron mails what it prints on stderr.
+Each of its calls names only a course, and the course listing is a single
+listing, which cannot be over a limit, and a limit of 0 does not warn; the
+assignment and user patterns stay at the default that names nothing.
+So its mail cannot fill up with warnings, whatever the size of the selection.
+Let's pin this with a selection above the limit and every listing old enough:
+all that would be needed for a warning is one more lookup that names something.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("course,group", [
+  ("Course", ".*"), ("Course", "Nothing"), ("Nothing", ".*")])
+def test_a_search_like_that_of_ungraded_sh_never_warns(
+    run_cli, capsys, any_listing_is_old_enough, course, group):
+  add_courses(30)
+  for course_id in range(1, 31):
+    responses.get(f"{CANVAS_API}/courses/{course_id}/assignment_groups",
+                  json=[])
+    responses.get(f"{CANVAS_API}/courses/{course_id}"
+                  f"/assignments/{100 + course_id}/submissions", json=[])
+  run_cli("users")
+  run_cli("assignments", "list")
+
+  printed = run_miss(run_cli, capsys, "submissions", "list",
+                     "-c", course, "-A", group, "-U")
+
+  assert "[WARNING]" not in printed.err
 @
 
 
@@ -763,6 +1521,7 @@ try:
   canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
       config,
       use_cache=not args.no_cache,
+      refresh=args.refresh_cache,
   )
 except canvaslms.cli.cache.CanvasCredentialsError as e:
   err(1, str(e))

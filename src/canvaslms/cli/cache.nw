@@ -43,6 +43,31 @@ We use the Canvas access token as the password for key derivation.
 This means that if the user changes their token, the old cache becomes
 inaccessible (which is correct behavior, as it's tied to a specific account).
 
+A cache is only useful if it is right, and five mechanisms keep this one fresh
+while keeping what it has.
+\begin{description}
+\item[Time to live] Each kind of listing expires after an interval suited to how
+often it changes (\cref{sec:cache-ttl-constants}).
+\item[Invalidation on write] A command that changes something in Canvas forgets
+the listings it made wrong, for instance [[invalidate_quiz_listing_cache]].
+\item[Refresh on a miss] A name that matches nothing makes the search look at
+Canvas once more (\cref{sec:refresh-on-miss}).
+\item[Refresh on request] [[--refresh-cache]] fetches again what the command reads
+(\cref{sec:refresh-on-request}).
+\item[Repair on read] A listing stored with a restriction, for instance by an
+older version, is fetched properly the next time it is read
+(\cref{sec:subset-listings}).
+\end{description}
+The third and fourth exist because the first two cannot know about a change made
+elsewhere, such as being added to a course.
+A request with a restriction skips all of this: it goes straight to Canvas and is
+not stored.
+All of them replace objects without losing what is cached below them
+(\cref{sec:cache-copy-to-new}).
+The time to live and the two refreshes add and update entries, and only a 404 on
+the individual refresh of a stale object removes one, so an entry that Canvas no
+longer lists stays in the cache.
+
 \section{Implementation}
 
 <<[[cache.py]]>>=
@@ -65,8 +90,13 @@ from urllib3.util.retry import Retry
 from canvaslms import dirs
 import canvaslms.hacks.attachment_cache as attachment_cache
 from canvaslms.hacks.canvasapi import (
+    request_refresh,
     SUBMISSION_TTL_MINUTES,
     DEFAULT_CACHE_TTL_DAYS,
+    COURSE_CACHE_TTL_DAYS,
+    MISS_REFRESH_MAX_LISTINGS,
+    MISS_REFRESH_MAX_LISTINGS_ALL_COURSES,
+    MISS_REFRESH_MIN_AGE_MINUTES,
     USER_CACHE_TTL_DAYS,
     GROUP_CACHE_TTL_DAYS
 )
@@ -88,11 +118,19 @@ the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
 <<test [[cache.py]]>>=
 """Tests for cache-backed Canvas loading."""
 
+from datetime import datetime, timedelta
+import canvasapi.course
+import logging
 import pathlib
 import pytest
+import requests
+import responses
+import socket
+import time
 
 import canvaslms.cli.cache as cache
 import canvaslms.cli.login
+import canvaslms.hacks.canvasapi
 
 <<test functions>>
 @
@@ -272,12 +310,18 @@ Those values are needed later when the caller wants to save the encrypted cache
 again.
 
 <<functions>>=
-def load_configured_canvas(config, use_cache=True):
+def load_configured_canvas(config, use_cache=True, refresh=False):
   """Return configured Canvas object and cache metadata.
+
+  With `refresh`, whatever is read through the object from now on is fetched
+  again, whatever its age, and the rest of the cache is kept.
 
   The return value is the triple ``(canvas, hostname, token)``.
   """
   import canvaslms.cli.login
+
+  if refresh:
+    request_refresh()
 
   hostname, token = canvaslms.cli.login.load_credentials(config)
 
@@ -294,6 +338,217 @@ def load_configured_canvas(config, use_cache=True):
       return canvas, hostname, token
 
   return create_canvas(hostname, token), hostname, token
+@
+
+The listing of courses expires by itself (\cref{sec:course-listing-outage}), and
+a course you were added to used to stay invisible until the cache was cleared by
+hand.
+Let's verify this through the real encrypted round trip, since what failed was
+the behaviour of a cache restored from disk.
+The HTTP layer is stubbed with [[responses]] because Canvas's answer must change
+between the run that wrote the cache and the one that reads it, which a recording
+cannot express.
+
+<<test functions>>=
+HOST = "https://canvas.example"
+COURSES_URL = f"{HOST}/api/v1/courses"
+
+@pytest.fixture
+def restored_canvas(tmp_cache_path, monkeypatch):
+  """Return a function that writes a cached course aged `age` and reloads it."""
+  monkeypatch.setattr(
+      canvaslms.cli.login, "load_credentials", lambda config: (HOST, "token"))
+
+  def restore(age):
+    canvas = cache.create_canvas(HOST, "token")
+    responses.get(COURSES_URL, json=[{"id": 1, "name": "Old course"}])
+    course = list(canvas.get_courses())[0]
+    course.assignment_cache["sentinel"] = "subtree"
+    canvas.course_all_fetched = datetime.now() - age
+    cache.save_canvas_cache(canvas, "token", HOST)
+
+    responses.reset()
+    responses.get(COURSES_URL, json=[{"id": 1, "name": "Old course"},
+                                     {"id": 2, "name": "New course"}])
+    return cache.load_configured_canvas({})[0]
+
+  return restore
+
+@responses.activate
+def test_expired_course_listing_is_fetched_again(restored_canvas):
+  canvas = restored_canvas(timedelta(days=cache.COURSE_CACHE_TTL_DAYS + 1))
+
+  courses = {course.id: course for course in canvas.get_courses()}
+
+  assert set(courses) == {1, 2}
+  assert courses[1].assignment_cache == {"sentinel": "subtree"}
+
+@responses.activate
+def test_recent_course_listing_is_not_fetched_again(restored_canvas):
+  canvas = restored_canvas(timedelta(hours=1))
+
+  courses = {course.id: course for course in canvas.get_courses()}
+
+  assert set(courses) == {1}
+  assert len(responses.calls) == 0
+@
+
+Most commands start by reading this listing, so its refresh must not take them
+down with it (\cref{sec:course-listing-outage}).
+We try the two ways Canvas can fail: not answering, and answering with an error.
+
+<<test functions>>=
+@pytest.fixture
+def expired_canvas_while_down(restored_canvas):
+  """Return a function giving a canvas with an expired listing, Canvas down."""
+  def restore(**failure):
+    canvas = restored_canvas(timedelta(days=cache.COURSE_CACHE_TTL_DAYS + 1))
+    responses.replace(responses.GET, COURSES_URL, **failure)
+    return canvas
+
+  return restore
+
+CANVAS_FAILURES = [
+    {"body": requests.exceptions.ConnectionError("Unreachable")},
+    {"json": {"errors": [{"message": "Rate Limit Exceeded"}]}, "status": 403}]
+
+@responses.activate
+@pytest.mark.parametrize("failure", CANVAS_FAILURES)
+def test_expired_course_listing_is_used_when_canvas_is_down(
+    expired_canvas_while_down, failure, caplog):
+  canvas = expired_canvas_while_down(**failure)
+
+  with caplog.at_level(logging.WARNING):
+    courses = list(canvas.get_courses())
+
+  assert [course.id for course in courses] == [1]
+  assert courses[0].assignment_cache == {"sentinel": "subtree"}
+  assert "Could not refresh" in caplog.text
+
+@responses.activate
+def test_failed_course_refresh_waits_before_trying_again(
+    expired_canvas_while_down, restored_canvas):
+  canvas = expired_canvas_while_down(**CANVAS_FAILURES[0])
+  list(canvas.get_courses())
+  list(canvas.get_courses())
+  assert len(responses.calls) == 1
+
+  canvas.course_all_fetched -= timedelta(
+      minutes=canvaslms.hacks.canvasapi.MISS_REFRESH_MIN_AGE_MINUTES + 1)
+  responses.replace(responses.GET, COURSES_URL,
+                    json=[{"id": 1, "name": "Old course"},
+                          {"id": 2, "name": "New course"}])
+
+  assert {course.id for course in canvas.get_courses()} == {1, 2}
+
+@responses.activate
+def test_asking_for_fresh_courses_reports_a_failure(
+    expired_canvas_while_down, monkeypatch):
+  canvas = expired_canvas_while_down(**CANVAS_FAILURES[0])
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", datetime.now())
+
+  with pytest.raises(requests.exceptions.ConnectionError):
+    list(canvas.get_courses())
+  assert len(responses.calls) == 1
+
+@responses.activate
+def test_asking_for_more_than_is_cached_reports_a_failure(
+    expired_canvas_while_down):
+  canvas = expired_canvas_while_down(**CANVAS_FAILURES[0])
+
+  with pytest.raises(requests.exceptions.ConnectionError):
+    list(canvas.get_courses(include=["term"]))
+  assert len(responses.calls) == 1
+@
+
+The tests above stub the HTTP layer, which leaves out the retry policy, and that
+is what decides how long the user waits.
+So here we use the real client against a port where nothing listens, recording
+the sleeps of the retries instead of sleeping them.
+What varies is who needs the request: a precaution gets one try, and a request the
+caller depends on still gets all of them.
+
+<<test functions>>=
+@pytest.fixture
+def unreachable_canvas(monkeypatch):
+  """Return a canvas with a cached course, and the list of retry sleeps."""
+  with socket.socket() as unused:
+    unused.bind(("127.0.0.1", 0))
+    port = unused.getsockname()[1]
+
+  sleeps = []
+  monkeypatch.setattr(time, "sleep", sleeps.append)
+  canvas = cache.create_canvas(f"http://127.0.0.1:{port}", "token")
+  course = canvasapi.course.Course(canvas._Canvas__requester,
+                                   {"id": 1, "name": "Old course"})
+  canvas.course_cache[1] = (course, {})
+  canvas.course_all_fetched = datetime.now() - timedelta(hours=1)
+  return canvas, sleeps
+
+def retries_in_place(canvas):
+  session = canvas._Canvas__requester._session
+  return session.get_adapter("http://canvas.example").max_retries.total == 10
+
+def test_expired_course_listing_does_not_wait_for_retries(unreachable_canvas):
+  canvas, sleeps = unreachable_canvas
+  canvas.course_all_fetched -= timedelta(days=cache.COURSE_CACHE_TTL_DAYS + 1)
+
+  assert [course.id for course in canvas.get_courses()] == [1]
+
+  assert sleeps == []
+  assert retries_in_place(canvas)
+
+def test_refresh_after_a_miss_does_not_wait_for_retries(unreachable_canvas):
+  canvas, sleeps = unreachable_canvas
+
+  assert list(canvaslms.hacks.canvasapi.retry_after_miss(
+      lambda: [course for course in canvas.get_courses() if course.id == 2],
+      [(canvas, "course")])) == []
+
+  assert sleeps == []
+  assert retries_in_place(canvas)
+
+def test_refresh_of_a_roster_does_not_wait_for_retries(unreachable_canvas):
+  canvas, sleeps = unreachable_canvas
+  course = canvas.course_cache[1][0]
+  course.user_all_fetched = datetime.now() - timedelta(hours=1)
+
+  assert list(canvaslms.hacks.canvasapi.retry_after_miss(
+      lambda: [user for user in course.get_users() if user.id == 7],
+      [(course, "user")])) == []
+
+  assert sleeps == []
+  assert retries_in_place(canvas)
+
+def test_a_real_search_does_not_wait_for_retries(unreachable_canvas):
+  """filter_courses is a generator, so it reads the listing only when consumed."""
+  canvas, sleeps = unreachable_canvas
+
+  assert list(canvaslms.cli.courses.filter_courses(canvas, "no such course")) == []
+
+  assert sleeps == []
+  assert retries_in_place(canvas)
+
+def test_one_try_holds_for_https_as_well(unreachable_canvas):
+  """The closed port is plain HTTP, while Canvas is reached over HTTPS."""
+  canvas, _ = unreachable_canvas
+  session = canvas._Canvas__requester._session
+
+  with canvaslms.hacks.canvasapi.without_retries([canvas]):
+    for scheme in ("https://canvas.example", "http://canvas.example"):
+      assert session.get_adapter(scheme).max_retries.total == 0
+
+  assert retries_in_place(canvas)
+
+def test_a_request_the_caller_depends_on_is_retried(unreachable_canvas,
+                                                    monkeypatch):
+  canvas, sleeps = unreachable_canvas
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", datetime.now())
+
+  with pytest.raises(requests.exceptions.ConnectionError):
+    list(canvas.get_courses())
+
+  assert sleeps
 @
 
 The attachment cache (see [[hacks/attachment_cache.nw]]) encrypts cached
@@ -841,19 +1096,39 @@ submissions) encrypted on disk. Objects are refreshed based on their type:
 
 - Submissions (non-passing): {SUBMISSION_TTL_MINUTES} minutes
 
+- The list of courses: {COURSE_CACHE_TTL_DAYS} days
+
 - Users: {USER_CACHE_TTL_DAYS} days
 
 - Groups: {GROUP_CACHE_TTL_DAYS} days
 
 - Other objects: {DEFAULT_CACHE_TTL_DAYS} days
 
-Submissions with passing grades (A, P, complete) are never refreshed.
+Submissions with passing grades (A, P, complete) don't expire. They are updated
+when all submissions of the assignment are fetched, or by canvaslms --refresh-cache.
 
-These windows can be tuned via environment variables (minutes for submissions,
-days for the rest): CANVASLMS_SUBMISSION_TTL_MINUTES,
-CANVASLMS_USER_CACHE_TTL_DAYS, CANVASLMS_GROUP_CACHE_TTL_DAYS,
-CANVASLMS_QUIZ_CACHE_TTL_DAYS, and CANVASLMS_DEFAULT_CACHE_TTL_DAYS. Raise them
+A course, user or assignment name that matches nothing also fetches that listing
+again, unless it is younger than {MISS_REFRESH_MIN_AGE_MINUTES} minutes. If more
+than {MISS_REFRESH_MAX_LISTINGS} listings are older than that, or more than
+{MISS_REFRESH_MAX_LISTINGS_ALL_COURSES} in a search over all courses (no -c, or
+-c '.*'), none is fetched and a warning says so. User lookups with groups
+(-G, -C) don't do this. To fetch what a command reads right away, use canvaslms
+--refresh-cache; the rest of the cache is kept.
+
+The same interval decides how soon a listing is fetched again when a read asks
+for something that only someone Canvas no longer lists lacks. Raising it delays
+finding someone who has returned, and 0 means every such read fetches.
+
+These windows can be tuned via environment variables (minutes for submissions and
+name misses, days for the rest): CANVASLMS_SUBMISSION_TTL_MINUTES,
+CANVASLMS_COURSE_CACHE_TTL_DAYS, CANVASLMS_USER_CACHE_TTL_DAYS, CANVASLMS_GROUP_CACHE_TTL_DAYS,
+CANVASLMS_QUIZ_CACHE_TTL_DAYS, CANVASLMS_DEFAULT_CACHE_TTL_DAYS and
+CANVASLMS_MISS_REFRESH_MINUTES. Raise them
 to reuse the cache across more runs, or lower them to see fresher data sooner.
+
+CANVASLMS_MISS_REFRESH_MAX_LISTINGS and
+CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES set the two limits on listings;
+0 turns the fetching off, without a warning, for that kind of search.
 
 The attachment cache stores downloaded submission files using content-addressed
 storage. Files not accessed in 90 days can be cleaned with clear-attachments.

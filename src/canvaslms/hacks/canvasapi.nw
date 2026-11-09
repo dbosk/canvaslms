@@ -17,12 +17,15 @@ import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
 from canvasapi.user import User
+import collections
+import contextlib
 from datetime import datetime, timedelta
 import functools
 import importlib
 import inspect
 import logging
 import os
+import requests
 import time
 import sys
 
@@ -98,9 +101,16 @@ IMPORTANT: These tests import canvaslms.hacks.canvasapi, which applies
 monkey-patches to canvasapi classes. The patches are applied at import
 time and affect all future instances.
 """
+import json
 import logging
+import os
+import subprocess
+import sys
+import urllib.parse
 
+import canvasapi
 import pytest
+import responses
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 
@@ -119,6 +129,7 @@ from canvasapi.user import User
 
 # The errors Canvas raises, for the tests that exercise failing requests.
 import canvasapi.exceptions
+import requests
 
 # This import applies the monkey-patches
 import canvaslms.hacks.canvasapi
@@ -673,15 +684,32 @@ This means that we need two functions to support the caching:
 \item [[must_update(prev_kwargs, kwargs)]] takes the old keyword 
 arguments ([[prev_kwargs]]) to check if they're a superset of the new keyword 
 arguments ([[kwargs]]).
-If not, the cache doesn't have all necessary information and we must fetch it.
+If not, the cache doesn't have all necessary information and we must fetch it,
+with the largest set of what has been asked for so far.
 \item [[merge_kwargs]] will take a list of keyword arguments dictionaries and 
 merge them.
 Most of the time these contain only the key [[include]] whose value is a list 
 of things to include.
 So essentially, we want to take the union of all these sets.
 \end{description}
+Superset means that every item asked for is among those the cache has.
+It's not enough that the new list has more items than the old one.
+A roster cached with [[["enrollments", "avatar_url"]]] has no email addresses,
+although [[["email", "enrollments"]]] is not a superset of it either, and each
+list has something the other lacks.
+Since the fetch asks for the union, the next request for either list finds
+everything in the cache, so two callers wanting different things don't take
+turns fetching.
+
+Canvas accepts a single value as well as a list, so we count a string as a list
+of one item.
+
 We can thus start with the following defaults:
 <<kwargs functions caches>>=
+def as_list(value):
+  """Returns `value` if it's a list, otherwise a list holding it."""
+  return value if isinstance(value, list) else [value]
+
 def must_update(prev_kwargs, new_kwargs,
                 ignore_keys=[
                   <<keys to ignore>>
@@ -698,8 +726,8 @@ def must_update(prev_kwargs, new_kwargs,
 
     if key not in prev_kwargs:
       return True
-    elif isinstance(value, list):
-      if set(value) > set(prev_kwargs[key]):
+    elif isinstance(value, list) or isinstance(prev_kwargs[key], list):
+      if not set(as_list(value)) <= set(as_list(prev_kwargs[key])):
         return True
     elif value != prev_kwargs[key]:
       return True
@@ -711,8 +739,9 @@ def merge_kwargs(kwargs_list,
                    <<keys to ignore>>
                  ]):
   """
-  Merges a list of keyword arguments dictionaries. Lists are unioned.
-  All non-list keys (usually strings) must be the same in all dictionaries.
+  Merges a list of keyword arguments dictionaries. Lists are unioned, and so are
+  values of `include` given as strings. All other non-list keys (usually strings)
+  must be the same in all dictionaries.
 
   <<doc for keys to ignore>>
   """
@@ -722,7 +751,8 @@ def merge_kwargs(kwargs_list,
     for key, value in kwargs.items():
       if key not in new_kwargs:
         new_kwargs[key] = value
-      elif isinstance(value, list) or isinstance(new_kwargs[key], list):
+      elif (isinstance(value, list) or isinstance(new_kwargs[key], list)
+            or key == "include"):
         # Convert both to lists if either is a list, then union
         prev_val = new_kwargs[key] if isinstance(new_kwargs[key], list) \
                    else [new_kwargs[key]]
@@ -739,8 +769,8 @@ def merge_kwargs(kwargs_list,
 @
 
 We can now define the keys to ignore.
-There are some keys that can be ignored for our purposes, like sorting order, 
-as they don't affect the caching.
+There are some keys that can be ignored for our purposes, like sorting order and
+page size, as they don't affect what the listing contains.
 In those cases, we simply use the last value, as seen in the loop above.
 <<doc for keys to ignore>>=
 By default, we ignore the keys
@@ -751,7 +781,8 @@ as they don't affect the caching.
 <<keys to ignore>>=
 "sort",
 "order",
-"order_by"
+"order_by",
+"per_page"
 @
 
 To check if a key can be ignored, we simply check if it's in the [[ignore_keys]]
@@ -803,6 +834,31 @@ class TestMustUpdate:
         new = {"include": ["user", "enrollments"]}
 
         assert must_update(prev, new)
+
+    def test_update_when_lists_only_overlap(self):
+        """An item the cache lacks counts, whatever else the cache has"""
+        prev = {"include": ["enrollments", "avatar_url"]}
+        new = {"include": ["email", "enrollments"]}
+
+        assert must_update(prev, new)
+
+    def test_update_when_lists_share_nothing(self):
+        prev = {"include": ["enrollments"]}
+        new = {"include": ["email"]}
+
+        assert must_update(prev, new)
+
+    def test_no_update_for_the_same_items_in_another_order(self):
+        prev = {"include": ["email", "enrollments"]}
+        new = {"include": ["enrollments", "email"]}
+
+        assert not must_update(prev, new)
+
+    def test_a_cached_string_counts_as_one_item(self):
+        prev = {"include": "email"}
+
+        assert not must_update(prev, {"include": ["email"]})
+        assert must_update(prev, {"include": ["avatar_url"]})
 
     def test_update_when_non_list_value_differs(self):
         """Different non-list value should trigger update"""
@@ -896,6 +952,25 @@ class TestMergeKwargs:
 
         with pytest.raises(ValueError, match="Cannot merge enrollment_type"):
             merge_kwargs([kwargs1, kwargs2])
+
+    def test_an_include_given_as_a_string_is_found_in_a_merged_list(self):
+        """Merging makes a list of strings, which must then satisfy them"""
+        merged = merge_kwargs([{"include": "user"}, {"include": "email"}])
+
+        assert not must_update(merged, {"include": "user"})
+        assert must_update(merged, {"include": "other"})
+
+    def test_merges_includes_given_as_strings(self):
+        """A single include may be given as a string"""
+        result = merge_kwargs([{"include": "user"}, {"include": "email"}])
+
+        assert set(result["include"]) == {"user", "email"}
+
+    def test_allows_conflicting_page_sizes(self):
+        """How the listing is paged says nothing about what is in it"""
+        result = merge_kwargs([{"per_page": 50}, {"per_page": 100}])
+
+        assert result["per_page"] == 100
 
     def test_allows_conflicting_ignored_keys(self):
         """Conflicting values for ignored keys should use last value"""
@@ -1455,6 +1530,8 @@ For example:
 }
 \end{minted}
 <<return cached result or fetch from [[get_attr]]>>=
+<<pass a restricted request for one object through to Canvas>>
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 
 <<let [[id]] be the ID of the object to fetch>>
@@ -1466,6 +1543,8 @@ except KeyError:
   obj = None
   prev_kwargs = {}
   cache_status = " (not found)"
+old_obj = obj
+refreshing_on_request = False
 
 if obj and must_update(prev_kwargs, kwargs):
   obj = None
@@ -1474,13 +1553,25 @@ elif obj and outdated(obj):
   reason = get_staleness_reason(obj)
   obj = None
   cache_status = f" (stale: {reason})" if reason else " (stale)"
+elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
+  obj = None
+  refreshing_on_request = True
+  cache_status = " (refresh requested)"
 
 if not obj:
   fetch_start = time.perf_counter()
-  obj = get_attr(self, *args, **kwargs)
+  union_kwargs = merge_kwargs([without_restrictions(prev_kwargs), kwargs])
+  try:
+    obj = get_attr(self, *args, **union_kwargs)
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    if not refreshing_on_request:
+      raise
+    <<keep [[old_obj]], which Canvas no longer has>>
   fetch_elapsed = time.perf_counter() - fetch_start
+  if old_obj:
+    <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
-  attr_cache[getattr(obj, cache_key)] = (obj, kwargs)
+  attr_cache[getattr(obj, cache_key)] = (obj, union_kwargs)
   logger.info(f"Cache miss{cache_status}: {attr_name} {cache_key}={id} fetched in "
               f"{fetch_elapsed:.2f}s")
 else:
@@ -1832,16 +1923,28 @@ yield all objects once from the bulk fetch, then yield them all again while
 checking for staleness, causing N individual API calls for outdated items
 immediately after a bulk fetch.
 <<return cached result or fetch from [[get_attrs]]>>=
+<<pass a request for a subset through to Canvas>>
+
 attr_cache = getattr(self, f"{attr_name}_cache")
 attr_all_fetched = getattr(self, f"{attr_name}_all_fetched")
 
+<<treat a listing cached with a restriction as not fetched>>
+
+if attr_all_fetched and predates_refresh(attr_all_fetched):
+  logger.info(f"Cache invalidation: {display_plural} - refresh requested")
+  attr_all_fetched = None
+
 if attr_all_fetched:
-  for _, prev_kwargs in attr_cache.values():
-    if must_update(prev_kwargs, kwargs):
+  for cached_obj, prev_kwargs in attr_cache.values():
+    if (must_update(prev_kwargs, kwargs)
+        and (not getattr(cached_obj, "_unlisted", False)
+             or old_enough_to_ask_again(attr_all_fetched))):
       logger.info(f"Cache invalidation: {display_plural} - new kwargs required "
                   f"(existing: {prev_kwargs}, requested: {kwargs})")
       attr_all_fetched = None
       break
+
+<<try to refresh an expired course listing>>
 
 if not attr_all_fetched:
   <<log reason for bulk refresh>>
@@ -1911,7 +2014,8 @@ bulk_start = time.perf_counter()
 
 original_includes = set(kwargs.get('include', []))
 union_kwargs = merge_kwargs(
-  [kwargs for _, kwargs in attr_cache.values()] + [kwargs])
+  [without_restrictions(kwargs) for _, kwargs in attr_cache.values()]
+  + [kwargs])
 merged_includes = set(union_kwargs.get('include', []))
 
 if merged_includes != original_includes:
@@ -1933,6 +2037,8 @@ for obj in fetched_objs:
     <<update [[obj]] with cache from [[old_obj]]>>
   obj._fetched_at = datetime.now()
   attr_cache[obj_key] = (obj, union_kwargs)
+<<clear restrictions from entries Canvas did not return>>
+<<mark entries Canvas did not return>>
 process_elapsed = time.perf_counter() - process_start
 
 setattr(self, f"{attr_name}_all_fetched", datetime.now())
@@ -1995,6 +2101,7 @@ for obj, obj_kwargs in list(attr_cache.values()):
     reason = get_staleness_reason(obj)
     reason_str = f" (reason: {reason})" if reason else ""
     refresh_start = time.perf_counter()
+    old_obj = obj
     try:
       obj = get_attr(self, obj_key, **obj_kwargs)
     except canvasapi.exceptions.ResourceDoesNotExist:
@@ -2002,6 +2109,7 @@ for obj, obj_kwargs in list(attr_cache.values()):
                   f"no longer exists")
       attr_cache.pop(obj_key, None)
       continue
+    <<update [[obj]] with cache from [[old_obj]]>>
     refresh_elapsed = time.perf_counter() - refresh_start
     logger.info(f"Individual refresh: {attr_name} {cache_key}={obj_key} in "
                 f"{refresh_elapsed:.2f}s{reason_str}")
@@ -2498,8 +2606,86 @@ variable throughout the entire [[new_get_attrs]] function, causing an
 lines~494--495).
 <<update [[obj]] with cache from [[old_obj]]>>=
 for cache_attr_name in dir(old_obj):
-  if cache_attr_name.endswith("_cache") or cache_attr_name.endswith("_all_fetched"):
+  if cache_attr_name.endswith(("_cache", "_all_fetched", "__unlisted")):
     setattr(obj, cache_attr_name, getattr(old_obj, cache_attr_name))
+@
+
+The same reasoning holds for every other way an object gets replaced, not only
+the bulk fetch: the singular method and the individual refresh of a listing also
+build a new object from Canvas's answer.
+Those two used to store the new object as it came, which silently threw away
+everything cached below it.
+A single [[canvas.get_course(id, include=["syllabus_body"])]] from the
+[[syllabus]] commands thus forgot that course's assignments, users and
+submissions, though nothing about them had changed.
+All three paths therefore share this chunk.
+
+A re-fetch must not lose the details of the object itself either.
+The cache entry remembers which keyword arguments produced it, and
+[[must_update]] trusts that record: after a plain [[get_item(1)]] has refreshed
+an object fetched with [[include=["a"]]], a later request for [[a]] must not
+find it missing.
+The singular method therefore fetches with the union of the old and new keyword
+arguments, as the bulk fetch already does.
+
+Let's verify both, for each way of replacing an object.
+The stand-in class is enough here: what we test is what the decorator does with
+the objects it receives, and a recording could not express Canvas's answer
+changing between the calls.
+
+<<test functions>>=
+class TestRefetchKeepsCachedDetails:
+    """Test that replacing an object loses nothing cached about it"""
+
+    def make_instance(self, fetches=None):
+        """Return a decorated instance with item 1 listed and given children"""
+        class TestClass:
+            def get_items(self, **kwargs):
+                return [canvas_object(Submission, id=1, grade="F")]
+            def get_item(self, item_id, **kwargs):
+                if fetches is not None:
+                    fetches.append(kwargs)
+                return canvas_object(Submission, id=item_id, grade="F")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        obj, _ = instance.item_cache[1]
+        obj.child_cache = {"sentinel": "subtree"}
+        obj.child_all_fetched = datetime(2026, 1, 1)
+        return instance
+
+    def age(self, obj):
+        """Make obj stale by the submission TTL"""
+        obj._fetched_at = datetime.now() - timedelta(
+            minutes=SUBMISSION_TTL_MINUTES + 1)
+
+    def assert_children_kept(self, obj):
+        assert obj.child_cache == {"sentinel": "subtree"}
+        assert obj.child_all_fetched == datetime(2026, 1, 1)
+
+    def test_singular_refetch_for_new_kwargs_keeps_children(self):
+        instance = self.make_instance()
+        self.assert_children_kept(instance.get_item(1, include=["more"]))
+
+    def test_singular_refetch_of_stale_object_keeps_children(self):
+        instance = self.make_instance()
+        self.age(instance.item_cache[1][0])
+        self.assert_children_kept(instance.get_item(1))
+
+    def test_individual_refresh_in_listing_keeps_children(self):
+        instance = self.make_instance()
+        self.age(instance.item_cache[1][0])
+        self.assert_children_kept(list(instance.get_items())[0])
+
+    def test_stale_refetch_keeps_earlier_includes(self):
+        fetches = []
+        instance = self.make_instance(fetches)
+        instance.get_item(1, include=["a"])
+        self.age(instance.item_cache[1][0])
+        instance.get_item(1)
+        assert fetches[-1] == {"include": ["a"]}
+        assert instance.item_cache[1][1] == {"include": ["a"]}
 @
 
 Now let's verify cache synchronization preserves hierarchical caches.
@@ -3132,17 +3318,9 @@ GROUP_CACHE_TTL_DAYS = env_number(
   "CANVASLMS_GROUP_CACHE_TTL_DAYS", 5, int)
 QUIZ_CACHE_TTL_DAYS = env_number(
   "CANVASLMS_QUIZ_CACHE_TTL_DAYS", 3, int)
+COURSE_CACHE_TTL_DAYS = env_number(
+  "CANVASLMS_COURSE_CACHE_TTL_DAYS", 1, int)
 @
-
-Some query arguments are additive, such as [[include]], and fit naturally in a
-generic cache that merges earlier requests into later ones. Restrictive
-arguments such as [[bucket="ungraded"]] behave differently: they describe a
-subset, not a richer version of the same collection.
-
-The generic cache in this module intentionally does not try to model those
-restrictive semantics. Callers that need an ungraded subset must therefore
-fetch the full collection and filter locally, which is what
-[[canvaslms.cli.submissions]] and [[canvaslms.cli.assignments]] now do.
 
 Another thing that we can do is to periodically reset the [[_all_fetched]] 
 flag.
@@ -3231,6 +3409,114 @@ elif attr_name in ["quiz_all_fetched", "new_quiz_all_fetched"]:
     logger.info(f"Cache invalidation: {attr_name} periodic refresh "
                 f"(age: {age.days} days, threshold: {QUIZ_CACHE_TTL_DAYS} days)")
     setattr(obj, attr_name, None)
+@
+
+The list of courses rarely changes, but when it does the cost of not noticing
+is unusually high.
+A pattern like [[-c prgi]] that still matches last year's course raises no
+error when this year's is missing from the cache: the command silently works on
+the wrong course.
+The refresh, on the other hand, is cheap, since it re-reads only the listing and
+every course keeps its cached contents (\cref{sec:cache-copy-to-new}).
+That imbalance is why [[COURSE_CACHE_TTL_DAYS]] is the shortest of the listing
+intervals, one day by default.
+
+This one cannot work like the others, for two reasons.
+The others hang off [[outdated]], which the listing methods call for each object
+\emph{in} their cache, so that it can expire that object's child listings.
+The [[Canvas]] object is the root of the hierarchy and therefore in no cache, so
+nothing would ever ask whether its listing had expired.
+
+\label{sec:course-listing-outage}
+The other reason is that nearly every command starts by reading this listing.
+Resetting the timestamp, as the others do, makes the next read fetch or fail, so
+one day after the last fetch every command would crash if Canvas could not be
+reached, although the cache holds what most of them need.
+The refresh is a precaution, not something the command asked for, so its failure
+must not cost the command its answer.
+The method itself therefore checks the age, as it reads the listing, and falls
+back on what it has.
+That only holds when the cached listing would otherwise have been good enough, so
+this comes after the checks for what cannot be served from the cache: a
+restriction left by an older version, a requested refresh or new keyword
+arguments.
+Those still fail loudly, since the cached listing is not what the caller asked for.
+That includes a fetch caused only by an entry Canvas no longer lists
+(\cref{sec:subset-listings}), as it did before we started marking them.
+
+Falling back is not enough if it comes late.
+The retry policy of [[configure_canvas_retry_policy]] is made for requests a
+command depends on: it tries a failed connection ten more times, and its waits add
+up to about 17 minutes.
+A command that could have answered from the cache would spend them waiting for
+something it does not need.
+So a precaution gets one try, through [[without_retries]].
+The price is that a passing failure, which the retries would have overcome, skips
+this refresh; the next try comes soon enough.
+
+A host that does not answer at all still takes until the connection times out,
+and a command can read the listing more than once.
+So a failure also puts off the next try by [[MISS_REFRESH_MIN_AGE_MINUTES]], the
+interval we already use for how soon looking again is worth it.
+Changing the timestamp does this without new state in the shared cache file, and
+older copies of this library do not expire this listing at all, so its value
+means nothing to them.
+<<try to refresh an expired course listing>>=
+if (attr_name == "course" and attr_all_fetched
+    and datetime.now() - attr_all_fetched
+        > timedelta(days=COURSE_CACHE_TTL_DAYS)):
+  logger.info(f"Cache invalidation: course_all_fetched periodic refresh "
+              f"(fetched: {attr_all_fetched}, "
+              f"threshold: {COURSE_CACHE_TTL_DAYS} days)")
+  try:
+    with without_retries([self]):
+      <<fetch all and populate [[attr_cache]]>>
+  except (canvasapi.exceptions.CanvasException,
+          requests.exceptions.RequestException) as error:
+    logger.warning(f"Could not refresh {display_plural}, "
+                   f"using the cached ones: {error}")
+    attr_all_fetched = (datetime.now()
+                        - timedelta(days=COURSE_CACHE_TTL_DAYS)
+                        + timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+    setattr(self, f"{attr_name}_all_fetched", attr_all_fetched)
+  else:
+    <<yield all objects in [[attr_cache]]>>
+    return
+@
+
+The retry policy lives in the adapters of the session, which all objects from one
+client share, so we swap the adapters for as long as the precaution lasts and put
+them back afterwards.
+The session is reached differently from the [[Canvas]] object and from the others,
+and a stand-in in the tests may have none.
+The block must not yield to the caller: whatever the caller did in the meantime
+would lose its retries too.
+<<functions>>=
+@contextlib.contextmanager
+def without_retries(owners):
+  """Make the requests in this block give up at the first failure.
+
+  `owners` are the Canvas objects whose requests are concerned.
+  """
+  sessions = {}
+  for owner in owners:
+    requester = (getattr(owner, "_requester", None)
+                 or getattr(owner, "_Canvas__requester", None))
+    session = getattr(requester, "_session", None)
+    if session is not None:
+      sessions[id(session)] = session
+
+  kept_adapters = [(session, session.adapters)
+                   for session in sessions.values()]
+  try:
+    for session, _ in kept_adapters:
+      session.adapters = collections.OrderedDict()
+      session.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
+      session.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
+    yield
+  finally:
+    for session, adapters in kept_adapters:
+      session.adapters = adapters
 @
 
 The [[outdated]] function is used by the caching decorator to check if cached
@@ -3342,6 +3628,1248 @@ class TestOutdated:
         assert outdated(submission)
 @
 
+
+\subsection{Requests for a subset of a listing}
+\label{sec:subset-listings}
+
+Some query arguments are additive, such as [[include]]: they ask for more about
+the same objects, and fit naturally in a cache that merges earlier requests into
+later ones.
+Others are restrictive, such as [[enrollment_type=["student"]]]: they describe a
+subset of the collection, not a richer version of it.
+
+Treating the second kind like the first is not merely imprecise, it corrupts the
+listing for everyone else.
+Here is how it happened.
+The FeedbackFruits tooling asked a course for
+[[get_users(enrollment_type=["student"], include=["email", "enrollments"])]].
+The cache took the answer for the course's complete roster and stored the
+restriction on each entry.
+From then on [[users]] and [[nytid]] asked for
+[[get_users(include=["enrollments"])]], found that satisfied, and saw no TAs.
+A refresh did not help, because it merges the keyword arguments of the entries
+into its request, so it asked Canvas for students only, again.
+Only [[--no-cache]], with no entries to merge, could find a TA.
+
+The cache cannot serve a subset from a listing, or a listing from a subset,
+without knowing what each argument means.
+So it does not try.
+A request with an argument we do not know to be additive or harmless, as the keys
+for sorting and paging are, goes straight to Canvas
+and leaves the cache alone, so the caller gets the right answer and nobody else
+is affected.
+Callers wanting speed can still fetch the full collection and filter locally,
+which is what [[canvaslms.cli.users]], [[canvaslms.cli.submissions]] and
+[[canvaslms.cli.assignments]] do.
+
+This protects every user of the library, not only the [[canvaslms]] command,
+since the check is in the decorated method itself.
+The contrast with our other refreshes is deliberate: [[--refresh-cache]] and the
+retry on a miss are things a caller must ask for or pass a pattern to, while a
+correct listing must not depend on how it is reached.
+<<constants>>=
+COMPLETE_LISTING_KEYS = (
+  "include",
+  <<keys to ignore>>
+)
+<<kwargs functions caches>>=
+def restricts_listing(kwargs):
+  """Return True if `kwargs` may ask for only a subset of a listing."""
+  return any(key not in COMPLETE_LISTING_KEYS for key in kwargs)
+
+def without_restrictions(kwargs):
+  """Return `kwargs` with only what applies to a complete listing."""
+  return {key: value for key, value in kwargs.items()
+          if key in COMPLETE_LISTING_KEYS}
+<<pass a request for a subset through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: {display_plural} restricted by {kwargs}")
+  yield from get_attrs(self, *args, **kwargs)
+  return
+@
+
+The same goes for a single object.
+[[get_assignment(5, all_dates=True)]] asks for something a listing does not have,
+so the answer cannot stand in for the entry.
+And an entry stored with such an argument would make the whole listing count as
+incomplete, as we see next: the listing would be fetched again each time such a
+call had been made.
+<<pass a restricted request for one object through to Canvas>>=
+if restricts_listing(kwargs):
+  logger.info(f"Not cached: {attr_name} restricted by {kwargs}")
+  return get_attr(self, *args, **kwargs)
+@
+
+Caches that already hold such a listing must recover too, and by themselves, as
+a program using the library has no [[--refresh-cache]] to pass.
+A listing with a restriction on any entry is not complete, so we treat it as not
+fetched, and the next reader fetches it properly.
+
+This could look like the kind of migration we otherwise solve by bumping
+[[CACHE_SCHEMA_VERSION]], but it is not one.
+The cache file is shared between programs that each have their own copy of this
+library, [[nytid]] for instance, so a copy older than this code can write such a
+listing at any time.
+A version bump would not stop that, and it would make programs with different
+versions discard each other's cache on every run.
+<<treat a listing cached with a restriction as not fetched>>=
+if attr_all_fetched and any(restricts_listing(prev_kwargs)
+                            for _, prev_kwargs in attr_cache.values()):
+  logger.info(f"Cache invalidation: {display_plural} - cached for a subset")
+  attr_all_fetched = None
+@
+
+The fetch that follows only replaces the entries Canvas returns.
+A student who has left the course would keep the restriction, and the listing
+would then count as incomplete on every read, at the cost of a new fetch each
+time.
+So we clear the restriction from what is left as well.
+<<clear restrictions from entries Canvas did not return>>=
+for obj_key, (obj, obj_kwargs) in list(attr_cache.items()):
+  if restricts_listing(obj_kwargs):
+    attr_cache[obj_key] = (obj, without_restrictions(obj_kwargs))
+@
+
+Let's verify this at the level of the decorator, whoever the caller is.
+A stand-in lets us see the keyword arguments each request carries.
+
+<<test functions>>=
+class TestRequestsForASubset:
+    """Test that a restriction never reaches the cached listing"""
+
+    def make_instance(self):
+        """Return an instance whose listing honours a restriction."""
+        class TestClass:
+            def __init__(self):
+                self.requests = []
+            def get_item(self, item_id, **kwargs):
+                self.requests.append(kwargs)
+                return canvas_object(id=item_id)
+            def get_items(self, **kwargs):
+                self.requests.append(kwargs)
+                ids = [1] if "enrollment_type" in kwargs else [1, 2]
+                return [canvas_object(id=each) for each in ids]
+
+        CacheGetMethods("item")(TestClass)
+        return TestClass()
+
+    def with_restriction_stored(self, *ids):
+        """Return an instance as an older version would have left it."""
+        instance = self.make_instance()
+        for item_id in ids:
+            instance.item_cache[item_id] = (
+                canvas_object(id=item_id),
+                {"enrollment_type": ["student"], "include": ["a"]})
+        instance.item_all_fetched = datetime.now()
+        return instance
+
+    @pytest.mark.parametrize("kwargs,restricts", [
+        ({}, False),
+        ({"include": ["a"]}, False),
+        ({"sort": "name", "order": "asc", "order_by": "x"}, False),
+        ({"per_page": 100}, False),
+        ({"enrollment_type": ["student"]}, True),
+        ({"include": ["a"], "search_term": "x"}, True)])
+    def test_what_restricts_a_listing(self, kwargs, restricts):
+        assert restricts_listing(kwargs) is restricts
+
+    def test_a_subset_is_passed_through_and_not_cached(self):
+        instance = self.make_instance()
+
+        subset = list(instance.get_items(enrollment_type=["student"]))
+
+        assert [obj.id for obj in subset] == [1]
+        assert instance.item_cache == {}
+        assert instance.item_all_fetched is None
+
+    def test_a_page_size_is_cached_like_any_listing(self):
+        instance = self.make_instance()
+
+        list(instance.get_items(per_page=50))
+        list(instance.get_items(per_page=100))
+
+        assert len(instance.requests) == 1
+
+    def test_a_restricted_singular_request_is_not_cached(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+
+        for _ in range(2):
+            instance.get_item(1, all_dates=True)
+        list(instance.get_items())
+
+        assert instance.requests == [{}, {"all_dates": True}, {"all_dates": True}]
+        assert instance.item_cache[1][1] == {}
+
+    def test_a_restricted_singular_request_on_an_empty_cache(self):
+        instance = self.make_instance()
+
+        assert instance.get_item(1, all_dates=True).id == 1
+        assert instance.item_cache == {}
+
+    def test_a_subset_leaves_a_cached_listing_alone(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+        requests = len(instance.requests)
+
+        list(instance.get_items(enrollment_type=["student"]))
+
+        assert len(instance.requests) == requests + 1
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+        assert len(instance.requests) == requests + 1
+
+    def test_a_stored_restriction_is_fetched_properly_and_only_once(self):
+        instance = self.with_restriction_stored(1)
+
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+        assert sorted(obj.id for obj in instance.get_items()) == [1, 2]
+
+        assert instance.requests == [{"include": ["a"]}]
+
+    def test_an_entry_canvas_no_longer_lists_does_not_refetch_forever(self):
+        instance = self.with_restriction_stored(1, 99)
+
+        list(instance.get_items())
+        list(instance.get_items())
+
+        assert len(instance.requests) == 1
+        assert instance.item_cache[99][1] == {"include": ["a"]}
+
+    def test_a_stale_singular_does_not_inherit_a_restriction(self):
+        instance = self.with_restriction_stored(1)
+        obj, _ = instance.item_cache[1]
+        obj._fetched_at = datetime.now() - timedelta(hours=1)
+        canvaslms.hacks.canvasapi.request_refresh()
+        try:
+            instance.get_item(1)
+        finally:
+            canvaslms.hacks.canvasapi.refresh_since = None
+
+        assert instance.requests == [{"include": ["a"]}]
+@
+
+An entry Canvas did not return can also hold a listing back in another way.
+It keeps the includes of the last fetch that returned it, so a student who has
+left the course lacks whatever the listing has been asked for since.
+Fetching the listing can't give them that while Canvas doesn't list them, so if
+the check above counted them like any other entry, every read asking for more
+than they have would fetch the whole listing again.
+But we can't stop asking either: Canvas may list them again, for instance when
+an enrollment is reactivated, and only a fetch can tell us that.
+
+So a fetch marks the entries it did not get back, and when the plural method
+compares the keyword arguments, a marked entry only counts once the listing is
+old enough, by the same rule as a name that matches nothing
+(\cref{sec:refresh-on-miss}).
+The reasoning is also the same: we asked Canvas recently and that answer still
+holds, so the time of the fetch works as the negative cache and we need no other
+state.
+Until then, someone who has returned is served without that include.
+
+What this saves is the repeated fetches of a burst of reads, not the fetches
+themselves.
+Someone who has left for good goes on lacking the include, so a program asking
+for it pays for one fetch per [[MISS_REFRESH_MIN_AGE_MINUTES]], and so for one
+per run if its runs are further apart than that.
+A single-object fetch that Canvas answers also replaces the entry and with it the
+mark, so the next read asking for more can cost one more fetch within the interval.
+We accept these costs since the alternative is to serve someone who has returned
+without what was asked for.
+
+Clearing a restriction, as above, only removes a claim about the listing.
+Recording the new includes on these entries would add a claim about the object,
+and a false one, since it doesn't have that data.
+A request for that one object would then be served without it, for instance
+[[get_course(id, include=["syllabus_body"])]] for a course that is no longer in
+the listing.
+With the mark, that request still sees what is missing and asks Canvas, which
+gives it or raises an error if it no longer has the object.
+Their includes still count towards the largest set, as they did when they were
+asked for, and an entry that Canvas returns again is a new object without the
+mark.
+
+A cache written by an earlier version has no marks, so it costs one more fetch,
+after which it has them.
+
+<<mark entries Canvas did not return>>=
+fetched_keys = {getattr(fetched, cache_key) for fetched in fetched_objs}
+for obj_key, (cached_obj, _) in attr_cache.items():
+  if obj_key not in fetched_keys:
+    cached_obj._unlisted = True
+@
+
+Now let's verify that a listing asks for what is missing, once.
+
+<<test functions>>=
+class TestIncludesOfAListing:
+    """Test that missing includes cause one fetch, with the largest set"""
+
+    def make_instance(self):
+        """Return an instance with a listing that sends what it is asked for."""
+        class TestClass:
+            def __init__(self):
+                self.requests = []
+                self.listed = [1, 2]
+            def fetched(self, item_id, kwargs):
+                self.requests.append(set(kwargs.get("include", [])))
+                return canvas_object(
+                    id=item_id, **{key: True for key in kwargs.get("include", [])})
+            def get_item(self, item_id, **kwargs):
+                return self.fetched(item_id, kwargs)
+            def get_items(self, **kwargs):
+                self.requests.append(set(kwargs.get("include", [])))
+                return [canvas_object(
+                          id=each,
+                          **{key: True for key in kwargs.get("include", [])})
+                        for each in self.listed]
+
+        CacheGetMethods("item")(TestClass)
+        return TestClass()
+
+    def test_overlapping_includes_fetch_the_largest_set_once(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments", "avatar_url"]))
+
+        items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert all(item.email and item.avatar_url for item in items)
+        assert instance.requests[-1] == {"enrollments", "avatar_url", "email"}
+        assert len(instance.requests) == 2
+        list(instance.get_items(include=["enrollments", "avatar_url"]))
+        list(instance.get_items(include=["email"]))
+        assert len(instance.requests) == 2
+
+    def test_overlapping_includes_of_one_object_fetch_the_largest_set_once(self):
+        instance = self.make_instance()
+        instance.get_item(1, include=["enrollments", "avatar_url"])
+
+        item = instance.get_item(1, include=["email", "enrollments"])
+
+        assert item.email and item.avatar_url
+        assert instance.requests[-1] == {"enrollments", "avatar_url", "email"}
+        instance.get_item(1, include=["avatar_url"])
+        assert len(instance.requests) == 2
+
+    def test_an_entry_canvas_no_longer_lists_costs_one_fetch(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+
+        for _ in range(3):
+            items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert len(instance.requests) == 2
+        assert {item.id for item in items} == {1, 2}
+
+    def test_an_entry_canvas_no_longer_lists_still_adds_to_the_largest_set(self):
+        """Only the entry that left is left holding `avatar_url` here."""
+        instance = self.make_instance()
+        list(instance.get_items(include=["avatar_url"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email"]))
+        instance.item_cache[1] = (instance.item_cache[1][0], {"include": ["email"]})
+
+        list(instance.get_items(include=["enrollments"]))
+
+        assert instance.requests[-1] == {"avatar_url", "email", "enrollments"}
+
+    def test_one_object_canvas_no_longer_lists_is_still_asked_for(self):
+        """It really lacks what the listing got since, so it must not hide that."""
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        requests = len(instance.requests)
+
+        item = instance.get_item(2, include=["email"])
+
+        assert item.email
+        assert len(instance.requests) == requests + 1
+
+    def test_an_entry_that_returns_is_found_once_the_listing_is_old_enough(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        instance.listed = [1, 2]
+        instance.item_all_fetched -= timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES)
+        requests = len(instance.requests)
+
+        items = list(instance.get_items(include=["email", "enrollments"]))
+
+        assert all(item.email for item in items)
+        assert not getattr(instance.item_cache[2][0], "_unlisted", False)
+        assert len(instance.requests) == requests + 1
+        list(instance.get_items(include=["email", "enrollments"]))
+        assert len(instance.requests) == requests + 1
+
+    def test_a_listing_that_once_came_back_empty_recovers(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = []
+        list(instance.get_items(include=["email"]))
+        instance.listed = [1, 2, 3]
+        instance.item_all_fetched -= timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES)
+
+        items = list(instance.get_items(include=["email"]))
+
+        assert {item.id for item in items} == {1, 2, 3}
+        assert all(item.email for item in items)
+
+    def test_an_assignment_replaced_by_a_fetch_keeps_who_was_left_out(self):
+        instance = self.make_instance()
+        list(instance.get_items())
+        old = instance.item_cache[1][0]
+        setattr(old, "__unlisted", {8})
+        instance.item_all_fetched = None
+
+        list(instance.get_items())
+
+        assert instance.item_cache[1][0] is not old
+        assert getattr(instance.item_cache[1][0], "__unlisted") == {8}
+
+    def test_a_listed_entry_lacking_an_include_still_causes_a_fetch(self):
+        instance = self.make_instance()
+        list(instance.get_items(include=["enrollments"]))
+        instance.listed = [1]
+        list(instance.get_items(include=["email", "enrollments"]))
+        requests = len(instance.requests)
+
+        list(instance.get_items(include=["avatar_url"]))
+
+        assert len(instance.requests) == requests + 1
+@
+
+\subsection{Refreshing on request}
+\label{sec:refresh-on-request}
+
+The time-to-live intervals are a guess about when things change, and sometimes
+the user knows better: they were just added to a course, or a grade was just
+corrected.
+[[--no-cache]] is no answer to that.
+It starts from an empty [[Canvas]] object and saves nothing, so it shows the
+truth once and leaves the cache as wrong as it was.
+Clearing the cache is no better, since it costs the whole hierarchy to fix one
+listing.
+What we want is the opposite of both: fetch again exactly what this command
+reads, and leave the rest of the cache alone.
+
+The hierarchy makes that almost free to express.
+A command only reaches the listings it actually walks, so the caching methods
+already sit at the right places, and they know how to replace objects without
+losing what is cached below them (\cref{sec:cache-copy-to-new}).
+All they lack is a way to know that their data is too old, whatever its age.
+
+We could set a flag saying \enquote{refresh}, but then each listing would have
+to remember that it has already been refreshed, or a listing read twice by a
+command would be fetched twice.
+Instead we record \emph{when} the refresh was requested.
+Anything fetched before that moment is stale, and anything fetched after it,
+including by this run's own refresh, is not.
+Every cached object already carries that timestamp, so this needs no new state
+in the cache, and the moment itself is not pickled: the next run starts over.
+<<functions>>=
+refresh_since = None
+
+
+def request_refresh():
+  """Treat everything fetched until now as stale, for the rest of this run."""
+  global refresh_since
+  refresh_since = datetime.now()
+
+
+def predates_refresh(fetched_at):
+  """Return True if `fetched_at` is from before a requested refresh.
+
+  A missing timestamp (`None`) counts as before.
+  """
+  if refresh_since is None:
+    return False
+  return fetched_at is None or fetched_at < refresh_since
+@
+
+Four places consult this, one for each way cached data can be returned without
+asking Canvas: the plural and singular methods of [[CacheGetMethods]], and the
+same two for submissions, where the singular case is the lazy refresh.
+That last one checks before it looks at the grade, so that a corrected final
+grade shows up: being final is a statement about what changes on its own, not
+about what the user just told us has changed.
+
+We deliberately do not put the check in [[outdated]], although that looks like
+the natural home.
+A bulk fetch does not remove entries Canvas no longer returns, and those keep
+their old timestamps.
+With the check in [[outdated]], the next listing in the same run would refresh
+each of them with a request of its own, and drop the ones that answer with a 404,
+so a refresh would behave differently depending on how often a command happens
+to read a listing.
+For the same reason a refresh adds and updates entries, but does not remove any.
+
+That promise has a consequence for the singular method, which does ask Canvas
+about such an entry.
+A student who left a course is still in its cached listing and their submissions
+are still worth showing, but asking Canvas for that student now gives a 404.
+The same read without [[--refresh-cache]] works, from the cache, so the option
+must not turn it into a crash: asking for fresher data cannot make data we have
+unavailable.
+We therefore keep the object, and record that we asked, so that the run does not
+ask again.
+Only a refresh on request gets this treatment.
+A 404 for an object that is not cached, or whose re-fetch the code needs in order
+to get data it lacks, is still the caller's to handle.
+<<keep [[old_obj]], which Canvas no longer has>>=
+logger.info(f"Kept in cache: {attr_name} {cache_key}={id} no longer exists")
+old_obj._fetched_at = datetime.now()
+return old_obj
+@
+
+Let's verify this.
+Each test first ages what it has cached to look like the work of an earlier run,
+because two calls within the same microsecond have the same timestamp, which is
+not older.
+The stand-in class lets Canvas's answer change between the calls, which a
+recording cannot express.
+
+<<test functions>>=
+@pytest.mark.parametrize("fetched_at,expected", [
+    (None, True),
+    (datetime(2026, 1, 1, 11), True),
+    (datetime(2026, 1, 1, 13), False)])
+def test_what_predates_a_requested_refresh(monkeypatch, fetched_at, expected):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since",
+                        datetime(2026, 1, 1, 12))
+    assert predates_refresh(fetched_at) is expected
+
+def test_nothing_predates_a_refresh_not_asked_for(monkeypatch):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+    assert predates_refresh(None) is False
+
+class TestRefreshOnRequest:
+    """Test what a requested refresh fetches, and what it leaves alone"""
+
+    @pytest.fixture(autouse=True)
+    def no_refresh_requested_yet(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+
+    def from_earlier_run(self):
+        """Return an instance whose item 1 was cached an hour ago."""
+        class TestClass:
+            listing = [1]
+            listings = 0
+            singles = 0
+            fail = False
+            def get_items(self, **kwargs):
+                if self.fail:
+                    raise canvasapi.exceptions.CanvasException("Unavailable")
+                self.listings += 1
+                return [canvas_object(id=each) for each in self.listing]
+            def get_item(self, item_id, **kwargs):
+                self.singles += 1
+                return canvas_object(id=item_id)
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        hour_ago = datetime.now() - timedelta(hours=1)
+        instance.item_all_fetched = hour_ago
+        obj, _ = instance.item_cache[1]
+        obj._fetched_at = hour_ago
+        obj.child_cache = {"sentinel": "subtree"}
+        return instance
+
+    def test_nothing_is_fetched_without_a_request(self):
+        instance = self.from_earlier_run()
+        instance.listing = [1, 2]
+
+        assert [obj.id for obj in instance.get_items()] == [1]
+        instance.get_item(1)
+        assert (instance.listings, instance.singles) == (1, 0)
+
+    def test_listing_is_fetched_once_and_keeps_children(self):
+        instance = self.from_earlier_run()
+        instance.listing = [1, 2]
+        request_refresh()
+
+        first = {obj.id: obj for obj in instance.get_items()}
+        second = list(instance.get_items())
+
+        assert set(first) == {1, 2}
+        assert len(second) == 2
+        assert instance.listings == 2
+        assert first[1].child_cache == {"sentinel": "subtree"}
+
+    def test_singular_is_fetched_once_and_keeps_children(self):
+        instance = self.from_earlier_run()
+        old, _ = instance.item_cache[1]
+        request_refresh()
+
+        first = instance.get_item(1)
+        second = instance.get_item(1)
+
+        assert first is not old
+        assert second is first
+        assert instance.singles == 1
+        assert first.child_cache == {"sentinel": "subtree"}
+
+    def test_singular_after_listing_makes_no_request(self):
+        instance = self.from_earlier_run()
+        request_refresh()
+
+        list(instance.get_items())
+        instance.get_item(1)
+
+        assert instance.singles == 0
+
+    def test_entry_gone_from_canvas_stays_without_extra_requests(self):
+        instance = self.from_earlier_run()
+        instance.listing = [2]
+        request_refresh()
+
+        list(instance.get_items())
+        again = sorted(obj.id for obj in instance.get_items())
+
+        assert again == [1, 2]
+        assert instance.singles == 0
+
+    def test_singular_keeps_entry_gone_from_canvas_and_asks_once(self):
+        class TestClass:
+            singles = 0
+            def get_items(self, **kwargs):
+                return [canvas_object(id=1)]
+            def get_item(self, item_id, **kwargs):
+                self.singles += 1
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        cached, _ = instance.item_cache[1]
+        cached._fetched_at = datetime.now() - timedelta(hours=1)
+        request_refresh()
+
+        assert instance.get_item(1) is cached
+        assert instance.get_item(1) is cached
+        assert instance.singles == 1
+
+    def test_singular_of_unknown_entry_still_reports_the_404(self):
+        class TestClass:
+            def get_items(self, **kwargs):
+                return []
+            def get_item(self, item_id, **kwargs):
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.ResourceDoesNotExist):
+            TestClass().get_item(1)
+
+    def test_singular_needing_new_kwargs_still_reports_the_404(self):
+        class TestClass:
+            def get_items(self, **kwargs):
+                return [canvas_object(id=1)]
+            def get_item(self, item_id, **kwargs):
+                raise canvasapi.exceptions.ResourceDoesNotExist("Not Found")
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        list(instance.get_items())
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.ResourceDoesNotExist):
+            instance.get_item(1, include=["more"])
+
+    def test_failed_refresh_leaves_the_cache_intact(self):
+        instance = self.from_earlier_run()
+        fetched = instance.item_all_fetched
+        instance.fail = True
+        request_refresh()
+
+        with pytest.raises(canvasapi.exceptions.CanvasException):
+            list(instance.get_items())
+
+        assert instance.item_all_fetched == fetched
+        assert instance.item_cache[1][0].child_cache == {"sentinel": "subtree"}
+
+    def submission_from_earlier_run(self, refetch=None):
+        """Return an assignment with a final grade cached an hour ago."""
+        response = MagicMock()
+        response.json.return_value = [{"id": 1, "user_id": 1, "grade": "F"}]
+        response.links = {}
+        requester = MagicMock()
+        requester.request.return_value = response
+        requester.base_url = "https://canvas.example/api/v1/"
+        requester.new_quizzes_url = "https://canvas.example/api/quiz/v1/"
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+        lazy = LazySubmission(
+            Submission(requester, {"id": 1, "user_id": 1, "grade": "P"}),
+            assignment, set(), refetch or MagicMock())
+        lazy.ensure_attrs(["rubric_assessment"])
+        lazy.user = "annotation"
+        object.__setattr__(lazy, "_last_refresh",
+                           datetime.now() - timedelta(hours=1))
+        getattr(assignment, "__cache")[1] = lazy
+        setattr(assignment, "__all_fetched",
+                datetime.now() - timedelta(hours=1))
+        return assignment, requester, lazy
+
+    def test_final_grade_stays_cached_without_a_request(self):
+        assignment, requester, lazy = self.submission_from_earlier_run()
+
+        assert assignment.get_submissions()[0].grade == "P"
+        requester.request.assert_not_called()
+
+    def test_submission_listing_corrects_grade_and_keeps_details(self):
+        assignment, requester, _ = self.submission_from_earlier_run()
+        request_refresh()
+
+        first = assignment.get_submissions()[0]
+        assignment.get_submissions()
+
+        assert first.grade == "F"
+        assert first.user == "annotation"
+        assert first.rubric_assessment is None
+        requester.request.assert_called_once()
+
+    def test_submission_includes_are_remembered_by_a_fetch(self):
+        assignment, requester, _ = self.submission_from_earlier_run()
+
+        assignment.get_submissions(include=["rubric_assessment"])
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        requester.request.assert_called_once()
+
+    def test_submissions_gone_from_canvas_make_no_more_requests(self):
+        """Of 5 cached submissions, Canvas lists 1; the rest left the course."""
+        response = MagicMock()
+        response.json.return_value = [{"id": 0, "user_id": 0, "grade": "P"}]
+        response.links = {}
+        requester = MagicMock()
+        requester.request.return_value = response
+        requester.base_url = "https://canvas.example/api/v1/"
+        requester.new_quizzes_url = "https://canvas.example/api/quiz/v1/"
+        assignment = Assignment(requester, {"id": 17, "course_id": 1})
+        hour_ago = datetime.now() - timedelta(hours=1)
+        single = MagicMock()
+        for user_id in range(5):
+            lazy = LazySubmission(
+                Submission(requester, {"id": user_id, "user_id": user_id,
+                                       "grade": "P"}),
+                assignment, set(), single)
+            object.__setattr__(lazy, "_last_refresh", hour_ago)
+            getattr(assignment, "__cache")[user_id] = lazy
+        setattr(assignment, "__all_fetched", hour_ago)
+        request_refresh()
+
+        for _ in range(3):
+            for submission in assignment.get_submissions(
+                    check_bulk_refresh=True):
+                submission.grade
+
+        requester.request.assert_called_once()
+        single.assert_not_called()
+
+    def test_lazy_read_corrects_a_final_grade_once(self):
+        def corrected(assignment, user, **kwargs):
+            corrected.calls += 1
+            return Submission(MagicMock(),
+                              {"id": 1, "user_id": 1, "grade": "F"})
+        corrected.calls = 0
+        _, _, lazy = self.submission_from_earlier_run(corrected)
+        request_refresh()
+
+        assert lazy.grade == "F"
+        assert lazy.grade == "F"
+        assert corrected.calls == 1
+@
+
+\subsection{Refreshing when a name matches nothing}
+\label{sec:refresh-on-miss}
+
+A user who types [[-c newcourse]] and is told that no course matches has no
+reason to suspect the cache.
+So when a pattern matches nothing, we look at the listing once more, this time
+at what Canvas says, and search again before giving up.
+
+We have to be careful about what counts as a miss.
+An empty result is not one by itself: nothing ungraded, or no TAs in a course, is
+a perfectly good answer that a refresh would only slow down.
+That also rules out the obvious implementation, which catches [[EmptyListError]]
+in [[main]] and runs the command again: it could not tell these cases apart, and
+a command that had already written something to Canvas would write it twice.
+The retry therefore sits where a name is matched against a listing, and it only
+refetches the listing that was searched.
+
+Two limits keep a routine miss cheap.
+A listing younger than [[MISS_REFRESH_MIN_AGE_MINUTES]] is not fetched again,
+because it can hardly have the answer yet.
+That needs no state of its own: the refresh itself updates the [[_all_fetched]]
+timestamp, so a script repeating a typo pays for one listing per interval.
+That includes [[ungraded.sh]], whose course pattern may name a round that does not
+exist yet: it is a name that matches nothing, so the script pays for one listing
+of the courses per interval until the round appears.
+It also makes the retry do nothing right after [[--refresh-cache]] or under
+[[--no-cache]], when the search just used fresh data.
+
+The other limit is on how many listings one miss may fetch, since each of them
+takes at least one request.
+How many is reasonable depends on the search.
+With [[users -c prgi Anna]] the user has picked the courses and expects Anna to
+be in one of them, so the answer is worth waiting for, even if the pattern spans
+many course rounds.
+With [[users Anna]] the search spans every course they have, and mistyping the
+name should not mean fetching every roster.
+A search narrowed with [[-c]] may therefore fetch up to
+[[MISS_REFRESH_MAX_LISTINGS]] listings, a search over all courses up to
+[[MISS_REFRESH_MAX_LISTINGS_ALL_COURSES]].
+Only the command knows which search it is making, so it passes the latter as
+[[max_listings]], using [[miss_refresh_limit]] of the [[courses]] module.
+Passing nothing gives the larger limit, which is right for a library caller, who
+named the courses it searches.
+
+We cannot know how many courses a user has or how long they are willing to wait,
+so 25 and 5 are only defaults, and the environment variables below set them.
+A limit of 0 turns the retry off for that kind of search, for instance for a
+script that would rather have a quick answer.
+[[filter_courses]] searches the course listing with the larger limit, so setting
+[[CANVASLMS_MISS_REFRESH_MAX_LISTINGS]] to 0 stops looking for new courses too.
+
+The limit stands for the cost of the refresh, so it counts the listings that are
+old enough to be fetched and not all that were searched.
+Otherwise a search over 30 courses where 3 rosters are old would be refused,
+although it costs 3 listings.
+It would also complain right after [[--refresh-cache]] or under [[--no-cache]],
+when there is nothing left to fetch and the answer is already based on what
+Canvas says.
+Over the limit nothing is fetched at all.
+Fetching only some of the listings would cost time and still not tell whether
+the name exists, and the user could not know which courses had been looked at.
+
+When the limit stops a refresh, we warn about it.
+This used to be silent, and that was wrong: the command goes on to report that
+nothing matched, in the same words as when it did look, and the user cannot tell
+\enquote{not there} from \enquote{did not look}.
+Only the second calls for doing something, so the warning names both ways to do
+it: [[--refresh-cache]] for this time, and the variable of the limit that
+applied for every time.
+Since it goes through logging it ends up on stderr, away from the TSV on stdout;
+[[-q]] hides it, and a library caller that has not configured logging still gets
+it from Python's handler of last resort.
+A script repeating such a search is warned on every run, because nothing was
+fetched and the listings stay old: its answer is as uncertain every time.
+A limit of 0 is different, there the user has asked for no retry and needs no
+reminder, so we only log that at the [[INFO]] level.
+
+A pattern that matches something is not a miss at all, even when the listing is
+stale, so [[-c prgi]] can still silently leave out a new course that the old one
+hides.
+This is why this retry complements the time-to-live and [[--refresh-cache]]
+rather than replacing them.
+<<constants>>=
+MISS_REFRESH_MIN_AGE_MINUTES = env_number(
+  "CANVASLMS_MISS_REFRESH_MINUTES", 10, int)
+MISS_REFRESH_MAX_LISTINGS = env_number(
+  "CANVASLMS_MISS_REFRESH_MAX_LISTINGS", 25, int)
+MISS_REFRESH_MAX_LISTINGS_ALL_COURSES = env_number(
+  "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5, int)
+<<functions>>=
+def retry_after_miss(find, listings, max_listings=None):
+  """Yield from `find()`; if empty, refresh `listings` and try once more.
+
+  `find` returns an iterable of matches, and `listings` holds the
+  `(owner, attribute)` pairs it searched, such as `(canvas, "course")`. Only a
+  listing that is old enough is refreshed. If more than `max_listings` are, which
+  defaults to `MISS_REFRESH_MAX_LISTINGS`, none is and a warning says so; 0
+  turns the refresh off without a warning. A failed refresh leaves the cache as
+  it was and the result empty.
+  """
+  found = False
+  for match in find():
+    found = True
+    yield match
+  if found:
+    return
+
+  <<find the [[old_listings]] among [[listings]]>>
+  if not old_listings:
+    return
+
+  <<give up unless the limit allows [[old_listings]]>>
+  <<expire the [[old_listings]]>>
+
+  try:
+    with without_retries(owner for owner, _, _ in old_listings):
+      matches = list(find())
+    yield from matches
+  except (canvasapi.exceptions.CanvasException,
+          requests.exceptions.RequestException) as error:
+    logger.warning(f"Could not refresh after finding no match: {error}")
+  finally:
+    <<keep the cached listings after a failed refresh>>
+@
+
+The default pattern of an option, [[.*]], does not name anything, so a search
+with it that finds nothing has not missed anything either: there is just no one
+with that role, say.
+Callers use this helper to leave their [[listings]] empty in that case.
+<<functions>>=
+def pattern_names_something(pattern):
+  """Return True if the regex `pattern` was given to find something specific."""
+  return bool(pattern) and pattern != ".*"
+@
+
+We only look at timestamps that are actually [[datetime]]s, since an owner that
+has no such listing, like an assignment group, has nothing to refresh.
+<<find the [[old_listings]] among [[listings]]>>=
+old_listings = []
+for owner, attribute in listings:
+  name = f"{attribute}_all_fetched"
+  fetched = getattr(owner, name, None)
+  if old_enough_to_ask_again(fetched):
+    old_listings.append((owner, name, fetched))
+<<functions>>=
+def old_enough_to_ask_again(fetched):
+  """Returns True if a fetch at `fetched` is too long ago to go on trusting."""
+  return (isinstance(fetched, datetime)
+          and datetime.now() - fetched
+              >= timedelta(minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+@
+
+We look up the default limit here rather than in the signature, where it would
+be fixed when the module is loaded.
+No search can stay within a negative limit, so we take it to mean the same as 0
+rather than warn about being over a limit of $-1$.
+<<give up unless the limit allows [[old_listings]]>>=
+limit = MISS_REFRESH_MAX_LISTINGS if max_listings is None else max_listings
+if limit <= 0:
+  logger.info("No match in the cache; the refresh is turned off "
+              f"(limit {limit})")
+  return
+if len(old_listings) > limit:
+  <<warn that the limit stops the refresh>>
+  return
+@
+
+The variable to name follows from the limit that applied.
+A caller may also pass a limit of its own, which no variable can raise, and then
+the warning must not suggest one.
+<<warn that the limit stops the refresh>>=
+ways_out = "--refresh-cache"
+if max_listings is None:
+  ways_out += ", or raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS"
+elif max_listings == MISS_REFRESH_MAX_LISTINGS_ALL_COURSES:
+  ways_out += ", or raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES"
+logger.warning(f"No match in the cache; not fetching {len(old_listings)} "
+               f"listings as the limit is {limit}.\nUse {ways_out}.")
+@
+
+Clearing the timestamp is what makes the next search fetch the listing.
+<<expire the [[old_listings]]>>=
+for owner, name, _ in old_listings:
+  logger.info(f"No match, refreshing listing: {name}")
+  setattr(owner, name, None)
+@
+
+The refresh is a favour, so failing at it should not make things worse.
+Without it the user would have been told that nothing matched, and that is still
+what they get, along with a warning, since the answer may now be wrong.
+For the same reason it gets one try (\cref{sec:course-listing-outage}), so the
+user does not wait 17 minutes to hear that nothing matched.
+We restore the timestamps because an expired listing would otherwise be fetched
+by the next command, which might well have found its match in the cache, and
+fail on Canvas being down.
+
+We cannot rely on seeing the exception to know that a refresh failed:
+[[list_users]] catches [[CanvasException]] itself, to go on with the other courses.
+What tells us is the timestamp, since a listing that was fetched has a new one.
+That is why this is in a [[finally]] clause and looks at each listing, which also
+keeps what a partly successful retry over several courses did get.
+<<keep the cached listings after a failed refresh>>=
+for owner, name, fetched in old_listings:
+  if getattr(owner, name) is None:
+    setattr(owner, name, fetched)
+@
+
+Let's verify the behaviour, again with a stand-in whose listing can change
+between the calls.
+
+<<test functions>>=
+class TestRetryAfterMiss:
+    """Test when a search that found nothing looks at Canvas again"""
+
+    def listing_owner(self, age=timedelta(hours=1), listing=(2,)):
+        """Return an owner of a listing cached `age` ago, with item 1."""
+        class TestClass:
+            listings = 0
+            fail = None
+            def get_item(self, item_id, **kwargs):
+                return canvas_object(id=item_id)
+            def get_items(self, **kwargs):
+                if self.fail:
+                    raise self.fail
+                self.listings += 1
+                return [canvas_object(id=each) for each in self.items]
+
+        CacheGetMethods("item")(TestClass)
+        owner = TestClass()
+        owner.items = [1]
+        list(owner.get_items())
+        owner.item_all_fetched = datetime.now() - age
+        owner.items = listing
+        return owner
+
+    def search(self, owner, wanted=2):
+        return list(retry_after_miss(
+            lambda: (obj.id for obj in owner.get_items() if obj.id == wanted),
+            [(owner, "item")]))
+
+    def test_new_item_is_found_with_one_more_listing(self):
+        owner = self.listing_owner()
+        assert self.search(owner) == [2]
+        assert owner.listings == 2
+
+    def test_a_match_does_not_look_at_canvas(self):
+        owner = self.listing_owner()
+        assert self.search(owner, wanted=1) == [1]
+        assert owner.listings == 1
+
+    def test_repeated_miss_lists_once_per_interval(self):
+        owner = self.listing_owner()
+        assert self.search(owner, wanted=3) == []
+        assert self.search(owner, wanted=3) == []
+        assert owner.listings == 2
+
+    def test_a_young_listing_is_not_fetched_again(self):
+        owner = self.listing_owner(age=timedelta(minutes=1))
+        assert self.search(owner) == []
+        assert owner.listings == 1
+
+    def test_a_connection_error_reports_no_match(self, caplog):
+        """The likeliest outage is not a CanvasException."""
+        owner = self.listing_owner()
+        fetched = owner.item_all_fetched
+        owner.fail = requests.exceptions.ConnectionError("Unreachable")
+
+        with caplog.at_level(logging.WARNING):
+            assert self.search(owner) == []
+
+        assert owner.item_all_fetched == fetched
+        assert "Could not refresh" in caplog.text
+
+    @pytest.mark.parametrize("pattern,expected", [
+        (None, False), ("", False), (".*", False), ("Anna", True)])
+    def test_only_a_given_pattern_names_something(self, pattern, expected):
+        assert pattern_names_something(pattern) is expected
+
+    def test_too_many_listings_are_not_fetched(self):
+        owners = [self.listing_owner()
+                  for _ in range(MISS_REFRESH_MAX_LISTINGS + 1)]
+        def find():
+            return [obj for owner in owners for obj in owner.get_items()
+                    if obj.id == 3]
+
+        assert list(retry_after_miss(
+            find, [(owner, "item") for owner in owners])) == []
+        assert all(owner.listings == 1 for owner in owners)
+
+    def test_as_many_listings_as_allowed_are_fetched(self):
+        owners = [self.listing_owner()
+                  for _ in range(MISS_REFRESH_MAX_LISTINGS)]
+        def find():
+            return [obj for owner in owners for obj in owner.get_items()
+                    if obj.id == 3]
+
+        assert list(retry_after_miss(
+            find, [(owner, "item") for owner in owners])) == []
+        assert all(owner.listings == 2 for owner in owners)
+
+    def test_an_owner_without_the_listing_is_left_alone(self):
+        assert list(retry_after_miss(lambda: [], [(object(), "item")])) == []
+
+    def test_a_failed_refresh_reports_no_match_and_keeps_the_cache(self, caplog):
+        owner = self.listing_owner()
+        fetched = owner.item_all_fetched
+        owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+        with caplog.at_level(logging.WARNING):
+            assert self.search(owner) == []
+
+        assert owner.item_all_fetched == fetched
+        assert [obj.id for obj, _ in owner.item_cache.values()] == [1]
+        assert "Could not refresh" in caplog.text
+
+    <<test methods for the limit on a miss>>
+@
+
+The limit deserves tests of its own, since most of what can go wrong with it is
+a refresh that does not happen, which looks just like a name that is not there.
+We count what is fetched through the stand-in, and read what the user is told
+from the log.
+Only the listings that are old enough may count: three old ones among thirty
+fit a limit of three.
+<<test methods for the limit on a miss>>=
+def owners(self, old=0, young=0):
+    """Return owners of `old` listings to fetch and `young` ones not to."""
+    return ([self.listing_owner() for _ in range(old)]
+            + [self.listing_owner(age=timedelta(minutes=1))
+               for _ in range(young)])
+
+def search_all(self, owners, **kwargs):
+    """Search the listings of all `owners` for what none of them has."""
+    def find():
+        return [obj for owner in owners for obj in owner.get_items()
+                if obj.id == 3]
+
+    return list(retry_after_miss(
+        find, [(owner, "item") for owner in owners], **kwargs))
+
+def fetched_again(self, owners):
+    return sum(owner.listings - 1 for owner in owners)
+
+def test_only_listings_old_enough_count(self, caplog):
+    owners = self.owners(old=3, young=27)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, max_listings=3)
+
+    assert [owner.listings for owner in owners] == [2] * 3 + [1] * 27
+    assert not caplog.records
+
+def test_nothing_to_fetch_is_no_reason_to_warn(self, caplog):
+    owners = self.owners(young=30)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners, max_listings=1)
+
+    assert self.fetched_again(owners) == 0
+    assert not caplog.records
+
+def test_nothing_to_fetch_is_no_reason_to_search_again(self):
+    searches = []
+
+    assert list(retry_after_miss(
+        lambda: searches.append("search") or [],
+        [(owner, "item") for owner in self.owners(young=1)])) == []
+
+    assert len(searches) == 1
+
+def test_over_the_limit_nothing_is_fetched(self):
+    owners = self.owners(old=4)
+    fetched = [owner.item_all_fetched for owner in owners]
+
+    self.search_all(owners, max_listings=3)
+
+    assert self.fetched_again(owners) == 0
+    assert [owner.item_all_fetched for owner in owners] == fetched
+
+def test_the_warning_says_how_many_and_how_to_get_past(self, caplog,
+                                                       monkeypatch):
+    """The default limit is looked up when searching, so this one applies."""
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS", 2)
+    owners = self.owners(old=3)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(owners)
+
+    assert self.fetched_again(owners) == 0
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "3 listings" in record.message
+    assert "limit is 2" in record.message
+    assert "--refresh-cache" in record.message
+    assert "raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS." in record.message
+
+def test_the_warning_names_the_limit_for_all_courses(self, caplog,
+                                                     monkeypatch):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 2)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(self.owners(old=3), max_listings=2)
+
+    [record] = caplog.records
+    assert ("raise CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES."
+            in record.message)
+
+def test_a_limit_of_the_callers_own_names_no_variable(self, caplog,
+                                                      monkeypatch):
+    """No setting would raise it, so the warning should not suggest one."""
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5)
+
+    with caplog.at_level(logging.WARNING):
+        self.search_all(self.owners(old=3), max_listings=2)
+
+    [record] = caplog.records
+    assert "limit is 2" in record.message
+    assert "--refresh-cache" in record.message
+    assert "CANVASLMS" not in record.message
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_no_limit_left_turns_the_retry_off_without_a_warning(self, caplog,
+                                                             limit):
+    owners = self.owners(old=1)
+
+    with caplog.at_level(logging.INFO):
+        self.search_all(owners, max_listings=limit)
+
+    assert self.fetched_again(owners) == 0
+    assert "turned off" in caplog.text
+    assert not [record for record in caplog.records
+                if record.levelno >= logging.WARNING]
+
+def test_a_match_is_no_reason_to_warn(self, caplog):
+    owners = self.owners(old=3)
+
+    with caplog.at_level(logging.WARNING):
+        assert [obj.id for obj in retry_after_miss(
+            lambda: [obj for owner in owners for obj in owner.get_items()],
+            [(owner, "item") for owner in owners], max_listings=1)
+        ] == [1, 1, 1]
+
+    assert not caplog.records
+@
+
+The settings are read when the module is imported, so we import it in a process
+of its own to see what a variable does.
+<<test functions>>=
+MISS_LIMIT_VARIABLES = ("CANVASLMS_MISS_REFRESH_MAX_LISTINGS",
+                        "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES")
+
+def import_with_limits(**variables):
+    """Import the module in a new process with `variables` in its environment.
+
+    Returns the finished process, which printed the two limits.
+    """
+    environment = {name: value for name, value in os.environ.items()
+                   if name not in MISS_LIMIT_VARIABLES}
+    environment.update(variables)
+    return subprocess.run(
+        [sys.executable, "-c",
+         "import canvaslms.hacks.canvasapi as module; "
+         "print(module.MISS_REFRESH_MAX_LISTINGS, "
+         "module.MISS_REFRESH_MAX_LISTINGS_ALL_COURSES)"],
+        env=environment, capture_output=True, text=True, check=True)
+
+@pytest.mark.parametrize("variables,limits", [
+    ({}, "25 5"),
+    ({MISS_LIMIT_VARIABLES[0]: "40"}, "40 5"),
+    ({MISS_LIMIT_VARIABLES[1]: "8"}, "25 8"),
+    ({MISS_LIMIT_VARIABLES[0]: "0", MISS_LIMIT_VARIABLES[1]: "0"}, "0 0"),
+])
+def test_the_limits_come_from_the_environment(variables, limits):
+    assert import_with_limits(**variables).stdout.strip() == limits
+
+@pytest.mark.parametrize("variable", MISS_LIMIT_VARIABLES)
+def test_a_malformed_limit_falls_back_to_the_default(variable):
+    process = import_with_limits(**{variable: "many"})
+
+    assert process.stdout.strip() == "25 5"
+    assert f"{variable}='many'" in process.stderr
+@
 
 \subsection{Diagnosing cache staleness}
 
@@ -3463,8 +4991,8 @@ for attr_name in dir(obj):
 
 The list of courses changes whenever new courses are created that we have
 access to.
-This usually happens well in advance, so we could have a rather long
-time-to-live on the courses cache.
+This usually happens well in advance, but someone can also add us to a course
+at any time, so the listing has a time-to-live of [[COURSE_CACHE_TTL_DAYS]] days.
 
 We use the [[CacheGetMethods]] decorator to add caching to the [[Canvas]] class
 for its [[get_course]] and [[get_courses]] methods.
@@ -3477,6 +5005,10 @@ def make_canvas_courses_cacheable():
 
 Note that we don't need a TTLCache here, since the [[outdated]] function will
 periodically reset the [[_all_fetched]] flag to trigger a refetch.
+One thing sets this listing apart from all the others: its owner, the [[Canvas]]
+object, is in no cache, so the listing methods never call [[outdated]] on it.
+The method checks the age of this listing itself instead
+(\cref{sec:course-listing-outage}).
 
 
 \subsection{Caching course contents}
@@ -4013,6 +5545,9 @@ def _needs_refresh(self):
   """Check if the wrapped submission needs refreshing."""
   submission = object.__getattribute__(self, '_submission')
   last_refresh = object.__getattribute__(self, '_last_refresh')
+
+  if predates_refresh(last_refresh):
+    return True
 
   # Never refresh final grades
   if submission.grade in NOREFRESH_GRADES:
@@ -5320,6 +6855,7 @@ This follows the same pattern as [[CacheGetMethods]], which uses [[None]] for
 \enquote{not fetched} and [[datetime.now()]] for \enquote{last fetch time}.
 <<extend class constructor for decorators>>=
 self.__all_fetched = None
+self.__unlisted = set()
 @ Now we can check if this is set or not.
 When we fetch, we want to include any data that was previously included.
 
@@ -5385,12 +6921,16 @@ else:
 
 check_bulk_refresh = kwargs.pop("check_bulk_refresh", False)
 student_ids = kwargs.pop("student_ids", None)
-need_refetch = self.__all_fetched is None
+need_refetch = (self.__all_fetched is None
+                or predates_refresh(self.__all_fetched))
 
 if not need_refetch:
-  for lazy_submission in self.__cache.values():
+  unlisted = getattr(self, "__unlisted", set())
+  for user_id, lazy_submission in self.__cache.items():
     cached_includes = set(lazy_submission._includes)
-    if not to_include.issubset(cached_includes):
+    if (not to_include.issubset(cached_includes)
+        and (user_id not in unlisted
+             or old_enough_to_ask_again(self.__all_fetched))):
       need_refetch = True
       break
 
@@ -5399,11 +6939,14 @@ if need_refetch:
     to_include |= set(lazy_submission._includes)
 
   logger.info(f"Fetching all submissions for assignment id={self.id}")
-  for raw_submission in get_submissions(self, include=list(to_include)):
-    lazy_submission = LazySubmission(raw_submission, self, to_include,
-                                     original_get_submission)
-    self.__cache[raw_submission.user_id] = lazy_submission
+  all_includes = to_include
+  returned = set()
+  for raw_submission in get_submissions(self, include=list(all_includes)):
+    <<keep [[raw_submission]] in the cache>>
+    returned.add(raw_submission.user_id)
 
+  <<count all cached submissions as just refreshed>>
+  self.__unlisted = set(self.__cache) - returned
   self.__all_fetched = datetime.now()
 else:
   cache_age = datetime.now() - self.__all_fetched
@@ -5418,11 +6961,39 @@ else:
 return list(self.__cache.values())
 @
 
+The bulk fetch above and the bulk refresh below both replace submissions that
+may already be cached, so they share one way of storing what they get.
+A cached submission keeps its wrapper and is replaced through
+[[_replace_submission]], so annotations and attribute names survive a bulk fetch
+exactly as they survive a lazy refresh.
+<<keep [[raw_submission]] in the cache>>=
+if raw_submission.user_id in self.__cache:
+  lazy_submission = self.__cache[raw_submission.user_id]
+  lazy_submission._replace_submission(raw_submission)
+  object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+  object.__setattr__(lazy_submission, '_includes', all_includes)
+else:
+  lazy_submission = LazySubmission(raw_submission, self, all_includes,
+                                   original_get_submission)
+  self.__cache[raw_submission.user_id] = lazy_submission
+@
+
+A fetch of the whole collection answers for every submission in the cache, also
+for the ones Canvas did not return, such as those of students who left the course.
+We asked and it has nothing newer, so those need no request of their own.
+If we left their timestamps alone, every read of them would ask Canvas again, and
+under [[--refresh-cache]], where they would keep predating the refresh for the
+rest of the run, enough of them would also make [[should_bulk_refresh_submissions]]
+fetch the whole collection again on each listing.
+Both ways of fetching the collection need this.
+<<count all cached submissions as just refreshed>>=
+for lazy_submission in self.__cache.values():
+  object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
+@
+
 The bulk refresh pre-check logic counts how many submissions would need refresh
 and triggers a bulk fetch if the count exceeds the threshold.
-The fetched submissions replace the wrapped ones through
-[[_replace_submission]], so annotations and attribute names survive a bulk
-refresh exactly as they survive a lazy one.  The fetch is the
+The fetch is the
 one part that can fail, so it is the only part we wrap; what we do when it does
 is the subject of \cref{sec:bulk-refresh-failure} below.
 <<check staleness threshold and bulk refresh if needed>>=
@@ -5438,22 +7009,55 @@ all_includes = set(to_include)
 for lazy_submission in self.__cache.values():
   all_includes |= set(lazy_submission._includes)
 
+returned = set()
 try:
   for raw_submission in get_submissions(self, include=list(all_includes)):
-    if raw_submission.user_id in self.__cache:
-      lazy_submission = self.__cache[raw_submission.user_id]
-      lazy_submission._replace_submission(raw_submission)
-      object.__setattr__(lazy_submission, '_last_refresh', datetime.now())
-      object.__setattr__(lazy_submission, '_includes', all_includes)
-    else:
-      lazy_submission = LazySubmission(raw_submission, self, all_includes,
-                                       original_get_submission)
-      self.__cache[raw_submission.user_id] = lazy_submission
+    <<keep [[raw_submission]] in the cache>>
+    returned.add(raw_submission.user_id)
 except canvasapi.exceptions.CanvasException as error:
   <<keep the cached submissions after a failed bulk refresh>>
 else:
+  <<count all cached submissions as just refreshed>>
+  self.__unlisted = set(self.__cache) - returned
   self.__all_fetched = datetime.now()
 @
+
+\subsubsection{Submissions Canvas no longer lists}
+\label{sec:unlisted-submissions}
+
+The timestamps above settle when a submission is fresh, but not what it holds.
+A fetch only replaces the submissions Canvas returns, so the submission of a
+student who has left the course keeps the includes of the last fetch that returned
+it.
+If a listing is then asked for an include it lacks, a fetch can't give it that
+while Canvas doesn't list it, and if the listing compared with it like any other,
+every such read would fetch the whole assignment again.
+A student can also return, though, and then only a fetch can tell us.
+
+So [[__unlisted]] holds the users whose submissions the last fetch of the
+collection did not return, and in [[<<return a list of all submissions>>]] those
+only count once that fetch is old enough, by the rule for a name that matches
+nothing (\cref{sec:refresh-on-miss}).
+Until then a student who has returned is served without that include, and a
+student who has left for good costs one fetch per interval, for reads asking for
+what they lack, on the same terms as a listing (\cref{sec:subset-listings}).
+We keep this on the assignment, beside [[__all_fetched]], since it is a fact about
+that fetch and not about the submission, and it follows the assignment when a
+listing replaces the object, as the caches do.
+It's also why we don't simply keep the includes of the last fetch there and
+compare with those.
+A submission fetched on its own, say of a student who just joined, can hold less
+than the listing asked for, and must still make the next listing fetch it.
+
+We also can't record the new includes on these wrappers.
+[[_includes]] says what the wrapper really holds, and a request for that one
+submission relies on it to see what it must fetch.
+What these submissions do hold still counts towards the largest set, since
+[[need_refetch]] takes the union over the whole cache.
+
+An assignment from a cache written by an earlier version has no [[__unlisted]].
+It behaves as if all submissions were listed, costs one more fetch and then has
+it.
 
 \subsubsection{When the bulk refresh fails}
 \label{sec:bulk-refresh-failure}
@@ -5483,11 +7087,12 @@ raises.
 The objection to so broad a catch is that it also swallows systemic failures,
 an expired token say, which the user would rather see at once.  It does not,
 and the reason is structural: only the \emph{re}fresh of data we already have
-is guarded.  The first fetch of an assignment's submissions---the
-[[need_refetch]] branch above---is left unguarded precisely because there is no
-cached answer to fall back on there, so a dead server or a rejected token still
-fails loudly on the first assignment the command touches, long before this code
-could hide it.
+is guarded.  The fetch of an assignment's submissions in the [[need_refetch]]
+branch above is left unguarded.  The first time, there is no cached answer to
+fall back on there, so a dead server or a rejected token still fails loudly on
+the first assignment the command touches, long before this code could hide it.
+Under [[--refresh-cache]] there is a cached answer, but the user has just told us
+not to trust it, so reporting the failure is again the honest thing to do.
 
 Logging and moving on is not enough on its own, because of how the code finds
 its way back here.  [[should_bulk_refresh_submissions]] asks the wrappers
@@ -5598,6 +7203,182 @@ class TestBulkRefreshFailureKeepsCache:
 
         requester.request.assert_called_once()
         refetch.assert_not_called()
+@
+
+Submissions that Canvas no longer lists must not make a listing fetch again and
+again (\cref{sec:unlisted-submissions}).
+Here the scenario spans several requests in which Canvas changes its answer,
+which a recording of one state cannot express, so [[responses]] stands in for
+Canvas and everything above the HTTP layer is real.
+
+<<test functions>>=
+class TestSubmissionsCanvasNoLongerLists:
+    """A submission missing from the listing costs no fetch per read"""
+
+    URL = "https://canvas.example.org"
+    LISTING = f"{URL}/api/v1/courses/1/assignments/2/submissions"
+
+    def assignment(self, listed):
+        """Return an assignment and the requests its listing has received."""
+        requests = []
+
+        def answer(request):
+            query = urllib.parse.urlsplit(request.url).query
+            requests.append(set(urllib.parse.parse_qs(query).get("include[]", [])))
+            return (200, {}, json.dumps(
+                [{"id": each, "user_id": each, "assignment_id": 2, "grade": "F"}
+                 for each in listed]))
+
+        responses.add_callback(responses.GET, self.LISTING, callback=answer)
+        canvas = canvasapi.Canvas(self.URL, "a token")
+        return (Assignment(canvas._Canvas__requester,
+                           {"id": 2, "course_id": 1}),
+                requests)
+
+    @responses.activate
+    def test_it_costs_one_fetch_with_a_wider_include(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+
+        for _ in range(3):
+            submissions = assignment.get_submissions(
+                include=["submission_comments"])
+
+        assert len(requests) == 2
+        assert requests[-1] == {"rubric_assessment", "submission_comments"}
+        assert len(submissions) == 2
+
+    @responses.activate
+    def test_one_submission_no_longer_listed_is_still_asked_for(self):
+        """It really lacks what the listing got since, so it must not hide that."""
+        listed = [1, 2]
+        assignment, _ = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+        responses.get(f"{self.LISTING}/2",
+                      json={"id": 2, "user_id": 2, "assignment_id": 2})
+        calls = len(responses.calls)
+
+        assignment.get_submission(2, include=["submission_comments"])
+
+        assert len(responses.calls) == calls + 1
+
+    @responses.activate
+    def test_a_listed_submission_lacking_an_include_still_causes_a_fetch(self):
+        """Fetched on its own, a new student's has less than the others have."""
+        assignment, requests = self.assignment([1])
+        assignment.get_submissions(include=["rubric_assessment"])
+        responses.get(f"{self.LISTING}/3",
+                      json={"id": 3, "user_id": 3, "assignment_id": 2})
+        assignment.get_submission(3)
+
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_new_include_after_that_still_causes_a_fetch(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+
+        assignment.get_submissions(include=["submission_history"])
+
+        assert len(requests) == 3
+        assert requests[-1] == {"rubric_assessment", "submission_comments",
+                                "submission_history"}
+
+    @responses.activate
+    def test_a_bulk_refresh_does_not_repeat_over_those_canvas_left_out(self):
+        listed = list(range(5))
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions()
+        del listed[1:]
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in getattr(assignment, "__cache").values():
+            object.__setattr__(each, "_last_refresh", old)
+
+        for _ in range(3):
+            assignment.get_submissions(check_bulk_refresh=True)
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_submission_that_returns_is_found_once_the_fetch_is_old_enough(self):
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        listed.remove(2)
+        assignment.get_submissions(include=["submission_comments"])
+        listed.append(2)
+        setattr(assignment, "__all_fetched", datetime.now() - timedelta(
+            minutes=MISS_REFRESH_MIN_AGE_MINUTES))
+
+        for _ in range(2):
+            submissions = assignment.get_submissions(
+                include=["submission_comments"])
+
+        assert len(requests) == 3
+        cache = getattr(assignment, "__cache")
+        assert "submission_comments" in cache[2]._includes
+        assert len(submissions) == 2
+
+    @responses.activate
+    def test_an_assignment_from_an_earlier_version_can_be_read(self):
+        """Pickles don't run constructors, so it has no record of who left."""
+        assignment, requests = self.assignment([1])
+        assignment.get_submissions(include=["rubric_assessment"])
+        delattr(assignment, "__unlisted")
+
+        assignment.get_submissions(include=["rubric_assessment"])
+
+        assert len(requests) == 1
+
+    @responses.activate
+    def test_a_bulk_refresh_records_who_it_left_out(self):
+        """Only the submission that left lacks what we then ask for."""
+        listed = [1, 2]
+        assignment, requests = self.assignment(listed)
+        assignment.get_submissions(include=["rubric_assessment"])
+        cache = getattr(assignment, "__cache")
+        object.__setattr__(cache[1], "_includes",
+                           {"rubric_assessment", "submission_comments"})
+        for user_id in range(3, 3 + BULK_REFRESH_MIN_COUNT):
+            cache[user_id] = LazySubmission(
+                Submission(assignment._requester,
+                           {"id": user_id, "user_id": user_id, "grade": "F"}),
+                assignment, {"rubric_assessment", "submission_comments"},
+                MagicMock())
+            listed.append(user_id)
+        listed.remove(2)
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in cache.values():
+            object.__setattr__(each, "_last_refresh", old)
+        assignment.get_submissions(check_bulk_refresh=True)
+        assert len(requests) == 2
+
+        assignment.get_submissions(include=["submission_comments"])
+
+        assert len(requests) == 2
+
+    @responses.activate
+    def test_a_new_include_after_a_bulk_refresh_still_causes_a_fetch(self):
+        assignment, requests = self.assignment(list(range(5)))
+        assignment.get_submissions()
+        old = datetime.now() - timedelta(minutes=SUBMISSION_TTL_MINUTES + 1)
+        for each in getattr(assignment, "__cache").values():
+            object.__setattr__(each, "_last_refresh", old)
+        assignment.get_submissions(check_bulk_refresh=True)
+        assert len(requests) == 2
+
+        assignment.get_submissions(include=["submission_comments"])
+
+        assert len(requests) == 3
 @
 
 A successful bulk refresh must keep what a lazy one keeps.  We give the
