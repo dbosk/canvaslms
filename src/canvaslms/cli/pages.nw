@@ -4,9 +4,9 @@
 }
 
 This chapter provides the [[pages]] module with its subcommands: [[list]],
-[[view]], and [[edit]]. Canvas wiki pages are a flexible content type used
-for course information, resources, and documentation that doesn't fit into
-announcements or assignments.
+[[view]], [[edit]] and [[delete]].
+Canvas wiki pages are a flexible content type used for course information,
+resources, and documentation that doesn't fit into announcements or assignments.
 
 The module follows the same bidirectional workflow as announcements and
 assignments: pages can be exported to Markdown with YAML front matter using
@@ -29,6 +29,8 @@ import rich.syntax
 
 from datetime import datetime
 
+import canvasapi.exceptions
+
 import canvaslms.cli
 import canvaslms.cli.content
 import canvaslms.cli.courses
@@ -44,7 +46,8 @@ def add_command(subp):
   """Adds the pages command with subcommands to argparse parser"""
   pages_parser = subp.add_parser("pages",
     help="Manage course wiki pages",
-    description="Manage wiki pages in Canvas courses: list, view, and edit.")
+    description="Manage wiki pages in Canvas courses: list, view, edit and "
+                "delete.")
 
   pages_subp = pages_parser.add_subparsers(
     title="pages commands",
@@ -54,6 +57,7 @@ def add_command(subp):
   <<add pages list subcommand>>
   <<add pages view subcommand>>
   <<add pages edit subcommand>>
+  <<add pages delete subcommand>>
 @
 
 Tests run against a real [[canvasapi]] course, wrapped for caching by
@@ -67,6 +71,7 @@ import zlib
 from unittest.mock import patch
 
 import canvasapi.course
+import pytest
 import responses
 from canvasapi import Canvas
 
@@ -358,8 +363,8 @@ print(output)
 The page object returned by [[get_pages()]] doesn't include the body content.
 We therefore keep a separate helper for fully fetched pages.
 It requests the page by URL slug and normalizes the full-page attributes
-([[front_page]], [[editing_roles]], and [[body]]) without changing the
-lighter-weight objects returned by [[get_pages()]].
+([[editing_roles]] and [[body]]) without changing the lighter-weight objects
+returned by [[get_pages()]].
 <<fetch full page content>>=
 full_page = get_full_page(page.course, page.url)
 @
@@ -1062,4 +1067,261 @@ Finally, we report a summary of what was done.
 print(f"\nDone. Updated {updated_count}/{len(page_list)} page(s).", file=sys.stderr)
 if skipped_count > 0:
   print(f"Skipped {skipped_count} page(s).", file=sys.stderr)
+@
+
+
+\section{The [[pages delete]] subcommand}
+\label{sec:pages-delete}
+
+Pages made with [[edit --create]] could only be removed in the web interface,
+so a rehearsal in a sandbox course, or any script that creates and cleans up,
+left pages behind.
+[[pages delete]] removes the pages that match [[-p]], after listing them and
+asking, as [[modules delete]] does.
+<<add pages delete subcommand>>=
+delete_parser = pages_subp.add_parser("delete",
+    help="Delete wiki pages from a course",
+    description="Deletes the pages matching -p after listing them and asking "
+      "for confirmation (skip with --force). The front page is never "
+      "deleted, since Canvas doesn't allow it.")
+delete_parser.set_defaults(func=pages_delete_command)
+<<add pages delete arguments>>
+@
+
+The other subcommands take every page by default, which is harmless for
+reading but not here: one forgotten [[-p]] would select the whole course.
+So [[-p]] has no default, and neither has the course.
+[[-M]] still narrows the selection to pages in matching modules, the same way
+as for the other subcommands.
+<<add pages delete arguments>>=
+canvaslms.cli.courses.add_course_option(delete_parser, required=True,
+                                        default=None)
+delete_parser.add_argument("-p", "--page", required=True,
+  help="Regex matching the title or URL slug of the pages to delete")
+delete_parser.add_argument("-M", "--module", default="",
+  help="Regex matching module title or Canvas identifier, "
+       "combined with -p for AND filtering")
+delete_parser.add_argument("--force", "-F", action="store_true",
+  help="Skip the confirmation prompt")
+@
+
+Like [[modules delete]], and unlike [[quizzes delete]], we accept several
+matches: removing a set of pages is the usual cleanup, and the regex is the
+same one [[list]] takes, so [[pages list -p]] shows beforehand what would go.
+That is also why everything is listed and confirmed before the first deletion.
+
+Canvas refuses to delete the front page of a course.
+Rather than let that fail halfway through, we take the front page out of the
+selection and say so, which also keeps [[-p '.*']] from ending in an error.
+If nothing else matched, there is nothing to delete, which is an error since
+the user asked for a deletion.
+The listing tells us which page is the front page, so this needs no extra
+request.
+That flag comes from the cache, though, which completes a listed page once and
+then keeps it until the listing expires, so it can be out of date if the front
+page was changed in Canvas since.
+Canvas then refuses the new front page, and we deal with that as with any other
+page it refuses, below.
+<<functions>>=
+def pages_delete_command(config, canvas, args):
+  """Delete the pages matching -p, after confirmation."""
+  pages = process_page_option(canvas, args)
+  <<leave the front page out of [[pages]]>>
+  <<list the pages about to be deleted>>
+  <<ask for confirmation unless forced>>
+  failed = 0
+  for page in pages:
+    <<delete [[page]], or report why Canvas refused>>
+  if failed:
+    canvaslms.cli.err(1, f"Could not delete {failed} of {len(pages)} page(s)")
+@
+
+A page Canvas refuses must not stop the others, since the user has confirmed
+the whole list, and a traceback halfway would not say which pages are gone.
+So we report each refusal, carry on, and exit with an error at the end if
+anything was left, which lets a script tell that the cleanup is incomplete.
+A refused page stays in the cache, as it is still in Canvas.
+<<delete [[page]], or report why Canvas refused>>=
+try:
+  page.delete()
+except canvasapi.exceptions.CanvasException as error:
+  print(f"Could not delete '{page.title}' in {page.course.course_code}: "
+        f"{error}", file=sys.stderr)
+  failed += 1
+  continue
+<<forget the deleted [[page]]>>
+print(f"Deleted page '{page.title}' in {page.course.course_code}",
+      file=sys.stderr)
+@
+
+<<leave the front page out of [[pages]]>>=
+front_pages = [page for page in pages if page.front_page]
+for page in front_pages:
+  print(f"Leaving out '{page.title}' in {page.course.course_code}: "
+        "Canvas doesn't delete the front page of a course", file=sys.stderr)
+pages = [page for page in pages if not page.front_page]
+if not pages:
+  canvaslms.cli.err(1, "Only the front page matched, nothing to delete")
+@
+
+The URL slug is shown along with the title, since titles can repeat and the
+slug is what identifies the page to Canvas.
+<<list the pages about to be deleted>>=
+for page in pages:
+  print(f"{page.course.course_code}\t{page.title}\t{page.url}",
+        file=sys.stderr)
+@
+
+Any answer but yes keeps the pages, and so does a closed input, as when the
+command runs without a terminal and without [[--force]].
+<<ask for confirmation unless forced>>=
+if not args.force:
+  try:
+    answer = input(f"Delete {len(pages)} page(s)? [y/N] ")
+  except EOFError:
+    answer = ""
+  if answer.strip().lower() not in ("y", "yes"):
+    print("Aborted.", file=sys.stderr)
+    return
+@
+
+A deleted page must leave the cache too.
+The next listing would not drop it, since a fetch of a listing adds and
+updates entries but never removes one, so later commands would select it and
+then fail against Canvas.
+Module items may point to the page as well, so we let the modules be fetched
+again rather than show an item for a page that no longer exists.
+<<forget the deleted [[page]]>>=
+if hasattr(page.course, "page_cache"):
+  page.course.page_cache.pop(page.url, None)
+canvaslms.cli.modules.invalidate_course_modules(page.course)
+@
+
+Let's verify the command against a real [[canvasapi]] course whose requests
+[[responses]] answers.
+Since [[responses]] refuses any request it was not told about, a page deleted
+by mistake fails the test even when nothing asserts on it.
+The cached listing is checked afterwards, as the next command would see it.
+<<test functions>>=
+def course_with_pages(*pages):
+  """Return a cached course listing `pages`, and that listing's mock.
+
+  A listed page has no body, so the cache completes each one with a request
+  of its own when the listing is read again.
+  """
+  listing = responses.get(f"{API}/courses/1/pages", json=list(pages))
+  for page in pages:
+    responses.get(f"{API}/courses/1/pages/{page['url']}",
+                  json={**page, "body": "<p>x</p>"})
+  course = canvasapi.course.Course(Canvas(SERVER, "token")._Canvas__requester,
+                                   {"id": 1, "course_code": "SBX101"})
+  assert len(list(course.get_pages())) == len(pages)
+  return course, listing
+
+def run_pages_delete(course, regex, force, answer="", module=""):
+  """Run pages delete on `course`, answering the question with `answer`."""
+  args = argparse.Namespace(page=regex, module=module, force=force)
+  def reply(prompt):
+    if answer is None:
+      raise EOFError
+    return answer
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]), \
+       patch("builtins.input", side_effect=reply):
+    pages_delete_command({}, None, args)
+
+def page_deletion(url):
+  """Register Canvas's answer to deleting page `url`; return its mock."""
+  return responses.delete(f"{API}/courses/1/pages/{url}",
+                          json=page_json(url, url))
+
+@responses.activate
+def test_delete_removes_the_matching_pages_and_forgets_them():
+  course, listing = course_with_pages(page_json("lab-1", "Lab 1"),
+                                      page_json("lab-2", "Lab 2"),
+                                      page_json("notes", "Notes"))
+  course.module_cache = {5: (object(), {})}
+  deletions = [page_deletion(url) for url in ("lab-1", "lab-2")]
+
+  run_pages_delete(course, "^Lab", force=True)
+
+  assert [deletion.call_count for deletion in deletions] == [1, 1]
+  assert [page.url for page in course.get_pages()] == ["notes"]
+  assert listing.call_count == 1
+  assert course.module_cache == {}
+
+@responses.activate
+def test_delete_asks_first_and_respects_no(capsys):
+  course, _ = course_with_pages(page_json("lab-1", "Lab 1"))
+  deletion = page_deletion("lab-1")
+  for answer in ("n", "", None):
+    run_pages_delete(course, "^Lab", force=False, answer=answer)
+  assert deletion.call_count == 0
+  assert [page.url for page in course.get_pages()] == ["lab-1"]
+  assert "SBX101\tLab 1\tlab-1" in capsys.readouterr().err
+
+  run_pages_delete(course, "^Lab", force=False, answer="y")
+  assert deletion.call_count == 1
+  assert list(course.get_pages()) == []
+
+@responses.activate
+def test_delete_leaves_the_front_page_alone(capsys):
+  course, _ = course_with_pages({**page_json("home", "Home"),
+                                  "front_page": True},
+                                 page_json("lab-1", "Lab 1"))
+  deletion = page_deletion("lab-1")
+
+  run_pages_delete(course, ".*", force=True)
+
+  assert deletion.call_count == 1
+  assert [page.url for page in course.get_pages()] == ["home"]
+  assert "front page" in capsys.readouterr().err
+
+@responses.activate
+def test_a_page_canvas_refuses_does_not_stop_the_others(capsys):
+  """As when the cache's front page is out of date."""
+  course, _ = course_with_pages(page_json("lab-1", "Lab 1"),
+                                page_json("lab-2", "Lab 2"),
+                                page_json("lab-3", "Lab 3"))
+  first, third = page_deletion("lab-1"), page_deletion("lab-3")
+  responses.delete(f"{API}/courses/1/pages/lab-2", status=400,
+                   json={"errors": [{"message": "front page"}]})
+
+  with pytest.raises(SystemExit) as exit_info:
+    run_pages_delete(course, "^Lab", force=True)
+
+  assert exit_info.value.code == 1
+  assert (first.call_count, third.call_count) == (1, 1)
+  assert [page.url for page in course.get_pages()] == ["lab-2"]
+  assert "Could not delete 'Lab 2'" in capsys.readouterr().err
+
+@responses.activate
+def test_delete_of_only_the_front_page_is_an_error():
+  course, _ = course_with_pages({**page_json("home", "Home"),
+                                  "front_page": True})
+
+  with pytest.raises(SystemExit) as exit_info:
+    run_pages_delete(course, "^Home$", force=True)
+
+  assert exit_info.value.code == 1
+  assert [page.url for page in course.get_pages()] == ["home"]
+
+@responses.activate
+def test_delete_without_a_match_is_an_empty_list():
+  course, _ = course_with_pages(page_json("notes", "Notes"))
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    run_pages_delete(course, "^Lab", force=True)
+
+def test_delete_needs_a_course_and_a_page_pattern():
+  """A default of every page would make a slip delete them all."""
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+
+  with pytest.raises(SystemExit):
+    parser.parse_args(["pages", "delete", "-c", "SBX101", "--force"])
+  with pytest.raises(SystemExit):
+    parser.parse_args(["pages", "delete", "-p", "^Lab", "--force"])
+  args = parser.parse_args(["pages", "delete", "-c", "SBX101", "-p", "^Lab"])
+  assert args.func is pages_delete_command and not args.force
 @
