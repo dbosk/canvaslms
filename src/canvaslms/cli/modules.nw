@@ -1371,13 +1371,20 @@ for course, module in targets:
         file=sys.stderr)
 @
 
+Any answer but yes keeps the modules, and so does a closed input, as when the
+command runs without a terminal and without [[--force]]; reading it would
+otherwise end in a traceback.
+Either way the command exits with status 1, so that a script that forgot
+[[--force]] can tell nothing was deleted, as in [[pages delete]].
 <<ask for confirmation unless forced>>=
 if not args.force:
-  answer = input(f"Delete {len(targets)} module(s)? Items are removed from "
-                 "the module, their content stays in the course. [y/N] ")
+  try:
+    answer = input(f"Delete {len(targets)} module(s)? Items are removed from "
+                   "the module, their content stays in the course. [y/N] ")
+  except EOFError:
+    answer = ""
   if answer.strip().lower() not in ('y', 'yes'):
-    print("Aborted.", file=sys.stderr)
-    return
+    canvaslms.cli.err(1, "Aborted, nothing deleted")
 @
 
 <<add delete arguments>>=
@@ -1385,23 +1392,31 @@ delete_parser.add_argument("regex",
   help="Regex for selecting the modules to delete (name or Canvas ID)")
 courses.add_course_option(delete_parser, required=True)
 delete_parser.add_argument("--force", "-F", action="store_true",
-  help="Skip the confirmation prompt")
+  help="Skip the confirmation prompt; without it, declining or a closed "
+       "input deletes nothing and exits with status 1")
 @
 
 Let's verify that deletion only happens after a yes (or [[--force]]), that
 all matches go, and that the cached module list is forgotten.
 <<test functions>>=
-def run_modules_delete(names, regex, force, answer=None):
-  """Run modules delete on a course with modules `names`; return them."""
-  mods = [make_module(name, 100 + i, position=1 + i)
-          for i, name in enumerate(names)]
+def run_modules_delete(names, regex, force, answer=None, eof=False,
+                       mods=None):
+  """Run modules delete on a course with modules `names`; return them.
+
+  A caller that expects the command to exit passes its own `mods` to look at
+  afterwards, as the return value is lost then.
+  """
+  if mods is None:
+    mods = [make_module(name, 100 + i, position=1 + i)
+            for i, name in enumerate(names)]
   course = make_course(mods)
   course.module_cache = {m.id: (m, {}) for m in mods}
   course.module_all_fetched = datetime.now()
   args = argparse.Namespace(regex=regex, force=force)
   with patch("canvaslms.cli.modules.courses.process_course_option",
              return_value=[course]), \
-       patch("builtins.input", return_value=answer or ""):
+       patch("builtins.input", return_value=answer or "",
+             side_effect=EOFError if eof else None):
     modules_delete_command({}, MagicMock(), args)
   return course, mods
 
@@ -1412,9 +1427,13 @@ def test_delete_force_deletes_all_matches():
   assert course.module_cache == {} and course.module_all_fetched is None
 
 def test_delete_asks_and_respects_no():
-  course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
-                                    answer="n")
-  mods[0].delete.assert_not_called()
+  for answer, eof in (("n", False), ("", False), (None, True)):
+    kept = [make_module("Week 1", 100, position=1)]
+    with pytest.raises(SystemExit) as exit_info:
+      run_modules_delete(["Week 1"], "^Week", force=False, answer=answer,
+                         eof=eof, mods=kept)
+    assert exit_info.value.code == 1
+    kept[0].delete.assert_not_called()
   course, mods = run_modules_delete(["Week 1"], "^Week", force=False,
                                     answer="y")
   mods[0].delete.assert_called_once()
