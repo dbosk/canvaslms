@@ -17,7 +17,9 @@ import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
 from canvasapi.user import User
+from canvasapi.util import is_multivalued
 import collections
+import collections.abc
 import contextlib
 from datetime import datetime, timedelta
 import functools
@@ -105,6 +107,7 @@ time and affect all future instances.
 import json
 import logging
 import os
+import pickle
 import subprocess
 import sys
 import urllib.parse
@@ -704,6 +707,36 @@ turns fetching.
 
 Canvas accepts a single value as well as a list, so we count a string as a list
 of one item.
+Any other collection counts as several values, a tuple or a set as much as a
+list: we ask [[canvasapi.util.is_multivalued]], which is what [[canvasapi]] itself
+uses to decide how to send an argument.
+Testing for [[list]] alone made [[include=("term",)]] one value, the tuple, which
+Canvas never sees: [[canvasapi]] sends its items.
+[[values_of]] reads a value the same way for both functions, and the merge
+stores the items as a list.
+The list matters beyond this code: the cache file is shared with older copies of
+the library, which only know lists.
+<<kwargs functions caches>>=
+def values_of(value):
+  """Return the items of a multivalued `value`, else a list holding `value`."""
+  return list(value) if is_multivalued(value) else [value]
+@
+
+A generator is multivalued too, but it can be read only once.
+Comparing it with what is cached would use it up, and the request would then
+go out without the includes, or the cache would store an exhausted generator,
+which can't even be pickled.
+So the cached methods read such an argument into a list as they are called,
+before anything else looks at it.
+Collections that can be read again, such as tuples and sets, are passed on as
+they are.
+<<kwargs functions caches>>=
+def with_iterators_read(kwargs):
+  """Return `kwargs` with each one-shot iterator, such as a generator, as a list."""
+  return {key: list(value) if isinstance(value, collections.abc.Iterator)
+               else value
+          for key, value in kwargs.items()}
+@
 
 We can thus start with the following defaults:
 <<kwargs functions caches>>=
@@ -727,8 +760,8 @@ def must_update(prev_kwargs, new_kwargs,
 
     if key not in prev_kwargs:
       return True
-    elif isinstance(value, list) or isinstance(prev_kwargs[key], list):
-      if not set(as_list(value)) <= set(as_list(prev_kwargs[key])):
+    elif is_multivalued(value) or is_multivalued(prev_kwargs[key]):
+      if not set(values_of(value)) <= set(values_of(prev_kwargs[key])):
         return True
     elif value != prev_kwargs[key]:
       return True
@@ -751,14 +784,11 @@ def merge_kwargs(kwargs_list,
   for kwargs in kwargs_list:
     for key, value in kwargs.items():
       if key not in new_kwargs:
-        new_kwargs[key] = value
-      elif (isinstance(value, list) or isinstance(new_kwargs[key], list)
+        new_kwargs[key] = list(value) if is_multivalued(value) else value
+      elif (is_multivalued(value) or is_multivalued(new_kwargs[key])
             or key == "include"):
-        # Convert both to lists if either is a list, then union
-        prev_val = new_kwargs[key] if isinstance(new_kwargs[key], list) \
-                   else [new_kwargs[key]]
-        curr_val = value if isinstance(value, list) else [value]
-        new_kwargs[key] = list(set(prev_val) | set(curr_val))
+        new_kwargs[key] = list(set(values_of(new_kwargs[key]))
+                               | set(values_of(value)))
       else:
         <<if [[key]] can be ignored>>:
           new_kwargs[key] = value
@@ -1541,6 +1571,7 @@ For example:
 }
 \end{minted}
 <<return cached result or fetch from [[get_attr]]>>=
+kwargs = with_iterators_read(kwargs)
 <<pass a restricted request for one object through to Canvas>>
 
 attr_cache = getattr(self, f"{attr_name}_cache")
@@ -1942,6 +1973,7 @@ lacking what is asked for are ones Canvas no longer lists.
 Such a fetch gets one try, and if it fails the cached listing is used instead
 (\cref{sec:course-listing-outage}).
 <<return cached result or fetch from [[get_attrs]]>>=
+kwargs = with_iterators_read(kwargs)
 <<pass a request for a subset through to Canvas>>
 
 attr_cache = getattr(self, f"{attr_name}_cache")
@@ -3378,6 +3410,110 @@ class TestWhatAListingAsksFor:
 
         assert listings[-1] == {"term"}
         assert canvas.course_all_kwargs == {"include": ["term"]}
+@
+
+An include may come as any collection that [[canvasapi]] sends as several
+values, not only as a list (\cref{sec:what-a-listing-asks-for} relies on the
+merge of them).
+Let's verify on the wire, through the same stand-in for Canvas, that a tuple, a
+set and a generator are each sent in full, count as the same items when they
+come back, and leave nothing in the cache that can't be saved.
+
+<<test functions>>=
+class TestIncludesInAnyCollection:
+    """Tuples, sets and generators are read as their items"""
+
+    URL = "https://canvas.example.org"
+    LISTING = f"{URL}/api/v1/courses"
+
+    def canvas(self):
+        """Return a canvas and the include sets of all its requests."""
+        sent = []
+
+        def answer(request):
+            query = urllib.parse.urlsplit(request.url).query
+            sent.append(set(urllib.parse.parse_qs(query).get("include[]", [])))
+            if urllib.parse.urlsplit(request.url).path.endswith("/1"):
+                return (200, {}, json.dumps({"id": 1, "name": "One"}))
+            return (200, {}, json.dumps([{"id": 1, "name": "One"}]))
+
+        responses.add_callback(responses.GET, self.LISTING, callback=answer)
+        responses.add_callback(responses.GET, f"{self.LISTING}/1",
+                               callback=answer)
+        return canvasapi.Canvas(self.URL, "a token"), sent
+
+    @responses.activate
+    @pytest.mark.parametrize("include", [
+        ("term", "teachers"),
+        {"term", "teachers"},
+        (each for each in ["term", "teachers"])],
+        ids=["tuple", "set", "generator"])
+    def test_a_listing_asked_for_any_collection(self, include):
+        canvas, sent = self.canvas()
+
+        list(canvas.get_courses(include=include))
+        list(canvas.get_courses(include=["teachers", "term"]))
+        list(canvas.get_courses(include=("term",)))
+
+        assert sent == [{"term", "teachers"}]
+        assert pickle.loads(pickle.dumps(canvas.course_cache))
+        assert isinstance(canvas.course_cache[1][1]["include"], list)
+
+    @responses.activate
+    def test_tuples_in_another_order_ask_for_nothing_new(self):
+        canvas, sent = self.canvas()
+
+        list(canvas.get_courses(include=("term", "teachers")))
+        list(canvas.get_courses(include=("teachers", "term")))
+
+        assert len(sent) == 1
+
+    @responses.activate
+    def test_a_tuple_adds_its_items_to_what_was_asked(self):
+        canvas, sent = self.canvas()
+
+        list(canvas.get_courses(include=["term"]))
+        canvas.course_all_fetched = None
+        list(canvas.get_courses(include=("teachers",)))
+
+        assert sent[-1] == {"term", "teachers"}
+
+    @responses.activate
+    @pytest.mark.parametrize("include", [
+        ("syllabus_body",),
+        {"syllabus_body"},
+        (each for each in ["syllabus_body"])],
+        ids=["tuple", "set", "generator"])
+    def test_one_object_asked_for_any_collection(self, include):
+        canvas, sent = self.canvas()
+
+        canvas.get_course(1, include=include)
+        canvas.get_course(1, include=["syllabus_body"])
+
+        assert sent == [{"syllabus_body"}]
+        assert pickle.loads(pickle.dumps(canvas.course_cache))
+
+    @responses.activate
+    def test_a_generator_is_not_used_up_by_the_comparison(self):
+        """The cached entry has an include, so the generator is compared first."""
+        canvas, sent = self.canvas()
+        canvas.get_course(1, include=["term"])
+
+        canvas.get_course(1, include=(each for each in ["syllabus_body"]))
+
+        assert sent[-1] == {"term", "syllabus_body"}
+
+    @responses.activate
+    def test_a_tuple_stored_by_an_older_copy_is_read_as_its_items(self):
+        """An earlier merge stored the first value as it came, a tuple too."""
+        canvas, sent = self.canvas()
+        list(canvas.get_courses())
+        course, _ = canvas.course_cache[1]
+        canvas.course_cache[1] = (course, {"include": ("term", "teachers")})
+
+        list(canvas.get_courses(include=("teachers", "term")))
+
+        assert len(sent) == 1
 @
 
 \subsection{Testing outdated objects}
