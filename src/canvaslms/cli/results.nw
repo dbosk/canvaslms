@@ -32,6 +32,7 @@ import canvaslms.hacks.canvasapi
 
 import argparse
 import csv
+import canvasapi.exceptions
 import canvasapi.submission
 import datetime as dt
 import importlib
@@ -58,11 +59,14 @@ functionality it verifies.
 """Tests for the canvaslms.cli.results module."""
 import argparse
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
+import responses
 
+import canvasapi.course
 import canvasapi.exceptions
+from canvasapi import Canvas
 
 import canvaslms.cli.results as results_module
 
@@ -110,6 +114,10 @@ Lists results of a course for export, for instance to the `ladok report`
 command. Output format, CSV:
 
   <course code> <component code> <student identifier> <grade> <grade date> <graders ...>
+
+The graders are everyone who graded a version of the submission. When Canvas
+cannot give a submission's history, for instance for a student who has left
+the course, only the grader of the current version is listed, with a warning.
 
 Can also export a list of missing assignment results (--missing option) that 
 prevent the student from getting a grade. Output format, CSV:
@@ -821,18 +829,29 @@ def round_to_day(timestamp):
 
 \section{Getting all graders for a submission}
 
-We need all graders who participated in the grading, meaning also those who 
+We need all graders who participated in the grading, meaning also those who
 previously graded (since the last grader might just complement it).
+They are found in the submission's history, one grader per graded version.
+The history is not always at hand, though, so we first make sure we have it,
+and fall back to the current version when Canvas cannot give it;
+\cref{sec:missing-submission-history} explains both.
 <<functions>>=
 def all_graders(submission):
   """
-  Returns a list of everyone who participated in the grading of the submission. 
-  I.e. also those who graded previous submissions, when submission history is 
+  Returns a list of everyone who participated in the grading of the submission.
+  I.e. also those who graded previous submissions, when submission history is
   available.
+
+  Without a history, Canvas cannot tell us the earlier graders, so we warn and
+  return only the grader of the current version (or no one, if ungraded).
   """
+  history = submission_history(submission)
+  if history is None:
+    <<warn and return only the grader of [[submission]]>>
+
   graders = []
 
-  for prev_submission in submission.submission_history:
+  for prev_submission in history:
     <<turn [[prev_submission]] into [[Submission]] object>>
     <<append [[prev_submission]]'s grader to [[graders]]>>
 
@@ -858,6 +877,213 @@ Fortunately, we can use the [[resolve_grader]] function from the
 grader = submissions.resolve_grader(prev_submission)
 if grader:
   graders.append(grader)
+@
+
+\subsection{When the cached submission has no history}
+\label{sec:missing-submission-history}
+
+The grade path asks [[list_submissions]] for [["submission_history"]], yet a
+submission can still arrive without it, as [[None]] after the normalization
+in the [[utils]] module (\enquote{Normalizing partial Canvas objects}).
+The submission cache keeps every submission it has seen, but a listing only
+replaces those Canvas returns.
+A student who has left the course is no longer listed, so their submission
+keeps whatever the last listing that did return it asked for; if that was,
+say, a plain [[canvaslms submissions]] run, it holds no history.
+The cache cannot fill it in from the listing and does not pretend to: the
+wrapper's includes still say the history is missing
+(\cref{sec:unlisted-submissions}).
+Iterating over [[None]] then raised [[TypeError]], and one departed student
+stopped the report for the whole course (issue~\#587).
+
+The one who needs the history is this reader, so it asks for it.
+We fetch that single submission with the include, through the assignment's
+cached [[get_submission]].
+The cache sees that the include is new, fetches the submission from Canvas with
+it, and stores the result, so a later run finds the history in the cache instead
+of asking again.
+If Canvas still has the submission of a student whom the listing leaves out,
+the report is then as complete as for anyone else.
+
+If Canvas does not have it, the single request answers 404, which
+[[canvasapi]]'s requester raises as [[ResourceDoesNotExist]] (it maps every 404
+to that class).
+We have not checked against Canvas which of the two answers a student who has
+left actually gets, so we handle both; the 404 is the one the cache already
+expects for such a student (\cref{sec:missing-submission}).
+We return [[None]] for that, and also when Canvas answers without a history,
+and let [[all_graders]] decide what that means.
+Other errors still propagate: a 500 or a rejected token is not about this one
+student and should be seen.
+<<functions>>=
+def submission_history(submission):
+  """
+  Returns the submission history of `submission`, or None if Canvas has none.
+
+  A cached submission may lack its history, for instance for a student no
+  longer listed in the course. Then we fetch that one submission with the
+  history included (which also stores it in the cache). None means that
+  Canvas could not give it: no such submission (404) or still no history.
+  """
+  submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
+  if submission.submission_history is not None:
+    return submission.submission_history
+
+  try:
+    fetched = submission.assignment.get_submission(
+      submission.user_id, include=["submission_history"])
+  except canvasapi.exceptions.ResourceDoesNotExist:
+    return None
+
+  fetched = canvaslms.cli.utils.ensure_submission_attrs(fetched)
+  return fetched.submission_history
+@
+
+Without the history, we cannot know who graded the earlier versions.
+We still know who graded the current one: the submission's own [[grader_id]].
+That grader set the grade that the row reports, so naming them is correct as
+far as it goes; what we lose is only those who complemented earlier versions.
+The alternatives are worse.
+Dropping the row would lose a grade that Canvas does hold, and reporting no
+graders would claim that nobody graded it.
+Crashing, as before, loses every other student's row too.
+So we report the current grader, or no one if the submission has no
+[[grader_id]] (as [[resolve_grader]] decides), and warn, so that the user knows
+the list of graders for this student may be incomplete and can check it in
+SpeedGrader.
+The warning names the course, the assignment and the student, since that is
+what the user needs to find the submission.
+<<warn and return only the grader of [[submission]]>>=
+canvaslms.cli.warn(
+  f"{submission.assignment.course.course_code} "
+  f"{submission.assignment.name}: Canvas gave no submission history for "
+  f"{submission_owner(submission)}, reporting only the grader of the "
+  f"current version")
+grader = submissions.resolve_grader(submission)
+return [grader] if grader else []
+@
+
+To name the student, the login ID is what users recognize, and the Canvas user
+ID is what is always there.
+The student is an annotation: [[filter_submissions]] sets [[submission.user]]
+on the grade path, but the grading modules call [[all_graders]] on submissions
+they fetched themselves, which have none.
+So it is not one of the Canvas attributes that the normalization guarantees,
+and we read it with a default.
+<<functions>>=
+def submission_owner(submission):
+  """
+  Returns the student's login ID, or their Canvas user ID when the
+  submission carries no `user` or that user has no login ID.
+  """
+  user = getattr(submission, "user", None)
+  if user is not None:
+    user = canvaslms.cli.utils.ensure_user_attrs(user)
+    if user.login_id:
+      return user.login_id
+  return f"user id {submission.user_id}"
+@
+
+Let's verify this through the [[results]] command itself, since the crash
+stopped the whole report, not just one call.
+The course is a real [[canvasapi]] course, wrapped for caching as in a run,
+whose requests are answered by [[responses]]: a recording could not show a
+student leaving between two runs, and [[responses]] lets us give the departed
+students' single requests the answers we want.
+We need three students.
+The first is listed with the history.
+The other two were in an earlier listing without the history, as by a plain
+[[canvaslms submissions]], and have since left, so the listing that [[results]]
+asks for no longer returns them.
+For the second, Canvas still answers the single request; for the third, it
+answers 404.
+Each student has a different set of graders, so the rows show which way each
+was handled: the history names two graders, the fallback only the current one.
+The report must hold all three rows, the 404 must be warned about by login, and
+the history fetched for the second must be kept in the cache.
+<<test functions>>=
+SERVER = "https://canvas.example.invalid"
+API = f"{SERVER}/api/v1"
+
+def student_json(user_id):
+  """Return a synthetic student as the course roster sends it."""
+  return {"id": user_id, "name": f"Student {user_id}",
+          "sortable_name": f"{user_id}, Student",
+          "login_id": f"student{user_id}",
+          "integration_id": f"int-{user_id}",
+          "enrollments": [{"type": "StudentEnrollment",
+                           "role": "StudentEnrollment",
+                           "enrollment_state": "active"}]}
+
+def graded_submission_json(user_id, grader_id, history=None):
+  """Return a passed submission, with its history only if given."""
+  submission = {"id": 100 + user_id, "user_id": user_id,
+                "assignment_id": 7, "grade": "P", "score": 1.0,
+                "submitted_at": "2026-10-01T10:00:00Z",
+                "graded_at": "2026-10-02T10:00:00Z",
+                "grader_id": grader_id, "workflow_state": "graded"}
+  if history is not None:
+    submission["submission_history"] = history
+  return submission
+
+@responses.activate
+def test_results_survive_submissions_without_history(capsys, caplog):
+  responses.get(f"{API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1,
+                       "assignment_group_id": 1, "published": True,
+                       "due_at": None}])
+  responses.get(f"{API}/courses/1/search_users",
+                json=[student_json(1), student_json(2), student_json(3)])
+  responses.get(f"{API}/courses/1/users/90",
+                json={"id": 90, "name": "Grader A", "login_id": "gradera"})
+  responses.get(f"{API}/courses/1/users/91",
+                json={"id": 91, "name": "Grader B", "login_id": "graderb"})
+  earlier_listing = responses.get(
+    f"{API}/courses/1/assignments/7/submissions",
+    json=[graded_submission_json(1, 90), graded_submission_json(2, 91),
+          graded_submission_json(3, 91)])
+  history_listing = responses.get(
+    f"{API}/courses/1/assignments/7/submissions",
+    json=[graded_submission_json(
+      1, 90, history=[graded_submission_json(1, 91),
+                      graded_submission_json(1, 90)])])
+  single_fetch = responses.get(
+    f"{API}/courses/1/assignments/7/submissions/2",
+    json=graded_submission_json(
+      2, 91, history=[graded_submission_json(2, 90),
+                      graded_submission_json(2, 91)]))
+  departed = responses.get(
+    f"{API}/courses/1/assignments/7/submissions/3", status=404,
+    json={"errors": [{"message": "The specified resource does not exist."}]})
+
+  course = canvasapi.course.Course(
+    Canvas(SERVER, "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+  assignment, = course.get_assignments()
+  list(assignment.get_submissions())
+
+  parser = argparse.ArgumentParser()
+  results_module.add_command(parser.add_subparsers())
+  args = parser.parse_args(["results", "-c", "SBX101", "-a", "Lab"])
+  args.delimiter = "\t"
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    results_module.results_command({}, None, args)
+
+  rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+  graders = {row[2]: sorted(row[5:]) for row in rows}
+  assert graders == {"int-1": ["Grader A <gradera>", "Grader B <graderb>"],
+                     "int-2": ["Grader A <gradera>", "Grader B <graderb>"],
+                     "int-3": ["Grader B <graderb>"]}
+  assert earlier_listing.call_count == 1
+  assert history_listing.call_count == 1
+  assert single_fetch.calls[0].request.params == {
+    "include[]": "submission_history"}
+  assert departed.call_count == 1
+  assert "student3" in caplog.text and "Lab" in caplog.text
+  assert "student2" not in caplog.text
+  assignment.get_submission(2, include=["submission_history"])
+  assert single_fetch.call_count == 1
 @
 
 
