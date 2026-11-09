@@ -4642,14 +4642,25 @@ We could not check against Canvas which courses its listing leaves out.
 
 So the course listing sets [[confirm_unlisted]] as well, and asks Canvas about
 each course it did not get back, with the singular method.
-Only a 404, which [[canvasapi]] raises as [[ResourceDoesNotExist]], says that the
-course is gone, and only then do we remove it.
+Two answers mean that the course is no longer ours, and only then do we remove
+it.
+A 404, which [[canvasapi]] raises as [[ResourceDoesNotExist]], says that the
+course does not exist.
+A 403, raised as [[Forbidden]], says that it exists but we may not read it, which
+is what a course we have left looks like.
+We checked these answers on KTH's Canvas on 9~November 2026, read-only: an
+existing course the user is not in gave 403 with the message
+\enquote{user not authorised to perform that action}, an ID that does not exist
+gave 404, and a public course gave 200.
+A rule of 404 alone would thus never have removed a course we left, which is the
+commonest way a course leaves the listing.
 A course that Canvas still gives us is kept, marked like any entry the listing
 did not return.
-Any other answer, an error from Canvas or none at all, tells us nothing about
-the course, so it is kept too.
-That includes a refusal: if Canvas answers a course we have lost access to with
-401 or 403 rather than 404, that course stays in the cache, marked.
+Any other answer tells us nothing about the course, so it is kept too.
+That includes 401, raised as [[Unauthorized]] (or [[InvalidAccessToken]]), which
+is about the token, not the course: removing courses because a token has expired
+would throw away the cache for a problem the next login fixes.
+It also includes other errors from Canvas and no answer at all.
 The request is a precaution like those of \cref{sec:course-listing-outage}, so
 it gets one try.
 It costs one request per course that has vanished from the listing, which is
@@ -4660,18 +4671,20 @@ Assignments don't need this: a teacher's listing of a course's assignments has
 all of them, so one missing from it has been deleted.
 <<functions>>=
 def canvas_says_it_is_gone(get_one, owner, key):
-  """Return True if Canvas answers 404 when `get_one` asks `owner` for `key`.
+  """Return True if Canvas answers 404 or 403 when `get_one` asks for `key`.
 
-  `get_one` is a singular get method that is not cached, or None, in which case
+  That is, the object does not exist, or exists but is closed to us. `get_one`
+  is a singular get method of `owner` that is not cached, or None, in which case
   nothing can be asked and the answer is False. The request gets one try, and
-  any other failure also gives False.
+  any other failure, a 401 included, also gives False.
   """
   if get_one is None:
     return False
   try:
     with without_retries([owner]):
       get_one(owner, key)
-  except canvasapi.exceptions.ResourceDoesNotExist:
+  except (canvasapi.exceptions.ResourceDoesNotExist,
+          canvasapi.exceptions.Forbidden):
     return True
   except (canvasapi.exceptions.CanvasException,
           requests.exceptions.RequestException) as error:
@@ -4746,9 +4759,14 @@ class TestForgettingWhatCanvasNoLongerLists:
 
     @responses.activate
     @pytest.mark.parametrize("how", ["ttl", "refresh"])
-    def test_a_course_gone_from_canvas_is_gone(self, how):
-        canvas = self.course_no_longer_listed(
-            how, status=404, json={"errors": [{"message": "Not Found"}]})
+    @pytest.mark.parametrize("answer", [
+        {"status": 404, "json": {"errors": [{"message": "Not Found"}]}},
+        {"status": 403, "json": {"status": "unauthorized", "errors": [{
+            "message": "user not authorised to perform that action"}]}}],
+        ids=["not found", "left"])
+    def test_a_course_gone_from_canvas_is_gone(self, how, answer):
+        """A 403 is what KTH's Canvas gave for a course one is not in."""
+        canvas = self.course_no_longer_listed(how, **answer)
 
         assert [course.id for course in canvas.get_courses()] == [1]
         assert set(canvas.course_cache) == {1}
@@ -4759,6 +4777,8 @@ class TestForgettingWhatCanvasNoLongerLists:
         {"json": {"id": 2, "name": "2"}},
         {"status": 500, "json": {"errors": [{"message": "Error"}]}},
         {"status": 401, "json": {"errors": [{"message": "Unauthorized"}]}},
+        {"status": 401, "headers": {"WWW-Authenticate": "Bearer"},
+         "json": {"errors": [{"message": "Invalid access token."}]}},
         {"body": requests.exceptions.ConnectionError("Unreachable")}])
     def test_a_course_canvas_does_not_call_gone_is_kept(self, answer):
         """Not as a precaution, which would hide an error escaping the check."""
@@ -5898,8 +5918,8 @@ at any time, so the listing has a time-to-live of [[COURSE_CACHE_TTL_DAYS]] days
 We use the [[CacheGetMethods]] decorator to add caching to the [[Canvas]] class
 for its [[get_course]] and [[get_courses]] methods.
 The decorator takes the attribute name [[course]] as argument.
-A course Canvas no longer lists is forgotten if Canvas also answers 404 for it
-(\cref{sec:forget-unlisted}).
+A course Canvas no longer lists is forgotten if Canvas also answers 404 or 403
+for it (\cref{sec:forget-unlisted}).
 <<functions>>=
 def make_canvas_courses_cacheable():
   import canvasapi.canvas
