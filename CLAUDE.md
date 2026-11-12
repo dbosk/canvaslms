@@ -931,6 +931,17 @@ on an individual refresh removes that one object. Users and submissions are neve
 removed, only marked `_unlisted`, since `results` needs students who have left.
 What was asked of one object (`get_course(id, include=[...])`) stays on that
 entry; the listing refetches with its own record, `{attr}_all_kwargs`.
+
+The cache file is not a copy of memory: classes register state filters
+(`add_state_filter` in `hacks/canvasapi.nw`, "What goes into the cache file")
+that run only while `save_canvas_cache` pickles. Two exist: a `User` keeps
+`ENROLLMENT_FIELDS` of each enrollment and records them as
+`_enrollment_fields` (read through `kept_kwargs`, so adding a field to the
+list refetches rosters, no schema bump), and a `Course` with nothing fetched
+below it for `CANVASLMS_CACHE_KEEP_DAYS` (90) is stored without its contents,
+departed users included. A filter must leave attributes in place (emptied),
+never change the live object, and keep the state a plain dict.
+
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
 a command or on `EmptyListError`.
