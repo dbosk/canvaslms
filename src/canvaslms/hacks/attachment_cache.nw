@@ -112,6 +112,9 @@ before read it when they report a cache hit and would fail without it.
 That happens in one place, [[_save_index]], which every write goes through:
 it gives each entry the fixed value, so a new entry needs no name at all, and
 names that are already in an index disappear the next time it is written.
+With submissions excluded from the cache there is no next time, since nothing
+is stored or restored then; [[cache clear-attachments]] writes the index too,
+and removes what the names belonged to.
 
 A [[.dat]] file written by an older, unencrypted canvaslms fails
 decryption.
@@ -166,6 +169,7 @@ import canvaslms.hacks.attachment_cache as attachment_cache
 """Encrypted content-addressed cache for Canvas submission attachments"""
 
 from canvaslms import dirs
+import canvaslms.hacks.canvasapi
 from cryptography.fernet import InvalidToken
 import hashlib
 import json
@@ -266,6 +270,26 @@ def set_fernet(fernet):
     """
     global _fernet
     _fernet = fernet
+@
+
+There is a second reason for the cache to be off.
+A user can keep submissions out of the Canvas object cache
+([[CACHE_EXCLUDE]] in [[hacks/canvasapi.nw]]), and the attachments are the
+submissions themselves, so they must stay off the disk as well.
+We ask when an attachment is about to be stored or restored, not once at
+program start: the exclusion can be turned on later, by a program that
+already holds its Canvas object, and it must hold from then on.
+What is already in the cache stays until [[cache clear-attachments]] removes
+it; it is just no longer read.
+
+<<encryption key state>>=
+def _why_disabled():
+    """Return why nothing is cached now, or None if the cache is in use."""
+    if _fernet is None:
+        return "no encryption key"
+    if "submission" in canvaslms.hacks.canvasapi.CACHE_EXCLUDE:
+        return "submissions are excluded from the cache"
+    return None
 @
 
 \subsubsection{Test fixtures}
@@ -439,11 +463,12 @@ def restore_cached_attachment(attachment_id: int,
     Decrypt the cached attachment into dest_path.
 
     Returns True on success, False on cache miss (not cached, missing
-    or undecryptable content file, or no encryption key registered).
+    or undecryptable content file, no encryption key registered, or
+    submissions excluded from the cache).
     Updates last_access timestamp on cache hit.
     """
-    if _fernet is None:
-        logger.debug(f"Attachment cache disabled (no encryption key): "
+    if _why_disabled():
+        logger.debug(f"Attachment cache disabled ({_why_disabled()}): "
                      f"{attachment_id}")
         return False
 
@@ -591,7 +616,8 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     """
     Cache an attachment file, encrypted, using content-addressed storage.
 
-    Does nothing if no encryption key is registered (see set_fernet).
+    Does nothing if no encryption key is registered (see set_fernet) or if
+    submissions are excluded from the cache.
 
     Args:
         attachment_id: Canvas attachment ID
@@ -599,8 +625,8 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
         metadata: Dictionary with 'size', 'content_type'; a 'filename' is
             accepted and not stored
     """
-    if _fernet is None:
-        logger.debug(f"Attachment cache disabled (no encryption key); "
+    if _why_disabled():
+        logger.debug(f"Attachment cache disabled ({_why_disabled()}); "
                      f"not caching {attachment_id}")
         return
 
@@ -652,6 +678,25 @@ name that an older copy of this library put there must be gone after the next
 write, while the entry keeps its [[filename]] key for those copies.
 
 <<test functions>>=
+def test_excluding_submissions_turns_the_cache_off_and_on_again(
+        tmp_cache, test_file, tmp_path, monkeypatch):
+    """Nothing is stored or restored while submissions are excluded"""
+    import canvaslms.hacks.canvasapi as hacks
+    metadata = {"size": 3, "content_type": "text/plain"}
+    restored = tmp_path / "restored.txt"
+    monkeypatch.setattr(hacks, "CACHE_EXCLUDE", frozenset())
+    attachment_cache.cache_attachment(1, test_file, metadata)
+
+    hacks.exclude_from_cache_file("personal")
+    attachment_cache.cache_attachment(2, test_file, metadata)
+    assert not attachment_cache.restore_cached_attachment(1, restored)
+    assert not restored.exists()
+    assert set(json.loads((tmp_cache / "index.json").read_text())) == {"1"}
+
+    hacks.exclude_from_cache_file("user")
+    assert attachment_cache.restore_cached_attachment(1, restored)
+    assert restored.read_bytes() == test_file.read_bytes()
+
 def test_index_holds_no_file_names(tmp_cache, test_file):
     """Neither a new entry nor an older one keeps its file name"""
     index_file = tmp_cache / "index.json"
