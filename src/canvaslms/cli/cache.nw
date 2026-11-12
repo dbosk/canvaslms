@@ -111,6 +111,7 @@ from urllib3.util.retry import Retry
 from canvaslms import dirs
 import canvaslms.cli.utils
 import canvaslms.hacks.attachment_cache as attachment_cache
+import canvaslms.hacks.canvasapi
 from canvaslms.hacks.canvasapi import (
     request_refresh,
     writing_cache_file,
@@ -890,10 +891,12 @@ def save_canvas_cache(canvas, token, hostname, force=False):
 
     # Pickle and encrypt
     pickle_start = time.perf_counter()
+    excluded = excluded_kinds()
     with writing_cache_file():
       pickled = pickle.dumps({
         "version": CACHE_SCHEMA_VERSION,
         "canvas": canvas,
+        "excluded": sorted(excluded),
       })
     pickle_elapsed = time.perf_counter() - pickle_start
     pickle_size = len(pickled)
@@ -909,6 +912,7 @@ def save_canvas_cache(canvas, token, hostname, force=False):
     <<write [[encrypted]] atomically to [[cache_path]]>>
     write_elapsed = time.perf_counter() - write_start
     remember_as_stored(canvas)
+    remember_excluded(canvas, excluded)
 
     save_elapsed = time.perf_counter() - save_start
     logger.info(f"Canvas cache save: {save_elapsed:.2f}s total "
@@ -1018,6 +1022,7 @@ def load_canvas_cache(token, hostname):
 
     <<discard [[payload]] on schema mismatch>>
     remember_as_stored(payload["canvas"])
+    remember_excluded(payload["canvas"], payload.get("excluded", ()))
 
     load_elapsed = time.perf_counter() - load_start
     logger.info(f"Canvas cache load: {load_elapsed:.2f}s total "
@@ -1441,10 +1446,17 @@ One consequence is that the modification time of the cache file now tells when
 something was last fetched, not when the cache was last used.
 <<skip the save if nothing was sent to Canvas>>=
 if not force and unchanged_since_stored(canvas):
-  logger.info("Canvas cache save skipped: no request sent to Canvas since "
-              "the cache was loaded or saved")
-  return
+  if not not_yet_excluded(canvas):
+    logger.info("Canvas cache save skipped: no request sent to Canvas since "
+                "the cache was loaded or saved")
+    return
+  logger.info(f"Canvas cache: saving to leave "
+              f"{', '.join(sorted(not_yet_excluded(canvas)))} out of the file")
 @
+
+The exception in the middle is explained in \cref{sec:cache-exclude-in-file}:
+the user has excluded a kind of object from the file, and the file does not say
+that it excludes it, so it may still hold that kind.
 
 Let's verify this through the real command line and the real encrypted file, as
 the user meets it.
@@ -1819,6 +1831,157 @@ def test_a_course_unused_for_long_is_listed_and_its_contents_fetched_again(
   assert "Lab" in run_canvaslms("assignments", "-c", "Old")
   assert [call.request.path_url.split("?")[0] for call in responses.calls] \
       == ["/api/v1/courses/1/assignments"]
+@
+
+
+\subsection{Kinds the user keeps out of the file}
+\label{sec:cache-exclude-in-file}
+
+The third filter leaves out the kinds of objects that the user has named, such
+as users and submissions, for those who don't want student data on disk
+(\cref{sec:cache-exclude}).
+The filter needs one thing from this module that the other two do not.
+
+They make the file smaller, and it does not matter when: the next save will
+do.
+An exclusion is a promise about what is on disk, and the next save may be far
+away, since a command that sends no request does not save
+(\cref{sec:skip-unchanged-save}).
+Someone who turns the exclusion on and then only reads pages from the cache
+would keep every roster in the file.
+So the file says what it excludes, in the envelope next to the version, and a
+save is not skipped while a kind is excluded that the file does not say it
+excludes.
+That save happens once: afterwards the file says so.
+
+The record is in the envelope and not in the [[Canvas]] object, like the
+version, because it describes the file.
+A copy of this library that does not know the key reads only the version and
+the object, as before.
+What such a copy saves has no record, and may hold the excluded kinds again if
+that program fetched them, so our next run saves once more.
+An exclusion holds for the file only if every program that writes it excludes
+the same.
+
+As with the request count, we remember for each [[Canvas]] object what the
+file excluded when the object last matched it.
+<<functions>>=
+def excluded_kinds():
+  """Return the kinds of objects to leave out of the cache file."""
+  return canvaslms.hacks.canvasapi.CACHE_EXCLUDE
+
+def remember_excluded(canvas, kinds):
+  """Note that the cache file of `canvas` excludes `kinds`."""
+  try:
+    excluded_in_file[canvas] = frozenset(kinds)
+  except TypeError:
+    pass
+
+def not_yet_excluded(canvas):
+  """Return the excluded kinds that the cache file of `canvas` may still hold."""
+  try:
+    return excluded_kinds() - excluded_in_file.get(canvas, frozenset())
+  except TypeError:
+    return excluded_kinds()
+<<constants>>=
+excluded_in_file = weakref.WeakKeyDictionary()
+@
+
+Let's verify it through the command line and the encrypted file.
+The exclusion is set as the environment variable would have set it at import.
+
+<<test functions>>=
+def envelope(path):
+  """Return the decrypted envelope of the cache file at `path`."""
+  return pickle.loads(
+      Fernet(cache.derive_key("token", HOST)).decrypt(path.read_bytes()))
+
+def users_in_file(path):
+  """Return how many users the courses in the cache file at `path` hold."""
+  return sum(len(course.user_cache)
+             for course, _ in envelope(path)["canvas"].course_cache.values())
+
+@pytest.fixture
+def roster_in_canvas():
+  """Stub Canvas with one course that has a student and a teacher."""
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  responses.get(f"{COURSES_URL}/1/search_users", json=[
+      enrolled(7, "Anna", "StudentEnrollment"),
+      enrolled(8, "Tora", "TeacherEnrollment")])
+
+def exclude(monkeypatch, *kinds):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
+                      frozenset(kinds))
+
+@responses.activate
+def test_turning_an_exclusion_on_rewrites_the_file_once_without_a_request(
+    run_canvaslms, tmp_cache_path, roster_in_canvas, monkeypatch, caplog):
+  run_canvaslms("users", "-c", "Old", "-s")
+  assert users_in_file(tmp_cache_path) == 2
+  assert envelope(tmp_cache_path)["excluded"] == []
+  responses.calls.reset()
+
+  exclude(monkeypatch, "user")
+  with caplog.at_level(logging.INFO, logger=cache.logger.name):
+    assert "Old course" in run_canvaslms("courses")
+
+  assert len(responses.calls) == 0
+  assert users_in_file(tmp_cache_path) == 0
+  assert envelope(tmp_cache_path)["excluded"] == ["user"]
+  assert "to leave user out of the file" in caplog.text
+
+  before = stored(tmp_cache_path)
+  run_canvaslms("courses")
+  assert stored(tmp_cache_path) == before
+
+@responses.activate
+def test_each_run_fetches_an_excluded_kind_and_nothing_else(
+    run_canvaslms, tmp_cache_path, roster_in_canvas, monkeypatch):
+  exclude(monkeypatch, "user")
+  students = run_canvaslms("users", "-c", "Old", "-s")
+  assert "Anna" in students
+  assert users_in_file(tmp_cache_path) == 0
+  responses.calls.reset()
+
+  assert run_canvaslms("users", "-c", "Old", "-s") == students
+
+  assert [call.request.path_url.split("?")[0] for call in responses.calls] \
+      == ["/api/v1/courses/1/search_users"]
+
+@responses.activate
+def test_a_file_without_the_record_counts_as_excluding_nothing(
+    run_canvaslms, tmp_cache_path, roster_in_canvas, monkeypatch):
+  run_canvaslms("users", "-c", "Old", "-s")
+  unrecorded = envelope(tmp_cache_path)
+  del unrecorded["excluded"]
+  tmp_cache_path.write_bytes(
+      Fernet(cache.derive_key("token", HOST)).encrypt(pickle.dumps(unrecorded)))
+
+  exclude(monkeypatch, "user")
+  run_canvaslms("courses")
+
+  assert users_in_file(tmp_cache_path) == 0
+@
+
+A program that uses the library can save more than once, for instance with
+[[canvaslms.save_canvas]] and again at exit.
+The save that brought the exclusion to the file must be remembered, or every
+later save in that process would write the file again.
+
+<<test functions>>=
+@responses.activate
+def test_a_second_save_in_one_process_is_skipped_once_the_file_excludes(
+    run_canvaslms, tmp_cache_path, roster_in_canvas, monkeypatch):
+  run_canvaslms("users", "-c", "Old", "-s")
+  canvas = cache.load_canvas_cache("token", HOST)
+  exclude(monkeypatch, "user")
+
+  cache.save_canvas_cache(canvas, "token", HOST)
+  assert users_in_file(tmp_cache_path) == 0
+  before = stored(tmp_cache_path)
+
+  cache.save_canvas_cache(canvas, "token", HOST)
+  assert stored(tmp_cache_path) == before
 @
 
 
