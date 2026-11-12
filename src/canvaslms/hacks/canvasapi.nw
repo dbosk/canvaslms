@@ -116,6 +116,7 @@ import sys
 import urllib.parse
 
 import canvasapi
+import canvasapi.module
 import copy
 import pytest
 import responses
@@ -6591,6 +6592,215 @@ class TestShortEnrollments:
 @
 
 
+\subsubsection{Courses nobody has used for a long time}
+\label{sec:forget-unused-contents}
+
+Nothing so far leaves the cache unless Canvas stops listing it.
+A roster that was fetched once, because a search went through every course,
+stays in the file for good, and every later command loads it.
+The second filter leaves out the contents of a course that has not been used for
+[[CACHE_KEEP_DAYS]] days.
+
+We cannot see what has been \emph{used}.
+A read that the cache answers leaves no trace, and it should not: a record of
+reads would have to be saved, and a command that only reads would write the
+whole file again (\cref{sec:skip-unchanged-save}).
+What we do have is when each object was \emph{fetched}.
+That is nearly as good, since a listing in use is fetched again whenever it
+expires, but only nearly: a submission with a passing grade never expires
+(\cref{sec:cache-ttl-constants}), so [[results]] for last year's course reads
+submissions that were fetched a year ago.
+Judging each listing by its own age would drop exactly those while they are in
+use.
+
+So the unit is the course.
+Any use of a course fetches something below it sooner or later, its roster
+every other day and its list of assignments every week, even when most of what
+is read is old.
+If nothing below a course has been fetched for [[CACHE_KEEP_DAYS]] days, the
+course has not been used for about as long.
+The course's own time stamp does not count: the list of courses is fetched
+every day, whether or not anyone looks at this course.
+An entry without a time stamp, such as an assignment that [[assignments create]]
+put in the cache itself, tells nothing; a course with only such entries is
+kept.
+<<constants>>=
+CACHE_KEEP_DAYS = env_number("CANVASLMS_CACHE_KEEP_DAYS", 90, int)
+<<functions>>=
+def newest_fetch_below(obj):
+  """Return when something cached below `obj` was last fetched, or None."""
+  try:
+    attributes = object.__getattribute__(obj, "__dict__")
+  except AttributeError:
+    return None
+  newest = None
+  for name, cache in attributes.items():
+    if not (name.endswith("_cache") and isinstance(cache, dict)):
+      continue
+    for entry in cache.values():
+      child = entry[0] if isinstance(entry, tuple) else entry
+      for fetched in (fetch_time(child), newest_fetch_below(child)):
+        if fetched and (newest is None or fetched > newest):
+          newest = fetched
+  return newest
+
+def fetch_time(obj):
+  """Return when the cached `obj` was fetched, or None if it doesn't say."""
+  try:
+    attributes = object.__getattribute__(obj, "__dict__")
+  except AttributeError:
+    return None
+  return attributes.get("_fetched_at") or attributes.get("_last_refresh")
+@
+
+We read the attributes through [[object.__getattribute__]], because the
+submissions in an assignment's cache are [[LazySubmission]] wrappers
+(\cref{sec:lazy-submission}), and asking one of those for an attribute in the
+ordinary way can make it fetch from Canvas.
+Their time stamp is [[_last_refresh]].
+
+What we leave out is everything cached below the course: each of its caches is
+empty in the file and each listing counts as not fetched, so the next command
+that reads one fetches it.
+With the assignments go their submissions, and with the roster the users who
+have left the course, whom the cache otherwise keeps for the sake of their
+results (\cref{sec:forget-unlisted}).
+That is the price, and it is why the limit is long and can be set:
+[[CANVASLMS_CACHE_KEEP_DAYS]] is 90 days unless set otherwise, and 0 keeps
+everything for good.
+The course itself stays, so the list of courses is still complete, and so does
+the record of what each of its listings asks for, [[_all_kwargs]], so the next
+fetch brings what the last one did.
+
+Like every state filter, this one changes the file and not the objects in
+memory, and it runs only when the file is written anyway.
+A command cannot lose what it is working with: what it fetched has a new time
+stamp.
+<<functions>>=
+def forget_unused_contents(course, state):
+  """State filter: leave out the contents of a course unused for a long time."""
+  if CACHE_KEEP_DAYS <= 0:
+    return
+  newest = newest_fetch_below(course)
+  if newest is None or datetime.now() - newest <= timedelta(days=CACHE_KEEP_DAYS):
+    return
+  for name, value in state.items():
+    if name.endswith("_cache") and isinstance(value, dict):
+      state[name] = {}
+    elif name.endswith("_all_fetched"):
+      state[name] = None
+  logger.info(f"Cache pruning: left out the contents of course "
+              f"{state.get('id')}, nothing fetched since {newest:%Y-%m-%d}")
+
+def make_unused_course_contents_forgotten():
+  import canvasapi.course
+  add_state_filter(canvasapi.course.Course, forget_unused_contents)
+@
+
+Let's verify it on a real [[Course]] with a user, an assignment, a submission
+and a module with one item, all fetched a given number of days ago.
+The course itself was fetched now, as the daily listing leaves it.
+
+<<test functions>>=
+def days_ago(days):
+    return datetime.now() - timedelta(days=days)
+
+def course_with_contents_fetched(fetched):
+    """Return a course whose contents were all fetched at `fetched`."""
+    course = Course(None, {"id": 1, "name": "Old course"})
+    course._fetched_at = datetime.now()
+
+    user = User(None, {"id": 7, "name": "Anna"})
+    assignment = Assignment(None, {"id": 5, "name": "Lab", "course_id": 1})
+    submission = LazySubmission(
+        Submission(None, {"id": 9, "user_id": 7, "grade": "P"}),
+        assignment, set(), None)
+    module = canvasapi.module.Module(None, {"id": 3, "name": "Week 1"})
+    item = canvasapi.module.ModuleItem(None, {"id": 4, "title": "Read"})
+    for obj in (user, assignment, module, item):
+        obj._fetched_at = fetched
+    object.__setattr__(submission, "_last_refresh", fetched)
+
+    getattr(assignment, "__cache")[7] = submission
+    module.module_item_cache[4] = (item, {})
+    course.user_cache[7] = (user, {"include": ["enrollments"]})
+    course.assignment_cache[5] = (assignment, {})
+    course.module_cache[3] = (module, {})
+    course.user_all_fetched = course.assignment_all_fetched = fetched
+    course.user_all_kwargs = {"include": ["enrollments"]}
+    return course
+
+class TestForgettingUnusedContents:
+    """Test that the file leaves out the contents of a course long unused"""
+
+    def test_a_course_unused_for_long_keeps_only_itself(self):
+        course = course_with_contents_fetched(days_ago(400))
+
+        stored = pickled_for_file(course)
+
+        assert stored.name == "Old course"
+        assert (stored.user_cache, stored.assignment_cache,
+                stored.module_cache) == ({}, {}, {})
+        assert stored.user_all_fetched is None
+        assert stored.assignment_all_fetched is None
+        assert stored.user_all_kwargs == {"include": ["enrollments"]}
+        assert len(course.user_cache) == 1
+        assert course.user_all_fetched is not None
+
+    @pytest.mark.parametrize("days,kept", [(89, True), (91, False)])
+    def test_the_limit_is_the_number_of_days_to_keep(self, days, kept):
+        stored = pickled_for_file(course_with_contents_fetched(days_ago(days)))
+
+        assert bool(stored.user_cache) == kept
+        assert bool(stored.assignment_cache) == kept
+
+    @pytest.mark.parametrize("fresh", [
+        lambda course: course.user_cache[7][0],
+        lambda course: course.assignment_cache[5][0],
+        lambda course: course.module_cache[3][0].module_item_cache[4][0],
+    ], ids=["user", "assignment", "module item"])
+    def test_one_recent_fetch_keeps_all_of_the_course(self, fresh):
+        course = course_with_contents_fetched(days_ago(400))
+        fresh(course)._fetched_at = datetime.now()
+
+        stored = pickled_for_file(course)
+
+        assert len(stored.user_cache) == 1
+        assert len(stored.assignment_cache) == 1
+        assert len(stored.module_cache) == 1
+        assert stored.user_all_fetched is not None
+
+    def test_a_recently_refreshed_submission_keeps_the_course(self):
+        course = course_with_contents_fetched(days_ago(400))
+        submission = getattr(course.assignment_cache[5][0], "__cache")[7]
+        object.__setattr__(submission, "_last_refresh", datetime.now())
+
+        stored = pickled_for_file(course)
+
+        assert len(stored.user_cache) == 1
+        assert len(getattr(stored.assignment_cache[5][0], "__cache")) == 1
+
+    @pytest.mark.parametrize("keep_days", [0, -1])
+    def test_no_limit_keeps_everything(self, monkeypatch, keep_days):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_KEEP_DAYS",
+                            keep_days)
+
+        stored = pickled_for_file(course_with_contents_fetched(days_ago(4000)))
+
+        assert len(stored.user_cache) == 1
+
+    def test_contents_without_time_stamps_are_kept(self):
+        course = Course(None, {"id": 1, "name": "New course"})
+        created = Assignment(None, {"id": 5, "name": "Lab", "course_id": 1})
+        course.assignment_cache[5] = (created, {})
+        course.assignment_cache["note"] = "not an entry"
+
+        stored = pickled_for_file(course)
+
+        assert set(stored.assignment_cache) == {5, "note"}
+@
+
+
 \subsection{Caching courses}
 
 The list of courses changes whenever new courses are created that we have
@@ -7008,6 +7218,7 @@ class TestGroupUserCaching:
 
 
 \subsection{Lazy-loading submissions}
+\label{sec:lazy-submission}
 
 The current caching approach has an inefficiency: when we call
 [[get_submissions()]], we immediately check if each cached submission needs
