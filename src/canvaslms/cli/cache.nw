@@ -837,6 +837,20 @@ updating and every future run pays full API cost---a failure mode that is
 undiagnosable without a log message.
 We therefore log a warning and continue.
 
+The warning names the exception's type as well as its message.
+The message alone often doesn't say what broke: \enquote{invalid load key} is
+clear only once we know that it is an [[UnpicklingError]], and a bug elsewhere
+that surfaces here, an [[AttributeError]] say, would otherwise look like a
+broken file.
+The traceback goes to the debug log, for whoever runs with [[-vv]] to find
+out.
+A load that fails says what went wrong in the same way.
+<<functions>>=
+def describe_error(err):
+  """Return the type and the message of the exception `err`."""
+  return f"{type(err).__name__}: {err}"
+@
+
 Before any of this, we check whether the save is needed at all: a command that
 sent no request to Canvas has nothing new to store, and the save is the most
 expensive thing such a command does.
@@ -884,8 +898,9 @@ def save_canvas_cache(canvas, token, hostname, force=False):
                  f"(pickle: {pickle_elapsed:.2f}s/{pickle_size/1024:.1f}KB, "
                  f"encrypt: {encrypt_elapsed:.2f}s, write: {write_elapsed:.2f}s)")
   except Exception as err:
-    logger.warning(f"Canvas cache save failed ({err}); "
+    logger.warning(f"Canvas cache save failed ({describe_error(err)}); "
                    f"continuing without saving the cache")
+    logger.debug("Traceback of the failed cache save", exc_info=True)
 @
 
 Writing the file in place would mean that a crash or kill mid-write leaves
@@ -952,6 +967,8 @@ A decryption failure usually means the token changed and is expected
 behavior, so we log it at INFO.
 Anything else is unexpected; we log it at WARNING, because an undiagnosed
 load failure silently degrades every run to full API cost.
+As for a failed save, the warning names the exception and the traceback goes
+to the debug log.
 
 We unpickle with the garbage collector paused, which
 \cref{sec:unpickle-without-gc} explains.
@@ -998,7 +1015,9 @@ def load_canvas_cache(token, hostname):
                 "(token changed?); starting fresh")
     return None
   except Exception as err:
-    logger.warning(f"Canvas cache load failed ({err}); starting fresh")
+    logger.warning(f"Canvas cache load failed ({describe_error(err)}); "
+                   f"starting fresh")
+    logger.debug("Traceback of the failed cache load", exc_info=True)
     return None
 @
 
@@ -1064,6 +1083,9 @@ Let's also verify the failure and atomicity behavior of saving: a failing
 save must leave an existing cache file untouched and emit a warning, a
 missing cache file must load quietly as [[None]], and the saved file must
 not be readable by other users.
+We verify the three ways a load can fail to give a cache as well: quietly for
+a missing file, at INFO for another token, and with a warning that names the
+exception for anything else.
 
 <<test functions>>=
 def test_failed_save_keeps_old_cache_and_warns(
@@ -1080,10 +1102,37 @@ def test_failed_save_keeps_old_cache_and_warns(
 
   assert tmp_cache_path.read_bytes() == old_bytes
   assert "cache save failed" in caplog.text
+  assert "RuntimeError" in caplog.text
 
 def test_load_missing_cache_returns_none(tmp_cache_path):
   """Loading without a cache file should quietly return None."""
   assert cache.load_canvas_cache("token", "https://host") is None
+
+def test_unreadable_cache_warns_with_what_went_wrong(tmp_cache_path, caplog):
+  """An unexpected load failure names the exception and keeps its traceback."""
+  key = cache.derive_key("token", "https://host")
+  tmp_cache_path.write_bytes(Fernet(key).encrypt(b"not a pickle"))
+
+  with caplog.at_level(logging.DEBUG, logger=cache.logger.name):
+    assert cache.load_canvas_cache("token", "https://host") is None
+
+  warnings = [record for record in caplog.records
+              if record.levelno == logging.WARNING]
+  assert len(warnings) == 1
+  assert "UnpicklingError" in warnings[0].getMessage()
+  assert any(record.levelno == logging.DEBUG and record.exc_info
+             for record in caplog.records)
+
+def test_wrong_token_is_expected_and_not_a_warning(tmp_cache_path, caplog):
+  """A cache encrypted with another token is discarded at INFO."""
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  with caplog.at_level(logging.INFO, logger=cache.logger.name):
+    assert cache.load_canvas_cache("other token", "https://host") is None
+
+  assert "cannot be decrypted" in caplog.text
+  assert not [record for record in caplog.records
+              if record.levelno >= logging.WARNING]
 
 def test_saved_cache_is_user_only(tmp_cache_path):
   """The cache file should be created with mode 0600."""
