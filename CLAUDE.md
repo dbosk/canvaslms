@@ -884,6 +884,8 @@ and `date` on `PATH` (see `ungraded.nw`).
 - Config stored in platform-specific location via `appdirs` (usually `~/.config/canvaslms/config.json`)
 - Credentials stored securely via `keyring` library
 - Environment variables: `CANVAS_SERVER`, `CANVAS_TOKEN` override config
+- `{"cache": {"exclude": "personal"}}` in the config file keeps student data
+  out of the cache file, see Cache Freshness
 - First-time setup: `canvaslms login`
 
 ## Canvas API Integration
@@ -941,7 +943,13 @@ that run only while `save_canvas_cache` pickles. Two exist: a `User` keeps
 list refetches rosters, no schema bump; `_unlisted` users are neither shortened
 nor counted as lacking, since nothing can refetch them), and a `Course` with
 nothing fetched below it for `CANVASLMS_CACHE_KEEP_DAYS` (90) is stored without
-its contents, departed users included, with a warning when it loses any. A
+its contents, departed users included, with a warning when it loses any. Each
+caching decorator also registers a filter for its kind (`leave_out_of_cache_file`),
+which empties that kind when the user excludes it: `--cache-exclude KINDS`, then
+`CANVASLMS_CACHE_EXCLUDE`, then `cache.exclude` in the configuration file
+(`personal` = user, group, submission). The file's envelope records what it
+excludes, and a save is forced once when an exclusion is new. A new decorator
+that caches personal data must add its kind to `PERSONAL_DATA_KINDS`. A
 filter must leave attributes in place (emptied), never change the live object,
 and keep the state a plain dict.
 
