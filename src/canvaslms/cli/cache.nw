@@ -159,6 +159,7 @@ from cryptography.fernet import Fernet
 import functools
 import gc
 import io
+import json
 import pickle
 import socket
 import sys
@@ -346,12 +347,21 @@ The function returns the [[canvas]] object together with the normalized
 Those values are needed later when the caller wants to save the encrypted cache
 again.
 
+It is also where we settle which kinds of objects the cache file leaves out,
+since the configuration is at hand and every program passes through here
+(\cref{sec:cache-exclude-sources}).
+
 <<functions>>=
-def load_configured_canvas(config, use_cache=True, refresh=False):
+def load_configured_canvas(config, use_cache=True, refresh=False,
+                           cache_exclude=None):
   """Return configured Canvas object and cache metadata.
 
   With `refresh`, whatever is read through the object from now on is fetched
   again, whatever its age, and the rest of the cache is kept.
+
+  `cache_exclude` names the kinds of objects to leave out of the cache file, as
+  a comma-separated string or a list; None leaves that to the environment and
+  the configuration.
 
   The return value is the triple ``(canvas, hostname, token)``.
   """
@@ -359,6 +369,7 @@ def load_configured_canvas(config, use_cache=True, refresh=False):
 
   if refresh:
     request_refresh()
+  <<decide which kinds the cache file leaves out>>
 
   hostname, token = canvaslms.cli.login.load_credentials(config)
 
@@ -1477,7 +1488,10 @@ def run_canvaslms(tmp_cache_path, tmp_path, monkeypatch, capsys):
       canvaslms.cli.login, "load_credentials", lambda config: (HOST, "token"))
 
   def run(*arguments):
-    monkeypatch.setattr(canvaslms.hacks.canvasapi, "refresh_since", None)
+    hacks = canvaslms.hacks.canvasapi
+    monkeypatch.setattr(hacks, "refresh_since", None)
+    monkeypatch.setattr(hacks, "CACHE_EXCLUDE", frozenset(hacks.env_names(
+        "CANVASLMS_CACHE_EXCLUDE", hacks.KIND_ALIASES)))
     monkeypatch.setattr(sys, "argv", [
         "canvaslms", "--config-file", str(tmp_path / "config.json"),
         *arguments])
@@ -1888,7 +1902,8 @@ excluded_in_file = weakref.WeakKeyDictionary()
 @
 
 Let's verify it through the command line and the encrypted file.
-The exclusion is set as the environment variable would have set it at import.
+The exclusion is set in the environment, and since the fixture runs the command
+in this process, also where the import would have put it.
 
 <<test functions>>=
 def envelope(path):
@@ -1910,6 +1925,7 @@ def roster_in_canvas():
       enrolled(8, "Tora", "TeacherEnrollment")])
 
 def exclude(monkeypatch, *kinds):
+  monkeypatch.setenv("CANVASLMS_CACHE_EXCLUDE", ",".join(kinds))
   monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
                       frozenset(kinds))
 
@@ -1982,6 +1998,166 @@ def test_a_second_save_in_one_process_is_skipped_once_the_file_excludes(
 
   cache.save_canvas_cache(canvas, "token", HOST)
   assert stored(tmp_cache_path) == before
+@
+
+
+\subsubsection{Where the setting comes from}
+\label{sec:cache-exclude-sources}
+
+The kinds to exclude can be given in three places, and the most specific one
+that says anything decides alone:
+\begin{enumerate}
+\item the option [[--cache-exclude]] of the command, or the argument
+  [[cache_exclude]] of [[canvaslms.get_canvas]] in a program;
+\item the environment variable [[CANVASLMS_CACHE_EXCLUDE]];
+\item the key [[exclude]] under [[cache]] in the configuration file, a
+  comma-separated string or a list:
+\begin{minted}{json}
+{"cache": {"exclude": "personal"}}
+\end{minted}
+\end{enumerate}
+The order is that of the credentials, where the environment also goes before
+the configuration file.
+One source replaces the others, it does not add to them, so that
+[[--cache-exclude none]] can turn off what the configuration file turned on.
+
+The configuration file is the place for it when the choice is about the
+machine and not about one command.
+It is also the only one of the three that every program sharing the cache
+file reads, since they all load through [[load_configured_canvas]], and an
+exclusion is only as good as the least careful program that writes the file
+(\cref{sec:cache-exclude-in-file}).
+
+The environment variable was read when [[hacks/canvasapi.nw]] was imported.
+Here we only decide whether one of the other two replaces it.
+<<decide which kinds the cache file leaves out>>=
+if cache_exclude is not None:
+  set_cache_exclusion(cache_exclude, "cache_exclude")
+elif "CANVASLMS_CACHE_EXCLUDE" not in os.environ:
+  configured = config.get("cache")
+  if isinstance(configured, dict) and configured.get("exclude") is not None:
+    set_cache_exclusion(configured["exclude"],
+                        "cache.exclude in the configuration file")
+@
+
+A name that is no kind is as dangerous here as in the environment: the user
+believes something is left out that is not.
+By now logging is configured, so we can warn right away.
+A value that is neither a string nor a list of strings gets the same
+treatment; we do not guess what a number was meant to exclude.
+<<functions>>=
+def set_cache_exclusion(kinds, setting):
+  """Leave `kinds` out of the cache file, as `setting` asks.
+
+  Warns about names that are no kind that is cached, and about a value that is
+  no string or list of strings, which is ignored.
+  """
+  hacks = canvaslms.hacks.canvasapi
+  if not (isinstance(kinds, str)
+          or (isinstance(kinds, (list, tuple, set, frozenset))
+              and all(isinstance(kind, str) for kind in kinds))):
+    logger.warning(f"{setting}: ignoring {kinds!r}, which is neither a "
+                   f"comma-separated string nor a list of kinds; "
+                   f"{hacks.known_kinds_text()}")
+    return
+  unknown = hacks.exclude_from_cache_file(kinds)
+  if unknown:
+    logger.warning(f"{setting}: {hacks.unknown_kinds_message(unknown)}")
+@
+
+The command line can do better than a warning, since it can refuse to run.
+[[kinds_to_exclude]] is the [[type]] that argparse applies to the option's
+value: a misspelled kind ends the command with the usage and the list of
+kinds, before anything is fetched or written.
+<<functions>>=
+def kinds_to_exclude(text):
+  """Return `text`, the value of --cache-exclude, if it names only kinds."""
+  hacks = canvaslms.hacks.canvasapi
+  unknown = hacks.unknown_kinds(hacks.names_in(text, hacks.KIND_ALIASES))
+  if unknown:
+    raise argparse.ArgumentTypeError(
+      f"unknown kind {', '.join(repr(kind) for kind in unknown)}; "
+      f"{hacks.known_kinds_text()}")
+  return text
+@
+
+Let's verify the order of the three sources through the command line, by what
+the file says it excludes.
+Each run stands for a new process, so the fixture reads the environment again
+before it, as the import would.
+The test of a misspelled kind stubs Canvas with nothing, so that a command
+that went on regardless would fail at its first request and not wait for a
+real server.
+
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("option,environment,configured,excluded", [
+    (None, None, None, []),
+    (None, None, "user", ["user"]),
+    (None, None, ["user", "group"], ["group", "user"]),
+    (None, "submission", "user", ["submission"]),
+    (None, "", "user", []),
+    ("page", "submission", "user", ["page"]),
+    ("none", None, "personal", []),
+    ("personal", None, None, ["group", "submission", "user"]),
+])
+def test_the_most_specific_source_decides_what_is_excluded(
+    run_canvaslms, tmp_cache_path, tmp_path, monkeypatch,
+    option, environment, configured, excluded):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  if configured is not None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"cache": {"exclude": configured}}))
+  if environment is None:
+    monkeypatch.delenv("CANVASLMS_CACHE_EXCLUDE", raising=False)
+  else:
+    monkeypatch.setenv("CANVASLMS_CACHE_EXCLUDE", environment)
+
+  run_canvaslms(*(["--cache-exclude", option] if option else []), "courses")
+
+  assert envelope(tmp_cache_path)["excluded"] == excluded
+
+@responses.activate
+def test_the_option_keeps_a_roster_out_of_the_file(
+    run_canvaslms, tmp_cache_path, roster_in_canvas):
+  students = run_canvaslms("--cache-exclude", "personal",
+                           "users", "-c", "Old", "-s")
+
+  assert "Anna" in students
+  assert users_in_file(tmp_cache_path) == 0
+
+@responses.activate
+def test_a_misspelled_kind_on_the_command_line_ends_the_command(
+    run_canvaslms, tmp_cache_path, capsys):
+  with pytest.raises(SystemExit) as ended:
+    run_canvaslms("--cache-exclude", "users", "courses")
+
+  assert ended.value.code == 2
+  error = capsys.readouterr().err
+  assert "unknown kind 'users'" in error and "submission" in error
+  assert not tmp_cache_path.exists()
+
+@responses.activate
+@pytest.mark.parametrize("configured,excluded,said", [
+    ("users, submission", ["submission", "users"], "unknown kind 'users'"),
+    (7, [], "ignoring 7"),
+    ({"user": True}, [], "ignoring {'user': True}"),
+])
+def test_a_bad_value_in_the_configuration_file_is_warned_about(
+    run_canvaslms, tmp_cache_path, tmp_path, monkeypatch, caplog,
+    configured, excluded, said):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  monkeypatch.delenv("CANVASLMS_CACHE_EXCLUDE", raising=False)
+  (tmp_path / "config.json").write_text(
+      json.dumps({"cache": {"exclude": configured}}))
+
+  run_canvaslms("courses")
+
+  assert envelope(tmp_cache_path)["excluded"] == excluded
+  warning, = [record.getMessage() for record in caplog.records
+              if record.levelno == logging.WARNING]
+  assert "cache.exclude in the configuration file" in warning
+  assert said in warning
 @
 
 
