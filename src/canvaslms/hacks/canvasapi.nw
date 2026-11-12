@@ -48,6 +48,8 @@ this_module = sys.modules[__name__]
 for name, function in inspect.getmembers(this_module, inspect.isfunction):
   if name.startswith("make_"):
     function()
+
+<<record the unknown kinds in the environment's cache exclusion>>
 @
 
 \section{Testing Canvas API monkey-patches}
@@ -116,6 +118,7 @@ import sys
 import urllib.parse
 
 import canvasapi
+import canvasapi.group
 import canvasapi.module
 import copy
 import pytest
@@ -1055,6 +1058,7 @@ class TestMergeKwargs:
 @
 
 \subsection{Wrapping the methods with a caching decorator}
+\label{sec:cache-get-methods-decorator}
 
 Now, let's turn our attention to the caching decorator.
 We want to cover both the singular and plural methods.
@@ -3639,6 +3643,7 @@ The helper tangles into the module before the constants (see the module
 outline), since the constants call it at import time.
 
 \subsection{When to report a malformed setting}
+\label{sec:setting-problems}
 
 The warning has two audiences with opposing needs.
 A command-line user must be able to silence it with [[-q]], and this is
@@ -6918,6 +6923,371 @@ class TestForgettingUnusedContents:
         stored = pickled_for_file(course)
 
         assert set(stored.assignment_cache) == {5, "note"}
+@
+
+
+\subsubsection{Kinds the user keeps out of the file}
+\label{sec:cache-exclude}
+
+By pickling the [[Canvas]] object, we persist everything below it in the
+hierarchy.
+Besides course content, that includes personal data: the participant list of
+every course ([[Course.user_cache]]), the members of every group
+([[Group.user_cache]]), the groups themselves, whose names often are student
+names, and the submissions we have fetched, with their history, comments and
+grades when those are included.
+
+Some users prefer not to keep student data on their machine, even in the
+encrypted cache file, while still benefiting from the caching of course content
+(issue~\#578).
+The third filter is for them: it leaves the kinds of objects they name out of
+the file.
+A kind is the attribute name that the caching decorators use, so [[user]]
+covers the participants of a course as well as the members of a group:
+\begin{minted}{bash}
+CANVASLMS_CACHE_EXCLUDE=user,group,submission canvaslms pages edit ...
+CANVASLMS_CACHE_EXCLUDE=personal canvaslms pages edit ...
+\end{minted}
+The second form uses the alias [[personal]], which stands for the kinds that
+hold personal data.
+The alias is the recommended form: the user states the intent, and when a
+future version caches a new kind of personal data, adding it to the alias
+protects everyone who already uses it.
+It also covers what a single kind does not: a group that was fetched with its
+members included carries their names itself, so excluding [[user]] alone leaves
+those in the file.
+
+Excluded objects are still cached in memory during the run, so a single
+command behaves exactly as before.
+Only the next run notices the difference: it must fetch the excluded objects
+again.
+That is the price of the option, and the reason it is opt-in.
+
+\paragraph{Reading the setting}
+The setting is a set of names, which the numeric [[env_number]] cannot read.
+A sibling helper splits the value on commas and expands aliases.
+We normalize case and whitespace, since [[User, Submission]] is an
+unambiguous request.
+The command line and the configuration file will give us the same kind of
+value, sometimes as a list already, so the parsing is a function of its own
+that takes either.
+<<environment helpers>>=
+def names_in(value, aliases):
+  """Return the set of lower-case names in `value`.
+
+  `value` is a comma-separated string or an iterable of such strings. Each
+  name in `aliases` is replaced by the set of names it stands for.
+  """
+  items = [value] if isinstance(value, str) else value
+  names = set()
+  for item in ",".join(items).split(","):
+    item = item.strip().lower()
+    if item:
+      names |= aliases.get(item, {item})
+  return names
+
+def env_names(name, aliases):
+  """Read the comma-separated setting `name` from the environment."""
+  return names_in(os.environ.get(name, ""), aliases)
+@
+
+The kinds holding personal data are users (course participants and group
+members), groups and submissions.
+We leave out group categories: their names describe a grouping, such as
+\enquote{Lab groups}, not the students in it.
+The alias [[none]] names no kind at all.
+It is there for the more specific sources of the setting, so that a command
+line can turn off what the configuration file turned on.
+<<constants>>=
+PERSONAL_DATA_KINDS = frozenset({"user", "group", "submission"})
+KIND_ALIASES = {"personal": PERSONAL_DATA_KINDS, "none": frozenset()}
+CACHE_EXCLUDE = frozenset(env_names("CANVASLMS_CACHE_EXCLUDE", KIND_ALIASES))
+<<functions>>=
+def exclude_from_cache_file(kinds):
+  """Leave the `kinds` of objects out of the cache file from now on.
+
+  `kinds` is a comma-separated string or an iterable of names, as in
+  CANVASLMS_CACHE_EXCLUDE, which this replaces. Returns the names that are no
+  kind that is cached, sorted, for the caller to report.
+  """
+  global CACHE_EXCLUDE
+  CACHE_EXCLUDE = frozenset(names_in(kinds, KIND_ALIASES))
+  return unknown_kinds(CACHE_EXCLUDE)
+@
+
+\paragraph{Leaving a kind out}
+Each caching decorator knows the attributes it keeps its cache in, so it is
+the one to register the filter for its kind, on the class it decorates.
+That works wherever in the hierarchy the object sits: users hang off both
+courses and groups, and groups off both courses and group categories.
+
+The filter must be careful about what it leaves out.
+Unpickling never runs [[__init__]], so an object restored without its cache
+attributes would crash on the first cached call.
+Instead of dropping the attributes, we reset them to the values the
+constructor gives them.
+All of them matter.
+If we emptied only the cache and kept the [[_all_fetched]] timestamp, the
+restored object would believe that it holds the complete listing, and the
+plural method would return an empty list instead of fetching it.
+Each object needs an empty value of its own, too: [[pickle]] stores an object
+it meets twice only once, so one shared empty dictionary in the states would
+come back as one dictionary shared by every course.
+The decorator therefore gives us, for each attribute, a function that makes
+the empty value.
+
+We test for exclusion when pickling, not when decorating, so that the setting
+can change after the decorators have run.
+We also record every kind that the decorators cache, so that we can tell a
+misspelled kind from a real one.
+<<constants>>=
+CACHED_KINDS = set()
+<<functions>>=
+def leave_out_of_cache_file(cls, kind, emptied):
+  """Give `cls` a state filter that leaves `kind` out when it is excluded.
+
+  `emptied` maps the attributes that hold the cache of `kind` to functions
+  that return their empty values.
+  """
+  CACHED_KINDS.add(kind)
+
+  def without_kind(obj, state):
+    if kind in CACHE_EXCLUDE:
+      for name, empty in emptied.items():
+        state[name] = empty()
+
+  add_state_filter(cls, without_kind)
+
+def nothing():
+  """Return None, the value of a listing that has not been fetched."""
+  return None
+@
+
+The general decorator, [[CacheGetMethods]], names its attributes after the
+kind it caches.
+We add to its chunk [[<<create decorator functions and update [[cls]]>>]],
+which \cref{sec:cache-get-methods-decorator} starts.
+The record of what the listing asks for, [[_all_kwargs]], stays: it names
+includes, not people, and the next fetch should bring what the last one did.
+<<create decorator functions and update [[cls]]>>=
+leave_out_of_cache_file(cls, attr_name, {
+  f"{attr_name}_cache": dict,
+  f"{attr_name}_all_fetched": nothing,
+})
+@
+
+The submissions decorator uses its own attribute names: its constructor
+extension stores the cache in [[__cache]] and the timestamp in
+[[__all_fetched]].
+Since the decorator is a function, not a class, Python does not mangle these
+names, so they are the literal attribute names.
+It has a third attribute, [[__unlisted]], with the identifiers of the students
+whose submissions Canvas no longer lists (\cref{sec:forget-unlisted}).
+Those are students too, so it is emptied with the rest.
+<<decorator body for caching assignment submissions>>=
+leave_out_of_cache_file(cls, "submission", {
+  "__cache": dict,
+  "__all_fetched": nothing,
+  "__unlisted": set,
+})
+@
+
+\paragraph{Misspelled kinds}
+A user who excludes a kind relies on the data being left out, so a misspelled
+kind must not go unnoticed.
+[[CANVASLMS_CACHE_EXCLUDE=users]] is an easy mistake: the kind is [[user]],
+so nothing would be excluded.
+Once all decorators are applied, we know every cached kind and can tell which
+names of the setting are none of them.
+<<functions>>=
+def unknown_kinds(kinds):
+  """Return the names in `kinds` that no decorator caches, sorted."""
+  return sorted(set(kinds) - CACHED_KINDS)
+
+def unknown_kinds_message(setting, unknown):
+  """Return what to tell the user about the `unknown` kinds in `setting`."""
+  return (f"{setting}: ignoring unknown kind "
+          f"{', '.join(repr(kind) for kind in unknown)}, so it is not left out "
+          f"of the cache file; the kinds are "
+          f"{', '.join(sorted(CACHED_KINDS))}, and personal stands for "
+          f"{', '.join(sorted(PERSONAL_DATA_KINDS))}")
+@
+
+For the environment variable we find out at the end of the import, after the
+[[make_*]] functions in the module outline have applied the decorators.
+That is too early to log, for the reason \cref{sec:setting-problems} gives:
+logging may not be configured yet, and a warning now could not be silenced
+with [[-q]].
+So the problem is recorded with the other malformed settings and reported with
+them.
+<<record the unknown kinds in the environment's cache exclusion>>=
+if unknown_kinds(CACHE_EXCLUDE):
+  SETTING_PROBLEMS["CANVASLMS_CACHE_EXCLUDE"] = unknown_kinds_message(
+    "CANVASLMS_CACHE_EXCLUDE", unknown_kinds(CACHE_EXCLUDE))
+@
+
+Let's verify the parsing first, including the aliases.
+<<test functions>>=
+@pytest.mark.parametrize("value,names", [
+    ("", set()),
+    (" User, submission,,", {"user", "submission"}),
+    ("personal,page", PERSONAL_DATA_KINDS | {"page"}),
+    ("none", set()),
+    (["user", "page,quiz"], {"user", "page", "quiz"}),
+])
+def test_names_in_a_setting(value, names):
+    assert names_in(value, KIND_ALIASES) == names
+
+def test_env_names_reads_the_variable(monkeypatch):
+    monkeypatch.delenv("CANVASLMS_TEST_NAMES", raising=False)
+    assert env_names("CANVASLMS_TEST_NAMES", {}) == set()
+
+    monkeypatch.setenv("CANVASLMS_TEST_NAMES", "a, B")
+    assert env_names("CANVASLMS_TEST_NAMES", {}) == {"a", "b"}
+@
+
+Now the filter itself.
+We test on the real, decorated [[canvasapi]] classes, built with no requester so
+that they can be pickled, and look at what comes back from the file: a course
+with a participant, a group with that participant as its member, and an
+assignment with a submission and the record of a student who has left.
+
+<<test functions>>=
+def course_with_people():
+    """Return a course with a user, a group, an assignment and a submission."""
+    now = datetime.now()
+    course = Course(None, {"id": 1, "name": "Course"})
+    user = User(None, {"id": 7, "name": "A Student"})
+    group = canvasapi.group.Group(None, {"id": 4, "name": "Anna and Bo"})
+    assignment = Assignment(None, {"id": 2, "name": "Lab 1", "course_id": 1})
+    submission = LazySubmission(
+        Submission(None, {"id": 9, "user_id": 7, "grade": "P"}),
+        assignment, set(), None)
+
+    getattr(assignment, "__cache")[7] = submission
+    setattr(assignment, "__all_fetched", now)
+    setattr(assignment, "__unlisted", {8})
+    group.user_cache[7] = (user, {})
+    group.user_all_fetched = now
+    course.user_cache[7] = (user, {"include": ["enrollments"]})
+    course.user_all_fetched = now
+    course.user_all_kwargs = {"include": ["enrollments"]}
+    course.group_cache[4] = (group, {})
+    course.group_all_fetched = now
+    course.assignment_cache[2] = (assignment, {})
+    course.assignment_all_fetched = now
+    return course
+
+def stored_with_exclusion(monkeypatch, kinds, obj=None):
+    """Return what the file holds of `obj` when `kinds` are excluded."""
+    monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE", frozenset())
+    assert exclude_from_cache_file(kinds) == []
+    return pickled_for_file(obj or course_with_people())
+
+class TestCacheExclusion:
+    """Test that excluded kinds are left out of the cache file, and only there"""
+
+    def test_nothing_is_left_out_by_default(self, monkeypatch):
+        stored = stored_with_exclusion(monkeypatch, "")
+
+        assert 7 in stored.user_cache
+        assert 4 in stored.group_cache
+        assert 7 in getattr(stored.assignment_cache[2][0], "__cache")
+
+    def test_an_excluded_kind_is_reset_wherever_it_is_cached(self, monkeypatch):
+        stored = stored_with_exclusion(monkeypatch, "user")
+
+        group = stored.group_cache[4][0]
+        assert (stored.user_cache, stored.user_all_fetched) == ({}, None)
+        assert (group.user_cache, group.user_all_fetched) == ({}, None)
+        assert stored.user_cache is not group.user_cache
+        assert stored.user_all_kwargs == {"include": ["enrollments"]}
+        assert group.name == "Anna and Bo"
+        assert stored.assignment_all_fetched is not None
+        assert 7 in getattr(stored.assignment_cache[2][0], "__cache")
+
+    def test_excluded_submissions_take_those_who_left_with_them(
+            self, monkeypatch):
+        stored = stored_with_exclusion(monkeypatch, "submission")
+
+        assignment = stored.assignment_cache[2][0]
+        assert assignment.name == "Lab 1"
+        assert getattr(assignment, "__cache") == {}
+        assert getattr(assignment, "__all_fetched") is None
+        assert getattr(assignment, "__unlisted") == set()
+        assert 7 in stored.user_cache
+
+    def test_personal_leaves_the_course_content(self, monkeypatch):
+        stored = stored_with_exclusion(monkeypatch, "personal")
+
+        assert (stored.user_cache, stored.group_cache) == ({}, {})
+        assert stored.group_all_fetched is None
+        assert getattr(stored.assignment_cache[2][0], "__cache") == {}
+        assert stored.assignment_cache[2][0].name == "Lab 1"
+
+    def test_the_objects_in_memory_keep_everything(self, monkeypatch):
+        course = course_with_people()
+
+        stored_with_exclusion(monkeypatch, "personal", course)
+
+        assert 7 in course.user_cache
+        assert course.user_all_fetched is not None
+        assert getattr(course.assignment_cache[2][0], "__unlisted") == {8}
+        assert 7 in copy.copy(course).user_cache
+        assert 7 in pickle.loads(pickle.dumps(course)).user_cache
+
+    @pytest.mark.parametrize("kinds,requests", [("", 1), ("user", 2)])
+    def test_the_next_run_fetches_an_excluded_kind_again(
+            self, monkeypatch, kinds, requests):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+
+        stored = stored_with_exclusion(monkeypatch, kinds, roster)
+        user, = stored.get_users(include=["enrollments"])
+
+        assert user.name == "Anna"
+        assert len(stored.requests) == requests
+
+    def test_a_misspelled_kind_is_told_apart(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
+                            frozenset())
+
+        assert exclude_from_cache_file("users, user") == ["users"]
+        assert PERSONAL_DATA_KINDS <= canvaslms.hacks.canvasapi.CACHED_KINDS
+        message = unknown_kinds_message("--cache-exclude", ["users"])
+        assert "'users'" in message and "submission" in message
+@
+
+The environment variable is read when the module is imported, so we import it
+in a process of its own, as for the other settings.
+
+<<test functions>>=
+def excluded_in_new_process(value):
+    """Import the module with CANVASLMS_CACHE_EXCLUDE set to `value`.
+
+    Returns the finished process, which reported the setting problems and
+    printed the excluded kinds, sorted.
+    """
+    environment = dict(os.environ, CANVASLMS_CACHE_EXCLUDE=value)
+    return subprocess.run(
+        [sys.executable, "-c",
+         "import canvaslms.hacks.canvasapi as module; "
+         "module.report_setting_problems(); "
+         "print(*sorted(module.CACHE_EXCLUDE))"],
+        env=environment, capture_output=True, text=True, check=True)
+
+def test_the_environment_names_the_excluded_kinds():
+    finished = excluded_in_new_process("personal, page")
+
+    assert finished.stdout.split() == ["group", "page", "submission", "user"]
+    assert finished.stderr == ""
+
+def test_a_misspelled_kind_in_the_environment_is_reported_once():
+    finished = excluded_in_new_process("users,submission")
+
+    assert finished.stdout.split() == ["submission", "users"]
+    assert finished.stderr.count("CANVASLMS_CACHE_EXCLUDE") == 1
+    assert "'users'" in finished.stderr
 @
 
 
