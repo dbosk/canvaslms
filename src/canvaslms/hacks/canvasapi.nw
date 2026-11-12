@@ -1593,7 +1593,7 @@ except KeyError:
 old_obj = obj
 refreshing_on_request = False
 
-if obj and must_update(prev_kwargs, kwargs):
+if obj and must_update(kept_kwargs(obj, prev_kwargs), kwargs):
   obj = None
   cache_status = " (new kwargs required)"
 elif obj and outdated(obj):
@@ -1637,6 +1637,8 @@ performance benefits.
 
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
+It gets them through [[kept_kwargs]], which leaves out what the cache file
+kept only part of (\cref{sec:short-enrollments}).
 We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
@@ -3321,6 +3323,7 @@ if must_update(union_kwargs, without_restrictions(old_kwargs)):
     if (not name.startswith("_") and name not in vars(obj)
         and not (name.endswith("_date") and name[:-5] in vars(obj))):
       setattr(obj, name, value)
+  <<carry over the mark of short enrollments>>
   obj_kwargs = merge_kwargs([union_kwargs, without_restrictions(old_kwargs)])
 @
 
@@ -4452,10 +4455,13 @@ the cache into 17~minutes of retries and a failure.
 A failure is remembered for the rest of the run, so later reads don't try again.
 An entry Canvas still lists that lacks what is asked for is another matter, and
 then the fetch is needed and gets the full retry policy, as before.
+What an entry was fetched with is read through [[kept_kwargs]]
+(\cref{sec:short-enrollments}), so an entry whose enrollments the cache file
+shortened too much for this process lacks them.
 <<find out whether the cached entries have what is asked for>>=
 lacking = [(cached_obj, prev_kwargs)
            for cached_obj, prev_kwargs in attr_cache.values()
-           if must_update(prev_kwargs, kwargs)]
+           if must_update(kept_kwargs(cached_obj, prev_kwargs), kwargs)]
 listed_lacking = [(cached_obj, prev_kwargs)
                   for cached_obj, prev_kwargs in lacking
                   if not getattr(cached_obj, "_unlisted", False)]
@@ -6317,6 +6323,271 @@ class TestStateFilters:
 
     def test_filters_of_a_class_run_in_the_order_added(self):
         assert pickled_for_file(Ordered(None, {})).order == ["first", "second"]
+@
+
+
+\subsubsection{Enrollments, shortened}
+\label{sec:short-enrollments}
+
+The first filter is for the largest thing in the file.
+We fetch every roster with [[include=["enrollments"]]], since the enrollments
+say who is a student and who is a teacher (the role filter of [[users]] reads
+their [[type]]).
+Canvas answers with 26 fields for each enrollment: grades, activity times,
+identifiers of the student system, links.
+In a real cache of 176 courses with 92\,000 cached users, those enrollments were
+43 of the pickle's 72~MB, for the sake of one field.
+
+So the file keeps a short list of fields, [[ENROLLMENT_FIELDS]]: what tells who
+someone is in a course and in which section, and nothing about how they are
+doing.
+The filter shortens the enrollments in the state and leaves the user in memory
+alone.
+
+A shortened entry must say that it is shortened.
+The cache trusts its record of what each entry was fetched with, and that record
+says [[enrollments]]; if the next reader needs a field we dropped, the record
+would lie to it.
+The filter therefore also stores which fields it kept, as
+[[_enrollment_fields]] on the user.
+An entry without that attribute has everything Canvas sent, which is true both
+for a freshly fetched user and for one written by a copy of this library that
+has no filter.
+A new attribute that is read with a default needs no new schema version.
+When an entry that was already short is stored again, the record cannot grow:
+it becomes the fields that both the entry and this process keep.
+<<constants>>=
+ENROLLMENT_FIELDS = frozenset({
+  "id", "user_id", "course_id", "course_section_id",
+  "type", "role", "enrollment_state",
+})
+<<functions>>=
+def short_enrollments(user, state):
+  """State filter: keep only `ENROLLMENT_FIELDS` of each enrollment.
+
+  Records the fields that may be left as `_enrollment_fields`.
+  """
+  enrollments = state.get("enrollments")
+  if ENROLLMENT_FIELDS is None or not isinstance(enrollments, list):
+    return
+  kept = ENROLLMENT_FIELDS & state.get("_enrollment_fields", ENROLLMENT_FIELDS)
+  state["enrollments"] = [
+    {field: value for field, value in enrollment.items() if field in kept}
+    if isinstance(enrollment, dict) else enrollment
+    for enrollment in enrollments]
+  state["_enrollment_fields"] = kept
+
+def make_stored_enrollments_short():
+  add_state_filter(canvasapi.user.User, short_enrollments)
+@
+
+The other half is to use the record.
+Whether a cached entry has what a call asks for is decided by [[must_update]],
+from the keyword arguments the entry was fetched with.
+We give it those arguments as the file kept them: if the entry's enrollments
+lack a field that this process keeps, the entry no longer counts as fetched with
+[[enrollments]].
+A call that asks for enrollments then fetches again, with everything the entry
+was ever fetched with, and gets a full object without the mark.
+A call that doesn't ask for them is answered from the cache as before.
+
+Which fields a process needs is [[ENROLLMENT_FIELDS]] again, so the two halves
+cannot disagree: what we would store is what we are content to read.
+That also makes the list safe to extend.
+When a later version reads one more field and adds it here, the entries stored
+without it count as lacking, and each roster is fetched once more.
+A program that uses this library and reads other fields can set
+[[ENROLLMENT_FIELDS]] to a larger set, or to [[None]] for everything, before it
+reads; it then also stores what it asked for.
+It shares the file with programs that shorten, though, so it fetches a roster
+again whenever one of them has saved it in between.
+<<functions>>=
+def kept_kwargs(obj, prev_kwargs):
+  """Return `prev_kwargs` without what the cache file kept only part of.
+
+  `prev_kwargs` are the keyword arguments the cached `obj` was fetched with.
+  """
+  kept = getattr(obj, "_enrollment_fields", None)
+  if (kept is None or "include" not in prev_kwargs
+      or (ENROLLMENT_FIELDS is not None and ENROLLMENT_FIELDS <= kept)):
+    return prev_kwargs
+  return {**prev_kwargs,
+          "include": [include for include in as_list(prev_kwargs["include"])
+                      if include != "enrollments"]}
+@
+
+The mark starts with an underscore, and attributes of ours are not copied from
+an old object to the one that replaces it
+(\cref{sec:what-a-listing-asks-for}).
+That is right when the new object brings enrollments of its own.
+But a listing that doesn't ask for enrollments keeps the old object's, if the
+entry had been fetched with them, and those are still short.
+The mark must follow the enrollments it describes.
+<<carry over the mark of short enrollments>>=
+if (hasattr(old_obj, "_enrollment_fields")
+    and getattr(obj, "enrollments", None)
+        is getattr(old_obj, "enrollments", None)):
+  obj._enrollment_fields = old_obj._enrollment_fields
+@
+
+Let's verify this on a stand-in for a course, whose one user Canvas sends with a
+full enrollment when asked to.
+The stand-in counts the requests, and since it is stored with the rest we can
+ask the copy that comes back from the file.
+For the last two tests one entry must have been fetched with more than the
+listing asks for, since that is when the new object takes over attributes of
+the old one: the listing is fetched first and then the user alone with more.
+In the first of them the listing fetches no enrollments, so the old, short ones
+are kept and their mark with them; in the second it fetches them, and the full
+enrollments must not get the mark.
+
+<<test functions>>=
+FULL_ENROLLMENT = {
+    "id": 7, "user_id": 1, "course_id": 1, "course_section_id": 3,
+    "type": "StudentEnrollment", "role": "StudentEnrollment",
+    "enrollment_state": "active",
+    "grades": {"current_grade": "A"},
+    "last_activity_at": "2026-01-01T00:00:00Z",
+    "sis_user_id": "abc",
+    "html_url": "https://canvas.example/courses/1/users/1",
+}
+
+class Roster:
+    """A stand-in course with one user, who has a full enrollment."""
+
+    def __init__(self):
+        self.requests = []
+
+    def answer(self, kwargs):
+        self.requests.append(kwargs)
+        fields = {"id": 1, "name": "Anna"}
+        if "enrollments" in as_list(kwargs.get("include", [])):
+            fields["enrollments"] = [dict(FULL_ENROLLMENT)]
+        return User(None, fields)
+
+    def get_users(self, **kwargs):
+        return [self.answer(kwargs)]
+
+    def get_user(self, user_id, **kwargs):
+        return self.answer(kwargs)
+
+CacheGetMethods("user")(Roster)
+
+def stored_roster():
+    """Return a roster fetched with enrollments, and what the file holds of it."""
+    roster = Roster()
+    list(roster.get_users(include=["enrollments"]))
+    return roster, pickled_for_file(roster)
+
+def only_user(roster):
+    """Return the one cached user of `roster`."""
+    (user, _), = roster.user_cache.values()
+    return user
+
+class TestShortEnrollments:
+    """Test that the cache file keeps a short list of enrollment fields"""
+
+    def test_file_keeps_the_short_list_and_memory_keeps_all(self):
+        roster, stored = stored_roster()
+
+        enrollment, = only_user(stored).enrollments
+        assert set(enrollment) == ENROLLMENT_FIELDS
+        assert enrollment["type"] == "StudentEnrollment"
+        assert "grades" in only_user(roster).enrollments[0]
+        assert not hasattr(only_user(roster), "_enrollment_fields")
+
+    def test_short_enrollments_answer_from_the_cache(self):
+        _, stored = stored_roster()
+
+        user, = stored.get_users(include=["enrollments"])
+        stored.get_user(1, include=["enrollments"])
+
+        assert user.enrollments[0]["role"] == "StudentEnrollment"
+        assert len(stored.requests) == 1
+
+    @pytest.mark.parametrize("needed", [None, ENROLLMENT_FIELDS | {"grades"}],
+                             ids=["everything", "one more field"])
+    def test_needing_more_fields_fetches_the_listing_again(
+            self, monkeypatch, needed):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS",
+                            needed)
+
+        user, = stored.get_users(include=["enrollments"])
+
+        assert len(stored.requests) == 2
+        assert "grades" in user.enrollments[0]
+        assert not hasattr(user, "_enrollment_fields")
+
+    def test_needing_more_fields_fetches_one_user_again(self, monkeypatch):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        user = stored.get_user(1, include=["enrollments"])
+
+        assert len(stored.requests) == 2
+        assert "grades" in user.enrollments[0]
+
+    def test_asking_for_no_enrollments_fetches_nothing(self, monkeypatch):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        list(stored.get_users())
+
+        assert len(stored.requests) == 1
+
+    def test_keeping_everything_stores_everything(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        _, stored = stored_roster()
+
+        assert "grades" in only_user(stored).enrollments[0]
+        assert not hasattr(only_user(stored), "_enrollment_fields")
+
+    @pytest.mark.parametrize("fields,recorded", [
+        (ENROLLMENT_FIELDS, ENROLLMENT_FIELDS),
+        (frozenset({"type"}), frozenset({"type"})),
+        (ENROLLMENT_FIELDS | {"grades"}, ENROLLMENT_FIELDS),
+        (None, ENROLLMENT_FIELDS),
+    ], ids=["same", "fewer", "more", "everything"])
+    def test_storing_a_short_entry_again_never_widens_its_record(
+            self, monkeypatch, fields, recorded):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS",
+                            fields)
+
+        again = only_user(pickled_for_file(stored))
+
+        assert again._enrollment_fields == recorded
+        assert set(again.enrollments[0]) == recorded
+
+    def test_a_listing_that_keeps_short_enrollments_keeps_their_mark(
+            self, monkeypatch):
+        roster = Roster()
+        list(roster.get_users())
+        roster.get_user(1, include=["enrollments"])
+        stored = pickled_for_file(roster)
+        stored.user_all_fetched = None
+
+        list(stored.get_users())
+
+        assert only_user(stored)._enrollment_fields == ENROLLMENT_FIELDS
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+        requests_before = len(stored.requests)
+        stored.get_user(1, include=["enrollments"])
+        assert len(stored.requests) == requests_before + 1
+
+    def test_a_listing_that_fetches_enrollments_leaves_no_mark(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        roster.get_user(1, include=["enrollments", "email"])
+        stored = pickled_for_file(roster)
+        stored.user_all_fetched = None
+
+        list(stored.get_users(include=["enrollments"]))
+
+        assert "grades" in only_user(stored).enrollments[0]
+        assert not hasattr(only_user(stored), "_enrollment_fields")
 @
 
 
