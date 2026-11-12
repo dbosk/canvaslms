@@ -64,7 +64,7 @@ The index maps Canvas attachment IDs to cached file metadata:
 {
   "12345": {
     "hash": "a1b2c3...",
-    "filename": "report.pdf",
+    "filename": "not stored",
     "size": 102400,
     "content_type": "application/pdf",
     "last_access": "2025-11-24T10:30:00"
@@ -97,9 +97,21 @@ this is an acceptable price for encryption at rest.
 
 The index stays plaintext JSON: cleanup must read it without a key, and a
 human-readable index is invaluable when debugging cache problems.
-It holds metadata (filenames, sizes), not student work, and it is
+It holds metadata (sizes, content types), not student work, and it is
 protected by file permissions instead: the cache directory is [[0o700]]
 and the index and content files [[0o600]].
+
+The index used to hold the name of each file as well.
+A student's file is often named after the student, so the one file we do not
+encrypt listed who had submitted what (issue~\#578), and nothing needed it:
+whoever restores an attachment already has its name from Canvas, and cleanup
+goes by hash and time of last access.
+So the name is no longer stored.
+The key stays, with a fixed value, because the copies of this library from
+before read it when they report a cache hit and would fail without it.
+That happens in one place, [[_save_index]], which every write goes through:
+it gives each entry the fixed value, so a new entry needs no name at all, and
+names that are already in an index disappear the next time it is written.
 
 A [[.dat]] file written by an older, unencrypted canvaslms fails
 decryption.
@@ -184,6 +196,7 @@ with default permissions.
 <<cache directory initialization>>=
 CACHE_DIR = pathlib.Path(dirs.user_cache_dir) / "attachments"
 INDEX_FILE = CACHE_DIR / "index.json"
+NO_FILENAME = "not stored"
 
 def _ensure_cache_dir():
     """Create cache directory if it doesn't exist, user-only access"""
@@ -199,10 +212,12 @@ def _load_index() -> dict[str, dict[str, Any]]:
     return {}
 
 def _save_index(index: dict[str, dict[str, Any]]):
-    """Save the metadata index to disk"""
+    """Save the metadata index to disk, without the names of the files"""
     _ensure_cache_dir()
     with open(INDEX_FILE, 'w') as f:
-        json.dump(index, f, indent=2)
+        json.dump({attachment_id: {**entry, "filename": NO_FILENAME}
+                   for attachment_id, entry in index.items()},
+                  f, indent=2)
     INDEX_FILE.chmod(0o600)
 @
 
@@ -322,9 +337,14 @@ def test_load_index_creates_empty_dict_if_missing(tmp_cache):
     assert index == {}
 @
 
+A saved index comes back as it was, except for the name of the file, which is
+not stored.
+The index we were given must keep its name, since the caller may go on using
+it.
+
 <<test functions>>=
 def test_save_and_load_index(tmp_cache):
-    """Test that index can be saved and loaded correctly"""
+    """Test that index is saved and loaded with all but the file name"""
     test_index = {
         "12345": {
             "hash": "abc123",
@@ -334,11 +354,13 @@ def test_save_and_load_index(tmp_cache):
             "last_access": "2025-11-24T10:30:00"
         }
     }
-    
+
     attachment_cache._save_index(test_index)
     loaded_index = attachment_cache._load_index()
-    
-    assert loaded_index == test_index
+
+    stored = dict(test_index["12345"], filename=attachment_cache.NO_FILENAME)
+    assert loaded_index == {"12345": stored}
+    assert test_index["12345"]["filename"] == "test.pdf"
 @
 
 \subsection{Computing content hashes}
@@ -461,7 +483,7 @@ def restore_cached_attachment(attachment_id: int,
     _save_index(index)
 
     logger.info(f"Attachment cache hit: {attachment_id} "
-                f"({entry['filename']}, {entry['size'] / 1024:.1f}KB)")
+                f"({entry['size'] / 1024:.1f}KB)")
 
     return True
 @
@@ -574,7 +596,8 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     Args:
         attachment_id: Canvas attachment ID
         file_path: Path to the downloaded file
-        metadata: Dictionary with 'filename', 'size', 'content_type'
+        metadata: Dictionary with 'size', 'content_type'; a 'filename' is
+            accepted and not stored
     """
     if _fernet is None:
         logger.debug(f"Attachment cache disabled (no encryption key); "
@@ -612,7 +635,6 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
     index = _load_index()
     index[str(attachment_id)] = {
         "hash": file_hash,
-        "filename": metadata.get("filename", "unknown"),
         "size": metadata.get("size", 0),
         "content_type": metadata.get("content_type", "application/octet-stream"),
         "last_access": datetime.now().isoformat()
@@ -625,6 +647,30 @@ def cache_attachment(attachment_id: int, file_path: pathlib.Path,
 Now we verify the main operations: caching new attachments and restoring
 cached attachments work together correctly, and that what reaches the disk
 is actually ciphertext with user-only permissions.
+First, though, the index: it must not hold the name of a file it caches, and a
+name that an older copy of this library put there must be gone after the next
+write, while the entry keeps its [[filename]] key for those copies.
+
+<<test functions>>=
+def test_index_holds_no_file_names(tmp_cache, test_file):
+    """Neither a new entry nor an older one keeps its file name"""
+    index_file = tmp_cache / "index.json"
+    index_file.write_text(json.dumps({"1": {
+        "hash": "0" * 64, "filename": "anna_andersson_lab1.pdf", "size": 3,
+        "content_type": "application/pdf",
+        "last_access": datetime.now().isoformat()}}))
+
+    attachment_cache.cache_attachment(2, test_file, {
+        "filename": "bo_berg_lab1.txt", "size": 3,
+        "content_type": "text/plain"})
+
+    assert "anna" not in index_file.read_text()
+    assert "bo_berg" not in index_file.read_text()
+    index = json.loads(index_file.read_text())
+    assert set(index) == {"1", "2"}
+    assert all("filename" in entry for entry in index.values())
+    assert index["1"]["size"] == 3
+@
 
 <<test functions>>=
 def test_cache_and_restore_attachment(tmp_cache, test_file, tmp_path):
