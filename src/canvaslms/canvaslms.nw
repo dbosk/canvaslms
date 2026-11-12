@@ -154,7 +154,8 @@ We keep that import local to avoid turning [[import canvaslms]] into an eager
 Canvas setup step.
 
 <<functions>>=
-def load_canvas_from_configuration(config_file=None, use_cache=True):
+def load_canvas_from_configuration(config_file=None, use_cache=True,
+                                   cache_exclude=None):
   """Load a configured Canvas object and its cache metadata."""
   import canvaslms.cli
   import canvaslms.cli.cache
@@ -164,6 +165,7 @@ def load_canvas_from_configuration(config_file=None, use_cache=True):
   canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
       config,
       use_cache=use_cache,
+      cache_exclude=cache_exclude,
   )
   return config_file, canvas, hostname, token
 @
@@ -237,7 +239,8 @@ With [[use_cache=False]] we still construct a correctly configured Canvas
 object, but we do not replace the singleton state.
 
 <<functions>>=
-def get_canvas(config_file=None, use_cache=True, refresh=False):
+def get_canvas(config_file=None, use_cache=True, refresh=False,
+               cache_exclude=None):
   """Return a configured Canvas client.
 
   When ``use_cache`` is true, this returns a process-local singleton backed by
@@ -246,6 +249,11 @@ def get_canvas(config_file=None, use_cache=True, refresh=False):
   With ``refresh``, whatever is read through the client from now on is fetched
   again, whatever its age, like the ``--refresh-cache`` option of the command;
   the rest of the cache is kept.
+
+  ``cache_exclude`` names the kinds of objects to leave out of the cache file,
+  like the ``--cache-exclude`` option of the command: a comma-separated string
+  or a list, such as ``"personal"``. It holds for the whole process. None
+  leaves the choice to the environment and the configuration file.
   """
   if refresh:
     import canvaslms.hacks.canvasapi
@@ -254,11 +262,15 @@ def get_canvas(config_file=None, use_cache=True, refresh=False):
   config_file = resolve_config_file(config_file)
 
   if use_cache and _canvas is not None and _canvas_config_file == config_file:
+    if cache_exclude is not None:
+      import canvaslms.cli.cache
+      canvaslms.cli.cache.set_cache_exclusion(cache_exclude, "cache_exclude")
     return _canvas
 
   config_file, canvas, hostname, token = load_canvas_from_configuration(
       config_file,
       use_cache=use_cache,
+      cache_exclude=cache_exclude,
   )
 
   if use_cache:
@@ -338,7 +350,7 @@ def test_get_canvas_memoizes_cached_instance(monkeypatch):
   loaded = []
   expected = object()
 
-  def fake_loader(config_file=None, use_cache=True):
+  def fake_loader(config_file=None, use_cache=True, cache_exclude=None):
     loaded.append((config_file, use_cache))
     return config_file, expected, "https://canvas.example", "token"
 
@@ -366,7 +378,7 @@ def test_get_canvas_refresh_applies_to_the_remembered_client(monkeypatch):
   import canvaslms.hacks.canvasapi as hacks
   monkeypatch.setattr(hacks, "refresh_since", None)
   monkeypatch.setattr(canvaslms, "load_canvas_from_configuration",
-                      lambda config_file=None, use_cache=True:
+                      lambda config_file=None, use_cache=True, cache_exclude=None:
                       (config_file, object(), "https://canvas.example", "t"))
   monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
 
@@ -378,6 +390,41 @@ def test_get_canvas_refresh_applies_to_the_remembered_client(monkeypatch):
   assert hacks.refresh_since is not None
 @
 
+A program has no [[--cache-exclude]] either, and gets it through
+[[cache_exclude]].
+What the cache file leaves out is a property of the process, not of one client,
+so it too must take effect on the remembered object, and on first use it must
+reach the loader, which otherwise lets the configuration file decide.
+
+<<test functions>>=
+def test_get_canvas_cache_exclude_reaches_loader_and_remembered_client(
+    monkeypatch):
+  """Kinds can be excluded both on first use and on a later call."""
+  import canvaslms.hacks.canvasapi as hacks
+  monkeypatch.setattr(hacks, "CACHE_EXCLUDE", frozenset())
+  asked = []
+
+  def fake_loader(config_file=None, use_cache=True, cache_exclude=None):
+    asked.append(cache_exclude)
+    return config_file, object(), "https://canvas.example", "token"
+
+  monkeypatch.setattr(canvaslms, "load_canvas_from_configuration", fake_loader)
+  monkeypatch.setattr(canvaslms, "register_canvas_atexit", lambda: None)
+
+  first = canvaslms.get_canvas(config_file="/tmp/config.json",
+                               cache_exclude="user")
+  assert asked == ["user"]
+
+  second = canvaslms.get_canvas(config_file="/tmp/config.json",
+                                cache_exclude=["submission"])
+  assert second is first
+  assert asked == ["user"]
+  assert hacks.CACHE_EXCLUDE == {"submission"}
+
+  canvaslms.get_canvas(config_file="/tmp/config.json")
+  assert hacks.CACHE_EXCLUDE == {"submission"}
+@
+
 When a caller requests an explicit reload, we must discard the remembered object
 and ask the lower-level loader again.
 
@@ -386,7 +433,7 @@ def test_reload_canvas_replaces_singleton(monkeypatch):
   """Reloading should replace the memoized Canvas object."""
   canvases = [object(), object()]
 
-  def fake_loader(config_file=None, use_cache=True):
+  def fake_loader(config_file=None, use_cache=True, cache_exclude=None):
     return config_file, canvases.pop(0), "https://canvas.example", "token"
 
   monkeypatch.setattr(canvaslms, "load_canvas_from_configuration", fake_loader)
@@ -457,7 +504,7 @@ def test_get_canvas_raises_for_missing_credentials(monkeypatch):
   monkeypatch.setattr(
       canvaslms,
       "load_canvas_from_configuration",
-      lambda config_file=None, use_cache=True: (_ for _ in ()).throw(
+      lambda config_file=None, use_cache=True, cache_exclude=None: (_ for _ in ()).throw(
           canvaslms.canvas_credentials_error_class()(
               "No hostname or token, run `canvaslms login`"
           )
