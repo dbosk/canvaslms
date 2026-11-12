@@ -84,10 +84,12 @@ import argparse
 import base64
 from canvasapi import Canvas
 import canvasapi.requester
+import contextlib
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet, InvalidToken
 import functools
+import gc
 import hashlib
 import logging
 import os
@@ -143,6 +145,7 @@ import requests
 import responses
 from cryptography.fernet import Fernet
 import functools
+import gc
 import io
 import pickle
 import socket
@@ -914,6 +917,9 @@ A decryption failure usually means the token changed and is expected
 behavior, so we log it at INFO.
 Anything else is unexpected; we log it at WARNING, because an undiagnosed
 load failure silently degrades every run to full API cost.
+
+We unpickle with the garbage collector paused, which
+\cref{sec:unpickle-without-gc} explains.
 <<functions>>=
 def load_canvas_cache(token, hostname):
   """Loads the Canvas object from encrypted cache, returns None if unavailable"""
@@ -937,7 +943,8 @@ def load_canvas_cache(token, hostname):
     decrypt_elapsed = time.perf_counter() - decrypt_start
 
     unpickle_start = time.perf_counter()
-    payload = pickle.loads(pickled)
+    with garbage_collection_paused():
+      payload = pickle.loads(pickled)
     unpickle_elapsed = time.perf_counter() - unpickle_start
 
     <<discard [[payload]] on schema mismatch>>
@@ -1048,6 +1055,82 @@ def test_saved_cache_is_user_only(tmp_cache_path):
   cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
 
   assert tmp_cache_path.stat().st_mode & 0o777 == 0o600
+@
+
+
+\subsection{Unpickling without the garbage collector}
+\label{sec:unpickle-without-gc}
+
+Unpickling is the largest part of a load.
+It creates a few million objects in one go, and none of them is garbage.
+Python's cyclic garbage collector cannot know that: it runs whenever enough new
+objects exist, and each run walks objects that a later run walks again.
+On a real cache with a 72~MB pickle (92\,000 users in 176 courses), unpickling
+took 2.1~s with the collector on and 0.8~s with it off, which took the whole
+load from 2.9~s to 1.8~s.
+So we keep the collector off while we unpickle.
+
+We also tried [[gc.freeze]] after the load, which moves the loaded objects out
+of the collector's sight for the rest of the run.
+It made no measurable difference to a command, and in a long-lived program it
+would keep every graph it ever loaded alive, so we leave it out.
+
+Afterwards we restore the state we found, we don't turn the collector on.
+This loader also runs inside other programs, through
+[[canvaslms.get_canvas]], and one that runs with the collector off must find it
+off when we return.
+The [[finally]] matters for the same reason: a file that cannot be unpickled is
+an ordinary outcome here, it gives a fresh [[Canvas]] object, and it must not
+leave the rest of the program without garbage collection.
+<<functions>>=
+@contextlib.contextmanager
+def garbage_collection_paused():
+  """Keep the cyclic garbage collector off inside the `with` block."""
+  was_enabled = gc.isenabled()
+  gc.disable()
+  try:
+    yield
+  finally:
+    if was_enabled:
+      gc.enable()
+@
+
+Let's verify that the collector is off exactly while we unpickle, whatever its
+state before, and that a payload that cannot be unpickled restores it too.
+
+<<test functions>>=
+@pytest.fixture
+def collector_state():
+  """Put the garbage collector back as it was after the test."""
+  was_enabled = gc.isenabled()
+  yield
+  (gc.enable if was_enabled else gc.disable)()
+
+@pytest.mark.parametrize("enabled_before", [True, False])
+def test_load_unpickles_with_the_collector_off_and_restores_it(
+    tmp_cache_path, monkeypatch, collector_state, enabled_before):
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+  seen = []
+  real_loads = pickle.loads
+  def loads(data):
+    seen.append(gc.isenabled())
+    return real_loads(data)
+  monkeypatch.setattr(cache.pickle, "loads", loads)
+  (gc.enable if enabled_before else gc.disable)()
+
+  assert cache.load_canvas_cache("token", "https://host") == \
+      {"fake": "canvas"}
+  assert seen == [False]
+  assert gc.isenabled() == enabled_before
+
+def test_failed_unpickling_restores_the_collector(
+    tmp_cache_path, collector_state):
+  key = cache.derive_key("token", "https://host")
+  tmp_cache_path.write_bytes(Fernet(key).encrypt(b"not a pickle"))
+  gc.enable()
+
+  assert cache.load_canvas_cache("token", "https://host") is None
+  assert gc.isenabled()
 @
 
 
