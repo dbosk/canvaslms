@@ -16,6 +16,7 @@ We do this as follows:
 import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
+import canvasapi.group
 import canvasapi.util
 from canvasapi.user import User
 from canvasapi.util import is_multivalued
@@ -23,6 +24,7 @@ import collections
 import collections.abc
 import contextlib
 import contextvars
+import copy
 from datetime import datetime, timedelta
 import functools
 import importlib
@@ -6953,9 +6955,10 @@ hold personal data.
 The alias is the recommended form: the user states the intent, and when a
 future version caches a new kind of personal data, adding it to the alias
 protects everyone who already uses it.
-It also covers what a single kind does not: a group that was fetched with its
-members included carries their names itself, so excluding [[user]] alone leaves
-those in the file.
+It also covers what a single kind does not.
+A group that was fetched with its members included carries their names itself,
+and a submission names its student in what Canvas sends, so excluding [[user]]
+alone leaves those in the file.
 
 Excluded objects are still cached in memory during the run, so a single
 command behaves exactly as before.
@@ -7090,6 +7093,52 @@ leave_out_of_cache_file(cls, "submission", {
   "__all_fetched": nothing,
   "__unlisted": set,
 })
+@
+
+\paragraph{What a command attached to a submission}
+Emptying the caches is not enough, because an excluded object can also sit on
+an object that is kept.
+The commands attach the student to each submission they work with
+([[submission.user]], set by [[filter_submissions]]), and the wrapper passes
+that on to the submission it wraps, which is what we store
+(\cref{sec:lazy-submission-pickle}).
+With users excluded and submissions kept, every roster was gone from the file
+and the same users were still in it, one on each submission.
+
+So a stored submission leaves out the attributes that hold an object of an
+excluded kind: a [[User]] when users are excluded, a [[Group]] when groups are.
+We go by the value and not by the name, which also catches what a file from
+before this filter already holds.
+The submission in memory keeps what was attached, since the command is still
+using it; we store a copy without those attributes.
+Nothing is lost by it: the commands attach the student anew on every run.
+Like the state filters, this applies only while the cache file is written.
+
+What Canvas itself sends as part of a submission is another matter.
+A submission names its student by identifier, and its comments and contents
+may name them too; that is the submission, and leaving it out is what the kind
+[[submission]] is for.
+<<constants>>=
+ATTACHED_KINDS = {"user": User, "group": canvasapi.group.Group}
+<<functions>>=
+def submission_for_cache_file(submission):
+  """Return `submission` as the cache file may hold it.
+
+  That is the submission itself, or while the cache file is written a copy
+  without the attributes that hold an object of an excluded kind.
+  """
+  if not writing_to_cache_file.get():
+    return submission
+  excluded = tuple(cls for kind, cls in ATTACHED_KINDS.items()
+                   if kind in CACHE_EXCLUDE)
+  attached = [name for name, value in vars(submission).items()
+              if isinstance(value, excluded)]
+  if not attached:
+    return submission
+  stored = copy.copy(submission)
+  for name in attached:
+    delattr(stored, name)
+  return stored
 @
 
 \paragraph{Misspelled kinds}
@@ -7239,6 +7288,54 @@ class TestCacheExclusion:
         assert getattr(course.assignment_cache[2][0], "__unlisted") == {8}
         assert 7 in copy.copy(course).user_cache
         assert 7 in pickle.loads(pickle.dumps(course)).user_cache
+
+    @pytest.mark.parametrize("kinds,in_file", [
+        ("", True), ("user", False), ("user,group", False), ("group", True),
+    ])
+    def test_a_submission_does_not_carry_an_excluded_user_into_the_file(
+            self, monkeypatch, kinds, in_file):
+        course = course_with_people()
+        submission = getattr(course.assignment_cache[2][0], "__cache")[7]
+        submission.user = course.user_cache[7][0]
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
+                            frozenset())
+        exclude_from_cache_file(kinds)
+
+        with writing_cache_file():
+            pickled = pickle.dumps(course)
+
+        assert (b"A Student" in pickled) == in_file
+        stored = getattr(pickle.loads(pickled).assignment_cache[2][0],
+                         "__cache")[7]
+        assert hasattr(object.__getattribute__(stored, "_submission"),
+                       "user") == in_file
+        assert stored.grade == "P"
+        assert submission.user.name == "A Student"
+
+    def test_a_submission_does_not_carry_an_excluded_group_into_the_file(
+            self, monkeypatch):
+        course = course_with_people()
+        submission = getattr(course.assignment_cache[2][0], "__cache")[7]
+        submission.group = course.group_cache[4][0]
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
+                            frozenset())
+        exclude_from_cache_file("user,group")
+
+        with writing_cache_file():
+            pickled = pickle.dumps(course)
+
+        assert b"Anna and Bo" not in pickled
+        assert submission.group.name == "Anna and Bo"
+
+    def test_outside_the_cache_file_a_submission_keeps_what_was_attached(
+            self, monkeypatch):
+        course = course_with_people()
+        submission = getattr(course.assignment_cache[2][0], "__cache")[7]
+        submission.user = course.user_cache[7][0]
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_EXCLUDE",
+                            frozenset({"user"}))
+
+        assert b"A Student" in pickle.dumps(submission)
 
     @pytest.mark.parametrize("kinds,requests", [("", 1), ("user", 2)])
     def test_the_next_run_fetches_an_excluded_kind_again(
@@ -8636,8 +8733,11 @@ pickling:
   refresh timestamp.  The annotation record is left out too, but for a
   different reason: annotations are per-run decorations that the CLI
   re-applies on every invocation (for instance [[filter_submissions]] sets
-  [[user]] anew each run), so persisting them would only freeze one run's
-  view of the data.
+  [[user]] anew each run), so persisting the record would only freeze one
+  run's view of the data.  The annotated attributes themselves are on the
+  wrapped submission and are stored with it, except those that hold an
+  object of a kind the user keeps out of the cache file
+  (\cref{sec:cache-exclude}).
 \item \textbf{After unpickling} ([[__setstate__]]): Start with an empty
   annotation record and take [[_original_get_submission]] from the class of
   the assignment, where the decorator keeps it as
@@ -8700,7 +8800,8 @@ def __getstate__(self):
   It is taken from the assignment's class again during unpickling.
   """
   state = {
-    '_submission': object.__getattribute__(self, '_submission'),
+    '_submission': submission_for_cache_file(
+      object.__getattribute__(self, '_submission')),
     '_assignment': object.__getattribute__(self, '_assignment'),
     '_includes': object.__getattribute__(self, '_includes'),
     '_last_refresh': object.__getattribute__(self, '_last_refresh'),
