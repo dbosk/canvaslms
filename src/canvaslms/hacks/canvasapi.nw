@@ -6369,9 +6369,9 @@ says [[enrollments]]; if the next reader needs a field we dropped, the record
 would lie to it.
 The filter therefore also stores which fields it kept, as
 [[_enrollment_fields]] on the user.
-An entry without that attribute has everything Canvas sent, which is true both
-for a freshly fetched user and for one written by a copy of this library that
-has no filter.
+An entry without that attribute has everything Canvas sent, which is true for a
+freshly fetched user and, with one exception that we return to below, for one
+written by a copy of this library that has no filter.
 A new attribute that is read with a default needs no new schema version.
 When an entry that was already short is stored again, the record cannot grow:
 it becomes the fields that both the entry and this process keep.
@@ -6387,7 +6387,8 @@ def short_enrollments(user, state):
   Records the fields that may be left as `_enrollment_fields`.
   """
   enrollments = state.get("enrollments")
-  if ENROLLMENT_FIELDS is None or not isinstance(enrollments, list):
+  if (ENROLLMENT_FIELDS is None or not isinstance(enrollments, list)
+      or state.get("_unlisted")):
     return
   kept = ENROLLMENT_FIELDS & state.get("_enrollment_fields", ENROLLMENT_FIELDS)
   state["enrollments"] = [
@@ -6415,6 +6416,25 @@ cannot disagree: what we would store is what we are content to read.
 That also makes the list safe to extend.
 When a later version reads one more field and adds it here, the entries stored
 without it count as lacking, and each roster is fetched once more.
+
+Someone who has left the course is the exception, on both sides.
+Canvas no longer lists them, so no fetch can bring back what we drop
+(\cref{sec:forget-unlisted}).
+The filter therefore leaves a user marked [[_unlisted]] as they are, which
+costs little, since they are few.
+One who was stored short before leaving stays short, and must not count as
+lacking: nothing can repair them, so every read would fetch the roster in vain,
+again and again.
+[[kept_kwargs]] therefore takes such an entry at its word.
+A caller that needs more fields gets that one user with fewer.
+
+The record has one more limit.
+A copy of this library from before the filters keeps a short entry's
+enrollments but not its mark, in the rare case where its listing replaces an
+entry that was fetched alone with more than the listing asks for.
+What it writes back is then short and unmarked, and we take it for complete
+until a process with the filter stores it again.
+With the default list this changes nothing, since everything we read is in it.
 A program that uses this library and reads other fields can set
 [[ENROLLMENT_FIELDS]] to a larger set, or to [[None]] for everything, before it
 reads; it then also stores what it asked for.
@@ -6428,6 +6448,7 @@ def kept_kwargs(obj, prev_kwargs):
   """
   kept = getattr(obj, "_enrollment_fields", None)
   if (kept is None or "include" not in prev_kwargs
+      or getattr(obj, "_unlisted", False)
       or (ENROLLMENT_FIELDS is not None and ENROLLMENT_FIELDS <= kept)):
     return prev_kwargs
   return {**prev_kwargs,
@@ -6596,6 +6617,39 @@ class TestShortEnrollments:
         stored.get_user(1, include=["enrollments"])
         assert len(stored.requests) == requests_before + 1
 
+    def test_someone_who_has_left_keeps_all_fields_in_the_file(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        only_user(roster)._unlisted = True
+
+        left = only_user(pickled_for_file(roster))
+
+        assert "grades" in left.enrollments[0]
+        assert not hasattr(left, "_enrollment_fields")
+
+    @pytest.mark.parametrize("read", [
+        lambda roster: list(roster.get_users(include=["enrollments"])),
+        lambda roster: roster.get_user(1, include=["enrollments"]),
+    ], ids=["listing", "one user"])
+    def test_someone_stored_short_who_then_left_is_not_fetched_for(
+            self, monkeypatch, read):
+        _, stored = stored_roster()
+        only_user(stored)._unlisted = True
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+        monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                            "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+
+        read(stored)
+
+        assert len(stored.requests) == 1
+
+    def test_an_enrollment_that_is_no_dictionary_is_stored_as_it_is(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        only_user(roster).enrollments.append("odd")
+
+        assert only_user(pickled_for_file(roster)).enrollments[1] == "odd"
+
     def test_a_listing_that_fetches_enrollments_leaves_no_mark(self):
         roster = Roster()
         list(roster.get_users(include=["enrollments"]))
@@ -6707,12 +6761,35 @@ def forget_unused_contents(course, state):
       state[name] = {}
     elif name.endswith("_all_fetched"):
       state[name] = None
-  logger.info(f"Cache pruning: left out the contents of course "
-              f"{state.get('id')}, nothing fetched since {newest:%Y-%m-%d}")
+  <<say that the contents of [[course]] were left out>>
 
 def make_unused_course_contents_forgotten():
   import canvasapi.course
   add_state_filter(canvasapi.course.Course, forget_unused_contents)
+@
+
+Most of what we leave out can be fetched again, so saying it in the log, for
+whoever runs with [[-v]], is enough.
+The users who had left the course cannot, and their results were the reason to
+keep them.
+Losing them deserves a warning, which names the setting that prevents it.
+It comes once for a course, since the next file has nothing left to lose.
+<<say that the contents of [[course]] were left out>>=
+left = sum(1 for entry in getattr(course, "user_cache", {}).values()
+           if isinstance(entry, tuple) and getattr(entry[0], "_unlisted", False))
+message = (f"Cache pruning: nothing in course {state.get('id')} was fetched "
+           f"since {newest:%Y-%m-%d}, so the cache file leaves out what was "
+           f"cached of it")
+if left:
+  logger.warning(f"{message}, including {count_noun(left, 'user')} who had "
+                 f"left the course; CANVASLMS_CACHE_KEEP_DAYS=0 keeps "
+                 f"everything")
+else:
+  logger.info(message)
+<<functions>>=
+def count_noun(count, noun):
+  """Return `count` with `noun`, in the plural unless the count is 1."""
+  return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 @
 
 Let's verify it on a real [[Course]] with a user, an assignment, a submission
@@ -6806,6 +6883,31 @@ class TestForgettingUnusedContents:
         stored = pickled_for_file(course_with_contents_fetched(days_ago(4000)))
 
         assert len(stored.user_cache) == 1
+
+    def test_losing_someone_who_had_left_is_a_warning(self, caplog):
+        course = course_with_contents_fetched(days_ago(400))
+        with caplog.at_level(logging.INFO):
+            pickled_for_file(course)
+        assert [record.levelno for record in caplog.records] == [logging.INFO]
+
+        caplog.clear()
+        course.user_cache[7][0]._unlisted = True
+        with caplog.at_level(logging.INFO):
+            pickled_for_file(course)
+
+        warning, = caplog.records
+        assert warning.levelno == logging.WARNING
+        assert "1 user who had left" in warning.getMessage()
+        assert "CANVASLMS_CACHE_KEEP_DAYS=0" in warning.getMessage()
+
+    def test_an_attribute_that_only_looks_like_a_cache_is_left_alone(self):
+        course = course_with_contents_fetched(days_ago(400))
+        course.note_cache = "not a cache"
+
+        stored = pickled_for_file(course)
+
+        assert stored.note_cache == "not a cache"
+        assert stored.user_cache == {}
 
     def test_contents_without_time_stamps_are_kept(self):
         course = Course(None, {"id": 1, "name": "New course"})
