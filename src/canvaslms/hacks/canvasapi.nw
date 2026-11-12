@@ -8601,6 +8601,7 @@ def __str__(self):
 @
 
 \subsubsection{Pickle support for cache persistence}
+\label{sec:lazy-submission-pickle}
 
 The [[LazySubmission]] wrapper must support pickling to enable cache
 persistence.
@@ -8624,7 +8625,7 @@ This is a \emph{bound method} when called, but we store the \emph{unbound
 function} from the decorator's closure.
 Method objects are not picklable by default.
 
-\paragraph{The solution: reconstruct from closure}
+\paragraph{The solution: find it again on the class}
 
 We implement [[__getstate__]] and [[__setstate__]] to handle
 pickling:
@@ -8638,47 +8639,38 @@ pickling:
   [[user]] anew each run), so persisting them would only freeze one run's
   view of the data.
 \item \textbf{After unpickling} ([[__setstate__]]): Start with an empty
-  annotation record and reconstruct
-  [[_original_get_submission]] by searching the decorator's closure.
-  The decorated method stores the original in its [[__closure__]]
-  attribute, which we can access via
-  [[assignment.__class__.get_submission]].
+  annotation record and take [[_original_get_submission]] from the class of
+  the assignment, where the decorator keeps it as
+  [[uncached_get_submission]] (\cref{sec:caching-submissions}).
 \end{enumerate}
 
-\paragraph{Why closure search works}
+\paragraph{Why the class, and not the closure}
 
-When the [[cache_submissions]] decorator wraps
-[[Assignment.get_submission]], it captures the original method in a
-closure variable (line~1072 in the decorator):
-\begin{minted}{python}
-original_get_submission = cls.get_submission
-\end{minted}
+The original method is the same for every submission of every assignment, so
+it does not belong in each wrapper's stored state; it belongs to the class,
+and a class is not pickled, only named.
+The decorator that wraps [[Assignment.get_submission]] therefore leaves the
+method it wrapped on the class, under a name of its own.
 
-This variable is referenced by the [[new_get_submission]] function,
-making it part of the function's closure.
-After unpickling, we can access this closure via the class's decorated method.
+An earlier version had no such attribute and searched for the method instead:
+the decorated method keeps the original in its [[__closure__]], and
+[[__setstate__]] took the first callable there with [[get_submission]] in its
+name.
+That depended on how the decorator happened to be written, down to the names
+of its variables, and when the search found nothing it left the attribute
+unset, so the first refresh failed with an [[AttributeError]] far from its
+cause (issue~\#317).
+An attribute lookup depends on one name that both sides state.
 
 \paragraph{Limitations and failure modes}
 
-This approach has several limitations:
-\begin{description}
-\item[Version compatibility] If the decorator implementation changes between
-  pickle and unpickle (e.g., code upgrade), the closure structure may differ,
-  causing reconstruction to fail.
-\item[Closure ambiguity] If multiple callable objects exist in the closure with
-  \enquote{get\_submission} in their name, we might retrieve the wrong one.
-  The heuristic checks for callables with matching names.
-\item[Graceful degradation] If reconstruction fails, we set
-  [[_original_get_submission]] to [[None]].
-  The wrapper remains functional for read-only access (attributes pass through
-  to the wrapped submission), but calling [[_refresh()]] will fail.
-  This is acceptable because:
-  \begin{itemize}
-  \item Cache files are typically invalidated on code changes
-  \item The user can clear the cache manually if issues arise
-  \item Better to have stale data than a complete crash
-  \end{itemize}
-\end{description}
+Only one remains.
+If the class of the assignment has no [[uncached_get_submission]], we set
+[[_original_get_submission]] to [[None]]: the wrapper can still be read, since
+attributes pass through to the wrapped submission, but it cannot refresh.
+For a real [[Assignment]] that cannot happen, because unpickling a
+[[LazySubmission]] imports this module, and importing it decorates the class.
+It is the case of a stand-in for an assignment, as in some tests.
 
 \paragraph{Alternative approaches considered}
 
@@ -8705,7 +8697,7 @@ def __getstate__(self):
   Prepare object for pickling.
 
   We can't pickle method references, so we exclude _original_get_submission.
-  It will be restored from the decorator's closure during unpickling.
+  It is taken from the assignment's class again during unpickling.
   """
   state = {
     '_submission': object.__getattribute__(self, '_submission'),
@@ -8719,37 +8711,68 @@ def __setstate__(self, state):
   """
   Restore object after unpickling.
 
-  Restore all attributes from state, and reconstruct _original_get_submission
-  by searching the decorator's closure for the original method.
+  Restore all attributes from state, and take _original_get_submission from
+  the class of the assignment, where the caching decorator keeps it.
   """
   for key, value in state.items():
     object.__setattr__(self, key, value)
   object.__setattr__(self, '_annotations', {})
+  object.__setattr__(
+    self, '_original_get_submission',
+    getattr(type(state['_assignment']), 'uncached_get_submission', None))
+@
 
-  # Restore the original method from the assignment's decorated method
-  # The decorated method has the original in its closure
-  assignment = state['_assignment']
-  decorated_method = assignment.__class__.get_submission
+Let's verify that a submission read back from the cache file can still be
+refreshed, which is what the original method is for.
+We go through the real [[Assignment]] and a real requester, with [[responses]]
+in place of Canvas: the submission is fetched, stored and read back, grows
+stale, and must then ask Canvas again and get the new grade.
 
-  # The original method is captured in the decorator's closure
-  # We can access it via the closure of the decorated method
-  # The decorated method's __closure__ contains the original method
-  try:
-    # Find the original_get_submission in the closure
-    for cell in decorated_method.__closure__:
-      try:
-        obj = cell.cell_contents
-        # Check if it's a callable with the right name
-        if callable(obj) and hasattr(obj, '__name__') and \
-           'get_submission' in obj.__name__:
-          object.__setattr__(self, '_original_get_submission', obj)
-          break
-      except (AttributeError, ValueError):
-        continue
-  except (AttributeError, TypeError):
-    # If we can't find it in closure, fall back to None
-    # This means refresh won't work, but at least unpickling succeeds
-    object.__setattr__(self, '_original_get_submission', None)
+<<test functions>>=
+SUBMISSION_URL = ("https://canvas.example/api/v1/"
+                  "courses/1/assignments/2/submissions/7")
+
+def stored_assignment_with_submission():
+    """Return an assignment whose submission was fetched and then pickled."""
+    canvas = canvasapi.Canvas("https://canvas.example", "token")
+    assignment = Assignment(canvas._Canvas__requester,
+                            {"id": 2, "course_id": 1, "name": "Lab 1"})
+    responses.get(SUBMISSION_URL, json={
+        "id": 9, "user_id": 7, "assignment_id": 2, "grade": "F"})
+    assignment.get_submission(7)
+    return pickle.loads(pickle.dumps(assignment))
+
+@responses.activate
+def test_a_submission_read_back_from_the_file_can_be_refreshed():
+    assignment = stored_assignment_with_submission()
+    submission = getattr(assignment, "__cache")[7]
+    object.__setattr__(submission, "_last_refresh",
+                       datetime.now() - timedelta(days=1))
+    responses.replace(responses.GET, SUBMISSION_URL, json={
+        "id": 9, "user_id": 7, "assignment_id": 2, "grade": "P"})
+
+    assert submission.grade == "P"
+    assert len(responses.calls) == 2
+
+@responses.activate
+def test_the_original_method_is_the_one_the_decorator_wrapped():
+    assignment = stored_assignment_with_submission()
+    submission = getattr(assignment, "__cache")[7]
+
+    original = object.__getattribute__(submission, "_original_get_submission")
+    assert original is Assignment.uncached_get_submission
+    assert original is not Assignment.get_submission
+
+def test_a_stand_in_for_an_assignment_gives_a_submission_that_reads():
+    wrapped = LazySubmission(
+        Submission(None, {"id": 9, "user_id": 7, "grade": "P"}),
+        Secretive(None, {"id": 2}), set(), None)
+
+    restored = pickle.loads(pickle.dumps(wrapped))
+
+    assert restored.grade == "P"
+    assert object.__getattribute__(
+        restored, "_original_get_submission") is None
 @
 
 This class is used by the caching decorator below.
@@ -9023,6 +9046,7 @@ class TestQuizCaching:
 @
 
 \subsection{Caching submissions}
+\label{sec:caching-submissions}
 
 For the results, we can construct something more specific.
 Results that we're interested in are submissions.
@@ -9064,6 +9088,9 @@ We need to add a cache attribute in the constructor, so we must decorate the
 constructor.
 We must also store the original [[get_submission]] method before decorating it,
 because [[LazySubmission]] needs to call it directly to avoid double-wrapping.
+We keep it on the class as well, as [[uncached_get_submission]], which is where
+a [[LazySubmission]] that has been read back from the cache file finds it
+(\cref{sec:lazy-submission-pickle}).
 Then we must decorate both [[get_submission]] and [[get_submissions]].
 <<decorator body for caching assignment submissions>>=
 old_constructor = cls.__init__
@@ -9077,6 +9104,7 @@ cls.__init__ = new_init
 
 # Store original method before wrapping (needed by LazySubmission)
 original_get_submission = cls.get_submission
+cls.uncached_get_submission = original_get_submission
 get_submission = cls.get_submission
 
 @functools.wraps(cls.get_submission)
