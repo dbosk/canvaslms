@@ -22,6 +22,7 @@ from canvasapi.util import is_multivalued
 import collections
 import collections.abc
 import contextlib
+import contextvars
 from datetime import datetime, timedelta
 import functools
 import importlib
@@ -115,6 +116,8 @@ import sys
 import urllib.parse
 
 import canvasapi
+import canvasapi.module
+import copy
 import pytest
 import responses
 from unittest.mock import MagicMock
@@ -1591,7 +1594,7 @@ except KeyError:
 old_obj = obj
 refreshing_on_request = False
 
-if obj and must_update(prev_kwargs, kwargs):
+if obj and must_update(kept_kwargs(obj, prev_kwargs), kwargs):
   obj = None
   cache_status = " (new kwargs required)"
 elif obj and outdated(obj):
@@ -1635,6 +1638,8 @@ performance benefits.
 
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
+It gets them through [[kept_kwargs]], which leaves out what the cache file
+kept only part of (\cref{sec:short-enrollments}).
 We'll return to the [[outdated]] function later, that one determines from the
 object itself if it needs updating.
 
@@ -3319,6 +3324,7 @@ if must_update(union_kwargs, without_restrictions(old_kwargs)):
     if (not name.startswith("_") and name not in vars(obj)
         and not (name.endswith("_date") and name[:-5] in vars(obj))):
       setattr(obj, name, value)
+  <<carry over the mark of short enrollments>>
   obj_kwargs = merge_kwargs([union_kwargs, without_restrictions(old_kwargs)])
 @
 
@@ -4450,10 +4456,13 @@ the cache into 17~minutes of retries and a failure.
 A failure is remembered for the rest of the run, so later reads don't try again.
 An entry Canvas still lists that lacks what is asked for is another matter, and
 then the fetch is needed and gets the full retry policy, as before.
+What an entry was fetched with is read through [[kept_kwargs]]
+(\cref{sec:short-enrollments}), so an entry whose enrollments the cache file
+shortened too much for this process lacks them.
 <<find out whether the cached entries have what is asked for>>=
 lacking = [(cached_obj, prev_kwargs)
            for cached_obj, prev_kwargs in attr_cache.values()
-           if must_update(prev_kwargs, kwargs)]
+           if must_update(kept_kwargs(cached_obj, prev_kwargs), kwargs)]
 listed_lacking = [(cached_obj, prev_kwargs)
                   for cached_obj, prev_kwargs in lacking
                   if not getattr(cached_obj, "_unlisted", False)]
@@ -6173,6 +6182,745 @@ for attr_name in dir(obj):
 @
 
 
+\subsection{What goes into the cache file}
+\label{sec:state-filters}
+
+So far the cache file holds the objects exactly as they are in memory:
+[[cli/cache.nw]] pickles the [[Canvas]] object, and [[pickle]] stores every
+attribute of every object below it.
+That is more than the file needs.
+Some attributes are large and never read again, and some listings have not been
+used for months (issue~\#586); some hold what a user doesn't want on disk at all
+(issue~\#578).
+The objects in memory must stay as they are, though: a command that just fetched
+a roster uses all of it, whatever the file is going to keep.
+
+[[pickle]] has a hook for this difference.
+Before it stores an object it asks the object's class for the state to store,
+through [[__getstate__]], and stores that in place of the attributes.
+We give a class that hook once, and let it run a list of \emph{state filters}.
+A filter is a function [[state_filter(obj, state)]] that changes [[state]], a
+copy of the object's attributes, in place.
+The stored state remains a dictionary of attributes, so nothing changes for
+whoever reads the file: unpickling sets what is there, and a copy of this
+library without the filters reads the file as before.
+A filter must therefore leave an attribute that the code reads without a
+default in place, emptied if need be, and not remove it.
+
+The filters must not run every time an object is pickled or copied.
+[[copy.copy]] asks [[__getstate__]] too, and a program using this library may
+pickle these objects for reasons of its own; neither should get a filtered
+object.
+So the filters run only inside [[writing_cache_file]], the context that
+[[cli/cache.nw]] enters while it pickles for the file.
+Outside it, the hook returns the attributes themselves, which is what [[pickle]]
+uses for an object without a hook.
+The context is a [[ContextVar]], so pickling in one thread does not filter what
+another thread copies meanwhile.
+
+A filter for a class also applies to its subclasses, base class first, and the
+filters of one class run in the order they were added.
+The hook is ours alone, though.
+A class that already decides its state with a [[__getstate__]] of its own cannot
+get filters, since ours would replace it without anyone noticing, so we refuse;
+and a subclass that defines one bypasses the filters of its base classes, which
+we cannot see from here.
+None of the [[canvasapi]] classes has one.
+<<functions>>=
+state_filters = {}
+writing_to_cache_file = contextvars.ContextVar("writing_to_cache_file",
+                                               default=False)
+
+@contextlib.contextmanager
+def writing_cache_file():
+  """Let the state filters apply to what is pickled inside the `with` block."""
+  token = writing_to_cache_file.set(True)
+  try:
+    yield
+  finally:
+    writing_to_cache_file.reset(token)
+
+def add_state_filter(cls, state_filter):
+  """Let `state_filter` change what the cache file stores of a `cls` object.
+
+  It is called as `state_filter(obj, state)` with a copy of the attributes of
+  `obj`, to change in place, each time such an object is pickled inside
+  `writing_cache_file`. It must not change `obj`.
+  """
+  if cls not in state_filters:
+    if vars(cls).get("__getstate__", state_for_pickle) is not state_for_pickle:
+      raise TypeError(f"{cls.__name__} has a __getstate__ of its own, "
+                      f"which the state filters would replace")
+    state_filters[cls] = []
+    cls.__getstate__ = state_for_pickle
+  state_filters[cls].append(state_filter)
+
+def state_for_pickle(self):
+  """Return the attributes to pickle for `self`, filtered for the cache file."""
+  if not writing_to_cache_file.get():
+    return self.__dict__
+  state = self.__dict__.copy()
+  for cls in reversed(type(self).__mro__):
+    for state_filter in state_filters.get(cls, ()):
+      state_filter(self, state)
+  return state
+@
+
+Let's verify the hook on classes of our own, so that no filter of a test stays
+on a real class.
+A filter must change what is pickled for the file and nothing else: not the
+object in memory, not a copy of it and not a pickle made outside the context.
+
+<<test functions>>=
+class Secretive(CanvasObject):
+    """A stand-in whose `secret` is left out of the cache file."""
+
+class Recording(Secretive):
+    """A subclass whose own filter records the `secret` it was given."""
+
+class Ordered(CanvasObject):
+    """A stand-in with two filters that note the order they ran in."""
+
+def without_secret(obj, state):
+    state["secret"] = None
+
+def seen_secret(obj, state):
+    state["seen"] = state["secret"]
+
+def first(obj, state):
+    state["order"] = ["first"]
+
+def second(obj, state):
+    state["order"] = state.get("order", []) + ["second"]
+
+add_state_filter(Secretive, without_secret)
+add_state_filter(Recording, seen_secret)
+add_state_filter(Ordered, first)
+add_state_filter(Ordered, second)
+
+def pickled_for_file(obj):
+    """Return `obj` as it comes back from the cache file."""
+    with writing_cache_file():
+        pickled = pickle.dumps(obj)
+    return pickle.loads(pickled)
+
+class TestStateFilters:
+    """Test what the cache file stores of an object with state filters"""
+
+    def test_filter_applies_to_the_file_only(self):
+        thing = Secretive(None, {"name": "x", "secret": "s"})
+
+        stored = pickled_for_file(thing)
+
+        assert (stored.name, stored.secret) == ("x", None)
+        assert thing.secret == "s"
+        assert copy.copy(thing).secret == "s"
+        assert pickle.loads(pickle.dumps(thing)).secret == "s"
+
+    def test_filters_stop_when_the_writing_fails(self):
+        thing = Secretive(None, {"secret": "s"})
+
+        with pytest.raises(RuntimeError):
+            with writing_cache_file():
+                raise RuntimeError("disk full")
+
+        assert pickle.loads(pickle.dumps(thing)).secret == "s"
+
+    def test_subclass_gets_the_filters_of_its_base_class_first(self):
+        stored = pickled_for_file(Recording(None, {"secret": "s"}))
+
+        assert (stored.secret, stored.seen) == (None, None)
+
+    def test_filters_of_a_class_run_in_the_order_added(self):
+        assert pickled_for_file(Ordered(None, {})).order == ["first", "second"]
+
+    def test_a_class_with_its_own_state_hook_is_refused(self):
+        class Stateful(CanvasObject):
+            def __getstate__(self):
+                return {}
+
+        with pytest.raises(TypeError, match="Stateful"):
+            add_state_filter(Stateful, without_secret)
+        assert Stateful not in canvaslms.hacks.canvasapi.state_filters
+@
+
+
+\subsubsection{Enrollments, shortened}
+\label{sec:short-enrollments}
+
+The first filter is for the largest thing in the file.
+We fetch every roster with [[include=["enrollments"]]], since the enrollments
+say who is a student and who is a teacher (the role filter of [[users]] reads
+their [[type]]).
+Canvas answers with 26 fields for each enrollment: grades, activity times,
+identifiers of the student system, links.
+In a real cache of 176 courses with 92\,000 cached users, those enrollments were
+43 of the pickle's 72~MB, for the sake of one field.
+
+So the file keeps a short list of fields, [[ENROLLMENT_FIELDS]]: what tells who
+someone is in a course and in which section, and nothing about how they are
+doing.
+The filter shortens the enrollments in the state and leaves the user in memory
+alone.
+
+A shortened entry must say that it is shortened.
+The cache trusts its record of what each entry was fetched with, and that record
+says [[enrollments]]; if the next reader needs a field we dropped, the record
+would lie to it.
+The filter therefore also stores which fields it kept, as
+[[_enrollment_fields]] on the user.
+An entry without that attribute has everything Canvas sent, which is true for a
+freshly fetched user and, with one exception that we return to below, for one
+written by a copy of this library that has no filter.
+A new attribute that is read with a default needs no new schema version.
+When an entry that was already short is stored again, the record cannot grow:
+it becomes the fields that both the entry and this process keep.
+<<constants>>=
+ENROLLMENT_FIELDS = frozenset({
+  "id", "user_id", "course_id", "course_section_id",
+  "type", "role", "enrollment_state",
+})
+<<functions>>=
+def short_enrollments(user, state):
+  """State filter: keep only `ENROLLMENT_FIELDS` of each enrollment.
+
+  Records the fields that may be left as `_enrollment_fields`.
+  """
+  enrollments = state.get("enrollments")
+  if (ENROLLMENT_FIELDS is None or not isinstance(enrollments, list)
+      or state.get("_unlisted")):
+    return
+  kept = ENROLLMENT_FIELDS & state.get("_enrollment_fields", ENROLLMENT_FIELDS)
+  state["enrollments"] = [
+    {field: value for field, value in enrollment.items() if field in kept}
+    if isinstance(enrollment, dict) else enrollment
+    for enrollment in enrollments]
+  state["_enrollment_fields"] = kept
+
+def make_stored_enrollments_short():
+  add_state_filter(canvasapi.user.User, short_enrollments)
+@
+
+The other half is to use the record.
+Whether a cached entry has what a call asks for is decided by [[must_update]],
+from the keyword arguments the entry was fetched with.
+We give it those arguments as the file kept them: if the entry's enrollments
+lack a field that this process keeps, the entry no longer counts as fetched with
+[[enrollments]].
+A call that asks for enrollments then fetches again, with everything the entry
+was ever fetched with, and gets a full object without the mark.
+A call that doesn't ask for them is answered from the cache as before.
+
+Which fields a process needs is [[ENROLLMENT_FIELDS]] again, so the two halves
+cannot disagree: what we would store is what we are content to read.
+That also makes the list safe to extend.
+When a later version reads one more field and adds it here, the entries stored
+without it count as lacking, and each roster is fetched once more.
+
+Someone who has left the course is the exception, on both sides.
+Canvas no longer lists them, so no fetch can bring back what we drop
+(\cref{sec:forget-unlisted}).
+The filter therefore leaves a user marked [[_unlisted]] as they are, which
+costs little, since they are few.
+One who was stored short before leaving stays short, and must not count as
+lacking: nothing can repair them, so every read would fetch the roster in vain,
+again and again.
+[[kept_kwargs]] therefore takes such an entry at its word.
+A caller that needs more fields gets that one user with fewer.
+
+The record has one more limit.
+A copy of this library from before the filters keeps a short entry's
+enrollments but not its mark, in the rare case where its listing replaces an
+entry that was fetched alone with more than the listing asks for.
+What it writes back is then short and unmarked, and we take it for complete
+until a process with the filter stores it again.
+With the default list this changes nothing, since everything we read is in it.
+A program that uses this library and reads other fields can set
+[[ENROLLMENT_FIELDS]] to a larger set, or to [[None]] for everything, before it
+reads; it then also stores what it asked for.
+It shares the file with programs that shorten, though, so it fetches a roster
+again whenever one of them has saved it in between.
+<<functions>>=
+def kept_kwargs(obj, prev_kwargs):
+  """Return `prev_kwargs` without what the cache file kept only part of.
+
+  `prev_kwargs` are the keyword arguments the cached `obj` was fetched with.
+  """
+  kept = getattr(obj, "_enrollment_fields", None)
+  if (kept is None or "include" not in prev_kwargs
+      or getattr(obj, "_unlisted", False)
+      or (ENROLLMENT_FIELDS is not None and ENROLLMENT_FIELDS <= kept)):
+    return prev_kwargs
+  return {**prev_kwargs,
+          "include": [include for include in as_list(prev_kwargs["include"])
+                      if include != "enrollments"]}
+@
+
+The mark starts with an underscore, and attributes of ours are not copied from
+an old object to the one that replaces it
+(\cref{sec:what-a-listing-asks-for}).
+That is right when the new object brings enrollments of its own.
+But a listing that doesn't ask for enrollments keeps the old object's, if the
+entry had been fetched with them, and those are still short.
+The mark must follow the enrollments it describes.
+<<carry over the mark of short enrollments>>=
+if (hasattr(old_obj, "_enrollment_fields")
+    and getattr(obj, "enrollments", None)
+        is getattr(old_obj, "enrollments", None)):
+  obj._enrollment_fields = old_obj._enrollment_fields
+@
+
+Let's verify this on a stand-in for a course, whose one user Canvas sends with a
+full enrollment when asked to.
+The stand-in counts the requests, and since it is stored with the rest we can
+ask the copy that comes back from the file.
+For the last two tests one entry must have been fetched with more than the
+listing asks for, since that is when the new object takes over attributes of
+the old one: the listing is fetched first and then the user alone with more.
+In the first of them the listing fetches no enrollments, so the old, short ones
+are kept and their mark with them; in the second it fetches them, and the full
+enrollments must not get the mark.
+
+<<test functions>>=
+FULL_ENROLLMENT = {
+    "id": 7, "user_id": 1, "course_id": 1, "course_section_id": 3,
+    "type": "StudentEnrollment", "role": "StudentEnrollment",
+    "enrollment_state": "active",
+    "grades": {"current_grade": "A"},
+    "last_activity_at": "2026-01-01T00:00:00Z",
+    "sis_user_id": "abc",
+    "html_url": "https://canvas.example/courses/1/users/1",
+}
+
+class Roster:
+    """A stand-in course with one user, who has a full enrollment."""
+
+    def __init__(self):
+        self.requests = []
+
+    def answer(self, kwargs):
+        self.requests.append(kwargs)
+        fields = {"id": 1, "name": "Anna"}
+        if "enrollments" in as_list(kwargs.get("include", [])):
+            fields["enrollments"] = [dict(FULL_ENROLLMENT)]
+        return User(None, fields)
+
+    def get_users(self, **kwargs):
+        return [self.answer(kwargs)]
+
+    def get_user(self, user_id, **kwargs):
+        return self.answer(kwargs)
+
+CacheGetMethods("user")(Roster)
+
+def stored_roster():
+    """Return a roster fetched with enrollments, and what the file holds of it."""
+    roster = Roster()
+    list(roster.get_users(include=["enrollments"]))
+    return roster, pickled_for_file(roster)
+
+def only_user(roster):
+    """Return the one cached user of `roster`."""
+    (user, _), = roster.user_cache.values()
+    return user
+
+class TestShortEnrollments:
+    """Test that the cache file keeps a short list of enrollment fields"""
+
+    def test_file_keeps_the_short_list_and_memory_keeps_all(self):
+        roster, stored = stored_roster()
+
+        enrollment, = only_user(stored).enrollments
+        assert set(enrollment) == ENROLLMENT_FIELDS
+        assert enrollment["type"] == "StudentEnrollment"
+        assert "grades" in only_user(roster).enrollments[0]
+        assert not hasattr(only_user(roster), "_enrollment_fields")
+
+    def test_short_enrollments_answer_from_the_cache(self):
+        _, stored = stored_roster()
+
+        user, = stored.get_users(include=["enrollments"])
+        stored.get_user(1, include=["enrollments"])
+
+        assert user.enrollments[0]["role"] == "StudentEnrollment"
+        assert len(stored.requests) == 1
+
+    @pytest.mark.parametrize("needed", [None, ENROLLMENT_FIELDS | {"grades"}],
+                             ids=["everything", "one more field"])
+    def test_needing_more_fields_fetches_the_listing_again(
+            self, monkeypatch, needed):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS",
+                            needed)
+
+        user, = stored.get_users(include=["enrollments"])
+
+        assert len(stored.requests) == 2
+        assert "grades" in user.enrollments[0]
+        assert not hasattr(user, "_enrollment_fields")
+
+    def test_needing_more_fields_fetches_one_user_again(self, monkeypatch):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        user = stored.get_user(1, include=["enrollments"])
+
+        assert len(stored.requests) == 2
+        assert "grades" in user.enrollments[0]
+
+    def test_asking_for_no_enrollments_fetches_nothing(self, monkeypatch):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        list(stored.get_users())
+
+        assert len(stored.requests) == 1
+
+    def test_keeping_everything_stores_everything(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+
+        _, stored = stored_roster()
+
+        assert "grades" in only_user(stored).enrollments[0]
+        assert not hasattr(only_user(stored), "_enrollment_fields")
+
+    @pytest.mark.parametrize("fields,recorded", [
+        (ENROLLMENT_FIELDS, ENROLLMENT_FIELDS),
+        (frozenset({"type"}), frozenset({"type"})),
+        (ENROLLMENT_FIELDS | {"grades"}, ENROLLMENT_FIELDS),
+        (None, ENROLLMENT_FIELDS),
+    ], ids=["same", "fewer", "more", "everything"])
+    def test_storing_a_short_entry_again_never_widens_its_record(
+            self, monkeypatch, fields, recorded):
+        _, stored = stored_roster()
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS",
+                            fields)
+
+        again = only_user(pickled_for_file(stored))
+
+        assert again._enrollment_fields == recorded
+        assert set(again.enrollments[0]) == recorded
+
+    def test_a_listing_that_keeps_short_enrollments_keeps_their_mark(
+            self, monkeypatch):
+        roster = Roster()
+        list(roster.get_users())
+        roster.get_user(1, include=["enrollments"])
+        stored = pickled_for_file(roster)
+        stored.user_all_fetched = None
+
+        list(stored.get_users())
+
+        assert only_user(stored)._enrollment_fields == ENROLLMENT_FIELDS
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+        requests_before = len(stored.requests)
+        stored.get_user(1, include=["enrollments"])
+        assert len(stored.requests) == requests_before + 1
+
+    def test_someone_who_has_left_keeps_all_fields_in_the_file(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        only_user(roster)._unlisted = True
+
+        left = only_user(pickled_for_file(roster))
+
+        assert "grades" in left.enrollments[0]
+        assert not hasattr(left, "_enrollment_fields")
+
+    @pytest.mark.parametrize("read", [
+        lambda roster: list(roster.get_users(include=["enrollments"])),
+        lambda roster: roster.get_user(1, include=["enrollments"]),
+    ], ids=["listing", "one user"])
+    def test_someone_stored_short_who_then_left_is_not_fetched_for(
+            self, monkeypatch, read):
+        _, stored = stored_roster()
+        only_user(stored)._unlisted = True
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "ENROLLMENT_FIELDS", None)
+        monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                            "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+
+        read(stored)
+
+        assert len(stored.requests) == 1
+
+    def test_an_enrollment_that_is_no_dictionary_is_stored_as_it_is(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        only_user(roster).enrollments.append("odd")
+
+        assert only_user(pickled_for_file(roster)).enrollments[1] == "odd"
+
+    def test_a_listing_that_fetches_enrollments_leaves_no_mark(self):
+        roster = Roster()
+        list(roster.get_users(include=["enrollments"]))
+        roster.get_user(1, include=["enrollments", "email"])
+        stored = pickled_for_file(roster)
+        stored.user_all_fetched = None
+
+        list(stored.get_users(include=["enrollments"]))
+
+        assert "grades" in only_user(stored).enrollments[0]
+        assert not hasattr(only_user(stored), "_enrollment_fields")
+@
+
+
+\subsubsection{Courses nobody has used for a long time}
+\label{sec:forget-unused-contents}
+
+Nothing so far leaves the cache unless Canvas stops listing it.
+A roster that was fetched once, because a search went through every course,
+stays in the file for good, and every later command loads it.
+The second filter leaves out the contents of a course that has not been used for
+[[CACHE_KEEP_DAYS]] days.
+
+We cannot see what has been \emph{used}.
+A read that the cache answers leaves no trace, and it should not: a record of
+reads would have to be saved, and a command that only reads would write the
+whole file again (\cref{sec:skip-unchanged-save}).
+What we do have is when each object was \emph{fetched}.
+That is nearly as good, since a listing in use is fetched again whenever it
+expires, but only nearly: a submission with a passing grade never expires
+(\cref{sec:cache-ttl-constants}), so [[results]] for last year's course reads
+submissions that were fetched a year ago.
+Judging each listing by its own age would drop exactly those while they are in
+use.
+
+So the unit is the course.
+Any use of a course fetches something below it sooner or later, its roster
+every other day and its list of assignments every week, even when most of what
+is read is old.
+If nothing below a course has been fetched for [[CACHE_KEEP_DAYS]] days, the
+course has not been used for about as long.
+The course's own time stamp does not count: the list of courses is fetched
+every day, whether or not anyone looks at this course.
+An entry without a time stamp, such as an assignment that [[assignments create]]
+put in the cache itself, tells nothing; a course with only such entries is
+kept.
+<<constants>>=
+CACHE_KEEP_DAYS = env_number("CANVASLMS_CACHE_KEEP_DAYS", 90, int)
+<<functions>>=
+def newest_fetch_below(obj):
+  """Return when something cached below `obj` was last fetched, or None."""
+  try:
+    attributes = object.__getattribute__(obj, "__dict__")
+  except AttributeError:
+    return None
+  newest = None
+  for name, cache in attributes.items():
+    if not (name.endswith("_cache") and isinstance(cache, dict)):
+      continue
+    for entry in cache.values():
+      child = entry[0] if isinstance(entry, tuple) else entry
+      for fetched in (fetch_time(child), newest_fetch_below(child)):
+        if fetched and (newest is None or fetched > newest):
+          newest = fetched
+  return newest
+
+def fetch_time(obj):
+  """Return when the cached `obj` was fetched, or None if it doesn't say."""
+  try:
+    attributes = object.__getattribute__(obj, "__dict__")
+  except AttributeError:
+    return None
+  return attributes.get("_fetched_at") or attributes.get("_last_refresh")
+@
+
+We read the attributes through [[object.__getattribute__]], because the
+submissions in an assignment's cache are [[LazySubmission]] wrappers
+(\cref{sec:lazy-submission}), and asking one of those for an attribute in the
+ordinary way can make it fetch from Canvas.
+Their time stamp is [[_last_refresh]].
+
+What we leave out is everything cached below the course: each of its caches is
+empty in the file and each listing counts as not fetched, so the next command
+that reads one fetches it.
+With the assignments go their submissions, and with the roster the users who
+have left the course, whom the cache otherwise keeps for the sake of their
+results (\cref{sec:forget-unlisted}).
+That is the price, and it is why the limit is long and can be set:
+[[CANVASLMS_CACHE_KEEP_DAYS]] is 90 days unless set otherwise, and 0 keeps
+everything for good.
+The course itself stays, so the list of courses is still complete, and so does
+the record of what each of its listings asks for, [[_all_kwargs]], so the next
+fetch brings what the last one did.
+
+Like every state filter, this one changes the file and not the objects in
+memory, and it runs only when the file is written anyway.
+A command cannot lose what it is working with: what it fetched has a new time
+stamp.
+<<functions>>=
+def forget_unused_contents(course, state):
+  """State filter: leave out the contents of a course unused for a long time."""
+  if CACHE_KEEP_DAYS <= 0:
+    return
+  newest = newest_fetch_below(course)
+  if newest is None or datetime.now() - newest <= timedelta(days=CACHE_KEEP_DAYS):
+    return
+  for name, value in state.items():
+    if name.endswith("_cache") and isinstance(value, dict):
+      state[name] = {}
+    elif name.endswith("_all_fetched"):
+      state[name] = None
+  <<say that the contents of [[course]] were left out>>
+
+def make_unused_course_contents_forgotten():
+  import canvasapi.course
+  add_state_filter(canvasapi.course.Course, forget_unused_contents)
+@
+
+Most of what we leave out can be fetched again, so saying it in the log, for
+whoever runs with [[-v]], is enough.
+The users who had left the course cannot, and their results were the reason to
+keep them.
+Losing them deserves a warning, which names the setting that prevents it.
+It comes once for a course, since the next file has nothing left to lose.
+<<say that the contents of [[course]] were left out>>=
+left = sum(1 for entry in getattr(course, "user_cache", {}).values()
+           if isinstance(entry, tuple) and getattr(entry[0], "_unlisted", False))
+message = (f"Cache pruning: nothing in course {state.get('id')} was fetched "
+           f"since {newest:%Y-%m-%d}, so the cache file leaves out what was "
+           f"cached of it")
+if left:
+  logger.warning(f"{message}, including {count_noun(left, 'user')} who had "
+                 f"left the course; CANVASLMS_CACHE_KEEP_DAYS=0 keeps "
+                 f"everything")
+else:
+  logger.info(message)
+<<functions>>=
+def count_noun(count, noun):
+  """Return `count` with `noun`, in the plural unless the count is 1."""
+  return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+@
+
+Let's verify it on a real [[Course]] with a user, an assignment, a submission
+and a module with one item, all fetched a given number of days ago.
+The course itself was fetched now, as the daily listing leaves it.
+
+<<test functions>>=
+def days_ago(days):
+    return datetime.now() - timedelta(days=days)
+
+def course_with_contents_fetched(fetched):
+    """Return a course whose contents were all fetched at `fetched`."""
+    course = Course(None, {"id": 1, "name": "Old course"})
+    course._fetched_at = datetime.now()
+
+    user = User(None, {"id": 7, "name": "Anna"})
+    assignment = Assignment(None, {"id": 5, "name": "Lab", "course_id": 1})
+    submission = LazySubmission(
+        Submission(None, {"id": 9, "user_id": 7, "grade": "P"}),
+        assignment, set(), None)
+    module = canvasapi.module.Module(None, {"id": 3, "name": "Week 1"})
+    item = canvasapi.module.ModuleItem(None, {"id": 4, "title": "Read"})
+    for obj in (user, assignment, module, item):
+        obj._fetched_at = fetched
+    object.__setattr__(submission, "_last_refresh", fetched)
+
+    getattr(assignment, "__cache")[7] = submission
+    module.module_item_cache[4] = (item, {})
+    course.user_cache[7] = (user, {"include": ["enrollments"]})
+    course.assignment_cache[5] = (assignment, {})
+    course.module_cache[3] = (module, {})
+    course.user_all_fetched = course.assignment_all_fetched = fetched
+    course.user_all_kwargs = {"include": ["enrollments"]}
+    return course
+
+class TestForgettingUnusedContents:
+    """Test that the file leaves out the contents of a course long unused"""
+
+    def test_a_course_unused_for_long_keeps_only_itself(self):
+        course = course_with_contents_fetched(days_ago(400))
+
+        stored = pickled_for_file(course)
+
+        assert stored.name == "Old course"
+        assert (stored.user_cache, stored.assignment_cache,
+                stored.module_cache) == ({}, {}, {})
+        assert stored.user_all_fetched is None
+        assert stored.assignment_all_fetched is None
+        assert stored.user_all_kwargs == {"include": ["enrollments"]}
+        assert len(course.user_cache) == 1
+        assert course.user_all_fetched is not None
+
+    @pytest.mark.parametrize("days,kept", [(89, True), (91, False)])
+    def test_the_limit_is_the_number_of_days_to_keep(self, days, kept):
+        stored = pickled_for_file(course_with_contents_fetched(days_ago(days)))
+
+        assert bool(stored.user_cache) == kept
+        assert bool(stored.assignment_cache) == kept
+
+    @pytest.mark.parametrize("fresh", [
+        lambda course: course.user_cache[7][0],
+        lambda course: course.assignment_cache[5][0],
+        lambda course: course.module_cache[3][0].module_item_cache[4][0],
+    ], ids=["user", "assignment", "module item"])
+    def test_one_recent_fetch_keeps_all_of_the_course(self, fresh):
+        course = course_with_contents_fetched(days_ago(400))
+        fresh(course)._fetched_at = datetime.now()
+
+        stored = pickled_for_file(course)
+
+        assert len(stored.user_cache) == 1
+        assert len(stored.assignment_cache) == 1
+        assert len(stored.module_cache) == 1
+        assert stored.user_all_fetched is not None
+
+    def test_a_recently_refreshed_submission_keeps_the_course(self):
+        course = course_with_contents_fetched(days_ago(400))
+        submission = getattr(course.assignment_cache[5][0], "__cache")[7]
+        object.__setattr__(submission, "_last_refresh", datetime.now())
+
+        stored = pickled_for_file(course)
+
+        assert len(stored.user_cache) == 1
+        assert len(getattr(stored.assignment_cache[5][0], "__cache")) == 1
+
+    @pytest.mark.parametrize("keep_days", [0, -1])
+    def test_no_limit_keeps_everything(self, monkeypatch, keep_days):
+        monkeypatch.setattr(canvaslms.hacks.canvasapi, "CACHE_KEEP_DAYS",
+                            keep_days)
+
+        stored = pickled_for_file(course_with_contents_fetched(days_ago(4000)))
+
+        assert len(stored.user_cache) == 1
+
+    def test_losing_someone_who_had_left_is_a_warning(self, caplog):
+        course = course_with_contents_fetched(days_ago(400))
+        with caplog.at_level(logging.INFO):
+            pickled_for_file(course)
+        assert [record.levelno for record in caplog.records] == [logging.INFO]
+
+        caplog.clear()
+        course.user_cache[7][0]._unlisted = True
+        with caplog.at_level(logging.INFO):
+            pickled_for_file(course)
+
+        warning, = caplog.records
+        assert warning.levelno == logging.WARNING
+        assert "1 user who had left" in warning.getMessage()
+        assert "CANVASLMS_CACHE_KEEP_DAYS=0" in warning.getMessage()
+
+    def test_an_attribute_that_only_looks_like_a_cache_is_left_alone(self):
+        course = course_with_contents_fetched(days_ago(400))
+        course.note_cache = "not a cache"
+
+        stored = pickled_for_file(course)
+
+        assert stored.note_cache == "not a cache"
+        assert stored.user_cache == {}
+
+    def test_contents_without_time_stamps_are_kept(self):
+        course = Course(None, {"id": 1, "name": "New course"})
+        created = Assignment(None, {"id": 5, "name": "Lab", "course_id": 1})
+        course.assignment_cache[5] = (created, {})
+        course.assignment_cache["note"] = "not an entry"
+
+        stored = pickled_for_file(course)
+
+        assert set(stored.assignment_cache) == {5, "note"}
+@
+
+
 \subsection{Caching courses}
 
 The list of courses changes whenever new courses are created that we have
@@ -6590,6 +7338,7 @@ class TestGroupUserCaching:
 
 
 \subsection{Lazy-loading submissions}
+\label{sec:lazy-submission}
 
 The current caching approach has an inefficiency: when we call
 [[get_submissions()]], we immediately check if each cached submission needs

@@ -75,6 +75,14 @@ for it as well.
 Users and submissions Canvas no longer lists stay in the cache, marked, since
 the results of a student who has left still count.
 
+The file is not a copy of what is in memory, though.
+When it is written, the classes leave out what is not worth loading on every
+run (\cref{sec:cache-file-contents}): most fields of each enrollment, and
+everything below a course that has not been used for [[CACHE_KEEP_DAYS]] days.
+The latter is the one case where something Canvas still has, or a user who has
+left, goes away with time alone; what Canvas still has is fetched again when it
+is next read.
+
 \section{Implementation}
 
 <<[[cache.py]]>>=
@@ -84,10 +92,12 @@ import argparse
 import base64
 from canvasapi import Canvas
 import canvasapi.requester
+import contextlib
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet, InvalidToken
 import functools
+import gc
 import hashlib
 import logging
 import os
@@ -103,8 +113,10 @@ import canvaslms.cli.utils
 import canvaslms.hacks.attachment_cache as attachment_cache
 from canvaslms.hacks.canvasapi import (
     request_refresh,
+    writing_cache_file,
     SUBMISSION_TTL_MINUTES,
     DEFAULT_CACHE_TTL_DAYS,
+    CACHE_KEEP_DAYS,
     COURSE_CACHE_TTL_DAYS,
     MISS_REFRESH_MAX_LISTINGS,
     MISS_REFRESH_MAX_LISTINGS_ALL_COURSES,
@@ -134,6 +146,7 @@ the package-level [[canvaslms.canvas]] facade inherit the same guarantees.
 
 from datetime import datetime, timedelta
 import argparse
+import canvasapi.canvas_object
 import canvasapi.course
 import canvasapi.user
 import logging
@@ -143,6 +156,7 @@ import requests
 import responses
 from cryptography.fernet import Fernet
 import functools
+import gc
 import io
 import pickle
 import socket
@@ -625,7 +639,7 @@ never the token itself.
 The registration is unconditional: the attachment cache is independent of
 the Canvas object cache, so it keeps working under [[--no-cache]], just as
 it did before encryption.
-This costs one extra PBKDF2 derivation per invocation (about 0.1 seconds).
+It costs no derivation of its own, since [[derive_key]] remembers the key.
 <<register attachment encryption key>>=
 attachment_cache.set_fernet(Fernet(derive_key(token, hostname)))
 @
@@ -690,10 +704,18 @@ This prevents someone from reusing a decryption key across different Canvas
 servers.
 
 We log the key derivation time because PBKDF2 with 100,000 iterations is
-computationally expensive (typically 100--200ms).
-This adds latency to every cache save and load operation, which is a necessary
-security cost to prevent brute-force attacks on the cache encryption.
+computationally expensive (typically 50--200ms), which is a necessary security
+cost to prevent brute-force attacks on the cache encryption.
+
+A run needs the key three times: for the attachment cache, to load the cache
+file and to save it.
+It is the same key each time, so we remember it and pay for one derivation.
+The memo is keyed on the token and the hostname, so another token or another
+server still gets its own key.
+It holds nothing the process does not hold already, since the key is derived
+from the token.
 <<functions>>=
+@functools.lru_cache(maxsize=4)
 def derive_key(token, hostname):
   """Derives a Fernet key from the Canvas token and hostname"""
   start = time.perf_counter()
@@ -714,6 +736,33 @@ def derive_key(token, hostname):
   logger.info(f"Key derivation: {elapsed:.2f}s (PBKDF2 100k iterations)")
 
   return key
+@
+
+Let's verify that a load and two saves derive the key once between them, and
+that the memo still tells tokens and hosts apart.
+
+<<test functions>>=
+def test_the_key_is_derived_once_for_load_and_save(tmp_cache_path, monkeypatch):
+  derivations = []
+  real_kdf = cache.PBKDF2HMAC
+  def counting_kdf(**kwargs):
+    derivations.append(kwargs["iterations"])
+    return real_kdf(**kwargs)
+  monkeypatch.setattr(cache, "PBKDF2HMAC", counting_kdf)
+  getattr(cache.derive_key, "cache_clear", lambda: None)()
+
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+  assert cache.load_canvas_cache("token", "https://host") == \
+      {"fake": "canvas"}
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  assert len(derivations) == 1
+
+def test_another_token_or_host_gets_another_key():
+  key = cache.derive_key("token", "https://host")
+
+  assert cache.derive_key("other", "https://host") != key
+  assert cache.derive_key("token", "https://other") != key
 @
 
 
@@ -799,6 +848,25 @@ updating and every future run pays full API cost---a failure mode that is
 undiagnosable without a log message.
 We therefore log a warning and continue.
 
+The warning names the exception's type as well as its message.
+The message alone often doesn't say what broke: \enquote{invalid load key} is
+clear only once we know that it is an [[UnpicklingError]], and a bug elsewhere
+that surfaces here, an [[AttributeError]] say, would otherwise look like a
+broken file.
+The traceback goes to the debug log, for whoever runs with [[-vv]] to find
+out.
+A load that fails says what went wrong in the same way.
+<<functions>>=
+def describe_error(err):
+  """Return the type and the message of the exception `err`."""
+  return f"{type(err).__name__}: {err}"
+@
+
+What we pickle is not always the object as it is in memory.
+Classes can have state filters that leave things out of the file
+(\cref{sec:state-filters}), and they apply only while we say that we are
+writing the cache file, which is what [[writing_cache_file]] is for.
+
 Before any of this, we check whether the save is needed at all: a command that
 sent no request to Canvas has nothing new to store, and the save is the most
 expensive thing such a command does.
@@ -822,10 +890,11 @@ def save_canvas_cache(canvas, token, hostname, force=False):
 
     # Pickle and encrypt
     pickle_start = time.perf_counter()
-    pickled = pickle.dumps({
-      "version": CACHE_SCHEMA_VERSION,
-      "canvas": canvas,
-    })
+    with writing_cache_file():
+      pickled = pickle.dumps({
+        "version": CACHE_SCHEMA_VERSION,
+        "canvas": canvas,
+      })
     pickle_elapsed = time.perf_counter() - pickle_start
     pickle_size = len(pickled)
 
@@ -846,8 +915,9 @@ def save_canvas_cache(canvas, token, hostname, force=False):
                  f"(pickle: {pickle_elapsed:.2f}s/{pickle_size/1024:.1f}KB, "
                  f"encrypt: {encrypt_elapsed:.2f}s, write: {write_elapsed:.2f}s)")
   except Exception as err:
-    logger.warning(f"Canvas cache save failed ({err}); "
+    logger.warning(f"Canvas cache save failed ({describe_error(err)}); "
                    f"continuing without saving the cache")
+    logger.debug("Traceback of the failed cache save", exc_info=True)
 @
 
 Writing the file in place would mean that a crash or kill mid-write leaves
@@ -914,6 +984,11 @@ A decryption failure usually means the token changed and is expected
 behavior, so we log it at INFO.
 Anything else is unexpected; we log it at WARNING, because an undiagnosed
 load failure silently degrades every run to full API cost.
+As for a failed save, the warning names the exception and the traceback goes
+to the debug log.
+
+We unpickle with the garbage collector paused, which
+\cref{sec:unpickle-without-gc} explains.
 <<functions>>=
 def load_canvas_cache(token, hostname):
   """Loads the Canvas object from encrypted cache, returns None if unavailable"""
@@ -937,7 +1012,8 @@ def load_canvas_cache(token, hostname):
     decrypt_elapsed = time.perf_counter() - decrypt_start
 
     unpickle_start = time.perf_counter()
-    payload = pickle.loads(pickled)
+    with garbage_collection_paused():
+      payload = pickle.loads(pickled)
     unpickle_elapsed = time.perf_counter() - unpickle_start
 
     <<discard [[payload]] on schema mismatch>>
@@ -956,7 +1032,9 @@ def load_canvas_cache(token, hostname):
                 "(token changed?); starting fresh")
     return None
   except Exception as err:
-    logger.warning(f"Canvas cache load failed ({err}); starting fresh")
+    logger.warning(f"Canvas cache load failed ({describe_error(err)}); "
+                   f"starting fresh")
+    logger.debug("Traceback of the failed cache load", exc_info=True)
     return None
 @
 
@@ -1022,6 +1100,9 @@ Let's also verify the failure and atomicity behavior of saving: a failing
 save must leave an existing cache file untouched and emit a warning, a
 missing cache file must load quietly as [[None]], and the saved file must
 not be readable by other users.
+We verify the three ways a load can fail to give a cache as well: quietly for
+a missing file, at INFO for another token, and with a warning that names the
+exception for anything else.
 
 <<test functions>>=
 def test_failed_save_keeps_old_cache_and_warns(
@@ -1034,20 +1115,147 @@ def test_failed_save_keeps_old_cache_and_warns(
     raise RuntimeError("unpicklable object in graph")
   monkeypatch.setattr(cache.pickle, "dumps", broken_dumps)
 
-  cache.save_canvas_cache({"new": "cache"}, "token", "https://host")
+  with caplog.at_level(logging.DEBUG, logger=cache.logger.name):
+    cache.save_canvas_cache({"new": "cache"}, "token", "https://host")
 
   assert tmp_cache_path.read_bytes() == old_bytes
   assert "cache save failed" in caplog.text
+  assert "RuntimeError" in caplog.text
+  assert any(record.levelno == logging.DEBUG and record.exc_info
+             for record in caplog.records)
 
 def test_load_missing_cache_returns_none(tmp_cache_path):
   """Loading without a cache file should quietly return None."""
   assert cache.load_canvas_cache("token", "https://host") is None
+
+def test_unreadable_cache_warns_with_what_went_wrong(tmp_cache_path, caplog):
+  """An unexpected load failure names the exception and keeps its traceback."""
+  key = cache.derive_key("token", "https://host")
+  tmp_cache_path.write_bytes(Fernet(key).encrypt(b"not a pickle"))
+
+  with caplog.at_level(logging.DEBUG, logger=cache.logger.name):
+    assert cache.load_canvas_cache("token", "https://host") is None
+
+  warnings = [record for record in caplog.records
+              if record.levelno == logging.WARNING]
+  assert len(warnings) == 1
+  assert "UnpicklingError" in warnings[0].getMessage()
+  assert any(record.levelno == logging.DEBUG and record.exc_info
+             for record in caplog.records)
+
+def test_wrong_token_is_expected_and_not_a_warning(tmp_cache_path, caplog):
+  """A cache encrypted with another token is discarded at INFO."""
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  with caplog.at_level(logging.INFO, logger=cache.logger.name):
+    assert cache.load_canvas_cache("other token", "https://host") is None
+
+  assert "cannot be decrypted" in caplog.text
+  assert not [record for record in caplog.records
+              if record.levelno >= logging.WARNING]
 
 def test_saved_cache_is_user_only(tmp_cache_path):
   """The cache file should be created with mode 0600."""
   cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
 
   assert tmp_cache_path.stat().st_mode & 0o777 == 0o600
+@
+
+The state filters must apply to what a save writes, and to nothing else.
+
+<<test functions>>=
+class Filtered(canvasapi.canvas_object.CanvasObject):
+  """An object whose `secret` a state filter keeps out of the cache file."""
+
+def without_secret(obj, state):
+  state["secret"] = None
+
+canvaslms.hacks.canvasapi.add_state_filter(Filtered, without_secret)
+
+def test_a_save_applies_the_state_filters(tmp_cache_path):
+  thing = Filtered(None, {"name": "x", "secret": "s"})
+
+  cache.save_canvas_cache(thing, "token", "https://host")
+
+  stored = cache.load_canvas_cache("token", "https://host")
+  assert (stored.name, stored.secret) == ("x", None)
+  assert thing.secret == "s"
+@
+
+
+\subsection{Unpickling without the garbage collector}
+\label{sec:unpickle-without-gc}
+
+Unpickling is the largest part of a load.
+It creates a few million objects in one go, and none of them is garbage.
+Python's cyclic garbage collector cannot know that: it runs whenever enough new
+objects exist, and each run walks objects that a later run walks again.
+On a real cache with a 72~MB pickle (92\,000 users in 176 courses), unpickling
+took 2.1~s with the collector on and 0.8~s with it off, which took the whole
+load from 2.9~s to 1.8~s.
+So we keep the collector off while we unpickle.
+
+We also tried [[gc.freeze]] after the load, which moves the loaded objects out
+of the collector's sight for the rest of the run.
+It made no measurable difference to a command, and in a long-lived program it
+would keep every graph it ever loaded alive, so we leave it out.
+
+Afterwards we restore the state we found, we don't turn the collector on.
+This loader also runs inside other programs, through
+[[canvaslms.get_canvas]], and one that runs with the collector off must find it
+off when we return.
+The [[finally]] matters for the same reason: a file that cannot be unpickled is
+an ordinary outcome here, it gives a fresh [[Canvas]] object, and it must not
+leave the rest of the program without garbage collection.
+<<functions>>=
+@contextlib.contextmanager
+def garbage_collection_paused():
+  """Keep the cyclic garbage collector off inside the `with` block."""
+  was_enabled = gc.isenabled()
+  gc.disable()
+  try:
+    yield
+  finally:
+    if was_enabled:
+      gc.enable()
+@
+
+Let's verify that the collector is off exactly while we unpickle, whatever its
+state before, and that a payload that cannot be unpickled restores it too.
+
+<<test functions>>=
+@pytest.fixture
+def collector_state():
+  """Put the garbage collector back as it was after the test."""
+  was_enabled = gc.isenabled()
+  yield
+  (gc.enable if was_enabled else gc.disable)()
+
+@pytest.mark.parametrize("enabled_before", [True, False])
+def test_load_unpickles_with_the_collector_off_and_restores_it(
+    tmp_cache_path, monkeypatch, collector_state, enabled_before):
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+  seen = []
+  real_loads = pickle.loads
+  def loads(data):
+    seen.append(gc.isenabled())
+    return real_loads(data)
+  monkeypatch.setattr(cache.pickle, "loads", loads)
+  (gc.enable if enabled_before else gc.disable)()
+
+  assert cache.load_canvas_cache("token", "https://host") == \
+      {"fake": "canvas"}
+  assert seen == [False]
+  assert gc.isenabled() == enabled_before
+
+def test_failed_unpickling_restores_the_collector(
+    tmp_cache_path, collector_state):
+  key = cache.derive_key("token", "https://host")
+  tmp_cache_path.write_bytes(Fernet(key).encrypt(b"not a pickle"))
+  gc.enable()
+
+  assert cache.load_canvas_cache("token", "https://host") is None
+  assert gc.isenabled()
 @
 
 
@@ -1539,6 +1747,81 @@ def test_a_cache_with_responses_from_an_older_copy_loads(
 @
 
 
+\subsection{What the cached classes leave out}
+\label{sec:cache-file-contents}
+
+The classes decide what the file keeps of their objects, through the state
+filters of \cref{sec:state-filters}; this module only says when the file is
+being written.
+The filters and their tests are in [[hacks/canvasapi.nw]].
+What we verify here is the whole way round, through the encrypted file and the
+commands that read it.
+
+The first filter keeps a short list of fields of each enrollment
+(\cref{sec:short-enrollments}).
+A roster read back from the file must still tell students from teachers, without
+asking Canvas again, and the file must not hold the fields the filter drops.
+
+<<test functions>>=
+def enrolled(user_id, name, kind):
+  """Return a user as Canvas lists them, with all we get about an enrollment."""
+  return {"id": user_id, "name": name, "login_id": name.lower(),
+          "enrollments": [{
+              "id": 10 * user_id, "user_id": user_id, "course_id": 1,
+              "course_section_id": 3, "type": kind, "role": kind,
+              "enrollment_state": "active",
+              "grades": {"current_grade": "A"},
+              "last_activity_at": "2026-01-01T00:00:00Z"}]}
+
+@responses.activate
+def test_a_roster_from_the_file_tells_roles_apart_with_short_enrollments(
+    run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  responses.get(f"{COURSES_URL}/1/search_users", json=[
+      enrolled(7, "Anna", "StudentEnrollment"),
+      enrolled(8, "Tora", "TeacherEnrollment")])
+  students = run_canvaslms("users", "-c", "Old", "-s")
+  assert "Anna" in students and "Tora" not in students
+
+  course, = cache.load_canvas_cache("token", HOST).course_cache.values()
+  stored = [user.enrollments[0] for user, _ in course[0].user_cache.values()]
+  assert len(stored) == 2
+  for enrollment in stored:
+    assert set(enrollment) == canvaslms.hacks.canvasapi.ENROLLMENT_FIELDS
+
+  responses.reset()
+  assert run_canvaslms("users", "-c", "Old", "-s") == students
+@
+
+The second filter leaves out the contents of a course that has not been used for
+a long time (\cref{sec:forget-unused-contents}).
+The course must stay in the list of courses, which is then still answered from
+the file, and a command that reads its contents must fetch them again.
+We make the assignment old by hand and save, which is when the filter runs.
+
+<<test functions>>=
+@responses.activate
+def test_a_course_unused_for_long_is_listed_and_its_contents_fetched_again(
+    run_canvaslms, tmp_cache_path):
+  responses.get(COURSES_URL, json=[OLD_COURSE])
+  responses.get(f"{COURSES_URL}/1/assignments", json=[LAB])
+  run_canvaslms("assignments", "-c", "Old")
+  canvas = cache.load_canvas_cache("token", HOST)
+  (course, _), = canvas.course_cache.values()
+  (assignment, _), = course.assignment_cache.values()
+  assignment._fetched_at -= timedelta(days=cache.CACHE_KEEP_DAYS + 1)
+  cache.save_canvas_cache(canvas, "token", HOST, force=True)
+  responses.calls.reset()
+
+  assert "Old course" in run_canvaslms("courses")
+  assert len(responses.calls) == 0
+
+  assert "Lab" in run_canvaslms("assignments", "-c", "Old")
+  assert [call.request.path_url.split("?")[0] for call in responses.calls] \
+      == ["/api/v1/courses/1/assignments"]
+@
+
+
 \subsection{Clearing the cache}
 
 To clear the cache, we simply remove the cache file for the given hostname.
@@ -1673,6 +1956,21 @@ def count_unit(count, unit):
   """Returns `count` with `unit` in singular or plural, e.g. "1 day"."""
   return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
 
+def unused_courses_help():
+  """Return the help paragraph on courses that have not been used for long."""
+  if CACHE_KEEP_DAYS <= 0:
+    return """\
+The cache file keeps what is cached below a course however long ago it was
+fetched, since CANVASLMS_CACHE_KEEP_DAYS is 0. A number of days makes the file
+leave out the contents of a course when nothing below it has been fetched for
+that long."""
+  return f"""\
+The cache file leaves out what is cached below a course once nothing below it
+has been fetched for {count_unit(CACHE_KEEP_DAYS, "day")}; it is fetched again
+when next read. The users who had left that course are then gone from the
+cache, and a warning says so. CANVASLMS_CACHE_KEEP_DAYS sets the number of
+days, and 0 keeps everything."""
+
 def add_command(subp):
   """Adds the cache command to argparse parser"""
   cache_parser = subp.add_parser(
@@ -1711,6 +2009,11 @@ and assignments Canvas no longer returns are removed from the cache, unless it
 returned none at all; a course only if Canvas, asked about it alone, answers
 that it does not exist or that the user may not read it. Users who have left a
 course are kept, since their results still count.
+
+{unused_courses_help()}
+
+Of each enrollment of a user, the cache file keeps the identifiers, the type,
+the role, the state and the section. Users who have left a course keep all.
 
 The same interval decides how soon a listing is fetched again when a read asks
 for something that only someone Canvas no longer lists lacks. Raising it
@@ -1804,9 +2107,30 @@ def test_cache_help_fits_80_columns_with_wide_values(monkeypatch):
                "USER_CACHE_TTL_DAYS", "GROUP_CACHE_TTL_DAYS",
                "DEFAULT_CACHE_TTL_DAYS", "MISS_REFRESH_MIN_AGE_MINUTES",
                "MISS_REFRESH_MAX_LISTINGS",
-               "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES"):
+               "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", "CACHE_KEEP_DAYS"):
     monkeypatch.setattr(cache, name, 999)
 
+  assert max(len(line) for line in cache_help().splitlines()) <= 80
+@
+
+One setting changes more than a number in the text.
+With [[CANVASLMS_CACHE_KEEP_DAYS]] at 0 nothing is ever left out of the file
+(\cref{sec:forget-unused-contents}), and \enquote{not fetched for 0 days} would
+say the opposite, so [[unused_courses_help]] has a paragraph for each case.
+
+<<test functions>>=
+@pytest.mark.parametrize("keep_days,said,not_said", [
+    (90, "has been fetched for 90 days", "however long ago"),
+    (0, "however long ago", "is fetched again when next read"),
+])
+def test_cache_help_describes_whether_unused_courses_are_left_out(
+    monkeypatch, keep_days, said, not_said):
+  monkeypatch.setattr(cache, "CACHE_KEEP_DAYS", keep_days)
+
+  text = " ".join(cache_help().split())
+
+  assert said in text
+  assert not_said not in text
   assert max(len(line) for line in cache_help().splitlines()) <= 80
 @
 
