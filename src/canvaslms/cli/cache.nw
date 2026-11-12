@@ -628,7 +628,7 @@ never the token itself.
 The registration is unconditional: the attachment cache is independent of
 the Canvas object cache, so it keeps working under [[--no-cache]], just as
 it did before encryption.
-This costs one extra PBKDF2 derivation per invocation (about 0.1 seconds).
+It costs no derivation of its own, since [[derive_key]] remembers the key.
 <<register attachment encryption key>>=
 attachment_cache.set_fernet(Fernet(derive_key(token, hostname)))
 @
@@ -693,10 +693,18 @@ This prevents someone from reusing a decryption key across different Canvas
 servers.
 
 We log the key derivation time because PBKDF2 with 100,000 iterations is
-computationally expensive (typically 100--200ms).
-This adds latency to every cache save and load operation, which is a necessary
-security cost to prevent brute-force attacks on the cache encryption.
+computationally expensive (typically 50--200ms), which is a necessary security
+cost to prevent brute-force attacks on the cache encryption.
+
+A run needs the key three times: for the attachment cache, to load the cache
+file and to save it.
+It is the same key each time, so we remember it and pay for one derivation.
+The memo is keyed on the token and the hostname, so another token or another
+server still gets its own key.
+It holds nothing the process does not hold already, since the key is derived
+from the token.
 <<functions>>=
+@functools.lru_cache(maxsize=4)
 def derive_key(token, hostname):
   """Derives a Fernet key from the Canvas token and hostname"""
   start = time.perf_counter()
@@ -717,6 +725,33 @@ def derive_key(token, hostname):
   logger.info(f"Key derivation: {elapsed:.2f}s (PBKDF2 100k iterations)")
 
   return key
+@
+
+Let's verify that a load and two saves derive the key once between them, and
+that the memo still tells tokens and hosts apart.
+
+<<test functions>>=
+def test_the_key_is_derived_once_for_load_and_save(tmp_cache_path, monkeypatch):
+  derivations = []
+  real_kdf = cache.PBKDF2HMAC
+  def counting_kdf(**kwargs):
+    derivations.append(kwargs["iterations"])
+    return real_kdf(**kwargs)
+  monkeypatch.setattr(cache, "PBKDF2HMAC", counting_kdf)
+  getattr(cache.derive_key, "cache_clear", lambda: None)()
+
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+  assert cache.load_canvas_cache("token", "https://host") == \
+      {"fake": "canvas"}
+  cache.save_canvas_cache({"fake": "canvas"}, "token", "https://host")
+
+  assert len(derivations) == 1
+
+def test_another_token_or_host_gets_another_key():
+  key = cache.derive_key("token", "https://host")
+
+  assert cache.derive_key("other", "https://host") != key
+  assert cache.derive_key("token", "https://other") != key
 @
 
 
