@@ -5640,7 +5640,7 @@ MISS_REFRESH_MAX_LISTINGS_ALL_COURSES = env_number(
   "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5, int)
 <<functions>>=
 def retry_after_miss(find, listings, max_listings=None, pattern=None,
-                     stop_at_first_match=False):
+                     stop_at_first_match=False, required=False):
   """Yield from `find()`; if empty, refresh `listings` and search again.
 
   `find` returns an iterable of matches, and `listings` holds the
@@ -5651,7 +5651,10 @@ def retry_after_miss(find, listings, max_listings=None, pattern=None,
   match. If more than `max_listings` are old enough, which defaults to
   `MISS_REFRESH_MAX_LISTINGS`, none is refreshed and a warning says so; 0 turns
   the refresh off without a warning. `pattern`, what was searched for, is only
-  used in the messages. A failed refresh leaves that listing as it was cached.
+  used in the messages. A failed refresh leaves that listing as it was cached,
+  and is reported as no match; with `required` it is retried as any request
+  and its failure is raised, for a caller that is about to create what it
+  did not find.
   """
   found = False
   for match in find():
@@ -5673,15 +5676,20 @@ def retry_after_miss(find, listings, max_listings=None, pattern=None,
     batches = [old_listings]
   for batch in batches:
     <<expire the listings of [[batch]]>>
+    not_refreshed = []
     try:
-      with without_retries(owner for owner, _, _ in batch):
+      with without_retries(() if required
+                           else (owner for owner, _, _ in batch)):
         matches = list(find())
     except (canvasapi.exceptions.CanvasException,
             requests.exceptions.RequestException) as error:
+      if required:
+        raise
       logger.warning(f"Could not refresh after finding no match: {error}")
       return
     finally:
       <<keep the cached listings of [[batch]] after a failed refresh>>
+    <<raise if a [[required]] refresh did not happen>>
     if matches:
       yield from matches
       return
@@ -5870,6 +5878,31 @@ refreshed before it keep what they got.
 for owner, name, fetched in batch:
   if getattr(owner, name) is None:
     setattr(owner, name, fetched)
+    not_refreshed.append(name)
+@
+
+One kind of caller cannot take \enquote{no match} for an answer when the
+refresh failed: a command that creates what it did not find.
+[[pages edit]] with [[--create]] makes a new page when no page has the title,
+and a refresh that failed would let it make a second page of that title
+because of one lost request.
+For such a caller the refresh is no favour, it is a check that the write
+depends on.
+With [[required]] it therefore keeps the usual retries, like any request a
+command depends on (\cref{sec:course-listing-outage}), and a failure is raised
+to the caller, who then creates nothing.
+The cached listing is put back all the same, for the next command.
+A search that catches the failure itself would hide it from us, so we also
+look at the timestamps here, and raise if a listing was not fetched.
+
+A listing that is too young to be fetched again is still trusted, and so is the
+cache when the limit turns the refresh off: [[required]] is about a refresh
+that was tried and failed, not about one we chose not to make.
+<<raise if a [[required]] refresh did not happen>>=
+if required and not_refreshed:
+  raise canvasapi.exceptions.CanvasException(
+    "Could not fetch the listing again to check for a match in Canvas: "
+    + ", ".join(name.removesuffix("_all_fetched") for name in not_refreshed))
 @
 
 Let's verify the behaviour, again with a stand-in whose listing can change
@@ -6229,6 +6262,47 @@ def test_a_failure_stops_the_refresh(self, caplog):
     assert [owner.item_all_fetched for owner in owners][1:] == fetched[1:]
     assert owners[0].item_all_fetched > fetched[0]
     assert "Could not refresh" in caplog.text
+
+def test_a_required_refresh_raises_its_failure(self, caplog):
+    owner = self.listing_owner()
+    fetched = owner.item_all_fetched
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+    with caplog.at_level(logging.WARNING), \
+         pytest.raises(canvasapi.exceptions.CanvasException,
+                       match="Unavailable"):
+        self.search_all([owner], required=True)
+
+    assert owner.item_all_fetched == fetched
+    assert not caplog.records
+
+def test_a_required_refresh_raises_a_failure_the_search_caught(self):
+    owner = self.listing_owner()
+    fetched = owner.item_all_fetched
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+    def find():
+        try:
+            return [obj for obj in owner.get_items() if obj.id == 3]
+        except canvasapi.exceptions.CanvasException:
+            return []
+
+    with pytest.raises(canvasapi.exceptions.CanvasException,
+                       match="Could not fetch the listing again.*: item"):
+        list(retry_after_miss(find, [(owner, "item")], required=True))
+
+    assert owner.item_all_fetched == fetched
+
+def test_a_required_refresh_that_works_is_like_any_other(self):
+    owner = self.listing_owner(listing=(3,))
+
+    assert [obj.id for obj in self.search_all([owner], required=True)] == [3]
+    assert owner.listings == 2
+
+def test_a_required_refresh_trusts_a_young_listing(self):
+    owner = self.listing_owner(age=timedelta(minutes=1))
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+    assert self.search_all([owner], required=True) == []
 @
 
 The settings are read when the module is imported, so we import it in a process
