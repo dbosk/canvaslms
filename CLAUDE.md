@@ -978,7 +978,9 @@ each course must have the item by itself (`find_unique_content`,
 `retry_after_miss(..., required=True)` or `content.match_after_refresh`, so that
 a failed refresh raises and nothing is created. Pass
 `courses.miss_refresh_limit(args)` as `max_listings`. `ungraded.sh` runs from cron, which mails stderr: a
-name that is found must print nothing (`test_a_search_like_that_of_ungraded_sh_never_warns`).
+name that is found in the cache must print nothing
+(`test_a_search_like_that_of_ungraded_sh_never_warns`); a refresh of several
+listings prints one warning, also when it then finds the name.
 
 The cache file is shared with programs holding their own, possibly older, copy
 of this library (nytid, fbf), so keep it readable by them: do not bump the schema
