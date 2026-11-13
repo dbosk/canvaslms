@@ -37,6 +37,7 @@ import canvaslms.cli.courses
 import canvaslms.cli.links
 import canvaslms.cli.modules
 import canvaslms.cli.utils
+from canvaslms.hacks.canvasapi import refresh_after_miss
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ would otherwise need the user's course listing answered too.
 """Tests for the pages command."""
 import argparse
 import zlib
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import canvasapi.course
@@ -106,6 +108,7 @@ def add_page_options(parser, required=False):
 def process_page_option(canvas, args):
   """Process page options and return matching pages."""
   course_list = canvaslms.cli.courses.process_course_option(canvas, args)
+  <<refresh the listings if a name matches nothing>>
   pages = []
   for course in course_list:
     <<filter pages for course>>
@@ -145,6 +148,106 @@ if args.module:
       course_modules, filtered_pages))
 
 pages.extend(filtered_pages)
+@
+
+\subsection{Looking again when no page matches}
+\label{sec:pages-refresh-on-miss}
+
+A page written in the web interface a minute ago is not in the cached listing
+yet, and neither is a module made there.
+When [[-p]] or [[-M]] names something that no selected course has, we look at
+what Canvas says once more (\cref{sec:refresh-on-miss}).
+As for modules (\cref{sec:modules-refresh-on-miss}), the question is asked once
+for the whole selection and before the loop over the courses, since a page that
+only one course round has is no reason to fetch the listings of the others.
+Only the names are looked for: a page that exists but is not in the module
+asked for is an answer, not a miss.
+<<functions>>=
+def refresh_pages_after_miss(course_list, regex, max_listings=None):
+  """Look at Canvas again if no page of `course_list` matches `regex`."""
+  refresh_after_miss(
+    regex,
+    lambda: (page for course in course_list
+                  for page in filter_pages(course, regex)),
+    [(course, "page") for course in course_list],
+    max_listings=max_listings)
+<<refresh the listings if a name matches nothing>>=
+limit = canvaslms.cli.courses.miss_refresh_limit(args)
+refresh_pages_after_miss(course_list, args.page, limit)
+canvaslms.cli.modules.refresh_modules_after_miss(
+  course_list, args.module, limit)
+@
+
+Let's verify this with a course that listed its pages an hour ago and has got
+a page since; the helpers are those of the tests of [[pages delete]]
+(\cref{sec:pages-delete}).
+<<test functions>>=
+def selected_pages(course, regex, course_regex="SBX", module=""):
+  """Return the URLs of the pages that `-p regex -M module` selects."""
+  args = argparse.Namespace(course=course_regex, page=regex, module=module)
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    return [page.url for page in process_page_option(None, args)]
+
+def course_with_a_page_since(*cached):
+  """Return a course that listed `cached` an hour ago, and the new listing.
+
+  Canvas has the page New since then.
+  """
+  course, _ = course_with_pages(*cached)
+  new = page_json("new", "New")
+  listing = responses.replace(responses.GET, f"{API}/courses/1/pages",
+                              json=[*cached, new])
+  responses.get(f"{API}/courses/1/pages/new", json={**new, "body": "<p>x</p>"})
+  course.page_all_fetched = datetime.now() - timedelta(hours=1)
+  return course, listing
+
+@responses.activate
+def test_a_page_canvas_has_got_since_is_found():
+  course, listing = course_with_a_page_since(page_json("notes", "Notes"))
+
+  assert selected_pages(course, "^New$") == ["new"]
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_page_in_the_cache_does_not_ask_canvas():
+  course, listing = course_with_a_page_since(page_json("notes", "Notes"))
+
+  assert selected_pages(course, "^Notes$") == ["notes"]
+  assert listing.call_count == 0
+
+@responses.activate
+def test_listing_all_pages_does_not_ask_canvas():
+  course, listing = course_with_a_page_since()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_pages(course, ".*")
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_module_canvas_has_got_since_selects_its_pages():
+  course, _ = course_with_pages(page_json("notes", "Notes"))
+  responses.get(f"{API}/courses/1/modules", json=[])
+  modules = responses.get(f"{API}/courses/1/modules", json=[
+    {"id": 12, "name": "Week 2", "items_count": 1}])
+  responses.get(f"{API}/courses/1/modules/12/items", json=[
+    {"id": 120, "module_id": 12, "title": "Notes", "type": "Page",
+     "page_url": "notes", "position": 1}])
+  list(course.get_modules())
+  course.module_all_fetched = datetime.now() - timedelta(hours=1)
+
+  assert selected_pages(course, ".*", module="Week 2") == ["notes"]
+  assert modules.call_count == 1
+
+@responses.activate
+def test_a_page_search_of_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, listing = course_with_a_page_since()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_pages(course, "^New$", course_regex=".*")
+  assert listing.call_count == 0
 @
 
 
