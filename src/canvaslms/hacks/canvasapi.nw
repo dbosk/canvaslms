@@ -1699,6 +1699,10 @@ elif obj and outdated(obj):
   reason = get_staleness_reason(obj)
   obj = None
   cache_status = f" (stale: {reason})" if reason else " (stale)"
+elif obj and fetched_alone_long_ago(obj):
+  obj = None
+  cache_status = (f" (stale: older than {DEFAULT_CACHE_TTL_DAYS} days, "
+                  f"which a listing may be)")
 elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
   obj = None
   refreshing_on_request = True
@@ -1733,6 +1737,9 @@ Cache misses require API calls to Canvas, which typically take hundreds of
 milliseconds to seconds depending on network latency and server response time.
 This timing data helps identify whether caching is providing the expected
 performance benefits.
+
+A file or a folder also gets an age limit here, which
+\cref{sec:files-fetched-alone} explains.
 
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
@@ -9290,6 +9297,7 @@ methods create the attributes of a course that was stored without them
 (\cref{sec:cache-attributes-on-read}).
 
 \subsubsection{Files that are only ever fetched one by one}
+\label{sec:files-fetched-alone}
 
 The listings expire like any other, after [[DEFAULT_CACHE_TTL_DAYS]] days, and
 the fetch that follows replaces every entry.
@@ -9301,21 +9309,32 @@ to replace the entries.
 A file that has since been renamed or moved in Canvas would keep its old path
 in every exported link until someone asked for [[--refresh-cache]].
 
-So a file or a folder is outdated once it is older than the listing would be
-allowed to be.
-After a listing has been fetched the two rules agree, since its entries are as
-old as it is.
-<<test if [[obj]] is outdated, return True if so>>=
-if isinstance(obj, (canvasapi.file.File, canvasapi.folder.Folder)):
+So when one file or folder is asked for and the cached one is older than a
+listing is allowed to be, we fetch it again.
+The rule belongs to the singular method and not to [[outdated]], which the
+plural method also asks about every entry.
+There it would do harm: a listing can stay in use for a day after its entries
+have passed the limit, since its timestamp is only reset when [[outdated]]
+looks at the course, and then every entry would be fetched on its own, one
+request for each file of the course where one listing would do.
+A listing has its own time to live, and that is the one that should replace
+its entries.
+<<functions>>=
+def fetched_alone_long_ago(obj):
+  """Return True if `obj` is a file or folder older than a listing may be."""
   fetched_at = getattr(obj, "_fetched_at", None)
-  if (fetched_at is not None and datetime.now() - fetched_at
-      > timedelta(days=DEFAULT_CACHE_TTL_DAYS)):
-    return True
+  return (isinstance(obj, (canvasapi.file.File, canvasapi.folder.Folder))
+          and fetched_at is not None
+          and datetime.now() - fetched_at
+              > timedelta(days=DEFAULT_CACHE_TTL_DAYS))
 @
 
 Let's verify this through the real [[Course]], with [[responses]] in place of
 Canvas, since what we test is which requests are sent, and the listing must
 change between two of them.
+One test is for the harm described above: a listing that is still in use
+although it and its entries are past the limit must be answered from the
+cache, and once [[outdated]] has looked at the course, with one request.
 
 <<test functions>>=
 FILES_URL = "https://canvas.example/api/v1/courses/1/files"
@@ -9391,6 +9410,33 @@ class TestFileAndFolderCaching:
         course.get_folder(5)
 
         assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_an_old_listing_is_never_refreshed_one_file_at_a_time(self):
+        course = course_with_files()
+        list(course.get_files())
+        for file, _ in course.file_cache.values():
+            file._fetched_at -= timedelta(days=DEFAULT_CACHE_TTL_DAYS + 1)
+        course.file_all_fetched -= timedelta(days=DEFAULT_CACHE_TTL_DAYS + 1)
+        responses.calls.reset()
+
+        assert [file.id for file in course.get_files()] == [7, 8]
+
+        assert len(responses.calls) == 0
+        outdated(course)
+        assert [file.id for file in course.get_files()] == [7, 8]
+        assert [call.request.path_url.split("?")[0]
+                for call in responses.calls] == ["/api/v1/courses/1/files"]
+
+    @responses.activate
+    def test_a_folder_canvas_no_longer_lists_is_forgotten(self):
+        course = course_with_files()
+        list(course.get_folders())
+        responses.replace(responses.GET, FOLDERS_URL, json=[ROOT_FOLDER_JSON])
+        course.folder_all_fetched = None
+
+        assert [folder.id for folder in course.get_folders()] == [1]
+        assert set(course.folder_cache) == {1}
 
     @responses.activate
     def test_a_course_stored_before_files_were_cached_lists_them(self):
