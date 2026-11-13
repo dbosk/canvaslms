@@ -56,7 +56,9 @@ from canvasapi.course import Course
 from canvasapi.grading_standard import GradingStandard
 from canvasapi.new_quiz import NewQuiz
 from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
+from canvasapi import Canvas
 from canvasapi.quiz_group import QuizGroup
+from canvasapi.user import User
 from canvasapi.util import combine_kwargs
 
 import canvaslms.cli.quizzes as quizzes
@@ -8823,7 +8825,8 @@ def accommodations_command(config, canvas, args):
   if not students:
     raise canvaslms.cli.EmptyListError("No users found matching the criteria")
 
-  plan = accommodation_plan(course_list, students, args.assignment)
+  plan = accommodation_plan(course_list, students, args.assignment,
+                            courses.miss_refresh_limit(args))
   <<refuse a plan that Canvas cannot carry out>>
 
   requester = canvas._Canvas__requester
@@ -8843,18 +8846,33 @@ def accommodations_command(config, canvas, args):
 
 The plan is a list of targets, each with its course and its students.  A
 student carries the course it was found in, which [[list_users]] sets.
+
+The quizzes are looked for in all the courses that have a matching student at
+once, not course by course.
+[[filter_quizzes]] looks at Canvas again when the name matches nothing in the
+courses it is given, so a call for each course would make every course without
+the quiz a miss of its own: an exam that one of eight course rounds has would
+fetch the listings of the other seven, with nothing to limit them
+(\cref{sec:refresh-on-miss}).
 <<functions>>=
-def accommodation_plan(course_list, students, regex):
-  """Return (course, name, quiz, students) for each target to accommodate"""
-  plan = []
+def accommodation_plan(course_list, students, regex, max_listings=None):
+  """Return (course, name, quiz, students) for each target to accommodate.
+
+  `max_listings` is how many quiz listings a name that matches nothing may
+  fetch, see `retry_after_miss`.
+  """
+  students_in = {}
   for course in course_list:
     course_students = [student for student in students
                        if student.course.id == course.id]
-    if not course_students:
-      continue
-    for name, quiz in accommodation_targets(course, regex):
-      plan.append((course, name, quiz, course_students))
-  return plan
+    if course_students:
+      students_in[course.id] = (course, course_students)
+  if regex is None:
+    return [(course, COURSE_LEVEL_TARGET, None, course_students)
+            for course, course_students in students_in.values()]
+  searched = [course for course, _ in students_in.values()]
+  return [(quiz.course, quiz.title, quiz, students_in[quiz.course.id][1])
+          for quiz in filter_quizzes(searched, regex, max_listings)]
 @
 
 Nothing to accommodate is an empty list, as elsewhere, and its message says
@@ -8880,14 +8898,90 @@ Without [[-a]] the course itself is the one target, named for the output by
 what it covers.
 <<constants>>=
 COURSE_LEVEL_TARGET = "all New Quizzes"
-<<functions>>=
-def accommodation_targets(course, regex):
-  """Yield (name, quiz) for each target in course; quiz None for the course"""
-  if regex is None:
-    yield COURSE_LEVEL_TARGET, None
-    return
-  for quiz in filter_quizzes([course], regex):
-    yield quiz.title, quiz
+@
+
+Let's verify that a quiz that only one of the students' courses has leaves
+the listings of the other course alone, and that a quiz Canvas has got since
+the listings were cached is found.
+<<test functions>>=
+def courses_of_students(exam_in_cache, exam_in_canvas):
+  """Return two courses with a student each, and their Classic listings.
+
+  The arguments are the ids of the courses whose cached listing has the
+  quiz Exam and of those where Canvas has it now. The listings were
+  cached an hour ago; the mocks count the requests since.
+  """
+  server = "https://canvas.example.invalid"
+  requester = Canvas(server, "token")._Canvas__requester
+  exam = [{"id": 5, "title": "Exam", "quiz_type": "assignment"}]
+  course_list, students, listings = [], [], []
+  for course_id in (1, 2):
+    classic = f"{server}/api/v1/courses/{course_id}/quizzes"
+    responses.get(classic, json=exam if course_id in exam_in_cache else [])
+    responses.get(f"{server}/api/quiz/v1/courses/{course_id}/quizzes",
+                  json=[])
+    course = Course(requester, {"id": course_id,
+                                "course_code": f"C{course_id}"})
+    quizzes.fetch_all_quizzes(course)
+    listings.append(responses.replace(
+      responses.GET, classic,
+      json=exam if course_id in exam_in_canvas else []))
+    an_hour_ago = datetime.now() - timedelta(hours=1)
+    course.quiz_all_fetched = course.new_quiz_all_fetched = an_hour_ago
+    student = User(requester, {"id": 100 + course_id})
+    student.course = course
+    course_list.append(course)
+    students.append(student)
+  return course_list, students, listings
+
+@responses.activate
+def test_a_quiz_in_one_course_does_not_refresh_the_others():
+  course_list, students, listings = courses_of_students({1}, {1, 2})
+
+  plan = quizzes.accommodation_plan(course_list, students, "^Exam$")
+
+  assert [(course.course_code, name, course_students)
+          for course, name, _, course_students in plan] == [
+    ("C1", "Exam", students[:1])]
+  assert [listing.call_count for listing in listings] == [0, 0]
+
+@responses.activate
+def test_a_quiz_canvas_has_got_since_is_accommodated():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students, "^Exam$")
+
+  assert [(course.course_code, name, course_students)
+          for course, name, _, course_students in plan] == [
+    ("C2", "Exam", students[1:])]
+  assert [listing.call_count for listing in listings] == [1, 1]
+
+@responses.activate
+def test_a_course_without_a_matching_student_is_not_searched():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students[:1], "^Exam$")
+
+  assert plan == []
+  assert [listing.call_count for listing in listings] == [1, 0]
+
+@responses.activate
+def test_the_plan_keeps_to_the_limit_it_is_given():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  assert quizzes.accommodation_plan(course_list, students, "^Exam$", 0) == []
+  assert [listing.call_count for listing in listings] == [0, 0]
+
+@responses.activate
+def test_without_a_quiz_pattern_each_course_with_a_student_is_a_target():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students[1:], None)
+
+  assert [(course.course_code, name, quiz, course_students)
+          for course, name, quiz, course_students in plan] == [
+    ("C2", quizzes.COURSE_LEVEL_TARGET, None, students[1:])]
+  assert [listing.call_count for listing in listings] == [0, 0]
 @
 
 \subsection{Sending the accommodations}
@@ -9213,6 +9307,31 @@ def test_nothing_to_accommodate_is_an_empty_list(options, message):
   course = course_with_students_and_quizzes()
   with pytest.raises(quizzes.canvaslms.cli.EmptyListError, match=message):
     run_accommodations(course, *options, "--extra-time", "30")
+@
+
+A quiz name that matches nothing makes the plan look at Canvas again, within
+the limit that [[-c]] decides.
+Let's verify that the command passes that limit on: with all courses
+selected and their limit at 0, a quiz that Canvas has got since the listings
+were cached is not looked for.
+<<test functions>>=
+@responses.activate
+def test_accommodating_in_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(quizzes.canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course = course_with_students_and_quizzes()
+  quizzes.fetch_all_quizzes(course)
+  an_hour_ago = datetime.now() - timedelta(hours=1)
+  course.quiz_all_fetched = course.new_quiz_all_fetched = an_hour_ago
+  listing = responses.replace(
+    responses.GET, f"{NEW_QUIZZES_API}/courses/1/quizzes",
+    json=[{"id": "7", "title": "Exam"}, {"id": "8", "title": "Late exam"}])
+
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_accommodations(course, "-c", ".*", "-a", "^Late exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert listing.call_count == 0
 @
 
 The combinations Canvas does not offer stop the command before it asks
