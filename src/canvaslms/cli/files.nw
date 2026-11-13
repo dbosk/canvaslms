@@ -63,7 +63,11 @@ import canvaslms.cli
 import canvaslms.cli.courses
 import canvaslms.cli.links
 import canvaslms.cli.utils
-from canvaslms.hacks.canvasapi import cached_entries
+from canvaslms.hacks.canvasapi import (
+    cached_entries,
+    pattern_names_something,
+    refresh_after_miss,
+)
 
 <<constants>>
 <<functions>>
@@ -287,6 +291,101 @@ def test_filter_files_by_path_id_and_folder():
   assert [f.id for f in filter_files(course, "lab", "^old")] == []
 @
 
+\subsection{Looking again when no file matches}
+\label{sec:files-refresh-on-miss}
+
+A file uploaded in the web interface a minute ago is not in the cached listing
+yet.
+When the patterns name something that no selected course has, we look at what
+Canvas says once more (\cref{sec:refresh-on-miss}), once for the whole
+selection and before the loop over the courses, as for modules
+(\cref{sec:modules-refresh-on-miss}).
+
+Two listings give a file its path, the files and the folders, but only the
+file listing needs to be fetched again.
+A file that is new, or that was moved, comes with its folder's id, and
+[[list_course_files]] fetches a folder it does not know by that id.
+That keeps the refresh to one listing per course, and a single course to a
+single listing, which [[retry_after_miss]] fetches without a word.
+What this leaves out is a folder that was renamed in the web interface: its id
+is known, so its old path is used until the folder listing expires or
+[[--refresh-cache]] is given.
+
+The folder pattern names something too, so [[--folder '^new']] with the default
+file pattern is a search for a name as well.
+We give the one that names something as the pattern.
+<<functions>>=
+def refresh_files_after_miss(course_list, regex=".*", folder_regex=None,
+                             max_listings=None):
+  """Look at Canvas again if no file of `course_list` matches the patterns."""
+  refresh_after_miss(
+    regex if pattern_names_something(regex) else folder_regex,
+    lambda: (file for course in course_list
+                  for file in filter_files(course, regex, folder_regex)),
+    [(course, "file") for course in course_list],
+    max_listings=max_listings)
+@
+
+Let's verify this with a course that listed its files an hour ago and has got
+a file since, in a folder that is new as well.
+<<test functions>>=
+def course_with_a_file_since():
+  """Return a course that listed its files an hour ago, and the new listing.
+
+  Canvas has the file `new/notes.pdf` since then, in a folder that the
+  cached folder listing lacks.
+  """
+  serve_listing(responses)
+  course = canvasapi_course(Canvas(SERVER, "token"))
+  list_course_files(course)
+  listing = responses.replace(
+    responses.GET, f"{API}/courses/1/files",
+    json=[*FILES, file_json(20, "notes.pdf", 9)])
+  responses.get(f"{API}/courses/1/folders/9",
+                json=folder_json(9, "course files/new", 1))
+  course.file_all_fetched = datetime.now() - timedelta(hours=1)
+  return course, listing
+
+def selected_files(course, course_regex="SBX", **options):
+  """Return the paths of the files that the options select in `course`."""
+  args = argparse.Namespace(**{"course": course_regex, "file": ".*",
+                               "folder": None, **options})
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    return [file.path for file in process_file_option(None, args)]
+
+@responses.activate
+def test_a_file_canvas_has_got_since_is_found():
+  course, listing = course_with_a_file_since()
+
+  assert selected_files(course, file="notes") == ["new/notes.pdf"]
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_folder_canvas_has_got_since_is_found():
+  course, listing = course_with_a_file_since()
+
+  assert selected_files(course, folder="^new$") == ["new/notes.pdf"]
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_file_in_the_cache_does_not_ask_canvas():
+  course, listing = course_with_a_file_since()
+
+  assert selected_files(course, file="lab1") == ["handouts/lab1.pdf"]
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_file_search_of_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, listing = course_with_a_file_since()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_files(course, course_regex=".*", file="notes")
+  assert listing.call_count == 0
+@
+
 
 \section{The link to paste into a page}
 \label{sec:files-link}
@@ -389,8 +488,11 @@ def add_file_options(parser, required=False):
 
 def process_file_option(canvas, args):
   """Return the files of the selected courses that match the options."""
+  course_list = canvaslms.cli.courses.process_course_option(canvas, args)
+  refresh_files_after_miss(course_list, args.file, args.folder,
+                           canvaslms.cli.courses.miss_refresh_limit(args))
   files = []
-  for course in canvaslms.cli.courses.process_course_option(canvas, args):
+  for course in course_list:
     files.extend(filter_files(course, args.file, args.folder))
   if not files:
     raise canvaslms.cli.EmptyListError("No files found matching the criteria")

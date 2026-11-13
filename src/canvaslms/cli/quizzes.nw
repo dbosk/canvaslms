@@ -56,7 +56,9 @@ from canvasapi.course import Course
 from canvasapi.grading_standard import GradingStandard
 from canvasapi.new_quiz import NewQuiz
 from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
+from canvasapi import Canvas
 from canvasapi.quiz_group import QuizGroup
+from canvasapi.user import User
 from canvasapi.util import combine_kwargs
 
 import canvaslms.cli.quizzes as quizzes
@@ -506,6 +508,10 @@ import canvaslms.cli.content as content
 import canvaslms.cli.links
 import canvaslms.cli.modules as modules
 import canvaslms.cli.utils
+from canvaslms.hacks.canvasapi import (
+    pattern_names_something,
+    retry_after_miss,
+)
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -776,10 +782,8 @@ We use the [[filter_quizzes()]] helper with a pattern of [[.*]] to get all
 quizzes, which provides consistent error handling and ensures we search both
 Classic and New Quizzes.
 
-A course with no quizzes at all and a course whose cached listing is stale
-look the same from here---an empty list---so the empty-course message
-carries the stale-listing hint of \cref{sec:quiz-listing-invalidation} as
-well.
+The pattern [[.*]] names nothing, so a course without quizzes is an answer
+and no reason to look at Canvas again (\cref{sec:refresh-on-miss}).
 <<functions>>=
 def list_command(config, canvas, args):
   """Lists all quizzes in a course"""
@@ -793,8 +797,7 @@ def list_command(config, canvas, args):
   quiz_list = list(filter_quizzes(course_list, ".*"))
 
   if not quiz_list:
-    canvaslms.cli.err(1, "No quizzes found in the specified course(s)"
-                         + STALE_LISTING_HINT)
+    canvaslms.cli.err(1, "No quizzes found in the specified course(s)")
 
   <<list all quizzes>>
 @
@@ -858,7 +861,8 @@ def list_two_quizzes_with_one_id(monkeypatch, capsys, show_id):
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter([classic, new]))
+                      lambda course_list, regex, limit=None:
+                        iter([classic, new]))
   args = argparse.Namespace(delimiter="\t", id=show_id)
   quizzes.list_command({}, MagicMock(), args)
   return [line.split("\t") for line in capsys.readouterr().out.splitlines()]
@@ -915,28 +919,187 @@ that searches both Classic and New Quizzes.
 The function takes a list of courses and a regex pattern, yielding quizzes
 whose title or ID matches the pattern. This consolidates the duplicate search
 logic that was previously scattered throughout the codebase.
+
+A quiz made in the web interface a minute ago is not in the cached listings
+yet, and the user who names it is told that there is no such quiz.
+So a pattern that names something and matches nothing in any of the courses
+makes us look at what Canvas says once more
+(\cref{sec:refresh-on-miss}).
+Unlike the page and module filters, this one gets all the selected courses, so
+the retry can sit inside it and every command that selects a quiz gets it.
+That puts a condition on the callers: they must give it all the courses they
+search in one call.
+A loop that calls it for one course at a time makes every course without the
+quiz a miss of its own, which is what [[quizzes accommodations]] did at first
+(\cref{sec:quiz-accommodations-plan}).
+A search for a quiz reads two listings per course, the Classic Quizzes and the
+New Quizzes, and a miss fetches both: nothing in a title says which kind the
+quiz is.
+
+[[quizzes edit]] also finds a quiz by the ID or the exact title in its file.
+Those are names as well, so [[find_quizzes]] takes the test as a function and
+[[filter_quizzes]] is the case where the test is a regex.
+The default pattern names nothing (\cref{sec:refresh-on-miss}): a course
+without quizzes is an answer, and listing it should not fetch anything.
+
+How many listings a miss may fetch depends on whether [[-c]] narrowed the
+search, which only the command knows; it passes [[max_listings]] as it does to
+[[filter_users]].
 <<functions>>=
-def filter_quizzes(course_list, regex):
+def quiz_listings(course_list):
+  """Return the cached listings a search for a quiz in the courses reads."""
+  return [(course, kind) for course in course_list
+                         for kind in ("quiz", "new_quiz")]
+
+def find_quizzes(course_list, is_wanted, named, max_listings=None):
+  """Yield the quizzes of the courses for which `is_wanted(quiz)` is true.
+
+  If there is none, the quiz listings are fetched again and searched once
+  more, see `retry_after_miss` for `max_listings`. `named` is what was
+  searched for, for the messages.
+  """
+  course_list = list(course_list)
+  def wanted_quizzes():
+    for course in course_list:
+      for quiz in fetch_all_quizzes(course):
+        if is_wanted(quiz):
+          yield quiz
+  return retry_after_miss(wanted_quizzes, quiz_listings(course_list),
+                          max_listings=max_listings, pattern=named)
+
+def filter_quizzes(course_list, regex, max_listings=None):
   """Returns all quizzes from courses whose title or ID matches regex
 
   Searches both Classic Quizzes and New Quizzes. Yields Quiz objects
-  with an attached course attribute for later reference.
+  with an attached course attribute for later reference. If a regex that
+  names something matches nothing, the listings are fetched again first.
 
   Args:
     course_list: List of Course objects to search
     regex: Regular expression string to match against quiz title or ID
+    max_listings: How many listings a miss may fetch, see retry_after_miss
 
   Yields:
     Quiz objects (both classic and new quizzes) that match the pattern
   """
   pattern = re.compile(regex, re.IGNORECASE)
+  def matches(quiz):
+    return bool(pattern.search(quiz.title or '')
+                or pattern.search(str(quiz.id)))
+  if pattern_names_something(regex):
+    return find_quizzes(course_list, matches, regex, max_listings)
+  return (quiz for course in course_list
+               for quiz in fetch_all_quizzes(course) if matches(quiz))
+@
 
-  for course in course_list:
-    quizzes = fetch_all_quizzes(course)
-    for quiz in quizzes:
-      # Match against quiz title or Canvas ID
-      if pattern.search(quiz.title or '') or pattern.search(str(quiz.id)):
-        yield quiz
+Most commands select their quiz with [[-a]] in courses they have selected
+with [[-c]], and report an empty selection in their own words.
+They share the search, and with it the limit that [[-c]] decides.
+<<functions>>=
+def selected_quizzes(course_list, args):
+  """Return the quizzes of `course_list` that `args.assignment` matches."""
+  return list(filter_quizzes(course_list, args.assignment,
+                             courses.miss_refresh_limit(args)))
+@
+
+Let's verify this with a real course whose requests [[responses]] answers
+(the course and its address are those of the tests in
+\cref{sec:quiz-listing-invalidation}).
+The course listed its quizzes an hour ago, when it had none, and Canvas has got
+one quiz of each kind since.
+<<test functions>>=
+QUIZ_LISTINGS = {
+  "quiz": "https://canvas.example.invalid/api/v1/courses/1/quizzes",
+  "new_quiz": "https://canvas.example.invalid/api/quiz/v1/courses/1/quizzes",
+}
+
+def course_with_quizzes_since():
+  """Return a course that listed no quizzes an hour ago, and the new listings.
+
+  Canvas has the Classic Quiz 5, Old style, and the New Quiz 9, New style,
+  since then. The listings are mocks that count their requests, by kind.
+  """
+  for url in QUIZ_LISTINGS.values():
+    responses.get(url, json=[])
+  course = wrapped_course()
+  assert quizzes.fetch_all_quizzes(course) == []
+  listings = {
+    "quiz": responses.replace(responses.GET, QUIZ_LISTINGS["quiz"], json=[
+      {"id": 5, "title": "Old style", "quiz_type": "assignment"}]),
+    "new_quiz": responses.replace(
+      responses.GET, QUIZ_LISTINGS["new_quiz"],
+      json=[{"id": "9", "title": "New style"}]),
+  }
+  an_hour_ago = datetime.now() - timedelta(hours=1)
+  course.quiz_all_fetched = course.new_quiz_all_fetched = an_hour_ago
+  return course, listings
+
+def requests_of(listings):
+  return {kind: listing.call_count for kind, listing in listings.items()}
+
+@responses.activate
+@pytest.mark.parametrize("title", ["Old style", "New style"])
+def test_a_quiz_canvas_has_got_since_is_found(title):
+  course, listings = course_with_quizzes_since()
+
+  found = list(quizzes.filter_quizzes([course], f"^{title}$"))
+
+  assert [quiz.title for quiz in found] == [title]
+  assert found[0].course is course
+  assert requests_of(listings) == {"quiz": 1, "new_quiz": 1}
+
+@responses.activate
+def test_a_quiz_in_the_cache_does_not_ask_canvas():
+  course, listings = course_with_quizzes_since()
+  list(quizzes.filter_quizzes([course], "style"))
+  course.quiz_all_fetched = datetime.now() - timedelta(hours=1)
+
+  found = list(quizzes.filter_quizzes([course], "^Old"))
+
+  assert [quiz.id for quiz in found] == [5]
+  assert requests_of(listings) == {"quiz": 1, "new_quiz": 1}
+
+@responses.activate
+def test_listing_all_quizzes_of_an_empty_course_does_not_ask_canvas():
+  course, listings = course_with_quizzes_since()
+
+  assert list(quizzes.filter_quizzes([course], ".*")) == []
+  assert requests_of(listings) == {"quiz": 0, "new_quiz": 0}
+
+@responses.activate
+def test_a_quiz_search_keeps_to_the_limit_it_is_given(caplog):
+  course, listings = course_with_quizzes_since()
+
+  with caplog.at_level(logging.WARNING):
+    assert list(quizzes.filter_quizzes([course], "style", 1)) == []
+
+  assert requests_of(listings) == {"quiz": 0, "new_quiz": 0}
+  assert "not fetching 2 listings" in caplog.text
+
+@responses.activate
+def test_a_quiz_search_says_which_listings_it_checks(caplog):
+  course, _ = course_with_quizzes_since()
+
+  with caplog.at_level(logging.WARNING):
+    list(quizzes.filter_quizzes([course], "style"))
+
+  assert ("No match for 'style' in the cache; "
+          "checking 2 listings of Classic Quizzes and New Quizzes"
+          in caplog.text)
+
+@responses.activate
+@pytest.mark.parametrize("course_regex,requests", [("SBX", 1), (".*", 0)])
+def test_selecting_a_quiz_with_a_keeps_to_the_limit_of_the_courses(
+    monkeypatch, course_regex, requests):
+  monkeypatch.setattr(quizzes.canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, listings = course_with_quizzes_since()
+  args = argparse.Namespace(course=course_regex, assignment="style")
+
+  found = quizzes.selected_quizzes([course], args)
+
+  assert len(found) == 2 * requests
+  assert requests_of(listings) == {"quiz": requests, "new_quiz": requests}
 @
 
 \subsection{Quiz option management functions}
@@ -963,10 +1126,10 @@ optional: a required [[-a]] has no default to offer, since argparse refuses
 to run without it.
 
 This is where [[quizzes view]] and interactive [[quizzes edit]] learn that
-they have nothing to work on, so the empty-selection message carries the
-stale-listing hint of \cref{sec:quiz-listing-invalidation}: a quiz created
-moments ago by another process is exactly the case where the criteria look
-wrong but are not.
+they have nothing to work on.
+A quiz created moments ago by another process is the case where the criteria
+look wrong but are not, and [[filter_quizzes]] has then already looked at
+Canvas once more.
 <<functions>>=
 def add_quiz_option(parser, required=False, suppress_help=False):
   """Adds quiz selection option to argparse parser
@@ -1012,11 +1175,12 @@ def process_quiz_option(canvas, args):
   quiz_regex = getattr(args, 'assignment', '.*')
 
   # Filter quizzes using our helper
-  quiz_list = list(filter_quizzes(course_list, quiz_regex))
+  quiz_list = list(filter_quizzes(course_list, quiz_regex,
+                                  courses.miss_refresh_limit(args)))
 
   if not quiz_list:
     raise canvaslms.cli.EmptyListError(
-      "No quizzes found matching the criteria" + STALE_LISTING_HINT)
+      "No quizzes found matching the criteria")
 
   return quiz_list
 @
@@ -1032,6 +1196,23 @@ def test_quiz_help_names_a_default_only_when_optional(required):
         option_help = " ".join(
             parser.format_help().split(option, 1)[1].split("  -", 1)[0].split())
         assert ("default:" in option_help) == (not required)
+@
+
+A search for a quiz in all courses gets their smaller limit.
+<<test functions>>=
+@responses.activate
+def test_selecting_a_quiz_in_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(quizzes.canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, listings = course_with_quizzes_since()
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    quizzes.process_quiz_option(
+      None, argparse.Namespace(course=".*", assignment="style"))
+
+  assert requests_of(listings) == {"quiz": 0, "new_quiz": 0}
 @
 
 
@@ -3102,18 +3283,15 @@ def test_invalidate_quiz_listing_ignores_uncached_course():
   quizzes.invalidate_quiz_listing_cache(object())
 @
 
-The same staleness also shapes what we say when a quiz cannot be found.
-\enquote{No quiz found} is true of a deleted quiz, of a typo in the pattern,
-and of a quiz created ten seconds ago by this very tool, and only the last
-of these has a remedy the user would never guess.  We therefore append the
-remedy to the not-found messages of the commands that select an existing
-quiz.
-
-<<constants>>=
-STALE_LISTING_HINT = (
-  "; if the quiz was created or renamed very recently, the cached quiz "
-  "listing may be stale, so retry with canvaslms --refresh-cache")
-@
+A quiz made outside this tool, in the web interface or by another program,
+is a different matter: no write of ours can tell us about it.
+The not-found messages used to end with the advice to try again with
+[[--refresh-cache]].
+They no longer do, because the search now does that by itself: when a name
+matches nothing, [[find_quizzes]] fetches the listings again before the command
+gives up (\cref{sec:refresh-on-miss}).
+Only a listing fetched in the last few minutes is trusted as it is, and for a
+quiz made in that time [[--refresh-cache]] remains.
 
 
 \section{The [[quizzes create]] subcommand}
@@ -6074,7 +6252,7 @@ def test_edit_command_invalidates_each_course_once(monkeypatch):
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter(quiz_list))
+                      lambda course_list, regex, limit=None: iter(quiz_list))
   monkeypatch.setattr(quizzes, "apply_quiz_edit",
                       lambda *args, **kwargs: True)
   monkeypatch.setattr("builtins.input", lambda prompt="": "y")
@@ -6134,54 +6312,43 @@ if 'modules' in settings:
   if spec_errors:
     canvaslms.cli.err(1, "Invalid modules in file: " + "; ".join(spec_errors))
 course_list = courses.process_course_option(canvas, args)
+limit = courses.miss_refresh_limit(args)
 
 if getattr(args, 'assignment', None):
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
   if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}"
-                         f"{STALE_LISTING_HINT}")
+    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
 else:
   quiz_id = settings.get('id')
   quiz_regex = settings.get('regex')
   quiz_title = settings.get('title')
 
   if quiz_id is not None and str(quiz_id).strip() != "":
-    quiz_list = []
-    for course in course_list:
-      for quiz in fetch_all_quizzes(course):
-        if str(quiz.id) == str(quiz_id):
-          quiz.course = course
-          quiz_list.append(quiz)
+    quiz_list = list(find_quizzes(
+      course_list, lambda quiz: str(quiz.id) == str(quiz_id),
+      str(quiz_id), limit))
     if not quiz_list:
-      canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found"
-                           f"{STALE_LISTING_HINT}")
+      canvaslms.cli.err(1, f"Quiz with ID {quiz_id} not found")
     if len(quiz_list) > 1:
       canvaslms.cli.err(1, f"Multiple quizzes match ID {quiz_id}")
   elif quiz_regex is not None and str(quiz_regex).strip() != "":
-    quiz_list = list(filter_quizzes(course_list, str(quiz_regex)))
+    quiz_list = list(filter_quizzes(course_list, str(quiz_regex), limit))
     if not quiz_list:
-      canvaslms.cli.err(1, f"No quiz found matching file regex: {quiz_regex}"
-                           f"{STALE_LISTING_HINT}")
+      canvaslms.cli.err(1, f"No quiz found matching file regex: {quiz_regex}")
   elif quiz_title is not None and str(quiz_title).strip() != "":
-    quiz_list = []
     title = str(quiz_title)
+    quiz_list = list(find_quizzes(
+      course_list, lambda quiz: (quiz.title or '') == title, title, limit))
     for course in course_list:
-      matches = [q for q in fetch_all_quizzes(course)
-                 if (q.title or '') == title]
-      for q in matches:
-        q.course = course
-      if len(matches) > 1:
+      if sum(quiz.course is course for quiz in quiz_list) > 1:
         canvaslms.cli.err(
           1,
           f"Multiple quizzes titled '{title}' in course {course.course_code}. "
           "Use settings.regex (or -a) to disambiguate."
         )
-      if matches:
-        quiz_list.extend(matches)
 
     if not quiz_list:
-      canvaslms.cli.err(1, f"No quiz found with title: {title}"
-                           f"{STALE_LISTING_HINT}")
+      canvaslms.cli.err(1, f"No quiz found with title: {title}")
   else:
     canvaslms.cli.err(
       1,
@@ -6198,6 +6365,106 @@ if len(quiz_list) > 1:
   if response != 'y':
     print("Aborted.")
     return
+@
+
+Let's verify that the quiz a file names by ID or by title is found when
+Canvas has got it since the listing was cached, with the course of the tests
+of [[filter_quizzes]].
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("settings,quiz_id", [
+    ({"id": 9}, "9"), ({"id": "5"}, 5),
+    ({"title": "New style"}, "9"), ({"title": "Old style"}, 5)])
+def test_edit_finds_the_quiz_of_a_file_that_canvas_has_got_since(
+    monkeypatch, settings, quiz_id):
+  course, listings = course_with_quizzes_since()
+  monkeypatch.setattr(quizzes, "read_quiz_from_file",
+                      lambda path: {"format": "json", "settings": settings,
+                                    "instructions": ""})
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  edited = []
+  monkeypatch.setattr(quizzes, "apply_quiz_edit",
+                      lambda quiz, *args, **kwargs: edited.append(quiz.id)
+                                                    or True)
+  args = argparse.Namespace(file="quiz.json", assignment=None,
+                            course="SBX", replace_items=False, html=False)
+
+  quizzes.edit_command({}, MagicMock(), args)
+
+  assert edited == [quiz_id]
+  assert requests_of(listings) == {"quiz": 1, "new_quiz": 1}
+
+@
+
+A title must name one quiz in a course, while the same title in two courses
+is the ordinary case of two course rounds.
+<<test functions>>=
+def courses_with_a_quiz_titled_twin(ids_by_course):
+  """Return courses whose Classic Quizzes are titled Twin, with these ids."""
+  server = "https://canvas.example.invalid"
+  requester = Canvas(server, "token")._Canvas__requester
+  course_list = []
+  for course_id, quiz_ids in ids_by_course.items():
+    responses.get(f"{server}/api/v1/courses/{course_id}/quizzes", json=[
+      {"id": quiz_id, "title": "Twin", "quiz_type": "assignment"}
+      for quiz_id in quiz_ids])
+    responses.get(f"{server}/api/quiz/v1/courses/{course_id}/quizzes",
+                  json=[])
+    course_list.append(Course(requester, {"id": course_id,
+                                          "course_code": f"C{course_id}"}))
+  return course_list
+
+@responses.activate
+@pytest.mark.parametrize("ids_by_course,edited", [
+    ({1: [5, 6]}, None), ({1: [5], 2: [6]}, [5, 6])])
+def test_edit_by_title_wants_one_quiz_of_that_title_in_a_course(
+    monkeypatch, caplog, ids_by_course, edited):
+  course_list = courses_with_a_quiz_titled_twin(ids_by_course)
+  monkeypatch.setattr(quizzes, "read_quiz_from_file",
+                      lambda path: {"format": "json",
+                                    "settings": {"title": "Twin"},
+                                    "instructions": ""})
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: course_list)
+  done = []
+  monkeypatch.setattr(quizzes, "apply_quiz_edit",
+                      lambda quiz, *args, **kwargs: done.append(quiz.id)
+                                                    or True)
+  monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+  args = argparse.Namespace(file="quiz.json", assignment=None,
+                            course="C", replace_items=False, html=False)
+
+  if edited is None:
+    with pytest.raises(SystemExit):
+      quizzes.edit_command({}, MagicMock(), args)
+    assert "Multiple quizzes titled 'Twin' in course C1" in caplog.text
+    assert done == []
+  else:
+    quizzes.edit_command({}, MagicMock(), args)
+    assert done == edited
+
+@responses.activate
+@pytest.mark.parametrize("settings,assignment", [
+    ({"id": 9}, None), ({"regex": "^New"}, None),
+    ({"title": "New style"}, None), ({}, "^New")])
+def test_edit_from_a_file_in_all_courses_keeps_to_their_limit(
+    monkeypatch, settings, assignment):
+  monkeypatch.setattr(quizzes.canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, listings = course_with_quizzes_since()
+  monkeypatch.setattr(quizzes, "read_quiz_from_file",
+                      lambda path: {"format": "json", "settings": settings,
+                                    "instructions": ""})
+  monkeypatch.setattr(quizzes.courses, "process_course_option",
+                      lambda canvas, args: [course])
+  args = argparse.Namespace(file="quiz.json", assignment=assignment,
+                            course=".*", replace_items=False, html=False)
+
+  with pytest.raises(SystemExit):
+    quizzes.edit_command({}, MagicMock(), args)
+
+  assert requests_of(listings) == {"quiz": 0, "new_quiz": 0}
 @
 
 If [[--replace-items]] is specified and the file contains items, we replace
@@ -8270,11 +8537,10 @@ def delete_command(config, canvas, args):
   """Deletes a quiz"""
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
-    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}"
-                         f"{STALE_LISTING_HINT}")
+    canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
   if len(quiz_list) > 1:
     canvaslms.cli.err(1, f"Multiple quizzes match '{args.assignment}'. "
                          "Please use a more specific pattern.")
@@ -8322,7 +8588,7 @@ def found_new_quiz_with_failing_requests(monkeypatch, canvas):
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [quiz.course])
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter([quiz]))
+                      lambda course_list, regex, limit=None: iter([quiz]))
   canvas._Canvas__requester.request.side_effect = \
     Unauthorized("Invalid access token")
   return quiz
@@ -8614,7 +8880,8 @@ def accommodations_command(config, canvas, args):
   if not students:
     raise canvaslms.cli.EmptyListError("No users found matching the criteria")
 
-  plan = accommodation_plan(course_list, students, args.assignment)
+  plan = accommodation_plan(course_list, students, args.assignment,
+                            courses.miss_refresh_limit(args))
   <<refuse a plan that Canvas cannot carry out>>
 
   requester = canvas._Canvas__requester
@@ -8632,20 +8899,36 @@ def accommodations_command(config, canvas, args):
     canvaslms.cli.err(1, f"{failures} accommodation(s) failed")
 @
 
+\label{sec:quiz-accommodations-plan}%
 The plan is a list of targets, each with its course and its students.  A
 student carries the course it was found in, which [[list_users]] sets.
+
+The quizzes are looked for in all the courses that have a matching student at
+once, not course by course.
+[[filter_quizzes]] looks at Canvas again when the name matches nothing in the
+courses it is given, so a call for each course would make every course without
+the quiz a miss of its own: an exam that one of eight course rounds has would
+fetch the listings of the other seven, with nothing to limit them
+(\cref{sec:refresh-on-miss}).
 <<functions>>=
-def accommodation_plan(course_list, students, regex):
-  """Return (course, name, quiz, students) for each target to accommodate"""
-  plan = []
+def accommodation_plan(course_list, students, regex, max_listings=None):
+  """Return (course, name, quiz, students) for each target to accommodate.
+
+  `max_listings` is how many quiz listings a name that matches nothing may
+  fetch, see `retry_after_miss`.
+  """
+  students_in = {}
   for course in course_list:
     course_students = [student for student in students
                        if student.course.id == course.id]
-    if not course_students:
-      continue
-    for name, quiz in accommodation_targets(course, regex):
-      plan.append((course, name, quiz, course_students))
-  return plan
+    if course_students:
+      students_in[course.id] = (course, course_students)
+  if regex is None:
+    return [(course, COURSE_LEVEL_TARGET, None, course_students)
+            for course, course_students in students_in.values()]
+  searched = [course for course, _ in students_in.values()]
+  return [(quiz.course, quiz.title, quiz, students_in[quiz.course.id][1])
+          for quiz in filter_quizzes(searched, regex, max_listings)]
 @
 
 Nothing to accommodate is an empty list, as elsewhere, and its message says
@@ -8659,7 +8942,7 @@ prepares an exam must be able to tell that a student was left out.
 if not plan:
   raise canvaslms.cli.EmptyListError(
     "No quizzes found matching the criteria in the courses of the matching "
-    "students" + STALE_LISTING_HINT)
+    "students")
 classic = [name for _, name, quiz, _ in plan
            if quiz is not None and not is_new_quiz(quiz)]
 if 'reduce_choices_enabled' in fields and classic:
@@ -8671,14 +8954,90 @@ Without [[-a]] the course itself is the one target, named for the output by
 what it covers.
 <<constants>>=
 COURSE_LEVEL_TARGET = "all New Quizzes"
-<<functions>>=
-def accommodation_targets(course, regex):
-  """Yield (name, quiz) for each target in course; quiz None for the course"""
-  if regex is None:
-    yield COURSE_LEVEL_TARGET, None
-    return
-  for quiz in filter_quizzes([course], regex):
-    yield quiz.title, quiz
+@
+
+Let's verify that a quiz that only one of the students' courses has leaves
+the listings of the other course alone, and that a quiz Canvas has got since
+the listings were cached is found.
+<<test functions>>=
+def courses_of_students(exam_in_cache, exam_in_canvas):
+  """Return two courses with a student each, and their Classic listings.
+
+  The arguments are the ids of the courses whose cached listing has the
+  quiz Exam and of those where Canvas has it now. The listings were
+  cached an hour ago; the mocks count the requests since.
+  """
+  server = "https://canvas.example.invalid"
+  requester = Canvas(server, "token")._Canvas__requester
+  exam = [{"id": 5, "title": "Exam", "quiz_type": "assignment"}]
+  course_list, students, listings = [], [], []
+  for course_id in (1, 2):
+    classic = f"{server}/api/v1/courses/{course_id}/quizzes"
+    responses.get(classic, json=exam if course_id in exam_in_cache else [])
+    responses.get(f"{server}/api/quiz/v1/courses/{course_id}/quizzes",
+                  json=[])
+    course = Course(requester, {"id": course_id,
+                                "course_code": f"C{course_id}"})
+    quizzes.fetch_all_quizzes(course)
+    listings.append(responses.replace(
+      responses.GET, classic,
+      json=exam if course_id in exam_in_canvas else []))
+    an_hour_ago = datetime.now() - timedelta(hours=1)
+    course.quiz_all_fetched = course.new_quiz_all_fetched = an_hour_ago
+    student = User(requester, {"id": 100 + course_id})
+    student.course = course
+    course_list.append(course)
+    students.append(student)
+  return course_list, students, listings
+
+@responses.activate
+def test_a_quiz_in_one_course_does_not_refresh_the_others():
+  course_list, students, listings = courses_of_students({1}, {1, 2})
+
+  plan = quizzes.accommodation_plan(course_list, students, "^Exam$")
+
+  assert [(course.course_code, name, course_students)
+          for course, name, _, course_students in plan] == [
+    ("C1", "Exam", students[:1])]
+  assert [listing.call_count for listing in listings] == [0, 0]
+
+@responses.activate
+def test_a_quiz_canvas_has_got_since_is_accommodated():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students, "^Exam$")
+
+  assert [(course.course_code, name, course_students)
+          for course, name, _, course_students in plan] == [
+    ("C2", "Exam", students[1:])]
+  assert [listing.call_count for listing in listings] == [1, 1]
+
+@responses.activate
+def test_a_course_without_a_matching_student_is_not_searched():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students[:1], "^Exam$")
+
+  assert plan == []
+  assert [listing.call_count for listing in listings] == [1, 0]
+
+@responses.activate
+def test_the_plan_keeps_to_the_limit_it_is_given():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  assert quizzes.accommodation_plan(course_list, students, "^Exam$", 0) == []
+  assert [listing.call_count for listing in listings] == [0, 0]
+
+@responses.activate
+def test_without_a_quiz_pattern_each_course_with_a_student_is_a_target():
+  course_list, students, listings = courses_of_students(set(), {2})
+
+  plan = quizzes.accommodation_plan(course_list, students[1:], None)
+
+  assert [(course.course_code, name, quiz, course_students)
+          for course, name, quiz, course_students in plan] == [
+    ("C2", quizzes.COURSE_LEVEL_TARGET, None, students[1:])]
+  assert [listing.call_count for listing in listings] == [0, 0]
 @
 
 \subsection{Sending the accommodations}
@@ -9006,6 +9365,31 @@ def test_nothing_to_accommodate_is_an_empty_list(options, message):
     run_accommodations(course, *options, "--extra-time", "30")
 @
 
+A quiz name that matches nothing makes the plan look at Canvas again, within
+the limit that [[-c]] decides.
+Let's verify that the command passes that limit on: with all courses
+selected and their limit at 0, a quiz that Canvas has got since the listings
+were cached is not looked for.
+<<test functions>>=
+@responses.activate
+def test_accommodating_in_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(quizzes.canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course = course_with_students_and_quizzes()
+  quizzes.fetch_all_quizzes(course)
+  an_hour_ago = datetime.now() - timedelta(hours=1)
+  course.quiz_all_fetched = course.new_quiz_all_fetched = an_hour_ago
+  listing = responses.replace(
+    responses.GET, f"{NEW_QUIZZES_API}/courses/1/quizzes",
+    json=[{"id": "7", "title": "Exam"}, {"id": "8", "title": "Late exam"}])
+
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_accommodations(course, "-c", ".*", "-a", "^Late exam$", "-u", ".*",
+                       "--extra-time", "30")
+
+  assert listing.call_count == 0
+@
+
 The combinations Canvas does not offer stop the command before it asks
 Canvas anything, which [[responses]] confirms by refusing every request that
 was not registered.
@@ -9115,7 +9499,7 @@ def export_command(config, canvas, args):
   """Exports a complete quiz (settings + questions) to JSON"""
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
@@ -10675,16 +11059,13 @@ def qti_replace(course, receipt, path, metadata, timeout):
 
 \paragraph{Selecting the destination.}
 The destination is found like any quiz the other commands work on, with
-[[filter_quizzes]], but we insist on exactly one match.  When there is none,
-the cached listing may be stale, and we add the hint of
-\cref{sec:quiz-listing-invalidation}.
+[[filter_quizzes]], but we insist on exactly one match.
 <<functions>>=
 def qti_target_quiz(course, pattern):
   """Returns the ID of the one Classic quiz in `course` matching `pattern`"""
   matches = list(filter_quizzes([course], pattern))
   if not matches:
-    raise QtiImportError(f"No quiz matches -a {pattern!r}"
-                         + STALE_LISTING_HINT)
+    raise QtiImportError(f"No quiz matches -a {pattern!r}")
   if len(matches) > 1:
     raise QtiImportError(f"-a {pattern!r} matches {len(matches)} quizzes; "
                          "a replacement needs exactly one")
@@ -10750,13 +11131,14 @@ unambiguous, and refused when it is published or has, or may have, attempts.
 def test_qti_target_quiz_needs_exactly_one_match(monkeypatch, matches,
                                                  message):
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter(matches))
+                      lambda course_list, regex, limit=None: iter(matches))
   with pytest.raises(quizzes.QtiImportError, match=message):
     quizzes.qti_target_quiz(make_course(), "Week")
 
 def test_qti_target_quiz_refuses_a_new_quiz(monkeypatch):
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter([make_new_quiz(id="7")]))
+                      lambda course_list, regex, limit=None:
+                        iter([make_new_quiz(id="7")]))
   with pytest.raises(quizzes.QtiImportError, match="Classic quizzes only"):
     quizzes.qti_target_quiz(make_course(), "^7$")
 
@@ -12935,7 +13317,7 @@ def items_list_command(config, canvas, args):
   """Lists all questions/items in a quiz"""
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
@@ -14515,7 +14897,7 @@ def items_add_command(config, canvas, args):
 
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
@@ -15234,7 +15616,7 @@ def items_edit_command(config, canvas, args):
 
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
@@ -15429,7 +15811,7 @@ def items_delete_command(config, canvas, args):
 
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")
@@ -15573,7 +15955,7 @@ def test_item_writes_forget_the_course_listings(
   monkeypatch.setattr(quizzes.courses, "process_course_option",
                       lambda canvas, args: [course])
   monkeypatch.setattr(quizzes, "filter_quizzes",
-                      lambda course_list, regex: iter([quiz]))
+                      lambda course_list, regex, limit=None: iter([quiz]))
   monkeypatch.setattr(quizzes, writer, lambda *args, **kwargs: result)
   quiz._items_cache = ({"items": []}, "some timestamp")
   path = tmp_path / "items.json"
@@ -15759,7 +16141,7 @@ def items_export_command(config, canvas, args):
   """Exports all questions from a quiz to JSON"""
   # Find the quiz
   course_list = courses.process_course_option(canvas, args)
-  quiz_list = list(filter_quizzes(course_list, args.assignment))
+  quiz_list = selected_quizzes(course_list, args)
 
   if not quiz_list:
     canvaslms.cli.err(1, f"No quiz found matching: {args.assignment}")

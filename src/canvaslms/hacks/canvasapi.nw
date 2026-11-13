@@ -5640,7 +5640,7 @@ MISS_REFRESH_MAX_LISTINGS_ALL_COURSES = env_number(
   "CANVASLMS_MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 5, int)
 <<functions>>=
 def retry_after_miss(find, listings, max_listings=None, pattern=None,
-                     stop_at_first_match=False):
+                     stop_at_first_match=False, required=False):
   """Yield from `find()`; if empty, refresh `listings` and search again.
 
   `find` returns an iterable of matches, and `listings` holds the
@@ -5651,7 +5651,11 @@ def retry_after_miss(find, listings, max_listings=None, pattern=None,
   match. If more than `max_listings` are old enough, which defaults to
   `MISS_REFRESH_MAX_LISTINGS`, none is refreshed and a warning says so; 0 turns
   the refresh off without a warning. `pattern`, what was searched for, is only
-  used in the messages. A failed refresh leaves that listing as it was cached.
+  used in the messages. A failed refresh leaves that listing as it was cached,
+  and is reported as no match; with `required` it is retried as any request
+  and its failure is raised, for a caller that is about to create what it
+  did not find. Such a `find` must read every one of `listings` in full each
+  time: a listing left unread counts as a failed refresh.
   """
   found = False
   for match in find():
@@ -5673,15 +5677,20 @@ def retry_after_miss(find, listings, max_listings=None, pattern=None,
     batches = [old_listings]
   for batch in batches:
     <<expire the listings of [[batch]]>>
+    not_refreshed = []
     try:
-      with without_retries(owner for owner, _, _ in batch):
+      with without_retries(() if required
+                           else (owner for owner, _, _ in batch)):
         matches = list(find())
     except (canvasapi.exceptions.CanvasException,
             requests.exceptions.RequestException) as error:
+      if required:
+        raise
       logger.warning(f"Could not refresh after finding no match: {error}")
       return
     finally:
       <<keep the cached listings of [[batch]] after a failed refresh>>
+    <<raise if a [[required]] refresh did not happen>>
     if matches:
       yield from matches
       return
@@ -5695,6 +5704,34 @@ Callers use this helper to leave their [[listings]] empty in that case.
 def pattern_names_something(pattern):
   """Return True if the regex `pattern` was given to find something specific."""
   return bool(pattern) and pattern != ".*"
+@
+
+Not every search can be handed to [[retry_after_miss]] as it is.
+The lookups of pages, modules and files take one course, and the commands call
+them in a loop over the selected courses, since they do something for each
+course in between.
+A retry inside such a lookup would make every course a search of its own: a page
+that exists in one of twelve course rounds is missing from the other eleven, and
+each of them would fetch its listing, on every run after the minimum age, with
+no limit across the courses.
+What counts as a miss is the name missing from the whole selection.
+Such a command therefore asks once, before its loop, with a search over all the
+courses, and only for the effect on the cache: after a refresh, the loop finds
+the new entry in the cached listings and makes no further request.
+The search can stop at the first match, since one match is enough to know that
+there was no miss.
+<<functions>>=
+def refresh_after_miss(pattern, find, listings, max_listings=None):
+  """Refresh `listings` if `pattern` names something that `find()` lacks.
+
+  For a search that goes owner by owner: call this once before it, with a
+  `find` that searches all the owners. The arguments are those of
+  `retry_after_miss`; a `pattern` that names nothing never refreshes.
+  """
+  if pattern_names_something(pattern):
+    for _ in retry_after_miss(find, listings, max_listings=max_listings,
+                              pattern=pattern):
+      break
 @
 
 We only look at timestamps that are actually [[datetime]]s, since an owner that
@@ -5791,9 +5828,32 @@ the course listing, which every command reads through [[filter_courses]].
 if len(old_listings) > 1:
   what = f" for '{pattern}'" if pattern else ""
   up_to = "up to " if stop_at_first_match else ""
-  kind = old_listings[0][1].removesuffix("_all_fetched")
   logger.warning(f"No match{what} in the cache; checking {up_to}"
-                 f"{len(old_listings)} listings of {kind}s in Canvas")
+                 f"{len(old_listings)} listings of "
+                 f"{kinds_in_words(old_listings)} in Canvas")
+@
+
+The message names what is listed, in the plural.
+Adding an s to the attribute name does for most kinds, but not for a quiz or a
+group category, and a search for a quiz reads two listings per course, one of
+Classic Quizzes and one of New Quizzes (\cref{sec:caching-quizzes}).
+So we name every kind among the listings, in the order they come.
+<<constants>>=
+LISTING_PLURALS = {
+  "quiz": "Classic Quizzes",
+  "new_quiz": "New Quizzes",
+  "group_category": "group categories",
+}
+<<functions>>=
+def kinds_in_words(old_listings):
+  """Return the kinds of `old_listings` in the plural, as `users and groups`."""
+  kinds = []
+  for _, name, _ in old_listings:
+    kind = name.removesuffix("_all_fetched")
+    words = LISTING_PLURALS.get(kind, kind.replace("_", " ") + "s")
+    if words not in kinds:
+      kinds.append(words)
+  return " and ".join(kinds)
 @
 
 The refresh is a favour, so failing at it should not make things worse.
@@ -5819,6 +5879,36 @@ refreshed before it keep what they got.
 for owner, name, fetched in batch:
   if getattr(owner, name) is None:
     setattr(owner, name, fetched)
+    not_refreshed.append(name)
+@
+
+One kind of caller cannot take \enquote{no match} for an answer when the
+refresh failed: a command that creates what it did not find.
+[[pages edit]] with [[--create]] makes a new page when no page has the title,
+and a refresh that failed would let it make a second page of that title
+because of one lost request.
+For such a caller the refresh is no favour, it is a check that the write
+depends on.
+With [[required]] it therefore keeps the usual retries, like any request a
+command depends on (\cref{sec:course-listing-outage}), and a failure is raised
+to the caller, who then creates nothing.
+The cached listing is put back all the same, for the next command.
+A search that catches the failure itself would hide it from us, so we also
+look at the timestamps here, and raise if a listing was not fetched.
+That puts a condition on the search of such a caller: it must read every
+listing it names, in full, each time it runs.
+A search that stops before it reads one of them, or reads it with an argument
+that bypasses the cache, leaves that timestamp empty and would be taken for a
+failure.
+
+A listing that is too young to be fetched again is still trusted, and so is the
+cache when the limit turns the refresh off: [[required]] is about a refresh
+that was tried and failed, not about one we chose not to make.
+<<raise if a [[required]] refresh did not happen>>=
+if required and not_refreshed:
+  raise canvasapi.exceptions.CanvasException(
+    "Could not fetch the listing again to check for a match in Canvas: "
+    + ", ".join(name.removesuffix("_all_fetched") for name in not_refreshed))
 @
 
 Let's verify the behaviour, again with a stand-in whose listing can change
@@ -5891,6 +5981,45 @@ class TestRetryAfterMiss:
         (None, False), ("", False), (".*", False), ("Anna", True)])
     def test_only_a_given_pattern_names_something(self, pattern, expected):
         assert pattern_names_something(pattern) is expected
+
+    def refresh_for(self, owners, pattern, wanted, **kwargs):
+        """Do what a command does before it searches `owners` one by one."""
+        refresh_after_miss(
+            pattern,
+            lambda: (obj for owner in owners for obj in owner.get_items()
+                     if obj.id == wanted),
+            [(owner, "item") for owner in owners], **kwargs)
+
+    def test_a_name_missing_from_every_owner_refreshes_them(self):
+        owners = [self.listing_owner(), self.listing_owner(listing=(1,))]
+
+        self.refresh_for(owners, "two", wanted=2)
+
+        assert [owner.listings for owner in owners] == [2, 2]
+        assert 2 in [obj.id for obj in owners[0].get_items()]
+        assert [owner.listings for owner in owners] == [2, 2]
+
+    def test_a_name_that_one_owner_has_refreshes_none(self):
+        owners = [self.listing_owner(), self.listing_owner()]
+
+        self.refresh_for(owners, "one", wanted=1)
+
+        assert [owner.listings for owner in owners] == [1, 1]
+
+    @pytest.mark.parametrize("pattern", [None, "", ".*"])
+    def test_a_pattern_that_names_nothing_refreshes_none(self, pattern):
+        owner = self.listing_owner()
+
+        self.refresh_for([owner], pattern, wanted=3)
+
+        assert owner.listings == 1
+
+    def test_the_refresh_before_a_loop_keeps_to_the_limit(self):
+        owners = [self.listing_owner(), self.listing_owner()]
+
+        self.refresh_for(owners, "two", wanted=2, max_listings=1)
+
+        assert [owner.listings for owner in owners] == [1, 1]
 
     def test_too_many_listings_are_not_fetched(self):
         owners = [self.listing_owner()
@@ -6117,6 +6246,16 @@ def test_one_listing_to_fetch_is_not_announced(self, caplog):
     assert self.fetched_again(owners) == 1
     assert not caplog.records
 
+def test_the_announcement_names_each_kind_in_the_plural(self):
+    listings = [(None, f"{kind}_all_fetched", None)
+                for kind in ("quiz", "new_quiz", "quiz", "group_category",
+                             "module_item")]
+
+    assert kinds_in_words(listings[:1]) == "Classic Quizzes"
+    assert kinds_in_words(listings) == (
+        "Classic Quizzes and New Quizzes and group categories "
+        "and module items")
+
 def test_a_failure_stops_the_refresh(self, caplog):
     owners = self.owners(old=3)
     fetched = [owner.item_all_fetched for owner in owners]
@@ -6129,6 +6268,47 @@ def test_a_failure_stops_the_refresh(self, caplog):
     assert [owner.item_all_fetched for owner in owners][1:] == fetched[1:]
     assert owners[0].item_all_fetched > fetched[0]
     assert "Could not refresh" in caplog.text
+
+def test_a_required_refresh_raises_its_failure(self, caplog):
+    owner = self.listing_owner()
+    fetched = owner.item_all_fetched
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+    with caplog.at_level(logging.WARNING), \
+         pytest.raises(canvasapi.exceptions.CanvasException,
+                       match="Unavailable"):
+        self.search_all([owner], required=True)
+
+    assert owner.item_all_fetched == fetched
+    assert not caplog.records
+
+def test_a_required_refresh_raises_a_failure_the_search_caught(self):
+    owner = self.listing_owner()
+    fetched = owner.item_all_fetched
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+    def find():
+        try:
+            return [obj for obj in owner.get_items() if obj.id == 3]
+        except canvasapi.exceptions.CanvasException:
+            return []
+
+    with pytest.raises(canvasapi.exceptions.CanvasException,
+                       match="Could not fetch the listing again.*: item"):
+        list(retry_after_miss(find, [(owner, "item")], required=True))
+
+    assert owner.item_all_fetched == fetched
+
+def test_a_required_refresh_that_works_is_like_any_other(self):
+    owner = self.listing_owner(listing=(3,))
+
+    assert [obj.id for obj in self.search_all([owner], required=True)] == [3]
+    assert owner.listings == 2
+
+def test_a_required_refresh_trusts_a_young_listing(self):
+    owner = self.listing_owner(age=timedelta(minutes=1))
+    owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+    assert self.search_all([owner], required=True) == []
 @
 
 The settings are read when the module is imported, so we import it in a process
@@ -9125,6 +9305,7 @@ Why opt-in instead of automatic?
 \end{itemize}
 
 \subsection{Caching quizzes}
+\label{sec:caching-quizzes}
 
 Courses contain quizzes, which come in two flavors:
 \begin{description}

@@ -528,7 +528,10 @@ LAB = {"id": 5, "name": "Lab", "course_id": 1}
 
 @pytest.fixture
 def run_cli(monkeypatch, tmp_path, capsys):
-  """Return a function running canvaslms as a new process, returning stdout."""
+  """Return a function running canvaslms as a new process, returning stdout.
+
+  What the last run printed on stderr is kept as the function's `stderr`.
+  """
   monkeypatch.setattr(canvaslms.cli.cache, "get_cache_path",
                       lambda hostname: str(tmp_path / "cache.enc"))
   monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
@@ -541,7 +544,9 @@ def run_cli(monkeypatch, tmp_path, capsys):
                                       str(tmp_path / "config.json"),
                                       *arguments])
     canvaslms.cli.main()
-    return capsys.readouterr().out
+    printed = capsys.readouterr()
+    run.stderr = printed.err
+    return printed.out
 
   return run
 
@@ -996,17 +1001,22 @@ def fetches_of(listing, count):
   return sum(requests_to(f"courses/{course_id}/{listing}")
              for course_id in range(1, count + 1))
 
-def run_miss(run_cli, capsys, *arguments):
+def run_miss(run_cli, capsys, *arguments, finds_nothing=True):
   """Run a command that finds nothing with logging as in a process of its own.
 
-  Returns what the command printed, stdout and stderr.
+  Returns what the command printed, stdout and stderr. With `finds_nothing`
+  false the command is one that succeeds in the end.
   """
   capsys.readouterr()
   root = logging.getLogger()
   handlers, level = root.handlers[:], root.level
   root.handlers[:] = []
   try:
-    assert_no_match(run_cli, *arguments)
+    if finds_nothing:
+      assert_no_match(run_cli, *arguments)
+    else:
+      out = run_cli(*arguments)
+      return argparse.Namespace(out=out, err=run_cli.stderr)
   finally:
     root.handlers[:] = handlers
     root.setLevel(level)
@@ -1283,25 +1293,31 @@ def test_library_caller_gets_the_larger_limit(
 
 The shipped [[ungraded.sh]] runs from cron with course patterns that may not
 match yet, and cron mails what it prints on stderr.
-Each of its calls names only a course, and the course listing is a single
-listing, which cannot be over a limit, and a limit of 0 does not warn; the
-assignment and user patterns stay at the default that names nothing.
-So its mail cannot fill up with warnings, whatever the size of the selection.
-Let's pin this with a selection above the limit and every listing old enough:
-all that would be needed for a warning is one more lookup that names something.
+Each of its calls names a course and an assignment group; the assignment and
+user patterns stay at the default that names nothing.
+The course listing is a single listing, which cannot be over a limit, and a
+limit of 0 does not warn.
+A group pattern that matches a group in any of the courses is no miss.
+So as long as the cache has what its patterns name, or they name no group at
+all, its mail gets no warning, whatever the size of the selection.
+Let's pin this with a selection above the limit and every listing old enough.
 
 <<test functions>>=
+def add_assignment_groups(count, groups_of_the_first=()):
+  """Give `count` courses their assignment groups and no submissions."""
+  for course_id in range(1, count + 1):
+    responses.get(f"{CANVAS_API}/courses/{course_id}/assignment_groups",
+                  json=list(groups_of_the_first) if course_id == 1 else [])
+    responses.get(f"{CANVAS_API}/courses/{course_id}"
+                  f"/assignments/{100 + course_id}/submissions", json=[])
+
 @responses.activate
 @pytest.mark.parametrize("course,group", [
-  ("Course", ".*"), ("Course", "Nothing"), ("Nothing", ".*")])
+  ("Course", ".*"), ("Course", "Labs"), ("Nothing", ".*")])
 def test_a_search_like_that_of_ungraded_sh_never_warns(
     run_cli, capsys, any_listing_is_old_enough, course, group):
   add_courses(30)
-  for course_id in range(1, 31):
-    responses.get(f"{CANVAS_API}/courses/{course_id}/assignment_groups",
-                  json=[])
-    responses.get(f"{CANVAS_API}/courses/{course_id}"
-                  f"/assignments/{100 + course_id}/submissions", json=[])
+  add_assignment_groups(30, [{"id": 7, "name": "Labs"}])
   run_cli("users")
   run_cli("assignments", "list")
 
@@ -1309,6 +1325,74 @@ def test_a_search_like_that_of_ungraded_sh_never_warns(
                      "-c", course, "-A", group, "-U")
 
   assert "[WARNING]" not in printed.err
+@
+
+A group pattern that matches no group in any of the courses is different: it
+names something that is not there, like a mistyped course pattern.
+The command reports that as an error, and the script lets the error into the
+mail on purpose, since that is how the pattern gets corrected.
+The search for the group adds one line before it, here that the listings are
+more than the limit allows, and fetches nothing.
+That line used not to be there, when [[-A]] alone among the names was never
+looked up again; it is the price of [[-A]] behaving as the other names do.
+
+The line does not always come with an error.
+When the group was made in Canvas since the listings were fetched, and the
+listings are few enough to fetch, the line says that they are checked, the
+group is found, and the command reports the submissions as usual.
+The mail then has that one warning, in the first report after the group was
+made, and none after it.
+
+<<test functions>>=
+@responses.activate
+def test_a_group_pattern_without_a_group_warns_once_beside_the_error(
+    run_cli, capsys, any_listing_is_old_enough):
+  add_courses(30)
+  add_assignment_groups(30)
+  run_cli("users")
+  run_cli("assignments", "list")
+  run_miss(run_cli, capsys, "submissions", "list",
+           "-c", "Course", "-A", ".*", "-U")
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "submissions", "list",
+                     "-c", "Course", "-A", "Nothing", "-U")
+
+  assert printed.err.count("[WARNING]") == 1
+  assert NOT_FETCHING in printed.err
+  assert "[ERROR]" in printed.err
+  assert fetches_of("assignment_groups", 30) == 0
+
+@responses.activate
+def test_a_group_made_since_is_found_with_one_warning_and_no_error(
+    run_cli, capsys, any_listing_is_old_enough):
+  add_courses(3)
+  add_assignment_groups(3)
+  responses.replace(
+    responses.GET, f"{CANVAS_API}/courses/1/assignments",
+    json=[dict(LAB, id=101, course_id=1, assignment_group_id=7)])
+  responses.replace(
+    responses.GET, f"{CANVAS_API}/courses/1/assignments/101/submissions",
+    json=[{"id": 1, "user_id": ANNA["id"], "assignment_id": 101,
+           "workflow_state": "submitted", "grade": None,
+           "submitted_at": "2026-11-01T10:00:00Z"}])
+  run_cli("users")
+  run_cli("assignments", "list")
+  run_miss(run_cli, capsys, "submissions", "list",
+           "-c", "Course", "-A", "Labs", "-U")
+  responses.replace(
+    responses.GET, f"{CANVAS_API}/courses/1/assignment_groups",
+    json=[{"id": 7, "name": "Labs"}])
+  responses.calls.reset()
+
+  printed = run_miss(run_cli, capsys, "submissions", "list",
+                     "-c", "Course", "-A", "Labs", "-U", finds_nothing=False)
+
+  assert "Lab" in printed.out
+  assert printed.err.count("[WARNING]") == 1
+  assert "checking 3 listings of assignment groups" in printed.err
+  assert "[ERROR]" not in printed.err
+  assert fetches_of("assignment_groups", 3) == 3
 @
 
 

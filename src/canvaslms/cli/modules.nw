@@ -51,6 +51,10 @@ import canvasapi
 import canvaslms.cli
 import canvaslms.cli.utils
 import canvaslms.cli.courses as courses
+from canvaslms.hacks.canvasapi import (
+    refresh_after_miss,
+    retry_after_miss,
+)
 import csv
 import re
 import sys
@@ -153,10 +157,14 @@ Canvas server.
 import argparse
 import csv
 import io
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, create_autospec, patch
 
+import canvasapi.exceptions
 import pytest
+import responses
+from canvasapi import Canvas
 from canvasapi.assignment import Assignment
 from canvasapi.course import Course
 from canvasapi.file import File
@@ -164,6 +172,7 @@ from canvasapi.module import Module, ModuleItem
 from canvasapi.page import Page
 from canvasapi.quiz import Quiz
 
+import canvaslms.hacks.canvasapi
 import canvaslms.cli.modules as modules
 from canvaslms.cli.modules import *
 
@@ -304,7 +313,7 @@ outputs one row per module in CSV format.
 <<functions>>=
 def modules_list_command(config, canvas, args):
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   
   for course in course_list:
     modules = filter_modules(course, args.regex)
@@ -326,7 +335,7 @@ of Canvas IDs based on the [[--show-id]] flag.
 <<functions>>=
 def modules_view_command(config, canvas, args):
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
 
   for course in course_list:
     modules = filter_modules(course, args.regex)
@@ -597,7 +606,7 @@ def modules_move_command(config, canvas, args):
   if args.position < 1:
     canvaslms.cli.err(1, "Position must be 1 or greater")
   item_regex = re.compile(args.item)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   moved = []
   for course in course_list:
     for module in filter_modules(course, args.regex):
@@ -719,7 +728,7 @@ CONTENT_KINDS = ('page', 'assignment', 'quiz', 'file')
 def modules_add_item_command(config, canvas, args):
   """Add an item to each matching module, unless the module has it."""
   <<check that the options fit the kind of item>>
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   added = []
   moved = []
   for course in course_list:
@@ -806,6 +815,15 @@ inside the function, when the command actually runs, keeps the dependency
 one-way at load time.
 The match must be unique: an item points at one thing, and a regex that
 matches several pages says nothing about which one was meant.
+
+The content must be in every selected course, since the item is added in each
+of them, so here a course that lacks it is a miss by itself.
+Before giving up we look at that course's listing once more
+(\cref{sec:refresh-on-miss}), and a page written in the web interface can be
+put in a module right away.
+With one course to search, [[retry_after_miss]] can wrap the search itself,
+and the kind is also the name of the cached listing.
+The quiz filter does this itself, since it takes a list of courses.
 <<functions>>=
 def find_unique_content(course, kind, regex):
   """Return the one page, assignment, quiz or file of `course` matching `regex`.
@@ -816,15 +834,19 @@ def find_unique_content(course, kind, regex):
   import canvaslms.cli.files
   import canvaslms.cli.pages
   import canvaslms.cli.quizzes
+  def looked_up(find):
+    return list(retry_after_miss(find, [(course, kind)], pattern=regex))
   if kind == 'page':
-    matches = canvaslms.cli.pages.filter_pages(course, regex)
+    matches = looked_up(
+        lambda: canvaslms.cli.pages.filter_pages(course, regex))
     names = [page.title for page in matches]
   elif kind == 'assignment':
-    matches = list(
-        canvaslms.cli.assignments.filter_assignments([course], regex))
+    matches = looked_up(
+        lambda: canvaslms.cli.assignments.filter_assignments([course], regex))
     names = [assignment.name for assignment in matches]
   elif kind == 'file':
-    matches = canvaslms.cli.files.filter_files(course, regex)
+    matches = looked_up(
+        lambda: canvaslms.cli.files.filter_files(course, regex))
     names = [file.path for file in matches]
   else:
     matches = list(canvaslms.cli.quizzes.filter_quizzes([course], regex))
@@ -837,6 +859,40 @@ def find_unique_content(course, kind, regex):
                          f"{course.course_code}: "
                          + ", ".join(repr(name) for name in names))
   return matches[0]
+@
+
+Let's verify that content Canvas has got since the listing was cached is found,
+for each kind with a listing of its own.
+The course is a real one whose requests [[responses]] answers; it listed the
+kind an hour ago, when it was empty.
+<<test functions>>=
+CONTENT_SINCE = {
+  "page": ("pages", {"url": "new", "title": "New", "page_id": 3}),
+  "assignment": ("assignments", {"id": 8, "name": "New", "course_id": 1}),
+  "file": ("files", {"id": 20, "display_name": "New.pdf",
+                     "filename": "New.pdf", "folder_id": 1}),
+}
+
+@responses.activate
+@pytest.mark.parametrize("kind", CONTENT_SINCE)
+def test_content_canvas_has_got_since_is_found(kind):
+  path, new = CONTENT_SINCE[kind]
+  course_url = f"{API}/courses/1"
+  responses.get(f"{course_url}/folders",
+                json=[{"id": 1, "full_name": "course files"}])
+  responses.get(f"{course_url}/pages/new", json={**new, "body": ""})
+  responses.get(f"{course_url}/{path}", json=[])
+  listing = responses.get(f"{course_url}/{path}", json=[new])
+  course = Course(Canvas(SERVER, "token")._Canvas__requester,
+                  {"id": 1, "name": "Course", "course_code": "CODE"})
+  assert list(getattr(course, f"get_{path}")()) == []
+  setattr(course, f"{kind}_all_fetched", datetime.now() - timedelta(hours=1))
+
+  found = modules.find_unique_content(course, kind, "^New")
+
+  assert (getattr(found, "id", None) or found.page_id) == new.get(
+    "id", new.get("page_id"))
+  assert listing.call_count == 1
 @
 
 Recognising an item the module already has is the search
@@ -1111,7 +1167,7 @@ matters to a script that compares positions before and after.
 def modules_remove_item_command(config, canvas, args):
   """Remove one item from each matching module; its content stays."""
   item_regex = re.compile(args.item)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   removed = []
   for course in course_list:
     for module in filter_modules(course, args.regex):
@@ -1189,6 +1245,12 @@ Canvas is happy to create several modules with the same name, which in a
 script is almost always a re-run rather than an intention, so we refuse a
 name that already exists in the course unless [[--allow-duplicate]] says
 otherwise.
+The name must be absent from Canvas, not only from the cache, so when the
+cached listing lacks it we fetch the listing once more before we create
+anything (\cref{sec:refresh-on-miss}).
+The creation depends on that check, so the refresh is a [[required]] one: if
+it fails, the command fails with it and creates nothing.
+With [[--allow-duplicate]] there is nothing to check and nothing is fetched.
 The new module is printed as a [[modules list]] row, so that a script can
 read back what it created in the format it already parses.
 
@@ -1220,9 +1282,12 @@ def modules_create_command(config, canvas, args):
 @
 
 <<refuse to duplicate an existing module name>>=
-existing = [m for m in course.get_modules()
-            if canvaslms.cli.utils.ensure_module_attrs(m).name == args.name]
-if existing and not args.allow_duplicate:
+def modules_of_that_name():
+  return [m for m in course.get_modules()
+          if canvaslms.cli.utils.ensure_module_attrs(m).name == args.name]
+if not args.allow_duplicate and list(retry_after_miss(
+    modules_of_that_name, [(course, "module")], pattern=args.name,
+    required=True)):
   canvaslms.cli.err(1, f"Module '{args.name}' already exists in "
                        f"{course.course_code}; use --allow-duplicate to add "
                        "another")
@@ -1326,6 +1391,59 @@ def test_create_refuses_duplicate_name_unless_allowed(capsys):
   course, created = run_modules_create(["Week 1"], capsys, name="Week 1",
                                        allow_duplicate=True)
   course.create_module.assert_called_once()
+
+@responses.activate
+def test_create_refuses_the_name_of_a_module_canvas_has_got_since(caplog):
+  """The fake Canvas has no answer to a request that creates a module."""
+  course, listing = course_listed_an_hour_ago(
+    1, [], [module_json(12, "Week 2")])
+  args = argparse.Namespace(delimiter="\t", position=None, unlock_at=None,
+                            sequential=False, publish=False,
+                            allow_duplicate=False, name="Week 2",
+                            prerequisite=[])
+
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]), pytest.raises(SystemExit):
+    modules.modules_create_command({}, None, args)
+
+  assert "already exists" in caplog.text
+  assert listing.call_count == 1
+
+def run_create_after_an_hour(now, allow_duplicate=False, status=200):
+  """Run modules create "Week 2" on a course that listed no modules.
+
+  Canvas answers the listing with `now` and `status`. Returns the mocks of
+  the listing and of the request that creates the module.
+  """
+  course, listing = course_listed_an_hour_ago(1, [], now)
+  if status != 200:
+    listing = responses.replace(responses.GET, f"{API}/courses/1/modules",
+                                json={"errors": "down"}, status=status)
+  created = responses.post(f"{API}/courses/1/modules",
+                           json=module_json(13, "Week 2"))
+  args = argparse.Namespace(delimiter="\t", position=None, unlock_at=None,
+                            sequential=False, publish=False,
+                            allow_duplicate=allow_duplicate, name="Week 2",
+                            prerequisite=[])
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]), patch("time.sleep"):
+    modules.modules_create_command({}, None, args)
+  return listing, created
+
+@responses.activate
+def test_create_creates_nothing_when_canvas_cannot_be_asked(capsys):
+  with pytest.raises(canvasapi.exceptions.CanvasException):
+    run_create_after_an_hour([], status=503)
+  assert not [call for call in responses.calls
+              if call.request.method == "POST"]
+
+@responses.activate
+def test_create_with_allow_duplicate_does_not_ask_canvas(capsys):
+  listing, created = run_create_after_an_hour(
+    [module_json(12, "Week 2")], allow_duplicate=True)
+
+  assert created.call_count == 1
+  assert listing.call_count == 0
 @
 
 
@@ -1344,7 +1462,7 @@ listing and the question come before any deletion.
 <<functions>>=
 def modules_delete_command(config, canvas, args):
   """Delete the modules matching a regex, after confirmation."""
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   targets = [(course, module)
              for course in course_list
              for module in filter_modules(course, args.regex)]
@@ -1480,6 +1598,7 @@ def resolve_prerequisites(course, regexes, position):
   """
   ids = []
   for regex in regexes:
+    refresh_modules_after_miss([course], regex)
     matches = [canvaslms.cli.utils.ensure_module_attrs(m)
                for m in filter_modules(course, regex)]
     if not matches:
@@ -1506,7 +1625,7 @@ def modules_edit_command(config, canvas, args):
   """Edit the modules matching a regex and print them as list rows."""
   <<require at least one edit option>>
   output = csv.writer(sys.stdout, delimiter=args.delimiter)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   for course in course_list:
     matches = [canvaslms.cli.utils.ensure_module_attrs(m)
                for m in filter_modules(course, args.regex)]
@@ -1733,7 +1852,7 @@ def modules_require_command(config, canvas, args):
   """Set (or remove) the completion requirement of an item in each module."""
   requirement = <<the requirement chosen by the flags>>
   item_regex = re.compile(args.item)
-  course_list = courses.process_course_option(canvas, args)
+  course_list = courses_to_search(canvas, args)
   required = []
   for course in course_list:
     for module in filter_modules(course, args.regex):
@@ -1871,6 +1990,146 @@ def filter_modules(course, regex):
     module = canvaslms.cli.utils.ensure_module_attrs(module)
     if name.search(module.name or '') or name.search(str(module.id)):
       yield module
+@
+
+\subsection{Looking again when no module matches}
+\label{sec:modules-refresh-on-miss}
+
+A module created in the web interface a minute ago is not in the cached
+listing, and the user who names it is told that nothing matches.
+As for courses, users and assignments, we then look at what Canvas says once
+more before giving up (\cref{sec:refresh-on-miss}).
+
+That retry cannot sit inside [[filter_modules]].
+The function takes one course, and the commands call it for each selected
+course in turn, so it would see a miss in every course that lacks the module,
+although [[Week 3]] may well exist in one course round and not yet in the next.
+Each of those courses would fetch its listing, and nothing would limit how many.
+What counts as a miss is the name missing from every selected course.
+So we search all of them first, only for the effect on the cache: if the
+listings were refreshed, the command's own loop finds the new module in them
+without another request.
+<<functions>>=
+def refresh_modules_after_miss(course_list, regex, max_listings=None):
+  """Look at Canvas again if no module of `course_list` matches `regex`."""
+  refresh_after_miss(
+    regex,
+    lambda: (module for course in course_list
+                    for module in filter_modules(course, regex)),
+    [(course, "module") for course in course_list],
+    max_listings=max_listings)
+@
+
+Every command that selects modules by its [[regex]] argument starts by
+selecting courses, so that is where they all ask.
+How many listings a miss may fetch depends on whether [[-c]] narrowed the
+search, which [[miss_refresh_limit]] of the [[courses]] module tells.
+<<functions>>=
+def courses_to_search(canvas, args):
+  """Return the selected courses, for a search for the modules `args.regex`.
+
+  Their module listings are fetched again first if no module in any of
+  them matches.
+  """
+  course_list = courses.process_course_option(canvas, args)
+  refresh_modules_after_miss(course_list, args.regex,
+                             courses.miss_refresh_limit(args))
+  return course_list
+@
+
+Let's verify this with real courses whose requests [[responses]] answers, since
+the stubs of the other tests replace [[get_modules]] and with it the cache.
+Each course has listed its modules an hour ago.
+A module that Canvas has got since is found, at the cost of one listing, and
+a module that only one of two courses has is no reason to ask about the other.
+<<test functions>>=
+SERVER = "https://canvas.example.invalid"
+API = f"{SERVER}/api/v1"
+
+def module_json(module_id, name):
+  """Return a module as the module listing sends it."""
+  return {"id": module_id, "name": name, "position": 1, "unlock_at": None,
+          "require_sequential_progress": False,
+          "prerequisite_module_ids": [], "published": True, "items_count": 0}
+
+def course_listed_an_hour_ago(course_id, cached, now):
+  """Return a course that cached the modules `cached`; Canvas has `now`.
+
+  Also returns the mock of the listing, which counts the requests.
+  """
+  url = f"{API}/courses/{course_id}/modules"
+  responses.get(url, json=cached)
+  listing = responses.get(url, json=now)
+  course = Course(Canvas(SERVER, "token")._Canvas__requester,
+                  {"id": course_id, "name": "Course",
+                   "course_code": f"CODE{course_id}"})
+  assert len(list(course.get_modules())) == len(cached)
+  course.module_all_fetched = datetime.now() - timedelta(hours=1)
+  return course, listing
+
+def listed_modules(course_list, regex, course_regex="CODE"):
+  """Return the rows that modules list prints for `regex` in `course_list`."""
+  args = argparse.Namespace(regex=regex, course=course_regex, delimiter="\t")
+  out = io.StringIO()
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=course_list), patch("sys.stdout", out):
+    modules.modules_list_command({}, None, args)
+  return [row.split("\t") for row in out.getvalue().splitlines()]
+
+@responses.activate
+def test_a_module_canvas_has_got_since_is_found():
+  week_1, week_2 = module_json(11, "Week 1"), module_json(12, "Week 2")
+  course, listing = course_listed_an_hour_ago(1, [week_1], [week_1, week_2])
+
+  rows = listed_modules([course], "Week 2")
+
+  assert [row[1] for row in rows] == ["Week 2"]
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_module_in_one_course_does_not_refresh_the_other():
+  week_1, week_2 = module_json(11, "Week 1"), module_json(12, "Week 2")
+  has_it, _ = course_listed_an_hour_ago(1, [week_1, week_2], [])
+  lacks_it, listing = course_listed_an_hour_ago(2, [week_1], [week_1, week_2])
+
+  rows = listed_modules([has_it, lacks_it], "Week 2")
+
+  assert [row[0] for row in rows] == ["CODE1"]
+  assert listing.call_count == 0
+
+@responses.activate
+def test_listing_all_modules_of_an_empty_course_does_not_ask_again():
+  course, listing = course_listed_an_hour_ago(1, [], [module_json(11, "W")])
+
+  assert listed_modules([course], ".*") == []
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_search_of_all_courses_keeps_to_the_smaller_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 1)
+  week_2 = module_json(12, "Week 2")
+  searched = [course_listed_an_hour_ago(course_id, [], [week_2])
+              for course_id in (1, 2)]
+
+  rows = listed_modules([course for course, _ in searched], "Week 2",
+                        course_regex=".*")
+
+  assert rows == []
+  assert [listing.call_count for _, listing in searched] == [0, 0]
+@
+
+A prerequisite is a module named by a regex as well, in one course, so the
+same applies to it: a module created just before in the web interface can be
+made a prerequisite right away.
+<<test functions>>=
+@responses.activate
+def test_a_prerequisite_canvas_has_got_since_is_found():
+  week_1, week_2 = module_json(11, "Week 1"), module_json(12, "Week 2")
+  course, listing = course_listed_an_hour_ago(1, [week_1], [week_1, week_2])
+
+  assert modules.resolve_prerequisites(course, ["Week 2"], None) == [12]
+  assert listing.call_count == 1
 @
 
 
@@ -2635,7 +2894,25 @@ and the completion requirement the user asked for; a later spec overwrites
 an earlier one, which gives the \enquote{last one wins} rule, and a spec
 without a position (or requirement) leaves no entry, which is how
 \enquote{absent means don't touch} falls out.
+
+A pattern that matches no module is not an error here: the item is simply not
+put anywhere for it.
+That makes a stale listing easy to overlook, since a module made in the web
+interface a moment ago is silently left out.
+So if any pattern matches nothing we first look at the course's module
+listing in Canvas once more (\cref{sec:refresh-on-miss}).
+That is one question for all the patterns, so that several patterns without
+a module cost one listing, also when the refresh fails.
 <<find modules matching regex patterns>>=
+def every_pattern_has_a_module():
+  names = [(module.name, str(module.id))
+           for module in map(canvaslms.cli.utils.ensure_module_attrs,
+                             course.get_modules())]
+  return [True] if all(
+    any(re.search(pattern, name) or re.search(pattern, module_id)
+        for name, module_id in names)
+    for pattern, _, _ in module_specs) else []
+list(retry_after_miss(every_pattern_has_a_module, [(course, "module")]))
 all_modules = [
     canvaslms.cli.utils.ensure_module_attrs(module)
     for module in course.get_modules()
@@ -2960,6 +3237,45 @@ def test_last_spec_with_position_wins():
       "^Week 1$"])
   module.create_module_item.assert_called_once_with(
       {'type': 'Assignment', 'content_id': 42, 'position': 4})
+
+@responses.activate
+def test_update_adds_the_item_to_a_module_canvas_has_got_since():
+  """A real course, as in the tests of the refresh after a miss.
+
+  One pattern has its module in the cache already, which must not keep
+  us from looking for the module of the other.
+  """
+  week_1, week_2 = module_json(11, "Week 1"), module_json(12, "Week 2")
+  course, listing = course_listed_an_hour_ago(1, [week_1], [week_1, week_2])
+  created = []
+  for module_id in (11, 12):
+    items = f"{API}/courses/1/modules/{module_id}/items"
+    responses.get(items, json=[])
+    created.append(responses.post(items, json={
+      "id": 10 * module_id, "module_id": module_id, "title": "Lab",
+      "type": "Assignment", "content_id": 42, "position": 1}))
+
+  added, removed, moved, required = update_item_modules(
+    course, 'Assignment', 42, ["^Week 1$", "^Week 2$"])
+
+  assert (added, removed) == (["Week 1", "Week 2"], [])
+  assert [post.call_count for post in created] == [1, 1]
+  assert listing.call_count == 1
+
+@responses.activate
+def test_update_asks_once_for_several_patterns_when_canvas_is_down(caplog):
+  course, _ = course_listed_an_hour_ago(1, [module_json(11, "Week 1")], [])
+  listing = responses.replace(responses.GET, f"{API}/courses/1/modules",
+                              json={"errors": "down"}, status=503)
+  responses.get(f"{API}/courses/1/modules/11/items", json=[])
+
+  with caplog.at_level(logging.WARNING):
+    added, removed, moved, required = update_item_modules(
+      course, 'Assignment', 42, ["^Week 2$", "^Week 3$", "^Week 4$"])
+
+  assert (added, removed) == ([], [])
+  assert listing.call_count == 1
+  assert caplog.text.count("Could not refresh") == 1
 
 def test_update_rejects_malformed_specs():
   course, module = one_module_course([])
