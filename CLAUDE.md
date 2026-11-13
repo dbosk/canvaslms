@@ -965,7 +965,13 @@ objects (`file.course`, `file.path`), never the cached objects themselves.
 
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
-a command or on `EmptyListError`.
+a command or on `EmptyListError`. A filter that takes one course
+(`filter_pages`, `filter_modules`, `filter_files`) must not retry inside: the
+command calls `refresh_after_miss` once before its loop over the courses
+(`refresh_pages_after_miss` and its siblings), so that a course lacking the name
+is not a miss of its own. Pass `courses.miss_refresh_limit(args)` as
+`max_listings`. `-A` (assignment groups) has no refresh on purpose: `ungraded.sh`
+names a group from cron and must never warn.
 
 The cache file is shared with programs holding their own, possibly older, copy
 of this library (nytid, fbf), so keep it readable by them: do not bump the schema
