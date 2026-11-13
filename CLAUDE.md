@@ -969,8 +969,12 @@ a command or on `EmptyListError`. A filter that takes one course
 (`filter_pages`, `filter_modules`, `filter_files`) must not retry inside: the
 command calls `refresh_after_miss` once before its loop over the courses
 (`refresh_pages_after_miss` and its siblings), so that a course lacking the name
-is not a miss of its own. Pass `courses.miss_refresh_limit(args)` as
-`max_listings`. `-A` (assignment groups) has no refresh on purpose: `ungraded.sh`
+is not a miss of its own. A filter that does retry inside (`filter_quizzes`,
+`filter_groups`, `filter_group_categories`, `filter_users`) must get everything
+that is searched in one call, never one course or category at a time. A lookup
+whose miss leads to a write (`--create`, `modules create`) must refresh before
+it creates (`content.match_after_refresh`). Pass
+`courses.miss_refresh_limit(args)` as `max_listings`. `-A` (assignment groups) has no refresh on purpose: `ungraded.sh`
 names a group from cron and must never warn.
 
 The cache file is shared with programs holding their own, possibly older, copy
