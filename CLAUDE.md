@@ -956,9 +956,12 @@ and keep the state a plain dict.
 
 Files and folders are cached on the course; a file or folder fetched alone
 expires after `DEFAULT_CACHE_TTL_DAYS`, since exporting links never reads the
-listing. A command that writes puts what Canvas answered in the cache
-(`remember_file`) and marks a listing as not fetched when it cannot know what
-else changed (`distrust_file_listings` after an upload).
+listing; the limit is in the singular getter (`fetched_alone_long_ago`), not
+in `outdated()`, which the plural getter asks about every entry. A command
+that writes puts what Canvas answered in the cache (`remember_file`) and marks
+a listing as not fetched when it cannot know what else changed
+(`distrust_file_listings` after an upload). Commands annotate copies of cached
+objects (`file.course`, `file.path`), never the cached objects themselves.
 
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
@@ -986,8 +989,9 @@ versions discard each other's cache, see Cache Freshness:
   (`__unlisted` on assignments, `_unlisted` on cached objects);
 - a new `CacheGetMethods` wrap: the wrapped getters create the `{attr}_cache`
   and `{attr}_all_fetched` of an object stored before the wrap. Code outside
-  the getters reaches a cache through `cached_entries(owner, attr)`, never
-  `owner.{attr}_cache` directly, for a kind added after 6.26.
+  the getters reaches the cache of such a kind (`file` and `folder` so far)
+  through `cached_entries(owner, attr)`, never `owner.{attr}_cache` directly,
+  since some copy sharing the file may have stored the object without it.
 
 ## Output Conventions
 

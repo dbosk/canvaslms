@@ -52,6 +52,7 @@ called; [[links]] depends on nothing here, so there is no cycle.
 <<[[files.py]]>>=
 """The files command: list, upload and edit course files."""
 
+import copy
 import csv
 from datetime import datetime
 import os
@@ -98,6 +99,7 @@ from datetime import timedelta
 import urllib.parse
 from unittest.mock import patch
 
+import canvasapi.file
 import pytest
 import responses
 from canvasapi import Canvas
@@ -202,6 +204,9 @@ path and a link to a file that is not there.
 The path of a folder comes from [[links.folder_path]], which strips the
 [[course files]] prefix that every folder's full name starts with.
 We keep the path, and the course for the output, on the file object.
+That object is a copy of the cached one: the two are ours, for this run, and
+the cache should hold the file as Canvas sent it
+(\cref{sec:files-upload-cache}).
 <<functions>>=
 def list_course_files(course):
   """Return the files of `course`, each with its `path` and `course` set.
@@ -213,7 +218,7 @@ def list_course_files(course):
              for folder in course.get_folders()}
   files = []
   for file in course.get_files():
-    file = canvaslms.cli.utils.ensure_file_attrs(file)
+    file = copy.copy(canvaslms.cli.utils.ensure_file_attrs(file))
     file.course = course
     if file.folder_id not in folders:
       folders[file.folder_id] = canvaslms.cli.links.folder_path(
@@ -739,6 +744,8 @@ whether Canvas made the folder for it.
 So we do two things.
 The new file goes into the cache, where a link to it by identifier finds it
 without a request.
+What goes in is a copy without the path and the course that the commands put
+on a file, so that the caller can go on using its own.
 And both listings are marked as not fetched, so the next command that lists
 files fetches them, which also forgets the file that was replaced
 (\cref{sec:forget-unlisted}).
@@ -749,8 +756,11 @@ def remember_file(course, file):
   """Put `file`, as Canvas just returned it, in the cache of `course`."""
   entries = cached_entries(course, "file")
   _, fetched_with = entries.get(file.id, (None, {}))
-  file._fetched_at = datetime.now()
-  entries[file.id] = (file, fetched_with)
+  stored = copy.copy(file)
+  for ours in ("course", "path"):
+    vars(stored).pop(ours, None)
+  stored._fetched_at = datetime.now()
+  entries[file.id] = (stored, fetched_with)
 
 def distrust_file_listings(course):
   """Have the next reader fetch the files and folders of `course` again."""
@@ -804,6 +814,84 @@ def test_an_uploaded_file_grows_old_like_a_fetched_one(tmp_path):
   course.get_file(20)._fetched_at -= timedelta(days=365)
 
   assert course.get_file(20).display_name == "renamed.pdf"
+@
+
+The cache must hold the files as Canvas sent them.
+The path and the course that the commands put on a file for their own use are
+recomputed on every run, and stored with the file they would be worse than
+useless: the course would be the object of that run, which the cache replaces
+whenever it fetches the course list, so every cached file would keep an old
+course alive and have it written to the cache file as well.
+An entry that is replaced keeps the record of what it was fetched with.
+
+<<test functions>>=
+@responses.activate
+def test_cached_files_carry_neither_course_nor_path(tmp_path, capsys):
+  serve_listing(responses)
+  responses.put(f"{API}/files/10",
+                json=file_json(10, "lab1.pdf", 2, locked=True))
+  serve_upload(responses, file_json(20, "lab3.pdf", 2))
+  course = canvasapi_course(Canvas(SERVER, "token"))
+
+  listed = list_course_files(course)
+  run(files_edit_command, course,
+      file="^handouts/lab1", folder=None, locked=True, hidden=None)
+  run(files_upload_command, course, **upload_args(tmp_path))
+
+  assert listed[0].course is course and listed[0].path == "handouts/lab1.pdf"
+  assert set(course.file_cache) == {10, 11, 12, 13, 14, 20}
+  for file, _ in course.file_cache.values():
+    assert not hasattr(file, "course") and not hasattr(file, "path")
+  assert course.file_cache[10][0].locked
+
+def test_a_remembered_file_keeps_what_its_entry_was_fetched_with():
+  course = canvasapi_course(Canvas(SERVER, "token"))
+  old = canvasapi.file.File(None, file_json(10, "lab1.pdf", 2))
+  course.file_cache[10] = (old, {"include": ["user"]})
+
+  remember_file(course, canvasapi.file.File(
+      None, file_json(10, "lab1.pdf", 2, locked=True)))
+
+  file, fetched_with = course.file_cache[10]
+  assert file.locked and fetched_with == {"include": ["user"]}
+@
+
+An upload can also create the folder it uploads into, and a link to the new
+file names that folder.
+Usually the upload learns of the folder itself, when it looks up where the
+file landed, and that lookup puts the folder in the cache.
+But the lookup can fail, and the upload goes on without it; and an upload into
+[[a/b]] can create [[a]] as well, which nobody looks up.
+The folder listing may have been fetched a moment ago, too recently for a
+lookup that finds nothing to ask again (\cref{sec:refresh-on-miss}), so it is
+the upload that must say the listing is no longer to be trusted.
+In the test the lookup of the folder fails.
+
+<<test functions>>=
+@responses.activate
+def test_a_link_into_a_folder_made_by_an_upload_resolves_at_once(tmp_path):
+  serve_listing(responses)
+  course = canvasapi_course(Canvas(SERVER, "token"))
+  list_course_files(course)
+  made = folder_json(6, "course files/new", 1)
+  uploaded = file_json(20, "lab1.pdf", 6)
+  responses.post(f"{API}/courses/1/files",
+                 json={"upload_url": "https://upload.example.invalid/x",
+                       "upload_params": {"key": "SYNTHETIC"}})
+  responses.post("https://upload.example.invalid/x", json=uploaded)
+  responses.get(f"{API}/courses/1/folders/6", status=500)
+
+  run(files_upload_command, course,
+      **upload_args(tmp_path, folder="/new/"))
+  assert 6 not in course.folder_cache
+  responses.replace(responses.GET, f"{API}/courses/1/folders",
+                    json=FOLDERS + [made])
+  responses.replace(responses.GET, f"{API}/courses/1/files",
+                    json=FILES + [uploaded])
+
+  found = canvaslms.cli.links.CourseIndex(course).file_candidates(
+      "new", "lab1.pdf")
+  assert [file.id for file in found] == [20]
 @
 
 
