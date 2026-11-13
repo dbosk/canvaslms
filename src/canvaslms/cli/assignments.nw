@@ -32,10 +32,7 @@ import canvaslms.cli.content
 import canvaslms.cli.courses as courses
 import canvaslms.cli.links
 import canvaslms.cli.modules as modules
-from canvaslms.hacks.canvasapi import (
-    pattern_names_something,
-    retry_after_miss,
-)
+from canvaslms.hacks.canvasapi import refresh_after_miss
 import canvaslms.cli.submissions as submissions
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
@@ -85,6 +82,7 @@ the helpers they verify.
 import argparse
 import pytest
 import requests
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 import canvasapi.course
@@ -293,21 +291,131 @@ filters, which are no reason to fetch anything.
 We therefore search by name alone first, and do so only for the effect on the
 cache: if there was a miss, the filtering below finds the new assignments in the
 refreshed listings, and no additional requests are made.
+That is what [[refresh_after_miss]] is for.
 <<refresh assignment listings if no name matches>>=
-if pattern_names_something(args.assignment):
-  list(retry_after_miss(
-    lambda: filter_assignments(course_list, args.assignment),
-    [(course, "assignment") for course in course_list],
-    max_listings=courses.miss_refresh_limit(args),
-    pattern=args.assignment))
+refresh_after_miss(
+  args.assignment,
+  lambda: filter_assignments(course_list, args.assignment),
+  [(course, "assignment") for course in course_list],
+  max_listings=courses.miss_refresh_limit(args))
+@
+
+The [[-M]] option names something too, a module, and its name can be missing
+from the cache in the same way: the module was made in the web interface since
+the listing was fetched.
+Without a refresh the command reports that no assignment matches, which is
+true and misleading.
+We treat it as we treat the assignment name, with the search that the
+[[modules]] commands use (\cref{sec:modules-refresh-on-miss}).
+Only the name is looked for.
+A module that is found but holds none of the assignments is an answer, not a
+miss.
+
+The [[-A]] option is left as it was, on purpose.
+The shipped [[ungraded.sh]] gives an assignment group pattern for every line of
+its configuration, from cron, and a pattern for a group that does not exist yet
+would then warn by mail on every run once the courses selected are more than
+the limit allows (\cref{sec:refresh-on-miss}).
+An assignment group is also rarely new: it is set up with the course, not
+during it.
+<<refresh module listings if no name matches>>=
+modules.refresh_modules_after_miss(
+  course_list, getattr(args, "module", None),
+  courses.miss_refresh_limit(args))
 <<process options for selecting assignments to assignments list>>=
 <<refresh assignment listings if no name matches>>
+<<refresh module listings if no name matches>>
 assignments_list = []
 
 for course in course_list:
   <<get ungraded flag>>
   <<apply sequential filters to get filtered assignments>>
   assignments_list += filtered_assignments
+@
+
+Let's verify this with a real course whose requests [[responses]] answers.
+The course listed its assignments just now, and its assignment groups and
+modules an hour ago, before the group and the module asked for existed.
+The assignment is found through the new module, with one more listing of the
+modules, while the new assignment group is not looked for.
+<<test functions>>=
+MISS_API = "https://canvas.example.invalid/api/v1/courses/1"
+
+def course_with_old_group_and_module_listings():
+  """Return a course, and the mocks of its group and module listings.
+
+  Canvas has an assignment group Exams and a module Week 2, both holding
+  the assignment Exam; the course cached the two listings before that,
+  with the group Labs and the empty module Week 1.
+  """
+  responses.get(f"{MISS_API}/assignments", json=[
+    {"id": 8, "name": "Exam", "course_id": 1, "assignment_group_id": 2}])
+  responses.get(f"{MISS_API}/assignment_groups",
+                json=[{"id": 1, "name": "Labs"}])
+  groups = responses.get(f"{MISS_API}/assignment_groups", json=[
+    {"id": 1, "name": "Labs"}, {"id": 2, "name": "Exams"}])
+  week_1 = {"id": 11, "name": "Week 1", "items_count": 0}
+  responses.get(f"{MISS_API}/modules", json=[week_1])
+  module_listing = responses.get(f"{MISS_API}/modules", json=[
+    week_1, {"id": 12, "name": "Week 2", "items_count": 1}])
+  responses.get(f"{MISS_API}/modules/11/items", json=[])
+  responses.get(f"{MISS_API}/modules/12/items", json=[
+    {"id": 120, "module_id": 12, "title": "Exam", "type": "Assignment",
+     "content_id": 8, "position": 1}])
+  course = Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "name": "Course", "course_code": "CODE"})
+  list(course.get_assignments())
+  list(course.get_assignment_groups())
+  list(course.get_modules())
+  an_hour_ago = datetime.now() - timedelta(hours=1)
+  course.assignment_group_all_fetched = an_hour_ago
+  course.module_all_fetched = an_hour_ago
+  return course, groups, module_listing
+
+def selected_assignments(searched, **options):
+  """Return the names that the assignment options select in `searched`."""
+  args = argparse.Namespace(**{"course": "CODE", "assignment": ".*",
+                               "assignment_group": "", "module": "",
+                               **options})
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[searched]):
+    return [assignment.name
+            for assignment in process_assignment_option(None, args)]
+
+@responses.activate
+def test_a_module_canvas_has_got_since_selects_its_assignments():
+  course, groups, modules_listing = course_with_old_group_and_module_listings()
+
+  assert selected_assignments(course, module="Week 2") == ["Exam"]
+  assert modules_listing.call_count == 1
+  assert groups.call_count == 0
+
+@responses.activate
+def test_an_assignment_group_canvas_has_got_since_is_not_looked_for():
+  course, groups, _ = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, assignment_group="Exams")
+  assert groups.call_count == 0
+
+@responses.activate
+def test_a_module_search_of_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, _, modules_listing = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, course=".*", module="Week 2")
+  assert modules_listing.call_count == 0
+
+@responses.activate
+def test_a_module_that_holds_no_assignment_is_not_a_miss():
+  course, _, modules_listing = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, module="Week 1")
+  assert modules_listing.call_count == 0
 @
 
 We check if the [[ungraded]] flag is set, defaulting to [[False]] if the
