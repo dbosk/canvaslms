@@ -925,8 +925,9 @@ name matches nothing (`retry_after_miss`), `--refresh-cache` (`request_refresh`)
 and repair on read of a listing stored with a restriction. They add and update
 entries; do not make them discard cached children (replace objects through
 `<<update [[obj]] with cache from [[old_obj]]>>`). The one exception: a complete,
-unrestricted fetch of a listing decorated with `forget_unlisted=True` (only
-`Canvas.get_courses` and `Course.get_assignments`) that returns at least one
+unrestricted fetch of a listing decorated with `forget_unlisted=True`
+(`Canvas.get_courses`, and `Course.get_assignments`, `get_files` and
+`get_folders`) that returns at least one
 entry removes the entries Canvas did not return, children and all (a course only
 after a one-try `get_course` for it gets a 404 or a 403, `confirm_unlisted=True`); a 404
 on an individual refresh removes that one object. Users and submissions are never
@@ -952,6 +953,12 @@ excludes, and a save is forced once when an exclusion is new. A new decorator
 that caches personal data must add its kind to `PERSONAL_DATA_KINDS`. A
 filter must leave attributes in place (emptied), never change the live object,
 and keep the state a plain dict.
+
+Files and folders are cached on the course; a file or folder fetched alone
+expires after `DEFAULT_CACHE_TTL_DAYS`, since exporting links never reads the
+listing. A command that writes puts what Canvas answered in the cache
+(`remember_file`) and marks a listing as not fetched when it cannot know what
+else changed (`distrust_file_listings` after an upload).
 
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
