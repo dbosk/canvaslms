@@ -51,7 +51,10 @@ import canvasapi
 import canvaslms.cli
 import canvaslms.cli.utils
 import canvaslms.cli.courses as courses
-from canvaslms.hacks.canvasapi import refresh_after_miss
+from canvaslms.hacks.canvasapi import (
+    refresh_after_miss,
+    retry_after_miss,
+)
 import csv
 import re
 import sys
@@ -810,6 +813,15 @@ inside the function, when the command actually runs, keeps the dependency
 one-way at load time.
 The match must be unique: an item points at one thing, and a regex that
 matches several pages says nothing about which one was meant.
+
+The content must be in every selected course, since the item is added in each
+of them, so here a course that lacks it is a miss by itself.
+Before giving up we look at that course's listing once more
+(\cref{sec:refresh-on-miss}), and a page written in the web interface can be
+put in a module right away.
+With one course to search, [[retry_after_miss]] can wrap the search itself,
+and the kind is also the name of the cached listing.
+The quiz filter does this itself, since it takes a list of courses.
 <<functions>>=
 def find_unique_content(course, kind, regex):
   """Return the one page, assignment, quiz or file of `course` matching `regex`.
@@ -820,15 +832,19 @@ def find_unique_content(course, kind, regex):
   import canvaslms.cli.files
   import canvaslms.cli.pages
   import canvaslms.cli.quizzes
+  def looked_up(find):
+    return list(retry_after_miss(find, [(course, kind)], pattern=regex))
   if kind == 'page':
-    matches = canvaslms.cli.pages.filter_pages(course, regex)
+    matches = looked_up(
+        lambda: canvaslms.cli.pages.filter_pages(course, regex))
     names = [page.title for page in matches]
   elif kind == 'assignment':
-    matches = list(
-        canvaslms.cli.assignments.filter_assignments([course], regex))
+    matches = looked_up(
+        lambda: canvaslms.cli.assignments.filter_assignments([course], regex))
     names = [assignment.name for assignment in matches]
   elif kind == 'file':
-    matches = canvaslms.cli.files.filter_files(course, regex)
+    matches = looked_up(
+        lambda: canvaslms.cli.files.filter_files(course, regex))
     names = [file.path for file in matches]
   else:
     matches = list(canvaslms.cli.quizzes.filter_quizzes([course], regex))
@@ -841,6 +857,40 @@ def find_unique_content(course, kind, regex):
                          f"{course.course_code}: "
                          + ", ".join(repr(name) for name in names))
   return matches[0]
+@
+
+Let's verify that content Canvas has got since the listing was cached is found,
+for each kind with a listing of its own.
+The course is a real one whose requests [[responses]] answers; it listed the
+kind an hour ago, when it was empty.
+<<test functions>>=
+CONTENT_SINCE = {
+  "page": ("pages", {"url": "new", "title": "New", "page_id": 3}),
+  "assignment": ("assignments", {"id": 8, "name": "New", "course_id": 1}),
+  "file": ("files", {"id": 20, "display_name": "New.pdf",
+                     "filename": "New.pdf", "folder_id": 1}),
+}
+
+@responses.activate
+@pytest.mark.parametrize("kind", CONTENT_SINCE)
+def test_content_canvas_has_got_since_is_found(kind):
+  path, new = CONTENT_SINCE[kind]
+  course_url = f"{API}/courses/1"
+  responses.get(f"{course_url}/folders",
+                json=[{"id": 1, "full_name": "course files"}])
+  responses.get(f"{course_url}/pages/new", json={**new, "body": ""})
+  responses.get(f"{course_url}/{path}", json=[])
+  listing = responses.get(f"{course_url}/{path}", json=[new])
+  course = Course(Canvas(SERVER, "token")._Canvas__requester,
+                  {"id": 1, "name": "Course", "course_code": "CODE"})
+  assert list(getattr(course, f"get_{path}")()) == []
+  setattr(course, f"{kind}_all_fetched", datetime.now() - timedelta(hours=1))
+
+  found = modules.find_unique_content(course, kind, "^New")
+
+  assert (getattr(found, "id", None) or found.page_id) == new.get(
+    "id", new.get("page_id"))
+  assert listing.call_count == 1
 @
 
 Recognising an item the module already has is the search
