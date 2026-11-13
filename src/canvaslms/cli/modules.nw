@@ -1248,6 +1248,9 @@ otherwise.
 The name must be absent from Canvas, not only from the cache, so when the
 cached listing lacks it we fetch the listing once more before we create
 anything (\cref{sec:refresh-on-miss}).
+The creation depends on that check, so the refresh is a [[required]] one: if
+it fails, the command fails with it and creates nothing.
+With [[--allow-duplicate]] there is nothing to check and nothing is fetched.
 The new module is printed as a [[modules list]] row, so that a script can
 read back what it created in the format it already parses.
 
@@ -2896,13 +2899,20 @@ A pattern that matches no module is not an error here: the item is simply not
 put anywhere for it.
 That makes a stale listing easy to overlook, since a module made in the web
 interface a moment ago is silently left out.
-So for a pattern that matches nothing we first look at the course's module
-listing in Canvas once more (\cref{sec:modules-refresh-on-miss}).
-The first such pattern fetches the listing, and it is then too fresh for the
-others to fetch it again.
+So if any pattern matches nothing we first look at the course's module
+listing in Canvas once more (\cref{sec:refresh-on-miss}).
+That is one question for all the patterns, so that several patterns without
+a module cost one listing, also when the refresh fails.
 <<find modules matching regex patterns>>=
-for pattern, _, _ in module_specs:
-  refresh_modules_after_miss([course], pattern)
+def every_pattern_has_a_module():
+  names = [(module.name, str(module.id))
+           for module in map(canvaslms.cli.utils.ensure_module_attrs,
+                             course.get_modules())]
+  return [True] if all(
+    any(re.search(pattern, name) or re.search(pattern, module_id)
+        for name, module_id in names)
+    for pattern, _, _ in module_specs) else []
+list(retry_after_miss(every_pattern_has_a_module, [(course, "module")]))
 all_modules = [
     canvaslms.cli.utils.ensure_module_attrs(module)
     for module in course.get_modules()
@@ -3230,21 +3240,42 @@ def test_last_spec_with_position_wins():
 
 @responses.activate
 def test_update_adds_the_item_to_a_module_canvas_has_got_since():
-  """A real course, as in the tests of the refresh after a miss."""
-  course, listing = course_listed_an_hour_ago(
-    1, [], [module_json(12, "Week 2")])
-  items = f"{API}/courses/1/modules/12/items"
-  responses.get(items, json=[])
-  created = responses.post(items, json={
-    "id": 120, "module_id": 12, "title": "Lab", "type": "Assignment",
-    "content_id": 42, "position": 1})
+  """A real course, as in the tests of the refresh after a miss.
+
+  One pattern has its module in the cache already, which must not keep
+  us from looking for the module of the other.
+  """
+  week_1, week_2 = module_json(11, "Week 1"), module_json(12, "Week 2")
+  course, listing = course_listed_an_hour_ago(1, [week_1], [week_1, week_2])
+  created = []
+  for module_id in (11, 12):
+    items = f"{API}/courses/1/modules/{module_id}/items"
+    responses.get(items, json=[])
+    created.append(responses.post(items, json={
+      "id": 10 * module_id, "module_id": module_id, "title": "Lab",
+      "type": "Assignment", "content_id": 42, "position": 1}))
 
   added, removed, moved, required = update_item_modules(
-    course, 'Assignment', 42, ["^Week 2$", "^Week 3$"])
+    course, 'Assignment', 42, ["^Week 1$", "^Week 2$"])
 
-  assert (added, removed) == (["Week 2"], [])
-  assert created.call_count == 1
+  assert (added, removed) == (["Week 1", "Week 2"], [])
+  assert [post.call_count for post in created] == [1, 1]
   assert listing.call_count == 1
+
+@responses.activate
+def test_update_asks_once_for_several_patterns_when_canvas_is_down(caplog):
+  course, _ = course_listed_an_hour_ago(1, [module_json(11, "Week 1")], [])
+  listing = responses.replace(responses.GET, f"{API}/courses/1/modules",
+                              json={"errors": "down"}, status=503)
+  responses.get(f"{API}/courses/1/modules/11/items", json=[])
+
+  with caplog.at_level(logging.WARNING):
+    added, removed, moved, required = update_item_modules(
+      course, 'Assignment', 42, ["^Week 2$", "^Week 3$", "^Week 4$"])
+
+  assert (added, removed) == ([], [])
+  assert listing.call_count == 1
+  assert caplog.text.count("Could not refresh") == 1
 
 def test_update_rejects_malformed_specs():
   course, module = one_module_course([])
