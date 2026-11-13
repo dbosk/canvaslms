@@ -977,8 +977,8 @@ each course must have the item by itself (`find_unique_content`,
 `modules create`) must refresh before it creates, with
 `retry_after_miss(..., required=True)` or `content.match_after_refresh`, so that
 a failed refresh raises and nothing is created. Pass
-`courses.miss_refresh_limit(args)` as `max_listings`. `-A` (assignment groups) has no refresh on purpose: `ungraded.sh`
-names a group from cron and must never warn.
+`courses.miss_refresh_limit(args)` as `max_listings`. `ungraded.sh` runs from cron, which mails stderr: a
+name that is found must print nothing (`test_a_search_like_that_of_ungraded_sh_never_warns`).
 
 The cache file is shared with programs holding their own, possibly older, copy
 of this library (nytid, fbf), so keep it readable by them: do not bump the schema
