@@ -1368,6 +1368,9 @@ cls.__init__ = new_init
 We do the same thing for the singular and plural get methods.
 We get the original method, then wrap it in a new method that adds suitable 
 caching or falls back to the original [[get_*]] function.
+Each wrapper starts by making sure the cache attributes are there, with the
+constructor's own chunk; \cref{sec:cache-attributes-on-read} explains for
+which objects the constructor has not done it.
 <<update the singular method>>=
 singular_name = f"get_{self.__attribute_name}"
 get_attr = getattr(cls, singular_name)
@@ -1376,6 +1379,7 @@ cache_key = self.__cache_key
 @functools.wraps(get_attr)
 def new_get_attr(self, *args, **kwargs):
   report_setting_problems()
+  <<construct [[attr_name]] cache attributes in [[self]]>>
   <<return cached result or fetch from [[get_attr]]>>
 
 setattr(cls, singular_name, new_get_attr)
@@ -1394,6 +1398,7 @@ confirm_unlisted = self.__confirm_unlisted
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
   report_setting_problems()
+  <<construct [[attr_name]] cache attributes in [[self]]>>
   <<return cached result or fetch from [[get_attrs]]>>
 
 setattr(cls, plural_name, new_get_attrs)
@@ -1539,6 +1544,91 @@ class TestCacheAttributeInjection:
 
         assert instance.value == 42
         assert hasattr(instance, "item_cache")
+@
+
+\subsubsection{Objects that were stored before their class was decorated}
+\label{sec:cache-attributes-on-read}
+
+The constructor is not the only way an object comes to be.
+One that is read from the cache file is unpickled, and unpickling sets the
+attributes that were stored without running any constructor.
+An object stored before its class cached this attribute, by an earlier version
+or by another program with an older copy of this library, therefore has no
+[[_cache]] and no [[_all_fetched]], and the wrapped methods would fail on
+their first line.
+
+That used to be why caching one more attribute needed a new schema version in
+[[cli/cache.nw]], which discards everyone's cache file, and with programs of
+different versions sharing the file, discards it again and again.
+It is simpler to make the attributes when they are first needed.
+The wrapped methods run the constructor's chunk before anything else, so an
+object without the attributes gets them empty, which is the truth: nothing of
+this kind has been fetched through it.
+In the other direction nothing is needed, since a copy that does not cache the
+attribute never looks at it.
+
+Code outside the wrapped methods that touches a cache, to add what a command
+has just created, say, cannot assume the attributes either.
+It gets the cache through [[cached_entries]].
+<<functions>>=
+def cached_entries(owner, attr_name):
+  """Return the cache dictionary of `attr_name` on `owner`.
+
+  Creates the cache attributes if `owner` was stored before its class cached
+  `attr_name`.
+  """
+  self = owner
+  <<construct [[attr_name]] cache attributes in [[self]]>>
+  return getattr(owner, f"{attr_name}_cache")
+@
+
+Let's verify that an object without the attributes works through both
+methods, and that it fetches rather than answering from a cache it never had.
+
+<<test functions>>=
+class TestCacheAttributesOnRead:
+    """Test an object stored before its class cached the attribute"""
+
+    def stored_before(self):
+        """Return an instance as unpickling an older file would give it."""
+        class TestClass:
+            def __init__(self):
+                self.requests = 0
+
+            def get_items(self, **kwargs):
+                self.requests += 1
+                return [canvas_object(id=1)]
+
+            def get_item(self, item_id, **kwargs):
+                self.requests += 1
+                return canvas_object(id=item_id)
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        del instance.item_cache, instance.item_all_fetched
+        return instance
+
+    def test_the_listing_is_fetched_and_then_cached(self):
+        instance = self.stored_before()
+
+        assert [item.id for item in instance.get_items()] == [1]
+        assert [item.id for item in instance.get_items()] == [1]
+        assert instance.requests == 1
+
+    def test_one_object_is_fetched_and_then_cached(self):
+        instance = self.stored_before()
+
+        assert instance.get_item(2).id == 2
+        assert instance.get_item(2).id == 2
+        assert instance.requests == 1
+
+    def test_other_code_gets_the_cache_too(self):
+        instance = self.stored_before()
+
+        entries = cached_entries(instance, "item")
+
+        assert entries == {} and entries is instance.item_cache
+        assert instance.item_all_fetched is None
 @
 
 In all [[get_attr]] requests, it's the positional arguments ([[*args]]) that 

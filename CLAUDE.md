@@ -968,15 +968,19 @@ uncached, for single objects too.
 
 The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
 `src/canvaslms/cli/cache.nw`). **Bump this constant whenever the layout of
-cached objects changes**: adding or removing a `CacheGetMethods` wrap,
-renaming cache attributes, or changing the shape of cache entries (e.g. the
+cached objects changes**: removing a `CacheGetMethods` wrap, renaming cache
+attributes, or changing the shape of cache entries (e.g. the
 `LazySubmission` wrapper). A version mismatch discards the cache (one full
 refetch on the next run); a forgotten bump crashes on users' existing caches.
 When in doubt, bump. Do not write lazy migration shims for old cache layouts.
-The exception is a new attribute that is read with a default and that older
-copies ignore (`__unlisted` on assignments, `_unlisted` on cached objects): it
-needs no bump, and a bump would make programs with different versions discard
-each other's cache, see Cache Freshness.
+Two things need no bump, and a bump would make programs with different
+versions discard each other's cache, see Cache Freshness:
+- a new attribute that is read with a default and that older copies ignore
+  (`__unlisted` on assignments, `_unlisted` on cached objects);
+- a new `CacheGetMethods` wrap: the wrapped getters create the `{attr}_cache`
+  and `{attr}_all_fetched` of an object stored before the wrap. Code outside
+  the getters reaches a cache through `cached_entries(owner, attr)`, never
+  `owner.{attr}_cache` directly, for a kind added after 6.26.
 
 ## Output Conventions
 
