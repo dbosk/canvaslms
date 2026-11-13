@@ -2347,6 +2347,14 @@ If exactly one assignment matches, we update it. If no assignments match and
 [[--create]] is specified, we create a new one. If multiple assignments match,
 the exception message lists the matching names so the user can make the regex
 more specific.
+
+Since no match can mean that an assignment is created, the cache alone must
+not decide it: an assignment made in the web interface since the listing was
+cached would get a twin of the same name.
+[[match_after_refresh]] (\cref{sec:match-after-refresh}) fetches the listing
+again before it reports no match.
+It calls the match a second time for that, so the match reads the listing
+itself.
 <<update or create assignment by regex>>=
 regex_pattern = attributes['regex']
 course_list = courses.process_course_option(canvas, args)
@@ -2355,14 +2363,14 @@ if not course_list:
 
 course = course_list[0]
 
-all_assignments = list(list_assignments([course]))
-
 try:
-  assignment = canvaslms.cli.content.match_item_by_regex(
-      all_assignments, regex_pattern,
-      [lambda a: a.name or '', lambda a: str(a.id)],
-      item_type="assignment",
-      name_func=lambda a: a.name or '')
+  assignment = canvaslms.cli.content.match_after_refresh(
+      lambda: canvaslms.cli.content.match_item_by_regex(
+          list(list_assignments([course])), regex_pattern,
+          [lambda a: a.name or '', lambda a: str(a.id)],
+          item_type="assignment",
+          name_func=lambda a: a.name or ''),
+      (course, "assignment"), regex_pattern)
   <<update existing assignment>>
 except re.error as e:
   canvaslms.cli.err(
@@ -2498,6 +2506,44 @@ def test_created_assignment_is_in_the_cached_listing(tmp_path):
   assert listing.call_count == 1
 @
 
+Let's also verify that an assignment Canvas has got since the listing was
+cached is updated and not created again, whether the file names it by a
+regex or by its name.
+The fake Canvas has no answer to a request that creates an assignment, so
+creating one would fail the test.
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("front_matter", [
+    "name: New lab", "regex: ^New lab$\nname: New lab"])
+def test_edit_with_create_updates_an_assignment_canvas_has_got_since(
+    tmp_path, front_matter):
+  api = "https://canvas.example.invalid/api/v1"
+  responses.get(f"{api}/courses/1/assignments",
+                json=[assignment_json(7, "Lab")])
+  listing = responses.get(f"{api}/courses/1/assignments", json=[
+    assignment_json(7, "Lab"), assignment_json(8, "New lab")])
+  updated = responses.put(f"{api}/courses/1/assignments/8",
+                          json=assignment_json(8, "New lab"))
+  course = canvasapi.course.Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101"})
+  assert [a.id for a in course.get_assignments()] == [7]
+  course.assignment_all_fetched = datetime.now() - timedelta(hours=1)
+  path = tmp_path / "new-lab.md"
+  path.write_text(f"---\n{front_matter}\n---\n\nBody\n")
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "SBX101", "-f",
+                            str(path), "--create", "--no-link-translation"])
+
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]):
+    assignments_edit_command({}, MagicMock(), args)
+
+  assert updated.call_count == 1
+  assert listing.call_count == 1
+@
+
 \subsubsection{Filter-based assignment matching}
 
 When no [[regex]] is specified in the YAML, we check whether a [[name]] is
@@ -2542,13 +2588,13 @@ if not course_list:
 
 course = course_list[0]
 
-all_assignments = list(list_assignments([course]))
-
 try:
-  assignment = canvaslms.cli.content.match_item_by_name(
-      all_assignments, name,
-      lambda a: a.name or '',
-      item_type="assignment")
+  assignment = canvaslms.cli.content.match_after_refresh(
+      lambda: canvaslms.cli.content.match_item_by_name(
+          list(list_assignments([course])), name,
+          lambda a: a.name or '',
+          item_type="assignment"),
+      (course, "assignment"), name)
   <<update existing assignment>>
 except canvaslms.cli.EmptyListError:
   if args.create:
