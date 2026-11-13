@@ -80,6 +80,7 @@ the helpers they verify.
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
 import argparse
+import logging
 import pytest
 import requests
 from datetime import datetime, timedelta
@@ -1017,7 +1018,14 @@ of a letter-graded assignment (\cref{sec:grading-standard-spec}).
 The matching is therefore written for any items that have an ID and a name,
 and [[key]] and [[kind]] only say, in the messages, which file key and which
 kind of item the spec was meant for.
+
+No match gets a [[ValueError]] of its own kind, so that a caller whose items
+come from the cache can tell the one failure that Canvas might answer
+differently from those it would not.
 <<functions>>=
+class NoNamedItemError(ValueError):
+  """No item matches the spec of a file key."""
+
 def resolve_named_item(items, spec, key, kind, current=None,
                        name_attr='name'):
   """Return the ID of the one item of `items` that `spec` names.
@@ -1044,7 +1052,7 @@ def resolve_named_item(items, spec, key, kind, current=None,
   if len(matches) == 1:
     return matches[0].id
   if not matches:
-    raise ValueError(f"{key}: no {kind} matches '{spec}'")
+    raise NoNamedItemError(f"{key}: no {kind} matches '{spec}'")
   names = ", ".join(f"'{getattr(item, name_attr, None)}'" for item in matches)
   raise ValueError(f"{key}: '{spec}' matches {len(matches)} {kind}s "
                    f"({names}); make it more specific")
@@ -1056,11 +1064,25 @@ def resolve_assignment_group(course, spec, current=None):
   ID. `current` is the ID of the item's present group, if any; it is kept
   when `spec` matches several groups including it.
   Raises ValueError when no group or several groups match, or when the
-  regex is invalid.
+  regex is invalid. Before it reports no match, the course's groups are
+  fetched again.
   """
-  return resolve_named_item(course.get_assignment_groups(), spec,
-                            'assignment_group', 'assignment group', current)
+  return canvaslms.cli.content.match_after_refresh(
+    lambda: resolve_named_item(course.get_assignment_groups(), spec,
+                               'assignment_group', 'assignment group',
+                               current),
+    (course, "assignment_group"), spec, miss=NoNamedItemError,
+    required=False)
 @
+
+The groups come from the cache, so a group made in the web interface since
+the listing was fetched would be reported as matching nothing.
+As for [[-A]] (\cref{sec:refresh-on-miss}), we look at Canvas once more before
+we say so, through [[match_after_refresh]] (\cref{sec:match-after-refresh}).
+Nothing is created when the group is missing, so the refresh is not a required
+one: if it fails, the answer is the one the cache gave.
+The grading schemes need nothing of the kind, since they are not cached and
+[[course_grading_standards]] asks Canvas every time.
 
 The export goes the other way: from the [[assignment_group_id]] of an
 assignment or quiz to the spec a file carries.
@@ -1150,6 +1172,75 @@ class TestAssignmentGroupSpec:
     course = course_with_groups((31, "Labs"))
     assert assignment_group_spec(course, 99) is None
     assert assignment_group_spec(course, None) is None
+@
+
+The stand-in course above has no cache, so let's verify the refresh with a
+real course whose requests [[responses]] answers.
+It listed its groups an hour ago, and Canvas has got the group Exams since.
+<<test functions>>=
+GROUPS_URL = "https://canvas.example.invalid/api/v1/courses/1/assignment_groups"
+
+def course_with_a_group_since(status=200):
+  """Return a course that cached two groups, and the listing now.
+
+  The cache has Labs and Lectures. Canvas has Exams as well, or answers
+  with `status`.
+  """
+  cached = [{"id": 31, "name": "Labs"}, {"id": 33, "name": "Lectures"}]
+  exams = {"id": 32, "name": "Exams"}
+  responses.get(GROUPS_URL, json=cached)
+  listing = responses.get(GROUPS_URL, status=status,
+                          json=[*cached, exams] if status == 200 else {})
+  course = Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "name": "Course", "course_code": "CODE"})
+  assert len(list(course.get_assignment_groups())) == 2
+  course.assignment_group_all_fetched = datetime.now() - timedelta(hours=1)
+  return course, listing
+
+@responses.activate
+def test_a_file_names_a_group_canvas_has_got_since():
+  course, listing = course_with_a_group_since()
+
+  assert resolve_assignment_group(course, "^Exams$") == 32
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_file_names_a_group_in_the_cache_without_asking_canvas():
+  course, listing = course_with_a_group_since()
+
+  assert resolve_assignment_group(course, "^Labs$") == 31
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_group_that_canvas_lacks_too_is_still_the_error_of_the_key():
+  course, listing = course_with_a_group_since()
+
+  with pytest.raises(ValueError,
+                     match="assignment_group: no assignment group matches"):
+    resolve_assignment_group(course, "^Seminars$")
+  assert listing.call_count == 1
+
+@responses.activate
+@pytest.mark.parametrize("spec,message", [
+    ("[", "assignment_group: invalid regex"),
+    ("^L", "matches 2 assignment groups")])
+def test_only_no_match_makes_the_file_lookup_ask_canvas(spec, message):
+  course, listing = course_with_a_group_since()
+
+  with pytest.raises(ValueError, match=message):
+    resolve_assignment_group(course, spec)
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_failed_refresh_leaves_the_answer_of_the_cache(caplog):
+  course, listing = course_with_a_group_since(status=503)
+
+  with caplog.at_level(logging.WARNING), \
+       pytest.raises(ValueError, match="no assignment group matches"):
+    resolve_assignment_group(course, "^Exams$")
+  assert listing.call_count == 1
+  assert "Could not refresh" in caplog.text
 @
 
 We also want to filter out the assignments of a course that belong to a given
