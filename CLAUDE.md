@@ -925,8 +925,9 @@ name matches nothing (`retry_after_miss`), `--refresh-cache` (`request_refresh`)
 and repair on read of a listing stored with a restriction. They add and update
 entries; do not make them discard cached children (replace objects through
 `<<update [[obj]] with cache from [[old_obj]]>>`). The one exception: a complete,
-unrestricted fetch of a listing decorated with `forget_unlisted=True` (only
-`Canvas.get_courses` and `Course.get_assignments`) that returns at least one
+unrestricted fetch of a listing decorated with `forget_unlisted=True`
+(`Canvas.get_courses`, and `Course.get_assignments`, `get_files` and
+`get_folders`) that returns at least one
 entry removes the entries Canvas did not return, children and all (a course only
 after a one-try `get_course` for it gets a 404 or a 403, `confirm_unlisted=True`); a 404
 on an individual refresh removes that one object. Users and submissions are never
@@ -953,6 +954,15 @@ that caches personal data must add its kind to `PERSONAL_DATA_KINDS`. A
 filter must leave attributes in place (emptied), never change the live object,
 and keep the state a plain dict.
 
+Files and folders are cached on the course; a file or folder fetched alone
+expires after `DEFAULT_CACHE_TTL_DAYS`, since exporting links never reads the
+listing; the limit is in the singular getter (`fetched_alone_long_ago`), not
+in `outdated()`, which the plural getter asks about every entry. A command
+that writes puts what Canvas answered in the cache (`remember_file`) and marks
+a listing as not fetched when it cannot know what else changed
+(`distrust_file_listings` after an upload). Commands annotate copies of cached
+objects (`file.course`, `file.path`), never the cached objects themselves.
+
 A new name lookup should use `retry_after_miss` where the name is matched, over
 the whole selection. An empty result is not always a miss, so never retry around
 a command or on `EmptyListError`.
@@ -968,15 +978,20 @@ uncached, for single objects too.
 
 The persisted Canvas cache is stamped with `CACHE_SCHEMA_VERSION` (defined in
 `src/canvaslms/cli/cache.nw`). **Bump this constant whenever the layout of
-cached objects changes**: adding or removing a `CacheGetMethods` wrap,
-renaming cache attributes, or changing the shape of cache entries (e.g. the
+cached objects changes**: removing a `CacheGetMethods` wrap, renaming cache
+attributes, or changing the shape of cache entries (e.g. the
 `LazySubmission` wrapper). A version mismatch discards the cache (one full
 refetch on the next run); a forgotten bump crashes on users' existing caches.
 When in doubt, bump. Do not write lazy migration shims for old cache layouts.
-The exception is a new attribute that is read with a default and that older
-copies ignore (`__unlisted` on assignments, `_unlisted` on cached objects): it
-needs no bump, and a bump would make programs with different versions discard
-each other's cache, see Cache Freshness.
+Two things need no bump, and a bump would make programs with different
+versions discard each other's cache, see Cache Freshness:
+- a new attribute that is read with a default and that older copies ignore
+  (`__unlisted` on assignments, `_unlisted` on cached objects);
+- a new `CacheGetMethods` wrap: the wrapped getters create the `{attr}_cache`
+  and `{attr}_all_fetched` of an object stored before the wrap. Code outside
+  the getters reaches the cache of such a kind (`file` and `folder` so far)
+  through `cached_entries(owner, attr)`, never `owner.{attr}_cache` directly,
+  since some copy sharing the file may have stored the object without it.
 
 ## Output Conventions
 

@@ -16,6 +16,8 @@ We do this as follows:
 import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
+import canvasapi.file
+import canvasapi.folder
 import canvasapi.group
 import canvasapi.util
 from canvasapi.user import User
@@ -1368,6 +1370,9 @@ cls.__init__ = new_init
 We do the same thing for the singular and plural get methods.
 We get the original method, then wrap it in a new method that adds suitable 
 caching or falls back to the original [[get_*]] function.
+Each wrapper starts by making sure the cache attributes are there, with the
+constructor's own chunk; \cref{sec:cache-attributes-on-read} explains for
+which objects the constructor has not done it.
 <<update the singular method>>=
 singular_name = f"get_{self.__attribute_name}"
 get_attr = getattr(cls, singular_name)
@@ -1376,6 +1381,7 @@ cache_key = self.__cache_key
 @functools.wraps(get_attr)
 def new_get_attr(self, *args, **kwargs):
   report_setting_problems()
+  <<construct [[attr_name]] cache attributes in [[self]]>>
   <<return cached result or fetch from [[get_attr]]>>
 
 setattr(cls, singular_name, new_get_attr)
@@ -1394,6 +1400,7 @@ confirm_unlisted = self.__confirm_unlisted
 @functools.wraps(get_attrs)
 def new_get_attrs(self, *args, **kwargs):
   report_setting_problems()
+  <<construct [[attr_name]] cache attributes in [[self]]>>
   <<return cached result or fetch from [[get_attrs]]>>
 
 setattr(cls, plural_name, new_get_attrs)
@@ -1541,6 +1548,91 @@ class TestCacheAttributeInjection:
         assert hasattr(instance, "item_cache")
 @
 
+\subsubsection{Objects that were stored before their class was decorated}
+\label{sec:cache-attributes-on-read}
+
+The constructor is not the only way an object comes to be.
+One that is read from the cache file is unpickled, and unpickling sets the
+attributes that were stored without running any constructor.
+An object stored before its class cached this attribute, by an earlier version
+or by another program with an older copy of this library, therefore has no
+[[_cache]] and no [[_all_fetched]], and the wrapped methods would fail on
+their first line.
+
+That used to be why caching one more attribute needed a new schema version in
+[[cli/cache.nw]], which discards everyone's cache file, and with programs of
+different versions sharing the file, discards it again and again.
+It is simpler to make the attributes when they are first needed.
+The wrapped methods run the constructor's chunk before anything else, so an
+object without the attributes gets them empty, which is the truth: nothing of
+this kind has been fetched through it.
+In the other direction nothing is needed, since a copy that does not cache the
+attribute never looks at it.
+
+Code outside the wrapped methods that touches a cache, to add what a command
+has just created, say, cannot assume the attributes either.
+It gets the cache through [[cached_entries]].
+<<functions>>=
+def cached_entries(owner, attr_name):
+  """Return the cache dictionary of `attr_name` on `owner`.
+
+  Creates the cache attributes if `owner` was stored before its class cached
+  `attr_name`.
+  """
+  self = owner
+  <<construct [[attr_name]] cache attributes in [[self]]>>
+  return getattr(owner, f"{attr_name}_cache")
+@
+
+Let's verify that an object without the attributes works through both
+methods, and that it fetches rather than answering from a cache it never had.
+
+<<test functions>>=
+class TestCacheAttributesOnRead:
+    """Test an object stored before its class cached the attribute"""
+
+    def stored_before(self):
+        """Return an instance as unpickling an older file would give it."""
+        class TestClass:
+            def __init__(self):
+                self.requests = 0
+
+            def get_items(self, **kwargs):
+                self.requests += 1
+                return [canvas_object(id=1)]
+
+            def get_item(self, item_id, **kwargs):
+                self.requests += 1
+                return canvas_object(id=item_id)
+
+        CacheGetMethods("item")(TestClass)
+        instance = TestClass()
+        del instance.item_cache, instance.item_all_fetched
+        return instance
+
+    def test_the_listing_is_fetched_and_then_cached(self):
+        instance = self.stored_before()
+
+        assert [item.id for item in instance.get_items()] == [1]
+        assert [item.id for item in instance.get_items()] == [1]
+        assert instance.requests == 1
+
+    def test_one_object_is_fetched_and_then_cached(self):
+        instance = self.stored_before()
+
+        assert instance.get_item(2).id == 2
+        assert instance.get_item(2).id == 2
+        assert instance.requests == 1
+
+    def test_other_code_gets_the_cache_too(self):
+        instance = self.stored_before()
+
+        entries = cached_entries(instance, "item")
+
+        assert entries == {} and entries is instance.item_cache
+        assert instance.item_all_fetched is None
+@
+
 In all [[get_attr]] requests, it's the positional arguments ([[*args]]) that 
 identify what to get.
 The keyword arguments ([[**kwargs]]) specify additional options.
@@ -1607,6 +1699,10 @@ elif obj and outdated(obj):
   reason = get_staleness_reason(obj)
   obj = None
   cache_status = f" (stale: {reason})" if reason else " (stale)"
+elif obj and fetched_alone_long_ago(obj):
+  obj = None
+  cache_status = (f" (stale: older than {DEFAULT_CACHE_TTL_DAYS} days, "
+                  f"which a listing may be)")
 elif obj and predates_refresh(getattr(obj, "_fetched_at", None)):
   obj = None
   refreshing_on_request = True
@@ -1641,6 +1737,9 @@ Cache misses require API calls to Canvas, which typically take hundreds of
 milliseconds to seconds depending on network latency and server response time.
 This timing data helps identify whether caching is providing the expected
 performance benefits.
+
+A file or a folder also gets an age limit here, which
+\cref{sec:files-fetched-alone} explains.
 
 We already saw [[must_update]] above.
 That one focuses on the keyword arguments.
@@ -9162,6 +9261,192 @@ class TestQuizCaching:
         assert 10 in instance.new_quiz_cache
         assert 20 in instance.new_quiz_cache
 @
+
+\subsection{Caching files and folders}
+\label{sec:caching-files}
+
+A course's files are what its pages and assignments link to, and a link names
+a file by its path: the folder it is in and its name.
+Translating links (see [[cli/links.nw]]) therefore asks for files and folders
+all the time, a file by its identifier when a page is exported and the files
+of a folder when it is imported again, and the [[files]] command lists them
+all.
+None of this was cached, so each run paid for it again: two requests for every
+distinct file a page links to (issue~\#477).
+
+We cache both on the [[Course]], like its other contents.
+<<functions>>=
+def make_course_files_cacheable():
+  """Add caching to Course.get_file/get_files and get_folder/get_folders"""
+  import canvasapi.course
+  canvasapi.course.Course = CacheGetMethods("file", forget_unlisted=True)(
+    canvasapi.course.Course)
+  canvasapi.course.Course = CacheGetMethods("folder", forget_unlisted=True)(
+    canvasapi.course.Course)
+@
+
+Both listings forget what Canvas no longer returns
+(\cref{sec:forget-unlisted}).
+A file that is replaced gets a new identifier, so without forgetting, the
+listing would show the old file next to the new one for good, and a deleted
+file would never go away.
+Nothing is cached below a file or a folder, so nothing else is lost with it.
+
+No new schema version is needed for the two new caches, since the wrapped
+methods create the attributes of a course that was stored without them
+(\cref{sec:cache-attributes-on-read}).
+
+\subsubsection{Files that are only ever fetched one by one}
+\label{sec:files-fetched-alone}
+
+The listings expire like any other, after [[DEFAULT_CACHE_TTL_DAYS]] days, and
+the fetch that follows replaces every entry.
+But exporting a page never reads a listing.
+It asks for one file at a time, by identifier, and an object fetched that way
+does not expire: [[outdated]] has no rule for it.
+For most kinds that is harmless, because their listings are read often enough
+to replace the entries.
+A file that has since been renamed or moved in Canvas would keep its old path
+in every exported link until someone asked for [[--refresh-cache]].
+
+So when one file or folder is asked for and the cached one is older than a
+listing is allowed to be, we fetch it again.
+The rule belongs to the singular method and not to [[outdated]], which the
+plural method also asks about every entry.
+There it would do harm: a listing can stay in use for a day after its entries
+have passed the limit, since its timestamp is only reset when [[outdated]]
+looks at the course, and then every entry would be fetched on its own, one
+request for each file of the course where one listing would do.
+A listing has its own time to live, and that is the one that should replace
+its entries.
+<<functions>>=
+def fetched_alone_long_ago(obj):
+  """Return True if `obj` is a file or folder older than a listing may be."""
+  fetched_at = getattr(obj, "_fetched_at", None)
+  return (isinstance(obj, (canvasapi.file.File, canvasapi.folder.Folder))
+          and fetched_at is not None
+          and datetime.now() - fetched_at
+              > timedelta(days=DEFAULT_CACHE_TTL_DAYS))
+@
+
+Let's verify this through the real [[Course]], with [[responses]] in place of
+Canvas, since what we test is which requests are sent, and the listing must
+change between two of them.
+One test is for the harm described above: a listing that is still in use
+although it and its entries are past the limit must be answered from the
+cache, and once [[outdated]] has looked at the course, with one request.
+
+<<test functions>>=
+FILES_URL = "https://canvas.example/api/v1/courses/1/files"
+FOLDERS_URL = "https://canvas.example/api/v1/courses/1/folders"
+ROOT_FOLDER_JSON = {"id": 1, "name": "course files",
+                    "full_name": "course files"}
+SLIDES_JSON = {"id": 5, "name": "slides", "full_name": "course files/slides",
+               "parent_folder_id": 1}
+
+def file_json(file_id, name, folder_id=5):
+    return {"id": file_id, "display_name": name, "filename": name,
+            "folder_id": folder_id}
+
+def course_with_files():
+    """Return a real course whose Canvas has two files in a folder."""
+    canvas = canvasapi.Canvas("https://canvas.example", "token")
+    responses.get(FILES_URL, json=[file_json(7, "intro.pdf"),
+                                   file_json(8, "lab.pdf")])
+    responses.get(FOLDERS_URL, json=[ROOT_FOLDER_JSON, SLIDES_JSON])
+    return Course(canvas._Canvas__requester, {"id": 1, "name": "Course"})
+
+class TestFileAndFolderCaching:
+    """Test that a course's files and folders are cached"""
+
+    @responses.activate
+    def test_the_listings_are_fetched_once_and_answer_single_lookups(self):
+        course = course_with_files()
+
+        for _ in range(2):
+            assert [file.id for file in course.get_files()] == [7, 8]
+            assert [folder.id for folder in course.get_folders()] == [1, 5]
+        assert course.get_file(8).display_name == "lab.pdf"
+        assert course.get_folder(5).full_name == "course files/slides"
+
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_a_file_canvas_no_longer_lists_is_forgotten(self):
+        course = course_with_files()
+        list(course.get_files())
+        responses.replace(responses.GET, FILES_URL,
+                          json=[file_json(9, "intro.pdf")])
+        course.file_all_fetched = None
+
+        assert [file.id for file in course.get_files()] == [9]
+        assert set(course.file_cache) == {9}
+
+    @responses.activate
+    @pytest.mark.parametrize("age_days,requests", [
+        (DEFAULT_CACHE_TTL_DAYS - 1, 1), (DEFAULT_CACHE_TTL_DAYS + 1, 2)])
+    def test_a_file_fetched_alone_is_fetched_again_when_old(
+            self, age_days, requests):
+        course = course_with_files()
+        responses.get(f"{FILES_URL}/7", json=file_json(7, "intro.pdf"))
+        file = course.get_file(7)
+        responses.replace(responses.GET, f"{FILES_URL}/7",
+                          json=file_json(7, "renamed.pdf", folder_id=1))
+        file._fetched_at -= timedelta(days=age_days)
+
+        again = course.get_file(7)
+
+        assert len(responses.calls) == requests
+        assert again.display_name == ("renamed.pdf" if requests == 2
+                                      else "intro.pdf")
+
+    @responses.activate
+    def test_a_folder_fetched_alone_is_fetched_again_when_old(self):
+        course = course_with_files()
+        responses.get(f"{FOLDERS_URL}/5", json=SLIDES_JSON)
+        folder = course.get_folder(5)
+        folder._fetched_at -= timedelta(days=DEFAULT_CACHE_TTL_DAYS + 1)
+
+        course.get_folder(5)
+
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_an_old_listing_is_never_refreshed_one_file_at_a_time(self):
+        course = course_with_files()
+        list(course.get_files())
+        for file, _ in course.file_cache.values():
+            file._fetched_at -= timedelta(days=DEFAULT_CACHE_TTL_DAYS + 1)
+        course.file_all_fetched -= timedelta(days=DEFAULT_CACHE_TTL_DAYS + 1)
+        responses.calls.reset()
+
+        assert [file.id for file in course.get_files()] == [7, 8]
+
+        assert len(responses.calls) == 0
+        outdated(course)
+        assert [file.id for file in course.get_files()] == [7, 8]
+        assert [call.request.path_url.split("?")[0]
+                for call in responses.calls] == ["/api/v1/courses/1/files"]
+
+    @responses.activate
+    def test_a_folder_canvas_no_longer_lists_is_forgotten(self):
+        course = course_with_files()
+        list(course.get_folders())
+        responses.replace(responses.GET, FOLDERS_URL, json=[ROOT_FOLDER_JSON])
+        course.folder_all_fetched = None
+
+        assert [folder.id for folder in course.get_folders()] == [1]
+        assert set(course.folder_cache) == {1}
+
+    @responses.activate
+    def test_a_course_stored_before_files_were_cached_lists_them(self):
+        course = course_with_files()
+        del course.file_cache, course.file_all_fetched
+        restored = pickle.loads(pickle.dumps(course))
+
+        assert [file.id for file in restored.get_files()] == [7, 8]
+@
+
 
 \subsection{Caching submissions}
 \label{sec:caching-submissions}
