@@ -181,6 +181,7 @@ import re
 import urllib.parse
 
 import canvaslms.cli
+from canvaslms.hacks.canvasapi import retry_after_miss
 @
 
 The four placeholders are Canvas's, spelled exactly as its exporter writes
@@ -197,11 +198,14 @@ They run against small fake courses, defined later in this chapter, and
 need no Canvas server.
 <<test [[links.py]]>>=
 """Tests for translating course links."""
+from datetime import timedelta
 import logging
 import types
 from unittest.mock import MagicMock, create_autospec
 
+import canvasapi
 import pytest
+import responses
 from canvasapi.course import Course
 from canvasapi.folder import Folder
 from canvasapi.module import Module
@@ -489,9 +493,9 @@ and fetching the assignment list to translate it would be a request the
 user pays for without getting anything.
 The lists come from the [[canvasapi]] course object, which the cache
 decorators in [[hacks/canvasapi.nw]] wrap for assignments, quizzes,
-modules and module items, so on a warm cache most tables cost no
-request at all; discussion topics, files and folders are not cached and
-are fetched when first needed.
+modules, module items, files and folders, so on a warm cache most tables
+cost no request at all; discussion topics are not cached and are fetched
+when first needed.
 <<classes>>=
 class CourseIndex:
   """Lazy name and id tables for the objects a course links to."""
@@ -632,9 +636,12 @@ def slugify(title):
 
 A file is named by its path below the course files root, the way a
 Canvas export names it.
-On the way out we have a file id and need its folder: one request for
-the file, one for the folder, both remembered so that a body with many
-links to the same folder pays once.
+On the way out we have a file id and need its folder.
+Both come from the cache when it has them, and otherwise cost one request
+each, after which the cache has them (\cref{sec:caching-files}).
+We also remember the answer here, for the body at hand, because that
+includes the answer \enquote{no such file}, which the cache does not keep
+and which a body may ask for many times.
 Canvas's root folder is called [[course files]] and every folder's
 [[full_name]] starts with it, so that prefix is stripped from the path
 and put back when resolving.
@@ -669,13 +676,25 @@ def folder_path(folder):
 @
 
 On the way in we have the path and need the file id.
-[[canvasapi]] resolves a folder path to the list of folders along it,
-ending with the folder asked for, and the folder lists its files.
-[[canvasapi]] puts the path into the request URL as it is, so a folder
-name with a [[#]], a [[?]] or a [[%]] would end the path early or be
-decoded into another name; we percent-encode each folder name, keeping
-the slashes between them, and Canvas decodes them again (checked in the
-sandbox course with [[Lab #1]], [[a?b]] and [[50%25 off]], 2026-10-29).
+The course lists its folders, each with its path as [[full_name]], and its
+files, each with the identifier of its folder, so the two listings answer the
+question for every file of the course.
+Both are cached (\cref{sec:caching-files}): the first link to a file costs
+the two listings, and after that every lookup in the course is free until
+they expire, in this run and the next.
+We used to ask Canvas for the folder at the path and then for that folder's
+files, which was two requests for each folder that a body links into, on
+every run.
+
+A cached listing can lack a file that was added to the course since, and the
+user who just uploaded a file and links to it must not be told that it does
+not exist.
+So a lookup that finds nothing looks at Canvas once more, through
+[[retry_after_miss]] (\cref{sec:refresh-on-miss}), which fetches a listing
+again unless it was fetched in the last few minutes.
+The folder is looked up first and the file second, each with its own listing,
+since a path whose folder does not exist needs no list of files to say so.
+
 A file has two names: [[display_name]] is what the user sees and what
 the export wrote, [[filename]] is the name on disk, which Canvas may
 have altered (a space becomes a plus).
@@ -683,15 +702,27 @@ The display name is matched first, the filename as a fallback.
 <<course index methods>>=
 def file_candidates(self, folder, name):
   """Return the files named `name` in the folder at path `folder`."""
+  full_name = f"{ROOT_FOLDER}/{folder}" if folder else ROOT_FOLDER
+
+  def folders_at_path():
+    return [each for each in self.course.get_folders()
+            if each.full_name == full_name]
+
+  def files_named(folder_ids):
+    files = [file for file in self.course.get_files()
+             if file.folder_id in folder_ids]
+    return ([file for file in files if file.display_name == name]
+            or [file for file in files if file.filename == name])
+
   try:
-    folders = list(
-      self.course.resolve_path(urllib.parse.quote(folder, safe="/"))
-      if folder else self.course.resolve_path())
-    files = list(folders[-1].get_files())
+    folder_ids = {each.id for each in retry_after_miss(
+      folders_at_path, [(self.course, "folder")], pattern=folder)}
+    if not folder_ids:
+      return []
+    return list(retry_after_miss(lambda: files_named(folder_ids),
+                                 [(self.course, "file")], pattern=name))
   except Exception:
     return []
-  return ([file for file in files if file.display_name == name]
-          or [file for file in files if file.filename == name])
 @
 
 \subsection{A fake course to look links up in}
@@ -788,13 +819,13 @@ stub_canvas_method(course, "get_modules", [module])
 <<fake files and folders>>=
 root = Folder(MagicMock(), {"id": 1, "name": "course files",
                             "full_name": "course files"})
-stub_canvas_method(root, "get_files", [])
 folder = Folder(MagicMock(), {"id": n["folder"], "name": "slides",
                               "full_name": "course files/slides",
                               "parent_folder_id": root.id})
 file = obj(id=n["file"], display_name="intro a.pdf",
            filename="intro+a.pdf", folder_id=n["folder"])
-stub_canvas_method(folder, "get_files", [file])
+top = obj(id=n["file"] + 1, display_name="syllabus.pdf",
+          filename="syllabus.pdf", folder_id=root.id)
 def get_file(file_id):
   if file_id == n["file"]:
     return file
@@ -802,13 +833,8 @@ def get_file(file_id):
 stub_canvas_method(course, "get_file").side_effect = get_file
 stub_canvas_method(course, "get_folder").side_effect = lambda folder_id: \
   {root.id: root, folder.id: folder}[folder_id]
-def resolve_path(path=None):
-  if not path:
-    return [root]
-  if path == "slides":
-    return [root, folder]
-  raise LookupError(path)
-stub_canvas_method(course, "resolve_path").side_effect = resolve_path
+stub_canvas_method(course, "get_folders", [root, folder])
+stub_canvas_method(course, "get_files", [file, top])
 @
 
 Let's verify the tables: names by id, candidates exactly and ignoring
@@ -858,6 +884,75 @@ def test_index_names_files_by_path_both_ways():
   assert [f.id for f in index.file_candidates("slides", "intro+a.pdf")] == [789]
   assert index.file_candidates("slides", "other.pdf") == []
   assert index.file_candidates("nowhere", "intro a.pdf") == []
+  assert [f.id for f in index.file_candidates("", "syllabus.pdf")] == [790]
+  assert index.file_candidates("", "intro a.pdf") == []
+  assert index.file_candidates("slides", "syllabus.pdf") == []
+@
+
+The fake course above answers from fixed lists, so it cannot show what the
+cache does.
+For that we use a real course with [[responses]] in place of Canvas: the
+listings must be fetched once for any number of lookups, and a file that was
+added to Canvas after they were fetched must still be found, at the price of
+one more listing, and only one.
+<<test functions>>=
+FILES_API = f"{SERVER}/api/v1/courses/1/files"
+FOLDERS_API = f"{SERVER}/api/v1/courses/1/folders"
+
+def course_with_listed_files(*files):
+  """Return a real course whose Canvas lists `files` in the folder slides."""
+  canvas = canvasapi.Canvas(SERVER, "token")
+  responses.get(FOLDERS_API, json=[
+      {"id": 1, "name": "course files", "full_name": "course files"},
+      {"id": 5, "name": "slides", "full_name": "course files/slides"}])
+  responses.get(FILES_API, json=[
+      {"id": file_id, "display_name": name, "filename": name, "folder_id": 5}
+      for file_id, name in files])
+  return Course(canvas._Canvas__requester,
+                {"id": 1, "name": "Course", "course_code": "C1"})
+
+@responses.activate
+def test_file_lookups_share_the_cached_listings():
+  course = course_with_listed_files((7, "intro.pdf"), (8, "lab.pdf"))
+
+  for name, file_id in [("intro.pdf", 7), ("lab.pdf", 8), ("intro.pdf", 7)]:
+    found = CourseIndex(course).file_candidates("slides", name)
+    assert [file.id for file in found] == [file_id]
+  assert CourseIndex(course).file_path(8) == ("slides", "lab.pdf")
+
+  assert len(responses.calls) == 2
+
+@responses.activate
+def test_a_file_added_since_the_listing_is_found_with_one_more_listing():
+  course = course_with_listed_files((7, "intro.pdf"))
+  index = CourseIndex(course)
+  assert index.file_candidates("slides", "new.pdf") == []
+  course.file_all_fetched -= timedelta(hours=1)
+  responses.replace(responses.GET, FILES_API, json=[
+      {"id": 9, "display_name": "new.pdf", "filename": "new.pdf",
+       "folder_id": 5}])
+  responses.calls.reset()
+
+  assert [file.id for file in index.file_candidates("slides", "new.pdf")] \
+      == [9]
+  assert index.file_candidates("slides", "missing.pdf") == []
+
+  assert [call.request.path_url.split("?")[0] for call in responses.calls] \
+      == ["/api/v1/courses/1/files"]
+
+@responses.activate
+def test_a_folder_that_is_not_there_costs_no_file_listing():
+  course = course_with_listed_files((7, "intro.pdf"))
+  index = CourseIndex(course)
+  index.file_candidates("slides", "intro.pdf")
+  course.folder_all_fetched -= timedelta(hours=1)
+  course.file_all_fetched -= timedelta(hours=1)
+  responses.calls.reset()
+
+  assert index.file_candidates("nowhere", "intro.pdf") == []
+
+  assert [call.request.path_url.split("?")[0] for call in responses.calls] \
+      == ["/api/v1/courses/1/folders"]
 
 def test_index_fetches_only_the_kinds_asked_for():
   course = fake_course()
