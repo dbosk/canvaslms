@@ -157,9 +157,11 @@ Canvas server.
 import argparse
 import csv
 import io
+import logging
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, create_autospec, patch
 
+import canvasapi.exceptions
 import pytest
 import responses
 from canvasapi import Canvas
@@ -1280,9 +1282,9 @@ def modules_create_command(config, canvas, args):
 def modules_of_that_name():
   return [m for m in course.get_modules()
           if canvaslms.cli.utils.ensure_module_attrs(m).name == args.name]
-existing = list(retry_after_miss(modules_of_that_name, [(course, "module")],
-                                 pattern=args.name))
-if existing and not args.allow_duplicate:
+if not args.allow_duplicate and list(retry_after_miss(
+    modules_of_that_name, [(course, "module")], pattern=args.name,
+    required=True)):
   canvaslms.cli.err(1, f"Module '{args.name}' already exists in "
                        f"{course.course_code}; use --allow-duplicate to add "
                        "another")
@@ -1403,6 +1405,42 @@ def test_create_refuses_the_name_of_a_module_canvas_has_got_since(caplog):
 
   assert "already exists" in caplog.text
   assert listing.call_count == 1
+
+def run_create_after_an_hour(now, allow_duplicate=False, status=200):
+  """Run modules create "Week 2" on a course that listed no modules.
+
+  Canvas answers the listing with `now` and `status`. Returns the mocks of
+  the listing and of the request that creates the module.
+  """
+  course, listing = course_listed_an_hour_ago(1, [], now)
+  if status != 200:
+    listing = responses.replace(responses.GET, f"{API}/courses/1/modules",
+                                json={"errors": "down"}, status=status)
+  created = responses.post(f"{API}/courses/1/modules",
+                           json=module_json(13, "Week 2"))
+  args = argparse.Namespace(delimiter="\t", position=None, unlock_at=None,
+                            sequential=False, publish=False,
+                            allow_duplicate=allow_duplicate, name="Week 2",
+                            prerequisite=[])
+  with patch("canvaslms.cli.modules.courses.process_course_option",
+             return_value=[course]), patch("time.sleep"):
+    modules.modules_create_command({}, None, args)
+  return listing, created
+
+@responses.activate
+def test_create_creates_nothing_when_canvas_cannot_be_asked(capsys):
+  with pytest.raises(canvasapi.exceptions.CanvasException):
+    run_create_after_an_hour([], status=503)
+  assert not [call for call in responses.calls
+              if call.request.method == "POST"]
+
+@responses.activate
+def test_create_with_allow_duplicate_does_not_ask_canvas(capsys):
+  listing, created = run_create_after_an_hour(
+    [module_json(12, "Week 2")], allow_duplicate=True)
+
+  assert created.call_count == 1
+  assert listing.call_count == 0
 @
 
 
