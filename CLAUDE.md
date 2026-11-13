@@ -971,9 +971,12 @@ command calls `refresh_after_miss` once before its loop over the courses
 (`refresh_pages_after_miss` and its siblings), so that a course lacking the name
 is not a miss of its own. A filter that does retry inside (`filter_quizzes`,
 `filter_groups`, `filter_group_categories`, `filter_users`) must get everything
-that is searched in one call, never one course or category at a time. A lookup
-whose miss leads to a write (`--create`, `modules create`) must refresh before
-it creates (`content.match_after_refresh`). Pass
+that is searched in one call, never one course or category at a time, unless
+each course must have the item by itself (`find_unique_content`,
+`modules create`). A lookup whose miss leads to a write (`--create`,
+`modules create`) must refresh before it creates, with
+`retry_after_miss(..., required=True)` or `content.match_after_refresh`, so that
+a failed refresh raises and nothing is created. Pass
 `courses.miss_refresh_limit(args)` as `max_listings`. `-A` (assignment groups) has no refresh on purpose: `ungraded.sh`
 names a group from cron and must never warn.
 
