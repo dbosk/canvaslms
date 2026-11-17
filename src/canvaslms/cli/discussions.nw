@@ -160,6 +160,20 @@ def add_view_command(subp):
   <<add view arguments>>
 @
 
+The tests are gathered in a module of their own, with the tests themselves
+placed after the code they verify.
+<<test [[discussions.py]]>>=
+"""Tests for the discussions command."""
+import argparse
+import re
+
+import pytest
+
+from canvaslms.cli.discussions import *
+
+<<test functions>>
+@
+
 
 \section{Announce command arguments}
 
@@ -916,7 +930,7 @@ def discussions_view_command(config, canvas, args):
   # Filter by regex if provided
   filtered_items = []
   for item in all_items:
-    if matches_regex_patterns(item, args):
+    if matches_regex_patterns(item, patterns):
       filtered_items.append(item)
   
   # Sort by creation date (newest first)
@@ -1288,71 +1302,107 @@ for discussion in discussions:
 
 \section{Helper functions for view command}
 
-Functions to support the view command functionality.
+The view command selects items with up to three regexes: [[--title]] on the
+title, [[--message]] on the message and [[--match]] on both.
+An item is shown if any of the given ones matches, and every item if none is
+given.
+
+We compile the regexes once, before any item is fetched, and pass the compiled
+patterns to the filter.
+Compiling them up front is what lets a mistyped regex stop the command with a
+message that names its option, before it has asked Canvas for anything.
+The filter used to compile them again for every item, from the command-line
+arguments, and to skip a regex that did not compile, which it could not tell
+was already rejected; it now gets only valid patterns
+(issue~\#338).
 <<compile regex patterns for view>>=
-pattern = None
-if args.match:
-  try:
-    flags = re.IGNORECASE if args.ignore_case else 0
-    pattern = re.compile(args.match, flags)
-  except re.error as e:
-    canvaslms.cli.err(1, f"Invalid regex for --match: {e}")
+patterns = view_patterns(args)
+<<functions>>=
+def view_patterns(args):
+  """Return the compiled --title, --message and --match regexes of `args`.
 
-title_pattern = None
-if args.title:
-  try:
-    flags = re.IGNORECASE if args.ignore_case else 0
-    title_pattern = re.compile(args.title, flags)
-  except re.error as e:
-    canvaslms.cli.err(1, f"Invalid regex for --title: {e}")
-
-message_pattern = None
-if args.message:
-  try:
-    flags = re.IGNORECASE if args.ignore_case else 0
-    message_pattern = re.compile(args.message, flags)
-  except re.error as e:
-    canvaslms.cli.err(1, f"Invalid regex for --message: {e}")
+  A regex that was not given is None. An invalid one exits with an error
+  that names its option.
+  """
+  flags = re.IGNORECASE if args.ignore_case else 0
+  patterns = {}
+  for option in ("title", "message", "match"):
+    regex = getattr(args, option)
+    if not regex:
+      patterns[option] = None
+      continue
+    try:
+      patterns[option] = re.compile(regex, flags)
+    except re.error as e:
+      canvaslms.cli.err(1, f"Invalid regex for --{option}: {e}")
+  return patterns
 @
 
+Each pattern searches its own part of the item, and [[--match]] searches the
+title and the message as one text, the title on the first line.
+A [[.]] does not match the newline between them, so a [[--match]] regex spans
+both parts only when it says so, with [[\n]] or the flag [[(?s)]].
 <<functions>>=
-def matches_regex_patterns(item, args):
-  """Check if discussion/announcement matches the regex patterns"""
-  if not (args.match or args.title or args.message):
+def matches_regex_patterns(item, patterns):
+  """Check if a discussion or announcement matches any of `patterns`.
+
+  `patterns` is what view_patterns returns; with none given, every item
+  matches.
+  """
+  if not any(patterns.values()):
     return True
-  
   title = getattr(item, 'title', '') or ''
   message = getattr(item, 'message', '') or ''
-  text = f"{title}\n{message}"
+  searched = {"title": title, "message": message,
+              "match": f"{title}\n{message}"}
+  return any(pattern.search(searched[option])
+             for option, pattern in patterns.items() if pattern)
+@
 
-  # Compile patterns dynamically (could be optimized by moving to discussions_view_command)
-  flags = re.IGNORECASE if args.ignore_case else 0
-  
-  if args.title:
-    try:
-      title_pattern = re.compile(args.title, flags)
-      if title_pattern.search(title):
-        return True
-    except re.error:
-      pass
-  
-  if args.message:
-    try:
-      message_pattern = re.compile(args.message, flags)  
-      if message_pattern.search(message):
-        return True
-    except re.error:
-      pass
-      
-  if args.match:
-    try:
-      pattern = re.compile(args.match, flags)
-      if pattern.search(text):
-        return True
-    except re.error:
-      pass
-  
-  return False
+Let's verify both: which regexes are compiled and how [[-i]] applies, that an
+item is shown when any given regex matches, and that a mistyped regex stops
+the command and names its option.
+The items are stand-ins with only the two fields the filter reads.
+<<test functions>>=
+def view_args(**options):
+  return argparse.Namespace(**{"title": None, "message": None, "match": None,
+                               "ignore_case": False, **options})
+
+def item(title, message):
+  return argparse.Namespace(title=title, message=message)
+
+def test_only_the_given_regexes_are_compiled():
+  patterns = view_patterns(view_args(title="^Exam", ignore_case=True))
+
+  assert patterns["message"] is None and patterns["match"] is None
+  assert patterns["title"].search("exam on Friday")
+
+@pytest.mark.parametrize("options,shown", [
+    ({}, True),
+    ({"title": "^Exam"}, True),
+    ({"title": "^Lab"}, False),
+    ({"message": "room"}, True),
+    ({"match": "Exam.*\n.*room"}, True),
+    ({"title": "^Lab", "message": "room"}, True),
+    ({"title": "^Lab", "message": "hall"}, False)])
+def test_an_item_is_shown_if_any_given_regex_matches(options, shown):
+  patterns = view_patterns(view_args(**options))
+
+  assert matches_regex_patterns(
+    item("Exam on Friday", "The room is E1"), patterns) is shown
+
+def test_a_missing_title_or_message_is_searched_as_empty():
+  patterns = view_patterns(view_args(match="^$"))
+
+  assert matches_regex_patterns(item(None, None), patterns)
+
+@pytest.mark.parametrize("option", ["title", "message", "match"])
+def test_an_invalid_regex_stops_the_command_and_names_its_option(
+    option, caplog):
+  with pytest.raises(SystemExit):
+    view_patterns(view_args(**{option: "["}))
+
+  assert f"Invalid regex for --{option}" in caplog.text
 @
 
 <<print discussion details with rich>>=
