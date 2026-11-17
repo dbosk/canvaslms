@@ -53,7 +53,8 @@ appear after their corresponding functionality:
 import argparse
 from datetime import datetime, timedelta
 import pytest
-from unittest.mock import Mock, MagicMock, create_autospec
+from unittest.mock import Mock, MagicMock, create_autospec, patch
+import responses
 from canvasapi import Canvas
 from canvasapi.course import Course
 from canvasapi.group import Group, GroupCategory
@@ -723,18 +724,16 @@ and the [[roles]] list as the parameters.
 Then we will print the most useful attributes (identifiers) of a user.
 <<get groups and print them>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
-if args.category:
-  categories = filter_group_categories(course_list, args.category)
-else:
-  categories = filter_group_categories(course_list, ".*")
+limit = courses.miss_refresh_limit(args)
+categories = filter_group_categories(course_list, args.category or ".*",
+                                     limit)
 
-for category in categories:
-  for group in filter_groups([category], args.regex):
-    row = [
-      category.course.course_code, category.name,
-      group.name, group.members_count
-    ]
-    output.writerow(row)
+for group in filter_groups(categories, args.regex, limit):
+  row = [
+    group.category.course.course_code, group.category.name,
+    group.name, group.members_count
+  ]
+  output.writerow(row)
 @
 
 
@@ -753,20 +752,30 @@ other selection option is, since the ID is what the Canvas URL shows
 unambiguous.  The search is unanchored, as it is for groups
 (\cref{sec:groups-by-id}), so [[^4711$]] pins a single category.
 <<functions>>=
-def filter_group_categories(course_list, regex):
+def filter_group_categories(course_list, regex, max_listings=None):
   """
   Filters out the group categories whose name or Canvas ID matches regex
-  in the courses in course_list
+  in the courses in course_list. If a regex that names something matches
+  nothing, the listings are fetched again first, see retry_after_miss for
+  `max_listings`.
   """
 
   name = re.compile(regex or ".*")
+  course_list = list(course_list)
 
-  for course in course_list:
-    for category in course.get_group_categories():
-      category = canvaslms.cli.utils.ensure_group_category_attrs(category)
-      if name.search(category.name or '') or name.search(str(category.id)):
-        category.course = course
-        yield category
+  def matching_categories():
+    for course in course_list:
+      for category in course.get_group_categories():
+        category = canvaslms.cli.utils.ensure_group_category_attrs(category)
+        if name.search(category.name or '') or name.search(str(category.id)):
+          category.course = course
+          yield category
+
+  listings = []
+  if pattern_names_something(regex):
+    listings = [(course, "group_category") for course in course_list]
+  return retry_after_miss(matching_categories, listings, max_listings,
+                          pattern=regex)
 @
 
 Let's verify the category filter on real [[canvasapi]] [[Course]] and
@@ -826,26 +835,252 @@ request extra data---[[process_group_options]] uses this to embed group
 memberships ([[include=["users"]]]) in the listing instead of fetching them
 group by group.
 <<functions>>=
-def filter_groups(items, regex, **kwargs):
+def filter_groups(items, regex, max_listings=None, **kwargs):
   """
   Items is a list of either courses or group categories,
   regex is a regular expression.
-  Returns all groups whose name or Canvas ID matches regex.
+  Returns all groups whose name or Canvas ID matches regex. If a regex that
+  names something matches nothing, the listings are fetched again first, see
+  retry_after_miss for `max_listings`.
 
-  Keyword arguments are passed on to ``.get_groups()``.
+  Other keyword arguments are passed on to ``.get_groups()``.
   """
 
   name = re.compile(regex or ".*")
+  items = list(items)
 
-  for item in items:
-    for group in item.get_groups(**kwargs):
-      group = canvaslms.cli.utils.ensure_group_attrs(group)
-      if name.search(group.name or '') or name.search(str(group.id)):
-        if isinstance(item, canvasapi.course.Course):
-          group.course = item
-        elif isinstance(item, canvasapi.group.GroupCategory):
-          group.category = item
-        yield group
+  def matching_groups():
+    for item in items:
+      for group in item.get_groups(**kwargs):
+        group = canvaslms.cli.utils.ensure_group_attrs(group)
+        if name.search(group.name or '') or name.search(str(group.id)):
+          if isinstance(item, canvasapi.course.Course):
+            group.course = item
+          elif isinstance(item, canvasapi.group.GroupCategory):
+            group.category = item
+          yield group
+
+  listings = []
+  if pattern_names_something(regex):
+    listings = [(item, "group") for item in items]
+  return retry_after_miss(matching_groups, listings, max_listings,
+                          pattern=regex)
+@
+
+\subsection{Looking again when no group or category matches}
+\label{sec:groups-refresh-on-miss}
+
+Groups are often made in the web interface, and a category or a group made
+there a minute ago is not in the cached listing yet.
+Both filters above take everything that is searched, the courses or the
+categories, so each can do what [[filter_users]] does: when a pattern that
+names something matches nothing in any of them, it fetches their listings
+again and searches once more (\cref{sec:refresh-on-miss}).
+A caller must then give the filter all it searches in one call.
+A loop that calls [[filter_groups]] for one category at a time would turn
+every category without the group into a miss of its own.
+
+Let's verify this with a real course whose requests [[responses]] answers.
+It has two categories, each with one group, and listed them an hour ago;
+Canvas has got a third category and a second group in the first category
+since.
+<<test functions>>=
+GROUPS_API = "https://canvas.example.invalid/api/v1"
+
+def group_json(group_id, name, category_id):
+    return {"id": group_id, "name": name, "group_category_id": category_id,
+            "members_count": 0}
+
+def course_with_groups_since():
+    """Return a course that listed its categories and groups an hour ago.
+
+    Also returns the mocks of the listings Canvas answers with now, by
+    name: the categories, the groups of each of the two categories, and
+    the groups of the course.
+    The groups were listed with their members, as the group options ask for
+    them, so that a later listing is not fetched for lack of the members.
+    """
+    labs, projects = ({"id": 1, "name": "Labs"}, {"id": 2, "name": "Projects"})
+    urls = {"categories": f"{GROUPS_API}/courses/1/group_categories",
+            "labs": f"{GROUPS_API}/group_categories/1/groups",
+            "projects": f"{GROUPS_API}/group_categories/2/groups",
+            "course": f"{GROUPS_API}/courses/1/groups"}
+    cached = {"categories": [labs, projects],
+              "labs": [group_json(11, "Lab 1", 1)],
+              "projects": [group_json(21, "Project 1", 2)]}
+    cached["course"] = cached["labs"] + cached["projects"]
+    for name, url in urls.items():
+        responses.get(url, json=cached[name])
+    course = Course(Canvas("https://canvas.example.invalid",
+                           "token")._Canvas__requester,
+                    {"id": 1, "name": "Course", "course_code": "CODE"})
+    categories = list(users_module.filter_group_categories([course], ".*"))
+    for searched in (categories, [course]):
+        assert len(list(users_module.filter_groups(
+            searched, ".*", include=["users"]))) == 2
+    now = {"categories": [labs, projects, {"id": 3, "name": "Seminars"}],
+           "labs": cached["labs"] + [group_json(12, "Lab 2", 1)],
+           "projects": cached["projects"]}
+    now["course"] = now["labs"] + now["projects"]
+    listings = {name: responses.replace(responses.GET, url, json=now[name])
+                for name, url in urls.items()}
+    an_hour_ago = datetime.now() - timedelta(hours=1)
+    course.group_category_all_fetched = an_hour_ago
+    for searched in (course, *categories):
+        searched.group_all_fetched = an_hour_ago
+    return course, listings
+
+def fetched(listings):
+    return {name for name, listing in listings.items() if listing.call_count}
+
+@responses.activate
+def test_a_category_canvas_has_got_since_is_found():
+    course, listings = course_with_groups_since()
+
+    found = list(users_module.filter_group_categories([course], "^Sem"))
+
+    assert [category.name for category in found] == ["Seminars"]
+    assert found[0].course is course
+    assert fetched(listings) == {"categories"}
+
+@responses.activate
+def test_listing_all_categories_does_not_ask_canvas():
+    course, listings = course_with_groups_since()
+
+    found = list(users_module.filter_group_categories([course], ".*"))
+
+    assert [category.name for category in found] == ["Labs", "Projects"]
+    assert fetched(listings) == set()
+
+@responses.activate
+def test_a_group_canvas_has_got_since_is_found_in_its_category():
+    course, listings = course_with_groups_since()
+    categories = users_module.filter_group_categories([course], ".*")
+
+    found = list(users_module.filter_groups(categories, "^Lab 2$"))
+
+    assert [group.name for group in found] == ["Lab 2"]
+    assert found[0].category.name == "Labs"
+    assert fetched(listings) == {"labs", "projects"}
+
+@responses.activate
+def test_a_group_canvas_has_got_since_is_found_in_its_course():
+    course, listings = course_with_groups_since()
+
+    found = list(users_module.filter_groups([course], "^Lab 2$"))
+
+    assert [group.name for group in found] == ["Lab 2"]
+    assert found[0].course is course
+    assert fetched(listings) == {"course"}
+
+@responses.activate
+@pytest.mark.parametrize("pattern", [None, "", ".*"])
+def test_listing_all_of_nothing_does_not_ask_canvas(pattern):
+    """A course without categories or groups is an answer, not a miss."""
+    urls = {"categories": f"{GROUPS_API}/courses/1/group_categories",
+            "course": f"{GROUPS_API}/courses/1/groups"}
+    for url in urls.values():
+        responses.get(url, json=[])
+    course = Course(Canvas("https://canvas.example.invalid",
+                           "token")._Canvas__requester,
+                    {"id": 1, "name": "Course", "course_code": "CODE"})
+    assert list(users_module.filter_group_categories([course], ".*")) == []
+    assert list(users_module.filter_groups([course], ".*")) == []
+    listings = {
+        "categories": responses.replace(
+            responses.GET, urls["categories"],
+            json=[{"id": 3, "name": "Seminars"}]),
+        "course": responses.replace(
+            responses.GET, urls["course"],
+            json=[group_json(12, "Lab 2", 1)])}
+    an_hour_ago = datetime.now() - timedelta(hours=1)
+    course.group_category_all_fetched = an_hour_ago
+    course.group_all_fetched = an_hour_ago
+
+    assert list(users_module.filter_group_categories([course], pattern)) == []
+    assert list(users_module.filter_groups([course], pattern)) == []
+    assert fetched(listings) == set()
+
+@responses.activate
+def test_a_group_search_keeps_to_the_limit_it_is_given():
+    course, listings = course_with_groups_since()
+    categories = users_module.filter_group_categories([course], ".*")
+
+    assert list(users_module.filter_groups(categories, "^Lab 2$",
+                                           max_listings=1)) == []
+    assert fetched(listings) == set()
+
+@responses.activate
+def test_a_category_search_keeps_to_the_limit_it_is_given():
+    course, listings = course_with_groups_since()
+
+    assert list(users_module.filter_group_categories(
+        [course], "^Sem", max_listings=0)) == []
+    assert fetched(listings) == set()
+@
+
+The [[groups]] command gives [[filter_groups]] all the categories at once,
+so a group that one category has leaves the other categories alone, and the
+options that select groups for other commands pass on the limit that [[-c]]
+decides.
+<<test functions>>=
+def groups_printed(searched, capsys, **options):
+    """Return the rows the groups command prints for the course `searched`."""
+    args = argparse.Namespace(**{"course": "CODE", "category": None,
+                                 "regex": ".*", "delimiter": "\t", **options})
+    with patch("canvaslms.cli.users.courses.process_course_option",
+               return_value=[searched]):
+        users_module.groups_command({}, None, args)
+    return [row.split("\t") for row in capsys.readouterr().out.splitlines()]
+
+@responses.activate
+def test_groups_command_does_not_refresh_a_category_that_lacks_the_group(
+        capsys):
+    course, listings = course_with_groups_since()
+
+    rows = groups_printed(course, capsys, regex="^Lab 1$")
+
+    assert rows == [["CODE", "Labs", "Lab 1", "0"]]
+    assert fetched(listings) == set()
+
+@responses.activate
+def test_groups_command_finds_a_group_canvas_has_got_since(capsys):
+    course, listings = course_with_groups_since()
+
+    rows = groups_printed(course, capsys, regex="^Lab 2$")
+
+    assert rows == [["CODE", "Labs", "Lab 2", "0"]]
+    assert fetched(listings) == {"labs", "projects"}
+
+@responses.activate
+def test_groups_command_in_all_courses_keeps_to_their_limit(
+        monkeypatch, capsys):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+    course, listings = course_with_groups_since()
+
+    assert groups_printed(course, capsys, course=".*", category="^Sem") == []
+    assert groups_printed(course, capsys, course=".*", regex="^Lab 2$") == []
+    assert fetched(listings) == set()
+
+@responses.activate
+@pytest.mark.parametrize("options", [
+    {"category": "^Sem", "group": None},
+    {"category": "Labs", "group": "^Lab 2$"},
+    {"category": None, "group": "^Lab 2$"}])
+def test_selecting_groups_in_all_courses_keeps_to_their_limit(
+        monkeypatch, options):
+    monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                        "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+    course, listings = course_with_groups_since()
+    args = argparse.Namespace(course=".*", **options)
+
+    with patch("canvaslms.cli.users.courses.process_course_option",
+               return_value=[course]), \
+         pytest.raises(canvaslms.cli.EmptyListError):
+        users_module.process_group_options(None, args)
+
+    assert fetched(listings) == set()
 @
 
 \subsection{Matching groups by name or Canvas ID}
@@ -1738,16 +1973,19 @@ def process_group_options(canvas, args):
   """Processes the group/group category options, returns a list of groups"""
 
   course_list = courses.process_course_option(canvas, args)
+  limit = courses.miss_refresh_limit(args)
 
   if args.category:
     group_list = list(filter_groups(
-      filter_group_categories(course_list, args.category),
+      filter_group_categories(course_list, args.category, limit),
       args.group,
+      limit,
       include=["users"]))
   else:
     group_list = list(filter_groups(
       course_list,
       args.group,
+      limit,
       include=["users"]))
   
   if not group_list:

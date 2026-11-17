@@ -93,6 +93,7 @@ import yaml
 import canvaslms.cli
 import canvaslms.cli.links
 import canvaslms.cli.utils
+from canvaslms.hacks.canvasapi import retry_after_miss
 @
 
 \section{Testing overview}
@@ -104,9 +105,13 @@ implementation section. The test file imports the module and pytest.
 import pytest
 import tempfile
 import os
+from datetime import datetime, timedelta
 
+import canvasapi.canvas_object
+import canvasapi.exceptions
 import canvaslms.cli
 import canvaslms.cli.content as content
+import canvaslms.hacks.canvasapi
 
 <<test yaml functions>>
 <<test schema functions>>
@@ -1669,6 +1674,171 @@ class TestMatchItemByName:
             items, "alpha",
             lambda x: x)
         assert result == "alpha"
+
+@
+
+\subsection{Looking at Canvas before deciding that nothing matches}
+\label{sec:match-after-refresh}
+
+Both functions search a listing that the caller read from the cache.
+An item made in the web interface since that listing was fetched is not in it,
+and for the commands that use these functions the consequence is worse than a
+misleading message: with [[--create]], no match means that the item is
+created, so the course ends up with two pages of the same title.
+The other name lookups look at Canvas once more before they give up
+(\cref{sec:refresh-on-miss}), and so must these.
+
+[[retry_after_miss]] wants a search that returns its matches, while the two
+functions above return one item or raise an exception.
+[[match_after_refresh]] is the adapter between them.
+The caller gives it the whole match as a function, one that reads the listing
+anew each time it is called, and the cached listing that function reads.
+No match the first time fetches that listing again, unless it was fetched in
+the last few minutes, and matches once more.
+If there is still nothing, the caller gets the [[EmptyListError]] of the last
+attempt, so the messages stay those of the two functions.
+Several matches and an invalid regex are not misses and pass through as they
+are.
+
+The caller may create the item on [[EmptyListError]], so that error must mean
+that we looked, not that we failed to look.
+The refresh is therefore a [[required]] one: it is retried like any request,
+and if it still fails the failure is raised in place of [[EmptyListError]],
+and nothing is created.
+
+Other lookups by name have the same shape with another exception, and no
+creation to guard: the assignment group that a file names is an error when it
+is missing (\cref{sec:assignment-group-spec}).
+For them the caller says which exception is the miss, and that the refresh is
+not required, so that a failed refresh leaves the answer as it was.
+<<matching functions>>=
+def match_after_refresh(match, listing, pattern=None, miss=None,
+                        required=True):
+    """Return `match()`, fetching `listing` again first if nothing matches.
+
+    Args:
+        match: Callable that reads the listing and returns the one match,
+            as match_item_by_regex and match_item_by_name do
+        listing: The cached listing it reads, as `(owner, attribute)`,
+            for example `(course, "page")`
+        pattern: What is searched for, for the log
+        miss: The exception with which `match` says that nothing matches,
+            by default canvaslms.cli.EmptyListError
+        required: Whether a failed refresh is raised (the caller may
+            create what is missing) or reported as no match
+
+    Returns:
+        The single matching item
+
+    Raises:
+        `miss`: Nothing matches after the refresh, or with `required`
+            false, also when the refresh failed
+        canvasapi.exceptions.CanvasException or
+        requests.exceptions.RequestException: The refresh failed and
+            `required` is true
+        Whatever else `match` raises
+    """
+    if miss is None:
+        miss = canvaslms.cli.EmptyListError
+    misses = []
+    def found():
+        try:
+            return [match()]
+        except miss as missed:
+            misses.append(missed)
+            return []
+    for item in retry_after_miss(found, [listing], pattern=pattern,
+                                 required=required):
+        return item
+    raise misses[-1]
+@
+
+Let's verify this with an owner whose listing goes through the real cache
+decorator, and which Canvas, played by the [[items]] attribute, has added an
+item to since the listing was cached an hour ago.
+<<test matching functions>>=
+class TestMatchAfterRefresh:
+    """Tests for match_after_refresh function."""
+
+    def owner_listed_an_hour_ago(self, cached, now):
+        class Owner:
+            listings = 0
+            fail = None
+            def get_items(self, **kwargs):
+                if self.fail:
+                    raise self.fail
+                self.listings += 1
+                return [canvasapi.canvas_object.CanvasObject(None, {"id": i})
+                        for i in self.items]
+        canvaslms.hacks.canvasapi.CacheGetMethods(
+            "item", include_singular=False)(Owner)
+        owner = Owner()
+        owner.items = cached
+        list(owner.get_items())
+        owner.item_all_fetched = datetime.now() - timedelta(hours=1)
+        owner.items = now
+        return owner
+
+    def match_by_id(self, owner, wanted):
+        return content.match_after_refresh(
+            lambda: content.match_item_by_name(
+                list(owner.get_items()), wanted, lambda item: item.id),
+            (owner, "item"), wanted)
+
+    def test_an_item_canvas_has_got_since_is_found(self):
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+
+        assert self.match_by_id(owner, 2).id == 2
+        assert owner.listings == 2
+
+    def test_an_item_in_the_cache_does_not_ask_canvas(self):
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+
+        assert self.match_by_id(owner, 1).id == 1
+        assert owner.listings == 1
+
+    def test_no_match_after_the_refresh_is_the_error_of_the_match(self):
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+
+        with pytest.raises(canvaslms.cli.EmptyListError,
+                           match="No items match name '3'"):
+            self.match_by_id(owner, 3)
+        assert owner.listings == 2
+
+    def test_a_failed_refresh_is_not_reported_as_no_match(self):
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+        owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+
+        with pytest.raises(canvasapi.exceptions.CanvasException,
+                           match="Unavailable"):
+            self.match_by_id(owner, 2)
+
+    def test_a_miss_can_be_another_exception_and_a_failure_no_match(self):
+        """A lookup that only reports: KeyError stands for its own error."""
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+        def match():
+            return {item.id: item for item in owner.get_items()}[2]
+
+        found = content.match_after_refresh(
+            match, (owner, "item"), miss=KeyError, required=False)
+        assert found.id == 2
+
+        owner = self.owner_listed_an_hour_ago([1], [1, 2])
+        owner.fail = canvasapi.exceptions.CanvasException("Unavailable")
+        with pytest.raises(KeyError):
+            content.match_after_refresh(
+                lambda: {item.id: item for item in owner.get_items()}[2],
+                (owner, "item"), miss=KeyError, required=False)
+
+    def test_several_matches_are_not_a_miss(self):
+        owner = self.owner_listed_an_hour_ago([1, 11], [1, 11, 2])
+
+        with pytest.raises(canvaslms.cli.MultipleMatchesError):
+            content.match_after_refresh(
+                lambda: content.match_item_by_name(
+                    list(owner.get_items()), 1, lambda item: item.id % 10),
+                (owner, "item"))
+        assert owner.listings == 1
 
 @
 

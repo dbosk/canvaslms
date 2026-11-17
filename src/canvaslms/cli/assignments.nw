@@ -32,10 +32,7 @@ import canvaslms.cli.content
 import canvaslms.cli.courses as courses
 import canvaslms.cli.links
 import canvaslms.cli.modules as modules
-from canvaslms.hacks.canvasapi import (
-    pattern_names_something,
-    retry_after_miss,
-)
+from canvaslms.hacks.canvasapi import refresh_after_miss
 import canvaslms.cli.submissions as submissions
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
@@ -83,8 +80,10 @@ the helpers they verify.
 <<test [[assignments.py]]>>=
 """Tests for assignment listing and filtering helpers."""
 import argparse
+import logging
 import pytest
 import requests
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 import canvasapi.course
@@ -293,21 +292,161 @@ filters, which are no reason to fetch anything.
 We therefore search by name alone first, and do so only for the effect on the
 cache: if there was a miss, the filtering below finds the new assignments in the
 refreshed listings, and no additional requests are made.
+That is what [[refresh_after_miss]] is for.
 <<refresh assignment listings if no name matches>>=
-if pattern_names_something(args.assignment):
-  list(retry_after_miss(
-    lambda: filter_assignments(course_list, args.assignment),
-    [(course, "assignment") for course in course_list],
-    max_listings=courses.miss_refresh_limit(args),
-    pattern=args.assignment))
+refresh_after_miss(
+  args.assignment,
+  lambda: filter_assignments(course_list, args.assignment),
+  [(course, "assignment") for course in course_list],
+  max_listings=courses.miss_refresh_limit(args))
+@
+
+The [[-A]] and [[-M]] options name things too, an assignment group and a
+module, and their names can be missing from the cache in the same way: the
+group or module was made in the web interface since the listing was fetched.
+Without a refresh the command reports that no assignment matches, which is
+true and misleading.
+We treat them as we treat the assignment name; for the module we use the
+search of the [[modules]] commands (\cref{sec:modules-refresh-on-miss}).
+Only the names are looked for.
+A group or module that is found but holds none of the assignments is an
+answer, not a miss.
+
+The shipped [[ungraded.sh]] gives a group pattern from cron, which mails what
+is printed on stderr, so it matters what the refresh prints there.
+A pattern that matches a group in the cache, in any of the courses, prints
+nothing.
+A pattern that matches none prints one line when more than one listing is
+concerned: that several listings are checked, or that they are more than the
+limit allows (\cref{sec:refresh-on-miss}).
+Usually an error follows, that no assignment matches, which the script lets
+through on purpose, since it is how a mistyped pattern gets noticed.
+But the line can also stand alone: when the group was made since the listings
+were fetched, the refresh finds it and the command goes on as usual.
+That happens once, on the first run after the group was made.
+<<refresh group and module listings if no name matches>>=
+refresh_after_miss(
+  getattr(args, "assignment_group", None),
+  lambda: (group for course in course_list
+                 for group in filter_assignment_groups(
+                   course, args.assignment_group)),
+  [(course, "assignment_group") for course in course_list],
+  max_listings=courses.miss_refresh_limit(args))
+modules.refresh_modules_after_miss(
+  course_list, getattr(args, "module", None),
+  courses.miss_refresh_limit(args))
 <<process options for selecting assignments to assignments list>>=
 <<refresh assignment listings if no name matches>>
+<<refresh group and module listings if no name matches>>
 assignments_list = []
 
 for course in course_list:
   <<get ungraded flag>>
   <<apply sequential filters to get filtered assignments>>
   assignments_list += filtered_assignments
+@
+
+Let's verify both with a real course whose requests [[responses]] answers.
+The course listed its assignments just now, and its assignment groups and
+modules an hour ago, before the group and the module asked for existed.
+The assignment is found in each case, with one more listing of the kind that
+was missing and none of the other.
+<<test functions>>=
+MISS_API = "https://canvas.example.invalid/api/v1/courses/1"
+
+def course_with_old_group_and_module_listings():
+  """Return a course, and the mocks of its group and module listings.
+
+  Canvas has an assignment group Exams and a module Week 2, both holding
+  the assignment Exam; the course cached the two listings before that,
+  with the group Labs and the empty module Week 1.
+  """
+  responses.get(f"{MISS_API}/assignments", json=[
+    {"id": 8, "name": "Exam", "course_id": 1, "assignment_group_id": 2}])
+  responses.get(f"{MISS_API}/assignment_groups",
+                json=[{"id": 1, "name": "Labs"}])
+  groups = responses.get(f"{MISS_API}/assignment_groups", json=[
+    {"id": 1, "name": "Labs"}, {"id": 2, "name": "Exams"}])
+  week_1 = {"id": 11, "name": "Week 1", "items_count": 0}
+  responses.get(f"{MISS_API}/modules", json=[week_1])
+  module_listing = responses.get(f"{MISS_API}/modules", json=[
+    week_1, {"id": 12, "name": "Week 2", "items_count": 1}])
+  responses.get(f"{MISS_API}/modules/11/items", json=[])
+  responses.get(f"{MISS_API}/modules/12/items", json=[
+    {"id": 120, "module_id": 12, "title": "Exam", "type": "Assignment",
+     "content_id": 8, "position": 1}])
+  course = Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "name": "Course", "course_code": "CODE"})
+  list(course.get_assignments())
+  list(course.get_assignment_groups())
+  list(course.get_modules())
+  an_hour_ago = datetime.now() - timedelta(hours=1)
+  course.assignment_group_all_fetched = an_hour_ago
+  course.module_all_fetched = an_hour_ago
+  return course, groups, module_listing
+
+def selected_assignments(searched, **options):
+  """Return the names that the assignment options select in `searched`."""
+  args = argparse.Namespace(**{"course": "CODE", "assignment": ".*",
+                               "assignment_group": "", "module": "",
+                               **options})
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[searched]):
+    return [assignment.name
+            for assignment in process_assignment_option(None, args)]
+
+@responses.activate
+def test_a_module_canvas_has_got_since_selects_its_assignments():
+  course, groups, modules_listing = course_with_old_group_and_module_listings()
+
+  assert selected_assignments(course, module="Week 2") == ["Exam"]
+  assert modules_listing.call_count == 1
+  assert groups.call_count == 0
+
+@responses.activate
+def test_an_assignment_group_canvas_has_got_since_is_found():
+  course, groups, modules_listing = course_with_old_group_and_module_listings()
+
+  assert selected_assignments(course, assignment_group="Exams") == ["Exam"]
+  assert groups.call_count == 1
+  assert modules_listing.call_count == 0
+
+@responses.activate
+def test_a_group_that_holds_no_assignment_is_not_a_miss():
+  course, groups, _ = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, assignment_group="Labs")
+  assert groups.call_count == 0
+
+@responses.activate
+def test_a_group_search_of_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, groups, _ = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, course=".*", assignment_group="Exams")
+  assert groups.call_count == 0
+
+@responses.activate
+def test_a_module_search_of_all_courses_keeps_to_their_limit(monkeypatch):
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MAX_LISTINGS_ALL_COURSES", 0)
+  course, _, modules_listing = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, course=".*", module="Week 2")
+  assert modules_listing.call_count == 0
+
+@responses.activate
+def test_a_module_that_holds_no_assignment_is_not_a_miss():
+  course, _, modules_listing = course_with_old_group_and_module_listings()
+
+  with pytest.raises(canvaslms.cli.EmptyListError):
+    selected_assignments(course, module="Week 1")
+  assert modules_listing.call_count == 0
 @
 
 We check if the [[ungraded]] flag is set, defaulting to [[False]] if the
@@ -884,7 +1023,14 @@ of a letter-graded assignment (\cref{sec:grading-standard-spec}).
 The matching is therefore written for any items that have an ID and a name,
 and [[key]] and [[kind]] only say, in the messages, which file key and which
 kind of item the spec was meant for.
+
+No match gets a [[ValueError]] of its own kind, so that a caller whose items
+come from the cache can tell the one failure that Canvas might answer
+differently from those it would not.
 <<functions>>=
+class NoNamedItemError(ValueError):
+  """No item matches the spec of a file key."""
+
 def resolve_named_item(items, spec, key, kind, current=None,
                        name_attr='name'):
   """Return the ID of the one item of `items` that `spec` names.
@@ -911,7 +1057,7 @@ def resolve_named_item(items, spec, key, kind, current=None,
   if len(matches) == 1:
     return matches[0].id
   if not matches:
-    raise ValueError(f"{key}: no {kind} matches '{spec}'")
+    raise NoNamedItemError(f"{key}: no {kind} matches '{spec}'")
   names = ", ".join(f"'{getattr(item, name_attr, None)}'" for item in matches)
   raise ValueError(f"{key}: '{spec}' matches {len(matches)} {kind}s "
                    f"({names}); make it more specific")
@@ -923,11 +1069,25 @@ def resolve_assignment_group(course, spec, current=None):
   ID. `current` is the ID of the item's present group, if any; it is kept
   when `spec` matches several groups including it.
   Raises ValueError when no group or several groups match, or when the
-  regex is invalid.
+  regex is invalid. Before it reports no match, the course's groups are
+  fetched again.
   """
-  return resolve_named_item(course.get_assignment_groups(), spec,
-                            'assignment_group', 'assignment group', current)
+  return canvaslms.cli.content.match_after_refresh(
+    lambda: resolve_named_item(course.get_assignment_groups(), spec,
+                               'assignment_group', 'assignment group',
+                               current),
+    (course, "assignment_group"), spec, miss=NoNamedItemError,
+    required=False)
 @
+
+The groups come from the cache, so a group made in the web interface since
+the listing was fetched would be reported as matching nothing.
+As for [[-A]] (\cref{sec:refresh-on-miss}), we look at Canvas once more before
+we say so, through [[match_after_refresh]] (\cref{sec:match-after-refresh}).
+Nothing is created when the group is missing, so the refresh is not a required
+one: if it fails, the answer is the one the cache gave.
+The grading schemes need nothing of the kind, since they are not cached and
+[[course_grading_standards]] asks Canvas every time.
 
 The export goes the other way: from the [[assignment_group_id]] of an
 assignment or quiz to the spec a file carries.
@@ -1017,6 +1177,75 @@ class TestAssignmentGroupSpec:
     course = course_with_groups((31, "Labs"))
     assert assignment_group_spec(course, 99) is None
     assert assignment_group_spec(course, None) is None
+@
+
+The stand-in course above has no cache, so let's verify the refresh with a
+real course whose requests [[responses]] answers.
+It listed its groups an hour ago, and Canvas has got the group Exams since.
+<<test functions>>=
+GROUPS_URL = "https://canvas.example.invalid/api/v1/courses/1/assignment_groups"
+
+def course_with_a_group_since(status=200):
+  """Return a course that cached two groups, and the listing now.
+
+  The cache has Labs and Lectures. Canvas has Exams as well, or answers
+  with `status`.
+  """
+  cached = [{"id": 31, "name": "Labs"}, {"id": 33, "name": "Lectures"}]
+  exams = {"id": 32, "name": "Exams"}
+  responses.get(GROUPS_URL, json=cached)
+  listing = responses.get(GROUPS_URL, status=status,
+                          json=[*cached, exams] if status == 200 else {})
+  course = Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "name": "Course", "course_code": "CODE"})
+  assert len(list(course.get_assignment_groups())) == 2
+  course.assignment_group_all_fetched = datetime.now() - timedelta(hours=1)
+  return course, listing
+
+@responses.activate
+def test_a_file_names_a_group_canvas_has_got_since():
+  course, listing = course_with_a_group_since()
+
+  assert resolve_assignment_group(course, "^Exams$") == 32
+  assert listing.call_count == 1
+
+@responses.activate
+def test_a_file_names_a_group_in_the_cache_without_asking_canvas():
+  course, listing = course_with_a_group_since()
+
+  assert resolve_assignment_group(course, "^Labs$") == 31
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_group_that_canvas_lacks_too_is_still_the_error_of_the_key():
+  course, listing = course_with_a_group_since()
+
+  with pytest.raises(ValueError,
+                     match="assignment_group: no assignment group matches"):
+    resolve_assignment_group(course, "^Seminars$")
+  assert listing.call_count == 1
+
+@responses.activate
+@pytest.mark.parametrize("spec,message", [
+    ("[", "assignment_group: invalid regex"),
+    ("^L", "matches 2 assignment groups")])
+def test_only_no_match_makes_the_file_lookup_ask_canvas(spec, message):
+  course, listing = course_with_a_group_since()
+
+  with pytest.raises(ValueError, match=message):
+    resolve_assignment_group(course, spec)
+  assert listing.call_count == 0
+
+@responses.activate
+def test_a_failed_refresh_leaves_the_answer_of_the_cache(caplog):
+  course, listing = course_with_a_group_since(status=503)
+
+  with caplog.at_level(logging.WARNING), \
+       pytest.raises(ValueError, match="no assignment group matches"):
+    resolve_assignment_group(course, "^Exams$")
+  assert listing.call_count == 1
+  assert "Could not refresh" in caplog.text
 @
 
 We also want to filter out the assignments of a course that belong to a given
@@ -2239,6 +2468,16 @@ If exactly one assignment matches, we update it. If no assignments match and
 [[--create]] is specified, we create a new one. If multiple assignments match,
 the exception message lists the matching names so the user can make the regex
 more specific.
+
+Since no match can mean that an assignment is created, the cache alone must
+not decide it: an assignment made in the web interface since the listing was
+cached would get a twin of the same name.
+[[match_after_refresh]] (\cref{sec:match-after-refresh}) fetches the listing
+again before it reports no match.
+It calls the match a second time for that, so the match reads the listing
+itself.
+If Canvas cannot be asked, the command fails with that error and creates
+nothing.
 <<update or create assignment by regex>>=
 regex_pattern = attributes['regex']
 course_list = courses.process_course_option(canvas, args)
@@ -2247,14 +2486,14 @@ if not course_list:
 
 course = course_list[0]
 
-all_assignments = list(list_assignments([course]))
-
 try:
-  assignment = canvaslms.cli.content.match_item_by_regex(
-      all_assignments, regex_pattern,
-      [lambda a: a.name or '', lambda a: str(a.id)],
-      item_type="assignment",
-      name_func=lambda a: a.name or '')
+  assignment = canvaslms.cli.content.match_after_refresh(
+      lambda: canvaslms.cli.content.match_item_by_regex(
+          list(list_assignments([course])), regex_pattern,
+          [lambda a: a.name or '', lambda a: str(a.id)],
+          item_type="assignment",
+          name_func=lambda a: a.name or ''),
+      (course, "assignment"), regex_pattern)
   <<update existing assignment>>
 except re.error as e:
   canvaslms.cli.err(
@@ -2390,6 +2629,73 @@ def test_created_assignment_is_in_the_cached_listing(tmp_path):
   assert listing.call_count == 1
 @
 
+Let's also verify that an assignment Canvas has got since the listing was
+cached is updated and not created again, whether the file names it by a
+regex or by its name.
+The fake Canvas has no answer to a request that creates an assignment, so
+creating one would fail the test.
+<<test functions>>=
+@responses.activate
+@pytest.mark.parametrize("front_matter", [
+    "name: New lab", "regex: ^New lab$\nname: New lab"])
+def test_edit_with_create_updates_an_assignment_canvas_has_got_since(
+    tmp_path, front_matter):
+  api = "https://canvas.example.invalid/api/v1"
+  responses.get(f"{api}/courses/1/assignments",
+                json=[assignment_json(7, "Lab")])
+  listing = responses.get(f"{api}/courses/1/assignments", json=[
+    assignment_json(7, "Lab"), assignment_json(8, "New lab")])
+  updated = responses.put(f"{api}/courses/1/assignments/8",
+                          json=assignment_json(8, "New lab"))
+  course = canvasapi.course.Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101"})
+  assert [a.id for a in course.get_assignments()] == [7]
+  course.assignment_all_fetched = datetime.now() - timedelta(hours=1)
+  path = tmp_path / "new-lab.md"
+  path.write_text(f"---\n{front_matter}\n---\n\nBody\n")
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "SBX101", "-f",
+                            str(path), "--create", "--no-link-translation"])
+
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]):
+    assignments_edit_command({}, MagicMock(), args)
+
+  assert updated.call_count == 1
+  assert listing.call_count == 1
+
+@responses.activate
+def test_edit_with_create_creates_nothing_when_canvas_cannot_be_asked(
+    tmp_path):
+  api = "https://canvas.example.invalid/api/v1"
+  responses.get(f"{api}/courses/1/assignments",
+                json=[assignment_json(7, "Lab")])
+  responses.get(f"{api}/courses/1/assignments", json={"errors": "down"},
+                status=503)
+  created = responses.post(f"{api}/courses/1/assignments",
+                           json=assignment_json(9, "New lab"))
+  course = canvasapi.course.Course(
+    Canvas("https://canvas.example.invalid", "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101"})
+  assert [a.id for a in course.get_assignments()] == [7]
+  course.assignment_all_fetched = datetime.now() - timedelta(hours=1)
+  path = tmp_path / "new-lab.md"
+  path.write_text("---\nname: New lab\n---\n\nBody\n")
+  parser = argparse.ArgumentParser()
+  add_command(parser.add_subparsers())
+  args = parser.parse_args(["assignments", "edit", "-c", "SBX101", "-f",
+                            str(path), "--create", "--no-link-translation"])
+
+  with patch("canvaslms.cli.assignments.courses.process_course_option",
+             return_value=[course]), \
+       pytest.raises(canvasapi.exceptions.CanvasException):
+    assignments_edit_command({}, MagicMock(), args)
+
+  assert created.call_count == 0
+@
+
 \subsubsection{Filter-based assignment matching}
 
 When no [[regex]] is specified in the YAML, we check whether a [[name]] is
@@ -2434,13 +2740,13 @@ if not course_list:
 
 course = course_list[0]
 
-all_assignments = list(list_assignments([course]))
-
 try:
-  assignment = canvaslms.cli.content.match_item_by_name(
-      all_assignments, name,
-      lambda a: a.name or '',
-      item_type="assignment")
+  assignment = canvaslms.cli.content.match_after_refresh(
+      lambda: canvaslms.cli.content.match_item_by_name(
+          list(list_assignments([course])), name,
+          lambda a: a.name or '',
+          item_type="assignment"),
+      (course, "assignment"), name)
   <<update existing assignment>>
 except canvaslms.cli.EmptyListError:
   if args.create:
