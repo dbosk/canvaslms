@@ -13,7 +13,6 @@ We do this as follows:
 <<[[canvasapi.py]]>>=
 """A module that modifies the classes of the canvasapi package"""
 
-import cachetools
 import canvasapi.assignment
 import canvasapi.exceptions
 import canvasapi.file
@@ -428,12 +427,17 @@ def make_useful_user_dunder_str():
 
 Now, we simply need to define a function to use as a drop-in replacement for 
 the [[__str__]] method.
+Canvas does not always send both fields: [[login_id]] is missing for users no
+longer enrolled, and a user embedded in another object may lack its [[name]].
+A [[__str__]] must not raise, since it is called where nobody expects an
+error, in a log message or an f-string, so we read both with defaults.
+An empty login gives empty brackets, and a missing name the user's Canvas ID,
+as in [[user 4 <>]].
 <<define [[name_and_login]]>>=
 def name_and_login(self):
-  try:
-    return f"{self.name} <{self.login_id}>"
-  except AttributeError as err:
-    return f"{self.name} <>"
+  name = getattr(self, "name", None) or f"user {getattr(self, 'id', '?')}"
+  login_id = getattr(self, "login_id", None) or ""
+  return f"{name} <{login_id}>"
 @
 
 Then we simply need to replace the current [[__str__]] method with the new one 
@@ -470,6 +474,15 @@ class TestUserStringRepresentation:
         result = str(user)
 
         assert result == "Bob Brown <>"
+
+    @pytest.mark.parametrize("fields,expected", [
+        ({"id": 4}, "user 4 <>"),
+        ({"id": 4, "login_id": "dd"}, "user 4 <dd>"),
+        ({"id": 4, "name": None, "login_id": None}, "user 4 <>")],
+        ids=["neither", "no name", "both None"])
+    def test_user_str_never_raises(self, fields, expected):
+        """A user embedded in another object may lack even its name"""
+        assert str(User(MagicMock(), fields)) == expected
 
     def test_user_str_useful_for_debugging(self):
         """String representation should be human-readable"""
@@ -647,10 +660,12 @@ get a higher grade.
 But once the student has the highest grade, an A or a P, the result will not 
 change.
 
-We will use the [[cachetools]] package to provide suitable caching decorators 
-for the [[canvasapi]] classes' methods.
-However, in some cases we can't, but need to write our own caching mechanisms.
-But this means that we can construct quite complex cache policies.
+We write our own caching decorators for the [[canvasapi]] classes' methods,
+rather than use a package such as [[cachetools]].
+The reason is given below: a listing and its single objects must be cached
+together, so that the one can answer for the other
+(\cref{sec:cache-get-methods-decorator}).
+This also lets us build the more complex cache policies this chapter needs.
 
 The general design is this:
 We add a cache attribute, then the methods store objects (return values) there.
@@ -1114,8 +1129,8 @@ assignment groups) produce objects that [[outdated()]] marks stale on their
 own.
 We initialize [[get_attr]] to [[None]] so the plural method can detect the
 configuration and skip individual refreshes; such entities instead rely
-entirely on the periodic bulk TTL machinery in [[outdated()]] for
-freshness.
+entirely on the periodic expiry of their listings
+(\cref{sec:expire-old-listings}) for freshness.
 <<create decorator functions and update [[cls]]>>=
 <<update constructor with new attributes>>
 
@@ -1692,6 +1707,8 @@ except KeyError:
 old_obj = obj
 refreshing_on_request = False
 
+if obj:
+  expire_old_listings(obj)
 if obj and must_update(kept_kwargs(obj, prev_kwargs), kwargs):
   obj = None
   cache_status = " (new kwargs required)"
@@ -2240,10 +2257,9 @@ for objects like pages that are marked stale when they lack complete data
 For plural-only entities ([[include_singular=False]]), [[get_attr]] is
 [[None]] and there is no singular method to refresh a single object with,
 so we yield the cached object as is.
-The order of the conjunction matters: [[outdated()]] must run even when we
-cannot refresh, because it has the side effect of resetting expired
-[[_all_fetched]] timestamps on the object's own child caches, which is what
-drives the periodic bulk refreshes.
+Each object the loop yields first has its own listings expired
+(\cref{sec:expire-old-listings}), whether it is refreshed or not: that is what
+drives the periodic bulk refreshes of the listings below it.
 
 The refresh can find that the object no longer exists: a page deleted in
 Canvas's web interface since the listing was cached is still in the cache,
@@ -2262,6 +2278,7 @@ Dropping entries while iterating over the dictionary is not allowed, so we
 iterate over a copy of its items.
 <<yield all objects in [[attr_cache]], update individual entries if needed>>=
 for obj, obj_kwargs in list(attr_cache.values()):
+  expire_old_listings(obj)
   if outdated(obj) and get_attr is not None:
     obj_key = getattr(obj, cache_key)
     reason = get_staleness_reason(obj)
@@ -2801,6 +2818,9 @@ Let's verify both, for each way of replacing an object.
 The stand-in class is enough here: what we test is what the decorator does with
 the objects it receives, and a recording could not express Canvas's answer
 changing between the calls.
+The listing below the object was fetched an hour ago, within every time to
+live, so that what we see is the replacement and not the expiry of that listing
+(\cref{sec:expire-old-listings}), which would empty its timestamp.
 
 <<test functions>>=
 class TestRefetchKeepsCachedDetails:
@@ -2821,9 +2841,11 @@ class TestRefetchKeepsCachedDetails:
         list(instance.get_items())
         obj, _ = instance.item_cache[1]
         obj.child_cache = {"sentinel": "subtree"}
-        obj.child_all_fetched = datetime(2026, 1, 1)
+        obj.child_all_fetched = self.an_hour_ago
         obj.child_all_kwargs = {"include": ["asked of the child listing"]}
         return instance
+
+    an_hour_ago = datetime.now() - timedelta(hours=1)
 
     def age(self, obj):
         """Make obj stale by the submission TTL"""
@@ -2832,7 +2854,7 @@ class TestRefetchKeepsCachedDetails:
 
     def assert_children_kept(self, obj):
         assert obj.child_cache == {"sentinel": "subtree"}
-        assert obj.child_all_fetched == datetime(2026, 1, 1)
+        assert obj.child_all_fetched == self.an_hour_ago
         assert obj.child_all_kwargs == {
             "include": ["asked of the child listing"]}
 
@@ -3710,14 +3732,8 @@ present on all Page objects from Canvas.
 If the object is a page but lacks the [[body]] attribute (or has [[body]] set to
 [[None]]), we treat it as incomplete and return [[True]] to trigger a refetch.
 <<check if page object is incomplete>>=
-try:
-  # If obj has page_id, it's a Page object
-  page_id = obj.page_id
-  # Page objects from get_pages() lack body; treat as incomplete
-  if not hasattr(obj, 'body') or obj.body is None:
-    return True
-except AttributeError:
-  pass
+if hasattr(obj, 'page_id') and getattr(obj, 'body', None) is None:
+  return True
 @
 
 For submissions without passing grades, we check if the [[SUBMISSION_TTL_MINUTES]]
@@ -3959,17 +3975,35 @@ COURSE_CACHE_TTL_DAYS = env_number(
   "CANVASLMS_COURSE_CACHE_TTL_DAYS", 1, int)
 @
 
-Another thing that we can do is to periodically reset the [[_all_fetched]] 
-flag.
-If we set it to [[None]], then we'll fetch all objects again.
-So we can check this value to see if a sufficient amount of time has passed for 
-us to reset it.
-Note, however, that for this case we shouldn't return [[True]] or [[False]], 
-since it's not the object itself that is outdated.
-We don't need to refetch this object, just for it to refetch its children.
-<<test if [[obj]] is outdated, return True if so>>=
-for attr_name in dir(obj):
-  <<reset [[_all_fetched]] if necessary>>
+\subsubsection{Expiring the listings below an object}
+\label{sec:expire-old-listings}
+
+An object can also carry listings of its own: a course has its assignments,
+its roster and so on, each with an [[_all_fetched]] timestamp.
+These listings get old while the object stays in the cache, so we
+periodically reset the timestamp to [[None]], which makes the next listing of
+that kind fetch everything again.
+
+This is not a question of whether the object itself is outdated: the course
+need not be fetched again for its roster to be.
+It is therefore a function of its own, [[expire_old_listings]], and not part
+of [[outdated]].
+It used to be part of it, as a side effect, which made [[outdated]] a test
+that changed what it tested.
+The plural getter called it once to count the stale objects for a log line and
+again for each object it yielded, and its correctness depended on the order of
+an [[and]] that a reader would take for an optimisation
+(issue~\#338).
+Now [[outdated]] only answers, and the getters call [[expire_old_listings]]
+on each object they take from the cache, once.
+<<function [[expire_old_listings]]>>=
+def expire_old_listings(obj):
+  """Forget when the listings below obj were fetched, if that is too long ago.
+
+  The next listing of such a kind is then fetched from Canvas again.
+  """
+  for attr_name in dir(obj):
+    <<reset [[_all_fetched]] if necessary>>
 @
 
 We want to periodically reset the [[_all_fetched]] date so that we periodically
@@ -4059,8 +4093,9 @@ That imbalance is why [[COURSE_CACHE_TTL_DAYS]] is the shortest of the listing
 intervals, one day by default.
 
 This one cannot work like the others, for two reasons.
-The others hang off [[outdated]], which the listing methods call for each object
-\emph{in} their cache, so that it can expire that object's child listings.
+The others hang off [[expire_old_listings]] (\cref{sec:expire-old-listings}),
+which the listing methods call for each object \emph{in} their cache, so that
+it can expire that object's child listings.
 The [[Canvas]] object is the root of the hierarchy and therefore in no cache, so
 nothing would ever ask whether its listing had expired.
 
@@ -4188,9 +4223,11 @@ def without_retries(owners):
 @
 
 The [[outdated]] function is used by the caching decorator to check if cached
-objects need refreshing.
+objects need refreshing, and [[expire_old_listings]] to let the listings below
+them expire.
 <<functions>>=
 <<function [[outdated]] to test if an object is outdated>>
+<<function [[expire_old_listings]]>>
 @
 
 Now let's verify the [[outdated]] function works correctly for different
@@ -4294,6 +4331,76 @@ class TestOutdated:
             minutes=SUBMISSION_TTL_MINUTES + 1)
 
         assert outdated(submission)
+
+    @pytest.mark.parametrize("fields,expected", [
+        ({"page_id": 3, "url": "intro"}, True),
+        ({"page_id": 3, "url": "intro", "body": None}, True),
+        ({"page_id": 3, "url": "intro", "body": "<p>x</p>"}, False),
+        ({"url": "intro"}, False)],
+        ids=["listed page", "page with no body", "full page", "not a page"])
+    def test_a_page_without_its_body_is_outdated(self, fields, expected):
+        """A page as the listing gives it lacks the body a view needs"""
+        assert outdated(canvas_object(Page, **fields)) is expected
+@
+
+
+\subsubsection{Verifying that the listings below an object expire}
+
+The listings below an object have their own time to live, by kind, and it
+runs out while the object is in the cache.
+Let's verify that through both getters, since either can be how the object is
+reached: a course cached with its assignments and its roster, the assignments
+listed three days ago and the roster as well.
+Three days is past the roster's limit ([[USER_CACHE_TTL_DAYS]], 2) and within
+the assignments' ([[DEFAULT_CACHE_TTL_DAYS]], 7).
+So after the course has been reached, the roster is fetched again and the
+assignments are not.
+
+<<test functions>>=
+COURSE_API = "https://canvas.example/api/v1/courses"
+
+def course_cached_three_days_ago(via_listing):
+    """Return a course cached with its assignments and roster, reached again.
+
+    The course is reached through the course listing or by its id, as
+    `via_listing` says. Also returns the mocks of the two listings below it.
+    """
+    canvas = canvasapi.Canvas("https://canvas.example", "token")
+    responses.get(COURSE_API, json=[{"id": 1, "name": "Course"}])
+    responses.get(f"{COURSE_API}/1", json={"id": 1, "name": "Course"})
+    listings = {
+        "assignment": responses.get(f"{COURSE_API}/1/assignments",
+                                    json=[{"id": 5, "name": "Lab"}]),
+        "user": responses.get(f"{COURSE_API}/1/search_users",
+                              json=[{"id": 7, "name": "Anna"}]),
+    }
+    course = next(iter(canvas.get_courses()))
+    list(course.get_assignments())
+    list(course.get_users())
+    three_days_ago = datetime.now() - timedelta(days=3)
+    course.assignment_all_fetched = course.user_all_fetched = three_days_ago
+    responses.calls.reset()
+    if via_listing:
+        course = next(iter(canvas.get_courses()))
+    else:
+        course = canvas.get_course(1)
+    return course, listings
+
+def requests_below(listings):
+    return {kind: sum(call.request.url.split("?")[0] == listing.url
+                      for call in responses.calls)
+            for kind, listing in listings.items()}
+
+@responses.activate
+@pytest.mark.parametrize("via_listing", [True, False],
+                         ids=["course listing", "course by id"])
+def test_a_listing_below_an_object_expires_by_its_own_limit(via_listing):
+    course, listings = course_cached_three_days_ago(via_listing)
+
+    list(course.get_assignments())
+    list(course.get_users())
+
+    assert requests_below(listings) == {"assignment": 0, "user": 1}
 @
 
 
@@ -6394,12 +6501,8 @@ def get_staleness_reason(obj):
 For Page objects without a [[body]] attribute, we return a reason indicating the
 object is incomplete:
 <<check incomplete page and return reason>>=
-try:
-  page_id = obj.page_id
-  if not hasattr(obj, 'body') or obj.body is None:
-    return "incomplete page object (missing body from get_pages())"
-except AttributeError:
-  pass
+if hasattr(obj, 'page_id') and getattr(obj, 'body', None) is None:
+  return "incomplete page object (missing body from get_pages())"
 @
 
 We log the specific reason for staleness to help diagnose cache behavior.
@@ -7691,10 +7794,12 @@ def make_canvas_courses_cacheable():
       canvasapi.canvas.Canvas)
 @
 
-Note that we don't need a TTLCache here, since the [[outdated]] function will
-periodically reset the [[_all_fetched]] flag to trigger a refetch.
+Note that we don't need a TTLCache here, since [[expire_old_listings]]
+(\cref{sec:expire-old-listings}) periodically resets the [[_all_fetched]] flag
+to trigger a refetch.
 One thing sets this listing apart from all the others: its owner, the [[Canvas]]
-object, is in no cache, so the listing methods never call [[outdated]] on it.
+object, is in no cache, so the listing methods never call
+[[expire_old_listings]] on it.
 The method checks the age of this listing itself instead
 (\cref{sec:course-listing-outage}).
 
@@ -8028,10 +8133,11 @@ We therefore wrap [[Group]] with a user cache as well.
 Memberships then live in [[group.user_cache]], persist inside the pickled
 [[Canvas]] object (groups are reachable from the course's group cache), and
 expire through the same [[user_all_fetched]] TTL
-([[USER_CACHE_TTL_DAYS]] days) that [[outdated()]] applies to any object
-carrying that attribute: every traversal of the cached groups listing calls
-[[outdated(group)]], which resets an expired [[user_all_fetched]] and
-thereby triggers a membership refetch on the next [[get_users()]] call.
+([[USER_CACHE_TTL_DAYS]] days) that [[expire_old_listings]] applies to any
+object carrying that attribute: every traversal of the cached groups listing
+calls [[expire_old_listings(group)]], which resets an expired
+[[user_all_fetched]] and thereby triggers a membership refetch on the next
+[[get_users()]] call.
 Note that this cache and its TTL govern the [[get_users()]] callers; the
 grouped user listing in [[users.nw]] \emph{prefers} the membership embedded
 in the groups listing itself, which instead refreshes on the groups cadence
@@ -8489,7 +8595,6 @@ def _refresh(self):
   submission = object.__getattribute__(self, '_submission')
   includes = object.__getattribute__(self, '_includes')
   original_get_submission = object.__getattribute__(self, '_original_get_submission')
-  annotations = object.__getattribute__(self, '_annotations')
 
   # Call original method directly (bypasses decorator, no double-wrapping)
   try:
@@ -9495,8 +9600,9 @@ listing is allowed to be, we fetch it again.
 The rule belongs to the singular method and not to [[outdated]], which the
 plural method also asks about every entry.
 There it would do harm: a listing can stay in use for a day after its entries
-have passed the limit, since its timestamp is only reset when [[outdated]]
-looks at the course, and then every entry would be fetched on its own, one
+have passed the limit, since its timestamp is only reset when
+[[expire_old_listings]] looks at the course, and then every entry would be
+fetched on its own, one
 request for each file of the course where one listing would do.
 A listing has its own time to live, and that is the one that should replace
 its entries.
@@ -9515,7 +9621,8 @@ Canvas, since what we test is which requests are sent, and the listing must
 change between two of them.
 One test is for the harm described above: a listing that is still in use
 although it and its entries are past the limit must be answered from the
-cache, and once [[outdated]] has looked at the course, with one request.
+cache, and once [[expire_old_listings]] has looked at the course, with one
+request.
 
 <<test functions>>=
 FILES_URL = "https://canvas.example/api/v1/courses/1/files"
@@ -9604,7 +9711,7 @@ class TestFileAndFolderCaching:
         assert [file.id for file in course.get_files()] == [7, 8]
 
         assert len(responses.calls) == 0
-        outdated(course)
+        expire_old_listings(course)
         assert [file.id for file in course.get_files()] == [7, 8]
         assert [call.request.path_url.split("?")[0]
                 for call in responses.calls] == ["/api/v1/courses/1/files"]

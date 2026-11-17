@@ -957,7 +957,9 @@ and keep the state a plain dict.
 Files and folders are cached on the course; a file or folder fetched alone
 expires after `DEFAULT_CACHE_TTL_DAYS`, since exporting links never reads the
 listing; the limit is in the singular getter (`fetched_alone_long_ago`), not
-in `outdated()`, which the plural getter asks about every entry. A command
+in `outdated()`, which the plural getter asks about every entry. `outdated()`
+only answers; the expiry of the listings below an object is
+`expire_old_listings()`, which both getters call once per cached object. A command
 that writes puts what Canvas answered in the cache (`remember_file`) and marks
 a listing as not fetched when it cannot know what else changed
 (`distrust_file_listings` after an upload). Commands annotate copies of cached
