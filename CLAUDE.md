@@ -1037,7 +1037,14 @@ versions discard each other's cache, see Cache Freshness:
 - `canvaslms[fbf]` - FeedbackFruits data (PyPI `FeedbackFruits`, import
   package `fbf`, repo github.com/dbosk/fbf). `cli.nw` adds its `fbf` command
   lazily in `main()` (fbf imports `canvaslms.cli`), only when installed; test
-  with a stand-in package, not by installing it
+  with a stand-in package, not by installing it. `submissions view` and
+  `grade -i` show the FBF work behind an FBF submission through
+  `fbf.view.Viewer` (found with `optional_fbf_module("view", "Viewer")`,
+  one viewer per command, `--no-fbf` turns it off); fbf owns everything FBF,
+  canvaslms only prints its sections. Try it live with
+  `PYTHONPATH=~/devel/edu/fbf/src poetry run canvaslms ...`, never
+  `pip install` fbf into the venv (its `canvaslms` dependency would replace
+  the local one)
 - `pandoc` - System package required by some subcommands
 
 ## Testing and Development
