@@ -28,6 +28,7 @@ import canvaslms.cli.users as users
 import canvaslms.cli.utils
 import canvaslms.hacks.canvasapi
 import canvaslms.hacks.attachment_cache as attachment_cache
+<<imports for FeedbackFruits work>>
 
 import argparse
 import csv
@@ -884,8 +885,9 @@ they pipe the output or skip the output altogether.
 <<get and print the submission data>>=
 console = rich.console.Console()
 <<create [[tmpdir]]>>
+fbf_viewer = make_fbf_viewer(config, canvas, args)
 for submission in submission_list:
-  view_submission(submission, args, tmpdir, console)
+  view_submission(submission, args, tmpdir, console, fbf_viewer)
 @
 
 Showing one submission is a function of its own, because it is not only done
@@ -894,16 +896,18 @@ shows the submissions one at a time, each followed by its grading.
 It takes the same view options, so a grader sees a submission exactly as
 [[submissions view]] would show it.
 <<functions>>=
-def view_submission(submission, args, tmpdir, console):
+def view_submission(submission, args, tmpdir, console, fbf_viewer=None):
   """Show `submission` like `submissions view`, following the options in `args`.
 
   Files are written below `tmpdir`, output goes through `console`.
+  `fbf_viewer`, from `make_fbf_viewer`, adds the FeedbackFruits work.
   """
   <<let [[subdir]] be the subdir for [[submission]]'s files>>
   output = format_submission(submission,
                              history=args.history,
                              tmpdir=tmpdir/subdir,
                              json_format=args.json,
+                             fbf_viewer=fbf_viewer,
                              <<args for diff option>>)
 
   <<write [[output]] to file in [[tmpdir/subdir]]>>
@@ -1276,6 +1280,8 @@ def add_view_options(parser):
   parser.add_argument("--include-null-submissions",
     action="store_true", default=False,
     help="Include placeholder rows without student work or feedback.")
+
+  <<add FeedbackFruits option>>
 
   <<add diff-related options>>
 
@@ -1722,6 +1728,7 @@ def format_submission(submission, history=False, json_format=False,
   <<add metadata to output>>
   <<add rubric assessment to output>>
   <<add comments to output>>
+  <<add FeedbackFruits work to output>>
   if history:
     <<let [[tmpdir]] be a directory to hold the versions>>
     if diff:
@@ -2415,6 +2422,13 @@ class TestAttachmentTempDir:
 
 We'll use [[tmpdir]] as the temporary directory to store the files when we try 
 to convert them.
+
+Once the file is on disk and its content type known, where it came from no
+longer matters, so the conversion is a function of its own,
+[[convert_file_to_md]].
+The work a student handed in to FeedbackFruits arrives on disk already, with
+no Canvas attachment behind it (\cref{sec:fbf-in-view}), and goes through the
+same conversion.
 <<functions>>=
 def convert_to_md(attachment: canvasapi.file.File,
                   tmpdir: pathlib.Path) -> str:
@@ -2425,6 +2439,13 @@ def convert_to_md(attachment: canvasapi.file.File,
   """
   <<download [[attachment]] to [[outfile]] in [[tmpdir]]>>
   <<let [[content_type]] be the attachment's content type>>
+  return convert_file_to_md(outfile, content_type)
+
+def convert_file_to_md(outfile: pathlib.Path, content_type: str) -> str:
+  """
+  Converts the file `outfile`, of `content_type`, to Markdown.
+  Returns the Markdown string.
+  """
   <<if [[content_type]] is text, just use [[outfile]] contents>>
   <<else if [[content_type]] is PDF, convert [[outfile]] using [[extract_text]]>>
   <<else convert [[outfile]] using [[pypandoc]]>>
@@ -2811,6 +2832,399 @@ class TestPDFConversionFallback:
         contents = convert_to_md(attachment, tmp_path)
 
         assert contents.startswith("Cannot convert this file")
+@
+
+
+\subsection{FeedbackFruits work}
+\label{sec:fbf-in-view}
+
+FeedbackFruits is an LTI tool, and for its assignments Canvas holds only the
+grade that FeedbackFruits sends back.
+The work itself stays in FeedbackFruits: the files the student handed in, the
+peer reviews received and given, the reflection, the discussion posts, and the
+breakdown of the grade into what the student did.
+The sections above therefore show such a submission as metadata, a grade and
+perhaps a comment, which is no help to a teacher who wants to see the work.
+
+The optional [[fbf]] package reaches FeedbackFruits with our Canvas token
+(\cref{sec:optional-fbf}), and its module [[fbf.view]] answers the question
+this command asks: what is the FeedbackFruits work behind this submission?
+It answers in our terms, as titled Markdown sections and the files it
+downloaded, so we print the sections like our own and convert the files like
+attachments.
+We could instead call [[fbf]]'s fetchers and format their results here, but
+FeedbackFruits' API is private and changes without notice, and every change
+would then need a change here as well.
+With [[fbf]] answering in sections, all we depend on is a small contract: a
+[[Viewer]] class, its [[sections]] method and its [[errors]].
+
+\paragraph{When it is fetched.}
+The work is fetched whenever [[fbf]] is installed and the assignment is a
+FeedbackFruits one; for any other assignment the viewer recognises that from
+the assignment's launch URL and sends no request.
+[[--no-fbf]] turns it off, for the grader who wants only the Canvas part and
+should not wait for FeedbackFruits to answer.
+<<add FeedbackFruits option>>=
+parser.add_argument("--no-fbf", action="store_true", default=False,
+  help="Do not show the FeedbackFruits work of FeedbackFruits assignments, "
+       "which is fetched when the optional fbf package is installed "
+       "(canvaslms[fbf]).")
+@
+
+\paragraph{One viewer per command.}
+Reaching FeedbackFruits starts with an LTI launch, several requests, and finding
+the student among the participants of an activity costs more.
+The viewer keeps both, one launch per course and the participants of each
+activity, so the commands create one viewer and use it for every submission
+they show: a view of a whole assignment then launches once.
+The [[fbf]] package imports [[canvaslms.cli]], so we cannot import it at the
+top of this module; we look for [[fbf.view]] when the command runs, with the
+same check as for the [[fbf]] command (\cref{sec:optional-fbf}).
+An [[fbf]] without [[fbf.view]], from before it existed, gives no viewer, as if
+it were not installed.
+The viewer launches with the same credentials as we use, and with the server
+named as [[fbf]] names it, by [[normalize_hostname]].
+<<imports for FeedbackFruits work>>=
+import canvaslms.cli.cache
+import canvaslms.cli.login
+<<functions>>=
+def make_fbf_viewer(config, canvas, args):
+  """Return a viewer of the FeedbackFruits work of submissions, or None.
+
+  None when `--no-fbf` was given or the optional fbf package, with its
+  `fbf.view`, is not installed.
+  """
+  if args.no_fbf:
+    return None
+  view = canvaslms.cli.optional_fbf_module("view", "Viewer")
+  if view is None:
+    return None
+  hostname, token = canvaslms.cli.login.load_credentials(config)
+  return view.Viewer(canvas, canvaslms.cli.cache.normalize_hostname(hostname),
+                     token)
+@
+
+\paragraph{Where it goes.}
+[[format_submission]] takes the viewer as [[fbf_viewer]], and adds the
+FeedbackFruits work after the comments.
+It is added before the history, not in each version, because FeedbackFruits
+keeps no versions of its own: what it shows is the state of the work now.
+The history calls [[format_submission]] once per version without a viewer, so
+the work appears once, whatever [[--history]] says.
+<<[[format_submission]] args>>=
+fbf_viewer=None,
+<<[[format_submission]] doc>>=
+`fbf_viewer`, from `make_fbf_viewer`, adds the FeedbackFruits work of the
+submission, if any; None leaves it out.
+@
+
+Each section becomes a section of ours, at the level of the comments, and each
+of its files a subsection, as an attachment would be.
+In JSON a section is an object with the body and the converted files by name.
+The files are downloaded into the submission's directory, so that they are with
+the rest when the user opens it ([[--open]]).
+<<add FeedbackFruits work to output>>=
+if fbf_viewer is not None:
+  <<let [[tmpdir]] be a fresh temporary directory>>
+  for section in fbf_work_sections(fbf_viewer, submission, tmpdir):
+    files = {path.name: convert_local_file(path) for path in section.files}
+    if json_format:
+      formatted_submission.update(format_section(
+        section.title, {"body": section.body, "files": files},
+        json_format=True))
+    else:
+      formatted_submission += format_section(section.title, section.body,
+                                             md_title_level=md_title_level)
+      for name, contents in files.items():
+        formatted_submission += format_section(
+          name, contents, md_title_level=md_title_level+"#")
+@
+
+A file from FeedbackFruits has no content type from Canvas, so we guess it
+from the file name, which gives [[text/x-python]] for [[lab.py]] and so the
+same highlighted block as a Python attachment.
+A file we cannot convert costs only itself, with a warning, as an attachment
+does (\cref{AttachmentFailureIsolation}).
+<<imports for FeedbackFruits work>>=
+import mimetypes
+<<functions>>=
+def convert_local_file(path):
+  """Convert the file at `path` to Markdown, by the type its name suggests.
+
+  A file that cannot be converted gives a placeholder and a warning.
+  """
+  content_type = mimetypes.guess_type(path.name)[0] or DEFAULT_CONTENT_TYPE
+  try:
+    return convert_file_to_md(path, content_type)
+  except Exception as err:
+    canvaslms.cli.warn(f"could not convert {path.name}: {err}")
+    return f"[Could not convert file: {err}]"
+@
+
+\paragraph{When FeedbackFruits fails.}
+FeedbackFruits may be down, its API may have changed, or the token may be one
+that the launch refuses.
+The Canvas part of the view is then still correct and still what the user
+asked for, so we warn on standard error, say in the output that the work could
+not be fetched, and show the rest.
+That is the reasoning of the attachment loop, where one file that cannot be
+converted costs only itself (\cref{AttachmentFailureIsolation}), and not that
+of an attachment object that is broken, which must stop us
+([[TestAttachmentErrorsAreNotSwallowed]]): a failing remote service is a state
+of the world, a broken object a bug.
+Which errors mean \enquote{FeedbackFruits failed} is for [[fbf]] to say, as
+the viewer's [[errors]]; any other exception is a bug and propagates.
+(The viewer itself already keeps a failing part, such as reviews it cannot
+read, from hiding the others; what reaches us is a failure before any part,
+such as the launch.)
+<<constants>>=
+FBF_FAILED = "Could not fetch the FeedbackFruits work: {}"
+<<imports for FeedbackFruits work>>=
+import types
+<<functions>>=
+def fbf_work_sections(fbf_viewer, submission, tmpdir):
+  """Return the FeedbackFruits sections of `submission` from `fbf_viewer`.
+
+  If FeedbackFruits fails, warn and return the error as a section.
+  """
+  try:
+    return fbf_viewer.sections(submission, tmpdir)
+  except fbf_viewer.errors as error:
+    canvaslms.cli.warn(FBF_FAILED.format(error))
+    return [types.SimpleNamespace(title="FeedbackFruits",
+                                  body=FBF_FAILED.format(error), files=[])]
+@
+
+Let's verify this from the outside, through [[format_submission]] and
+[[view_submission]].
+The viewer is a stand-in with the contract of [[fbf.view]] (rung~4 of the
+testing ladder): the real one needs FeedbackFruits, and [[fbf]] tests it
+against FeedbackFruits itself; what we test here is what we do with its
+answer.
+It records the submissions it is asked about and answers with one section
+holding a Python file, or raises what it is told to.
+
+<<test functions>>=
+import importlib
+import pathlib
+import sys
+import textwrap
+import types
+from canvaslms.cli.submissions import (FBF_FAILED, add_view_options,
+                                       grade_interactively, make_fbf_viewer,
+                                       submissions_view_command,
+                                       view_submission)
+
+class FbfError(Exception):
+    """What the stand-in viewer raises as a FeedbackFruits failure."""
+
+class StandInViewer:
+    """A viewer with the contract of `fbf.view.Viewer`."""
+
+    errors = (FbfError,)
+
+    def __init__(self, raises=None):
+        self.raises = raises
+        self.asked = []
+
+    def sections(self, submission, workdir):
+        self.asked.append(submission)
+        if self.raises:
+            raise self.raises
+        path = pathlib.Path(workdir) / "lab.py"
+        path.write_text("print('hello')\n")
+        return [types.SimpleNamespace(title="FeedbackFruits grade",
+                                      body="- Overall: 80 %", files=[]),
+                types.SimpleNamespace(title="FeedbackFruits submission",
+                                      body="- lab (document)", files=[path])]
+
+class TestFeedbackFruitsWork:
+    """Test showing the FeedbackFruits work behind a submission."""
+
+    <<FeedbackFruits work test methods>>
+@
+
+The sections come after the comments, the file as a highlighted Python block
+in a subsection of its own; in JSON, as objects with the body and the files.
+
+<<FeedbackFruits work test methods>>=
+def make_submission(self, **fields):
+    """Build a submission with a comment and nothing handed in to Canvas."""
+    return make_canvas_submission(
+        grader_id=None, grade="8", submitted_at=None, graded_at=None,
+        body=None, submission_comments=[
+            {"author_name": "Bob", "created_at": None, "comment": "Nice"}],
+        **fields)
+
+def test_sections_and_files_follow_the_comments(self, tmp_path):
+    """The work is shown after the Canvas part, files converted."""
+    output = format_submission(self.make_submission(), tmpdir=tmp_path,
+                               fbf_viewer=StandInViewer())
+    assert output.index("# Comments") \
+        < output.index("# FeedbackFruits grade") \
+        < output.index("# FeedbackFruits submission") \
+        < output.index("## lab.py")
+    assert "```python\nprint('hello')" in output
+
+def test_json_holds_bodies_and_files(self, tmp_path):
+    """In JSON each section is its body and its converted files."""
+    output = format_submission(self.make_submission(), tmpdir=tmp_path,
+                               json_format=True, fbf_viewer=StandInViewer())
+    work = output["FeedbackFruits submission"]
+    assert work["body"] == "- lab (document)"
+    assert work["files"]["lab.py"].startswith("```python")
+@
+
+Under [[--history]] the work appears once, not once per version.
+
+<<FeedbackFruits work test methods>>=
+def test_history_shows_the_work_once(self, tmp_path):
+    """The versions are formatted without the viewer."""
+    viewer = StandInViewer()
+    output = format_submission(
+        self.make_submission(submission_history=[{"id": 1, "user_id": 2},
+                                                 {"id": 1, "user_id": 2}]),
+        history=True, tmpdir=tmp_path, fbf_viewer=viewer)
+    assert "Version 1" in output
+    assert output.count("FeedbackFruits grade") == 1
+    assert len(viewer.asked) == 1
+@
+
+A failing FeedbackFruits costs only its own part, with a warning; a bug
+propagates.
+
+<<FeedbackFruits work test methods>>=
+def test_a_failing_fbf_keeps_the_canvas_part(self, tmp_path, caplog):
+    """The error is warned about and shown in place of the work."""
+    viewer = StandInViewer(raises=FbfError("launch refused"))
+    output = format_submission(self.make_submission(), tmpdir=tmp_path,
+                               fbf_viewer=viewer)
+    assert "# Comments" in output
+    assert FBF_FAILED.format("launch refused") in output
+    assert "launch refused" in caplog.text
+
+def test_a_bug_in_the_viewer_propagates(self, tmp_path):
+    """Only the viewer's own errors are caught."""
+    viewer = StandInViewer(raises=TypeError("bug"))
+    with pytest.raises(TypeError):
+        format_submission(self.make_submission(), tmpdir=tmp_path,
+                          fbf_viewer=viewer)
+@
+
+The commands reach this through [[view_submission]], which must hand the
+viewer on; the work then lands in the metadata file of [[-o]], beside the
+downloaded file.
+The options are parsed by the real [[add_view_options]], so that the test also
+covers [[--no-fbf]].
+
+<<FeedbackFruits work test methods>>=
+def view_args(self, *argv):
+    """Parse view options as `submissions view` would."""
+    parser = argparse.ArgumentParser()
+    add_view_options(parser)
+    return parser.parse_args(list(argv))
+
+def test_view_submission_hands_the_viewer_on(self, tmp_path):
+    """The metadata file holds the work, the directory the file."""
+    submission = self.make_submission()
+    submission.user = make_user(login_id="ada")
+    args = self.view_args("-o", str(tmp_path))
+    view_submission(submission, args, tmp_path, None, StandInViewer())
+    directory = tmp_path / "ada" / "C1" / "A1"
+    assert "# FeedbackFruits submission" \
+        in (directory / "metadata.md").read_text()
+    assert (directory / "lab.py").is_file()
+@
+
+[[make_fbf_viewer]] gives no viewer with [[--no-fbf]], without even looking
+for [[fbf]], nor without [[fbf.view]]; with it, a viewer on the server as
+[[fbf]] names it.
+For the last two we put a small package named [[fbf]] first on the path, as
+the tests of the [[fbf]] command do (\cref{sec:optional-fbf}), and take any
+real [[fbf]] out of [[sys.modules]] meanwhile.
+
+<<FeedbackFruits work test methods>>=
+@pytest.fixture
+def fbf_with_view(self, tmp_path, monkeypatch):
+    """Put an fbf with a view module first on the path."""
+    package = tmp_path / "fbf"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "view.py").write_text(textwrap.dedent('''
+        class Viewer:
+            def __init__(self, canvas, canvas_url, canvas_token):
+                self.canvas_url = canvas_url
+                self.canvas_token = canvas_token
+        '''))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [name for name in sys.modules
+                 if name.split(".")[0] == "fbf"]:
+        monkeypatch.delitem(sys.modules, name)
+    importlib.invalidate_caches()
+    yield package
+    for name in [name for name in sys.modules
+                 if name.split(".")[0] == "fbf"]:
+        del sys.modules[name]
+
+def test_make_fbf_viewer(self, fbf_with_view, monkeypatch):
+    """A viewer only when wanted and available."""
+    monkeypatch.setattr("canvaslms.cli.login.load_credentials",
+                        lambda config: ("canvas.example.com", "token"))
+    viewer = make_fbf_viewer({}, None, self.view_args())
+    assert viewer.canvas_url == "https://canvas.example.com"
+    assert viewer.canvas_token == "token"
+    assert make_fbf_viewer({}, None, self.view_args("--no-fbf")) is None
+    (fbf_with_view / "view.py").unlink()
+    sys.modules.pop("fbf.view", None)
+    importlib.invalidate_caches()
+    assert make_fbf_viewer({}, None, self.view_args()) is None
+@
+
+Finally the two commands that show submissions, from their options to their
+output: [[submissions view]], with [[fbf]] found on the path, and interactive
+grading, which must show the work before it asks for the grade.
+Selecting the submissions and editing the grading file are replaced, as in the
+other tests of these commands, since they need Canvas and an editor.
+
+<<FeedbackFruits work test methods>>=
+def test_submissions_view_shows_the_work(self, fbf_with_view, monkeypatch,
+                                         tmp_path):
+    """The view command finds fbf.view and shows what it answers."""
+    (fbf_with_view / "view.py").write_text(textwrap.dedent('''
+        import types
+        class Viewer:
+            errors = ()
+            def __init__(self, canvas, canvas_url, canvas_token):
+                pass
+            def sections(self, submission, workdir):
+                return [types.SimpleNamespace(
+                    title="FeedbackFruits grade", body="- 80 %", files=[])]
+        '''))
+    submission = self.make_submission()
+    submission.user = make_user(login_id="ada")
+    monkeypatch.setattr("canvaslms.cli.submissions.process_submission_options",
+                        lambda canvas, args: [submission])
+    monkeypatch.setattr("canvaslms.cli.login.load_credentials",
+                        lambda config: ("canvas.example.com", "token"))
+    submissions_view_command({}, None, self.view_args("-o", str(tmp_path)))
+    assert "# FeedbackFruits grade" \
+        in (tmp_path / "ada" / "C1" / "A1" / "metadata.md").read_text()
+
+def test_interactive_grading_shows_the_work(self, monkeypatch, tmp_path):
+    """Each submission is shown with its work before the grading."""
+    submission = self.make_submission()
+    submission.assignment = make_assignment(
+        rubric=None, grading_type="points", points_possible=10)
+    submission.user = make_user(login_id="ada")
+    monkeypatch.setattr("canvaslms.cli.utils.edit_text",
+                        lambda text, suffix: "no front matter")
+    monkeypatch.setattr("builtins.input", lambda prompt: "s")
+    viewer = StandInViewer()
+    grade_interactively([submission], self.view_args("-o", str(tmp_path)),
+                        viewer)
+    assert viewer.asked == [submission]
+    assert "# FeedbackFruits grade" \
+        in (tmp_path / "ada" / "C1" / "A1" / "metadata.md").read_text()
 @
 
 
@@ -5553,7 +5967,8 @@ it with them has no sensible meaning; we refuse rather than guess.
 if results or rubric_updates:
   canvaslms.cli.err(1, "-i cannot be combined with -g, -m, -R or "
                        "--rubric-file: the editor sets those")
-grade_interactively(submission_list, args)
+grade_interactively(submission_list, args,
+                    make_fbf_viewer(config, canvas, args))
 @
 
 The loop borrows from [[submissions view]] what makes the submissions
@@ -5567,8 +5982,11 @@ kept from last week.
 The grader stops with Ctrl-C, which may come in the pager, the editor or
 anywhere in between; submissions already graded stay graded.
 <<functions>>=
-def grade_interactively(submission_list, args):
-  """Show each submission, then grade it with what the user writes."""
+def grade_interactively(submission_list, args, fbf_viewer=None):
+  """Show each submission, then grade it with what the user writes.
+
+  `fbf_viewer`, from `make_fbf_viewer`, adds the FeedbackFruits work.
+  """
   <<enable history when diff is requested>>
   submission_list = filter_view_submissions(
     submission_list,
@@ -5582,7 +6000,7 @@ def grade_interactively(submission_list, args):
   try:
     for submission in submission_list:
       <<make sure [[submission]] holds Canvas's current assessment>>
-      view_submission(submission, args, tmpdir, console)
+      view_submission(submission, args, tmpdir, console, fbf_viewer)
       grading = ask_for_grading(submission)
       if grading:
         grade_submission(submission, *grading)
