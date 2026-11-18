@@ -1027,6 +1027,9 @@ versions discard each other's cache, see Cache Freshness:
 - `pypandoc>=1.11` - Document conversion
 - `arrow>=1.2.3` - Date/time handling
 - `keyring>=24.2,<26.0` - Credential storage
+- `cryptography>=41` - Encryption of the cache files (`cache.nw`,
+  `attachment_cache.nw`); declared explicitly since keyring pulls it in only
+  on Linux, through SecretStorage (issue #623)
 - `pytorial>=0.10.0,<1.0` - Interactive tutorials (the `tutorial` command)
 - `requests>=2.30`, `urllib3>=2` - Imported directly by the retry policy in
   `cache.nw` (`Retry(backoff_max=...)` needs urllib3 2); declared explicitly
