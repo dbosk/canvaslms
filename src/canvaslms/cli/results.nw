@@ -28,6 +28,7 @@ We outline the module:
 import canvaslms.cli
 from canvaslms.cli import assignments, courses, modules, submissions, users
 import canvaslms.cli.utils
+import canvaslms.grades
 import canvaslms.hacks.canvasapi
 
 import argparse
@@ -190,9 +191,13 @@ assignment groups in those courses.
 If the user provides assignment groups, we will automatically summarize the 
 results of all assignments in the assignment group.
 
-We will create a list of results, where each result is a tuple (actually a 
+We will create a list of results, where each result is a tuple (actually a
 list, since the length might vary).
 These tuples will then be printed in CSV format to standard output.
+The summarizers are generators, so the grading happens only when we collect
+their rows into a list.
+That is where a summary module can refuse a grade it does not understand,
+which we turn into an error message in \cref{sec:refused-grades}.
 <<get results and print them>>=
 output = csv.writer(sys.stdout, delimiter=args.delimiter)
 
@@ -203,8 +208,7 @@ elif hasattr(args, 'module') and args.module != "":
 else:
   results = summarize_assignments(canvas, args)
 
-# Convert to list and check if empty
-results = list(results)
+<<collect [[results]], or stop on a refused grade>>
 if not results:
   raise canvaslms.cli.EmptyListError("No results found matching the criteria")
 
@@ -1329,6 +1333,163 @@ Similarly, this is a good point to do the filtering of grades.
 if grade is None or grade_date is None \
     or not filter_grade(grade, args.filter_grades):
   continue
+@
+
+\subsection{When the summary module refuses a grade}
+\label{sec:refused-grades}
+
+A summary module understands only some grading scales.
+The default, [[conjunctavg]], averages A--E and requires P on P/F, so a
+points-graded assignment in the group, say a diagnostic test graded [[2.5]],
+is a grade it cannot place.
+It does not guess: it raises an [[UnknownGradeError]] whose message names
+the grade and the assignment, and [[disjunctmax]] does the same, also on the
+[[--missing]] path (\cref{summary-modules,conjunctavg,disjunctmax}).
+That message is exactly what the teacher needs.
+What they used to get instead was a traceback around it, which made a
+mismatch between the course and the [[-S]] module look like a bug in
+canvaslms.
+
+So we catch the [[UnknownGradeError]] and print its message as an error.
+We still stop at the first such grade: the export is meant for a system
+like LADOK, and an export that leaves out the students whose grades could
+not be summarized looks complete when it is not.
+The remedy is with the teacher, who can choose a module that understands
+the scale with [[-S]] or move the assignment out of the group, so the message
+names both.
+A module's message need not end with a full stop, so we strip one if it is
+there and add our own, which keeps the two sentences apart either way.
+
+The guard sits where the summarizers' generators run, which is when
+[[results_command]] collects them into a list; a [[try]] around the calls
+that create the generators would catch nothing.
+That list runs everything the command does before printing: resolving
+courses, assignments and users, fetching submissions, and only then the
+summary module.
+Much of that can raise a plain [[ValueError]], a Canvas reply that is not
+valid JSON for one, and a guard on [[ValueError]] would report such a
+failure as a grade the summary module refused, and send the teacher to
+[[-S]], even on the [[-a]] path, where no summary module runs.
+Catching only the exception the modules raise for a refused grade keeps
+those failures as they were, tracebacks and all.
+A third-party module that still raises a plain [[ValueError]] gets the old
+traceback too; that is the price of not misdiagnosing the rest.
+<<collect [[results]], or stop on a refused grade>>=
+try:
+  results = list(results)
+except canvaslms.grades.UnknownGradeError as error:
+  canvaslms.cli.err(1, f"{str(error).rstrip('.')}. The summary module "
+    f"'{args.summary_module}' cannot summarize this grade; "
+    f"select one that can with -S, "
+    f"or remove the assignment from the group.")
+@
+
+Let's verify this with the grade from the report that prompted it, a
+[[2.5]] in a group summarized by the real [[conjunctavg]].
+The course is a real [[canvasapi]] course whose requests [[responses]]
+answers, like in the tests of the graders above, so the
+[[UnknownGradeError]] comes from the module itself, not from a stand-in.
+<<test functions>>=
+@responses.activate
+def test_results_report_a_refused_grade_without_traceback(capsys, caplog):
+  responses.get(f"{API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Diagnostic test", "course_id": 1,
+                       "assignment_group_id": 3, "published": True,
+                       "due_at": None}])
+  responses.get(f"{API}/courses/1/assignment_groups",
+                json=[{"id": 3, "name": "Exam", "position": 1,
+                       "group_weight": 0}])
+  responses.get(f"{API}/courses/1/search_users", json=[student_json(1)])
+  responses.get(f"{API}/courses/1/users/90",
+                json={"id": 90, "name": "Grader A", "login_id": "gradera"})
+  points = graded_submission_json(1, 90)
+  points["grade"] = "2.5"
+  points["submission_history"] = [dict(points)]
+  responses.get(f"{API}/courses/1/assignments/7/submissions",
+                json=[points])
+  responses.get(f"{API}/courses/1/assignments/7/submissions/1",
+                json=points)
+
+  course = canvasapi.course.Course(
+    Canvas(SERVER, "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+
+  parser = argparse.ArgumentParser()
+  results_module.add_command(parser.add_subparsers())
+  args = parser.parse_args(["results", "-c", "SBX101", "-A", "Exam"])
+  args.delimiter = "\t"
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]), \
+       pytest.raises(SystemExit) as exit:
+    results_module.results_command({}, None, args)
+
+  assert exit.value.code == 1
+  assert "Unknown grade 2.5" in caplog.text
+  assert "Diagnostic test" in caplog.text
+  assert "-S" in caplog.text
+  assert capsys.readouterr().out == ""
+@
+
+The [[--missing]] report goes through the same list, so a module that
+refuses the grade there gets the same treatment.
+The real [[disjunctmax]] refuses the [[2.5]] when it ranks the attempts;
+the stand-ins are those of [[install_missing_path]]
+(\cref{sec:missing-passing-predicate}).
+<<test functions>>=
+def test_missing_report_on_a_refused_grade_without_traceback(
+    monkeypatch, caplog):
+  import canvaslms.grades.disjunctmax as disjunctmax
+
+  course = SimpleNamespace(id=5, course_code="DD1301")
+  user = MissingPathUser(1, "student1")
+  assignment = SimpleNamespace(name="Diagnostic test", course=course,
+                               submission_types=["online_upload"])
+  assignment.get_submission = Mock(
+    return_value=SimpleNamespace(grade="2.5", submitted_at=None,
+                                 graded_at="2026-01-10T10:00:00Z"))
+
+  args = install_missing_path(monkeypatch, assignment, user, disjunctmax)
+  args.summary_module = "canvaslms.grades.disjunctmax"
+  args.assignment_group = ""
+  args.module = ""
+  args.delimiter = "\t"
+
+  with pytest.raises(SystemExit) as exit:
+    results_module.results_command({}, None, args)
+
+  assert exit.value.code == 1
+  assert "Unknown grade 2.5" in caplog.text
+  assert "Diagnostic test" in caplog.text
+  assert "-S" in caplog.text
+@
+
+Finally, the reason the guard is narrow: any other [[ValueError]] must reach
+the user as before, not as advice to change [[-S]].
+A Canvas reply that is not JSON is the realistic case, so the stand-in module
+raises the [[json.JSONDecodeError]] that such a reply gives.
+<<test functions>>=
+def test_other_value_errors_are_not_blamed_on_the_summary_module(
+    monkeypatch, caplog):
+  import json
+
+  def broken_missing_assignments(assignments_list, users_list,
+                                 optional_assignments=None):
+    raise json.JSONDecodeError("Expecting value", "<html>", 0)
+    yield
+
+  course = SimpleNamespace(id=5, course_code="DD1301")
+  args = install_missing_path(
+    monkeypatch, SimpleNamespace(name="Lab", course=course),
+    MissingPathUser(1, "student1"),
+    SimpleNamespace(missing_assignments=broken_missing_assignments))
+  args.assignment_group = ""
+  args.module = ""
+  args.delimiter = "\t"
+
+  with pytest.raises(json.JSONDecodeError):
+    results_module.results_command({}, None, args)
+
+  assert "-S" not in caplog.text
 @
 
 \subsection{Discovering available grading modules}
