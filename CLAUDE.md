@@ -1041,7 +1041,9 @@ versions discard each other's cache, see Cache Freshness:
   `grade -i` show the FBF work behind an FBF submission through
   `fbf.view.Viewer` (found with `optional_fbf_module("view", "Viewer")`,
   one viewer per command, `--no-fbf` turns it off); fbf owns everything FBF,
-  canvaslms only prints its sections. Try it live with
+  canvaslms only prints its sections. The viewer caches between runs (fbf's
+  `cache.nw`): canvaslms passes `refresh=args.refresh_cache` and calls
+  `close()` in a `finally`, both only if the installed fbf has them. Try it live with
   `PYTHONPATH=~/devel/edu/fbf/src poetry run canvaslms ...`, never
   `pip install` fbf into the venv (its `canvaslms` dependency would replace
   the local one)

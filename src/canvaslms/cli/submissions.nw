@@ -886,8 +886,11 @@ they pipe the output or skip the output altogether.
 console = rich.console.Console()
 <<create [[tmpdir]]>>
 fbf_viewer = make_fbf_viewer(config, canvas, args)
-for submission in submission_list:
-  view_submission(submission, args, tmpdir, console, fbf_viewer)
+try:
+  for submission in submission_list:
+    view_submission(submission, args, tmpdir, console, fbf_viewer)
+finally:
+  close_fbf_viewer(fbf_viewer)
 @
 
 Showing one submission is a function of its own, because it is not only done
@@ -2887,6 +2890,7 @@ named as [[fbf]] names it, by [[normalize_hostname]].
 <<imports for FeedbackFruits work>>=
 import canvaslms.cli.cache
 import canvaslms.cli.login
+import inspect
 <<functions>>=
 def make_fbf_viewer(config, canvas, args):
   """Return a viewer of the FeedbackFruits work of submissions, or None.
@@ -2900,9 +2904,29 @@ def make_fbf_viewer(config, canvas, args):
   if view is None:
     return None
   hostname, token = canvaslms.cli.login.load_credentials(config)
+  options = {}
+  if "refresh" in inspect.signature(view.Viewer).parameters:
+    options["refresh"] = getattr(args, "refresh_cache", False)
   return view.Viewer(canvas, canvaslms.cli.cache.normalize_hostname(hostname),
-                     token)
+                     token, **options)
+
+def close_fbf_viewer(fbf_viewer):
+  """Let `fbf_viewer` keep what it fetched for the next run, if it can."""
+  if fbf_viewer is not None and hasattr(fbf_viewer, "close"):
+    fbf_viewer.close()
 @
+
+\paragraph{Between runs.}
+The viewer keeps what it fetched between runs, in a cache file of its own and
+the system keyring, so that the next view need not launch FeedbackFruits nor
+ask it again for what has not changed.
+It writes them when told it is done, by [[close]], which the commands call
+when they have shown their last submission, also when they stop on an error
+or a Ctrl-C, so that what was fetched is kept.
+[[--refresh-cache]] makes it fetch everything again, as for Canvas.
+An [[fbf]] from before the cache has neither the [[refresh]] option nor
+[[close]], so we pass and call them only when they are there; the view then
+works as before, only slower.
 
 \paragraph{Where it goes.}
 [[format_submission]] takes the viewer as [[fbf_viewer]], and adds the
@@ -3210,6 +3234,50 @@ Selecting the submissions and editing the grading file are replaced, as in the
 other tests of these commands, since they need Canvas and an editor.
 
 <<FeedbackFruits work test methods>>=
+def test_the_viewer_is_closed_and_told_to_refresh(self, fbf_with_view,
+                                                 monkeypatch, tmp_path):
+    """A viewer with the cache gets --refresh-cache and is closed.
+
+    Both commands close it also when they stop on an exception: a Ctrl-C
+    for the view, an error for interactive grading, which catches a
+    Ctrl-C itself.
+    """
+    (fbf_with_view / "view.py").write_text(textwrap.dedent('''
+        VIEWERS = []
+        RAISE = KeyboardInterrupt
+        class Viewer:
+            errors = ()
+            def __init__(self, canvas, canvas_url, canvas_token,
+                         refresh=False):
+                self.refresh, self.closed = refresh, False
+                VIEWERS.append(self)
+            def sections(self, submission, workdir):
+                raise RAISE
+            def close(self):
+                self.closed = True
+        '''))
+    submission = self.make_submission()
+    submission.user = make_user(login_id="ada")
+    monkeypatch.setattr("canvaslms.cli.submissions.process_submission_options",
+                        lambda canvas, args: [submission])
+    monkeypatch.setattr("canvaslms.cli.login.load_credentials",
+                        lambda config: ("canvas.example.com", "token"))
+    args = self.view_args("-o", str(tmp_path))
+    args.refresh_cache = True
+    with pytest.raises(KeyboardInterrupt):
+        submissions_view_command({}, None, args)
+    viewer, = sys.modules["fbf.view"].VIEWERS
+    assert viewer.refresh and viewer.closed
+    vars(args).update(grade=None, message=None, rubric=None,
+                      rubric_file=None, interactive=True)
+    submission.assignment = make_assignment(
+        rubric=None, grading_type="points", points_possible=10)
+    sys.modules["fbf.view"].RAISE = RuntimeError
+    with pytest.raises(RuntimeError):
+        submissions_grade_command({}, None, args)
+    _, grader = sys.modules["fbf.view"].VIEWERS
+    assert grader.closed
+
 def test_submissions_view_shows_the_work(self, fbf_with_view, monkeypatch,
                                          tmp_path):
     """The view command finds fbf.view and shows what it answers."""
@@ -3234,9 +3302,10 @@ def test_submissions_view_shows_the_work(self, fbf_with_view, monkeypatch,
         in (tmp_path / "ada" / "C1" / "A1" / "metadata.md").read_text()
 
 def test_grade_i_shows_the_work(self, fbf_with_view, monkeypatch, tmp_path):
-    """The grade command hands interactive grading a viewer."""
+    """The grade command hands interactive grading a viewer, then closes it."""
     (fbf_with_view / "view.py").write_text(textwrap.dedent('''
         import types
+        CLOSED = []
         class Viewer:
             errors = ()
             def __init__(self, canvas, canvas_url, canvas_token):
@@ -3244,6 +3313,8 @@ def test_grade_i_shows_the_work(self, fbf_with_view, monkeypatch, tmp_path):
             def sections(self, submission, workdir):
                 return [types.SimpleNamespace(
                     title="FeedbackFruits grade", body="- 80 %", files=[])]
+            def close(self):
+                CLOSED.append(self)
         '''))
     submission = self.make_submission()
     submission.assignment = make_assignment(
@@ -3262,6 +3333,7 @@ def test_grade_i_shows_the_work(self, fbf_with_view, monkeypatch, tmp_path):
     submissions_grade_command({}, None, args)
     assert "# FeedbackFruits grade" \
         in (tmp_path / "ada" / "C1" / "A1" / "metadata.md").read_text()
+    assert len(sys.modules["fbf.view"].CLOSED) == 1
 
 def test_interactive_grading_shows_the_work(self, monkeypatch, tmp_path):
     """Each submission is shown with its work before the grading."""
@@ -6020,8 +6092,11 @@ it with them has no sensible meaning; we refuse rather than guess.
 if results or rubric_updates:
   canvaslms.cli.err(1, "-i cannot be combined with -g, -m, -R or "
                        "--rubric-file: the editor sets those")
-grade_interactively(submission_list, args,
-                    make_fbf_viewer(config, canvas, args))
+fbf_viewer = make_fbf_viewer(config, canvas, args)
+try:
+  grade_interactively(submission_list, args, fbf_viewer)
+finally:
+  close_fbf_viewer(fbf_viewer)
 @
 
 The loop borrows from [[submissions view]] what makes the submissions
