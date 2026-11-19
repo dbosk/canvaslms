@@ -989,7 +989,14 @@ of this library (nytid, fbf), so keep it readable by them: do not bump the schem
 for what can be repaired on read, and leave entries correct in themselves. A
 cached listing is always complete: `CacheGetMethods` only caches `include` and the
 sorting and page-size keys, and sends any other argument straight to Canvas
-uncached, for single objects too.
+uncached, for single objects too. The one way submissions enter the cache
+without a listing is `prefetch_submissions` (`hacks/canvasapi.nw`): for at most
+`PREFETCH_MAX_STUDENTS` students it fetches their submissions with one
+`students/submissions` request per course and stores them like single
+fetches, never setting `__all_fetched`. Canvas refuses that whole request if it
+names a student not in the course or an unpublished assignment, so callers
+pass `students_by_course` (from `user.course`, see `students_by_course` in
+`submissions.nw`) and the prefetch asks for published assignments only.
 
 ### Cache Schema Versioning
 
