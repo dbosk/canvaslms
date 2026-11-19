@@ -1452,7 +1452,7 @@ def submissions_by_assignment(assignments, include, check_bulk_refresh,
   the assignment comes with the cached submissions of those students only.
   """
   assignments = list(assignments)
-  covered = canvaslms.hacks.canvasapi.prefetch_submissions(
+  covered = canvaslms.hacks.canvasapi.fetch_students_submissions(
     assignments, students_by_course, include)
   for assignment in assignments:
     if assignment.id in covered:
@@ -1495,16 +1495,34 @@ We cannot tell which course to ask for such a user's submissions, and a
 mapping without them would leave their submissions out of what the cache
 hands back, so then there is no mapping at all, and everything is listed as
 before.
+
+A course where none of the students is on the roster is not asked at all, so
+two kinds of course must be left to their listings instead, mapped to
+[[None]].
+One is a course whose roster could not be read, which [[list_users]] notes in
+[[UNREAD_ROSTERS]]: its students are unknown, not absent.
+The other is a course whose cached roster still holds a student who has left,
+marked [[_unlisted]]: Canvas refuses a request that names a student not in
+the course, and the cache holds that student's submissions, which only the
+listing returns.
 <<functions>>=
 def students_by_course(user_list):
-  """Return {course ID: user IDs} of `user_list`, or None if some user does
-  not know the course it was listed in."""
+  """Return {course ID: user IDs, or None to leave it to its listings} of
+  `user_list`, or None if some user does not know the course it was listed
+  in."""
   by_course = {}
   for user in user_list:
     course = getattr(user, "course", None)
     if course is None:
       return None
-    by_course.setdefault(course.id, set()).add(user.id)
+    if course.id in by_course and by_course[course.id] is None:
+      continue
+    if getattr(user, "_unlisted", False):
+      by_course[course.id] = None
+    else:
+      by_course.setdefault(course.id, set()).add(user.id)
+  for course_id in users.UNREAD_ROSTERS:
+    by_course[course_id] = None
   return by_course
 @
 
@@ -1567,8 +1585,9 @@ class TestListSubmissions:
 @
 
 Now let's verify the way through the cache for a few students.
-The mapping follows the course each user was listed in, and one user without
-a course turns it off.
+The mapping follows the course each user was listed in, one user without a
+course turns it off, and a course with a student who has left, or whose roster
+could not be read, is left to its listings.
 A covered assignment is not listed: [[responses]] answers only the course's
 listing of students' submissions, so a request for the assignment's own
 listing would fail the test.
@@ -1589,6 +1608,16 @@ class TestStudentsByCourse:
 
     def test_a_user_without_a_course_turns_it_off(self):
         assert students_by_course([user_in(1, 3), user_in(None, 4)]) is None
+
+    def test_a_course_with_a_student_who_left_is_listed(self):
+        departed = user_in(1, 4)
+        departed._unlisted = True
+        users = [user_in(1, 3), departed, user_in(1, 5), user_in(2, 3)]
+        assert students_by_course(users) == {1: None, 2: {3}}
+
+    def test_a_course_whose_roster_was_not_read_is_listed(self, monkeypatch):
+        monkeypatch.setattr(canvaslms.cli.users, "UNREAD_ROSTERS", {2})
+        assert students_by_course([user_in(1, 3)]) == {1: {3}, 2: None}
 
 URL = "https://canvas.example.org"
 API = f"{URL}/api/v1"
@@ -1618,7 +1647,8 @@ And through the commands themselves: [[submissions list -u]], and
 [[grade]], must hand the course of the student they resolved on to the
 listing, so that the student's submissions come in the course's one request
 and the assignment is never listed.
-A selected course whose roster lacks the student is not asked at all.
+A selected course whose roster lacks the student is not asked at all, but
+one whose roster could not be read is listed, as before.
 We run the real [[main]], with the cache file in a temporary directory and
 HTTP stubbed by [[responses]] as in the tests of the command line in
 [[cli.nw]]; again any request not registered fails.
@@ -1632,6 +1662,7 @@ def run_cli(monkeypatch, tmp_path, capsys):
                         lambda hostname: str(tmp_path / "cache.enc"))
     monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
                         lambda config: (URL, "token"))
+    monkeypatch.setattr(canvaslms.cli.users, "UNREAD_ROSTERS", set())
 
     def run(*arguments):
         monkeypatch.setattr(sys, "argv", ["canvaslms", "--config-file",
@@ -1689,6 +1720,38 @@ def test_a_course_without_the_student_is_not_listed(run_cli):
     output = run_cli("submissions", "list", "-c", "C[12]", "-u", "anna", "-l")
 
     assert output.count("anna") == 1
+
+@responses.activate
+def test_a_course_whose_roster_failed_is_listed(run_cli):
+    responses.get(f"{API}/courses",
+                  json=[{"id": 1, "name": "Course", "course_code": "C1"},
+                        {"id": 4, "name": "Other", "course_code": "C2"}])
+    responses.get(f"{API}/courses/1/assignments",
+                  json=[{"id": 2, "name": "Lab", "course_id": 1,
+                         "published": True}])
+    responses.get(f"{API}/courses/4/assignments",
+                  json=[{"id": 5, "name": "Lab", "course_id": 4,
+                         "published": True}])
+    responses.get(f"{API}/courses/1/search_users",
+                  json=[{"id": 3, "name": "Anna Andersson", "login_id": "anna",
+                         "enrollments": [{"type": "StudentEnrollment"}]}])
+    responses.get(f"{API}/courses/4/search_users", status=403,
+                  json={"errors": [{"message": "unauthorized"}]})
+    responses.get(f"{API}/courses/1/students/submissions",
+                  json=[{"id": 9, "user_id": 3, "assignment_id": 2,
+                         "grade": "P", "workflow_state": "graded",
+                         "submitted_at": None,
+                         "graded_at": "2026-10-02T10:00:00Z"}])
+    listing = responses.get(
+        f"{API}/courses/4/assignments/5/submissions",
+        json=[{"id": 10, "user_id": 3, "assignment_id": 5, "grade": "F",
+               "workflow_state": "graded", "submitted_at": None,
+               "graded_at": "2026-10-03T10:00:00Z"}])
+
+    output = run_cli("submissions", "list", "-c", "C[12]", "-u", "anna", "-l")
+
+    assert output.count("anna") == 2
+    assert listing.call_count == 1
 
 @responses.activate
 def test_viewing_one_student_asks_the_course_once(run_cli):

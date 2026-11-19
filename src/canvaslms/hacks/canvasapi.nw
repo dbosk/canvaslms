@@ -10950,14 +10950,19 @@ course.
 The callers' mapping is therefore all or nothing: a caller that cannot say
 which course some user came from passes none
 (\cref{sec:list-submissions-prefetch} in [[submissions.nw]]).
+And a course can be named but mapped to [[None]], which leaves it to its
+listings: so the callers mark a course whose roster could not be read, which
+must not pass for one without the students, and a course whose cached roster
+still holds a student who has left, which Canvas would refuse to answer for.
 
 <<functions>>=
-def prefetch_submissions(assignments, students_by_course, include=()):
+def fetch_students_submissions(assignments, students_by_course, include=()):
   """Fetch a few students' submissions with one request per course.
 
   `students_by_course` maps a course ID to the IDs of the students to fetch
-  there, and must name every course where some of them are on the roster.
-  Returns {assignment ID: cached submissions of those students} for every
+  there, or to None to leave that course to its listings, and must name
+  every course where some of them are on the roster.  Returns
+  {assignment ID: cached submissions of those students} for every
   assignment where each of them has one, and an empty list for the
   assignments of courses it does not name; the other assignments are left
   to their own listings.
@@ -10965,15 +10970,17 @@ def prefetch_submissions(assignments, students_by_course, include=()):
   covered = {}
   if not students_by_course:
     return covered
-  if len(set().union(*students_by_course.values())) > PREFETCH_MAX_STUDENTS:
+  wanted_students = set().union(
+    *(ids for ids in students_by_course.values() if ids is not None))
+  if len(wanted_students) > PREFETCH_MAX_STUDENTS:
     return covered
   include = set(as_list(include or []))
   by_course = collections.defaultdict(list)
   for assignment in assignments:
-    if assignment.course_id in students_by_course:
-      by_course[assignment.course_id].append(assignment)
-    else:
+    if assignment.course_id not in students_by_course:
       covered[assignment.id] = []
+    elif students_by_course[assignment.course_id] is not None:
+      by_course[assignment.course_id].append(assignment)
   for course_id, course_assignments in by_course.items():
     students = sorted(students_by_course[course_id])
     <<fetch the submissions of [[students]] that the cache lacks>>
@@ -10988,8 +10995,9 @@ We do this only for a few students, [[PREFETCH_MAX_STUDENTS]] of them:
 twenty unless [[CANVASLMS_PREFETCH_MAX_STUDENTS]] says otherwise.
 With 100 submissions to a page, the course's listing of $k$ students in $A$
 assignments takes $\lceil kA/100\rceil$ requests, against at least $A$ for
-the assignments' own listings; with twenty students that is at most a fifth
-as many, and the request, which names every student, stays short.
+the assignments' own listings; with twenty students that is
+$\lceil A/5\rceil$, a fifth as many for a course of many assignments, and
+the request, which names every student, stays short.
 For more students the gain shrinks, and the assignments' own listings leave
 the cache complete for whoever reads the whole class next.
 <<constants>>=
@@ -11003,8 +11011,12 @@ A request Canvas refuses, for a student who has left the course for
 instance, costs us nothing but the time: we note it in the log and leave
 those assignments to their listings, which is how they were fetched before.
 We catch [[CanvasException]] here, as the bulk refresh does
-(\cref{sec:bulk-refresh-failure}), and with less worry: the listing that
-follows still fails loudly if the failure was Canvas's or our token's.
+(\cref{sec:bulk-refresh-failure}), and with less worry: the listings that
+follow ask Canvas for what is not cached, and fail loudly if the failure was
+Canvas's or our token's.
+Nothing else is caught: a failure of the network, or a server that keeps
+answering 503 until the retries give up, would hit those listings just the
+same, and is better reported at once.
 <<fetch the submissions of [[students]] that the cache lacks>>=
 wanted = {assignment.id: assignment for assignment in course_assignments
           if getattr(assignment, "published", True)
@@ -11086,7 +11098,7 @@ students and sends the includes asked for.
 def test_one_request_covers_the_published_assignments(self):
     assignments, sent = self.course([self.row(2, 3), self.row(3, 3)])
 
-    covered = prefetch_submissions(assignments, {1: {3}},
+    covered = fetch_students_submissions(assignments, {1: {3}},
                                    ["submission_history"])
 
     assert sorted(covered) == [2, 3]
@@ -11101,7 +11113,7 @@ def test_one_request_covers_the_published_assignments(self):
 def test_only_the_course_s_own_students_are_asked_for(self):
     assignments, sent = self.course([self.row(2, 3), self.row(3, 3)])
 
-    prefetch_submissions(assignments, {1: {3}, 9: {5}})
+    fetch_students_submissions(assignments, {1: {3}, 9: {5}})
 
     assert sent[0]["student_ids[]"] == ["3"]
 @
@@ -11115,7 +11127,7 @@ def test_a_student_without_a_submission_leaves_it_uncovered(self):
     assignments, sent = self.course([self.row(2, 3), self.row(2, 5),
                                      self.row(3, 3)])
 
-    covered = prefetch_submissions(assignments, {1: {3, 5}})
+    covered = fetch_students_submissions(assignments, {1: {3, 5}})
 
     assert sorted(covered) == [2]
     assert sorted(s.user_id for s in covered[2]) == [3, 5]
@@ -11123,8 +11135,11 @@ def test_a_student_without_a_submission_leaves_it_uncovered(self):
 
 A course with none of the students on its roster asks nothing and has none of
 their submissions.
-Too many students ask nothing either, and a refused request leaves everything
-to the listings, with a note in the log of which course it was.
+A course mapped to [[None]] is left to its listings.
+Twenty students are asked for, more ask nothing.
+A refused request leaves everything to the listings, with a note in the log of
+which course it was, while a failure that is not Canvas's answer is not
+caught.
 
 <<prefetch test methods>>=
 @responses.activate
@@ -11133,17 +11148,34 @@ def test_a_course_without_the_students_asks_nothing(self):
     elsewhere = Assignment(assignments[0]._requester,
                            {"id": 5, "course_id": 9, "published": True})
 
-    covered = prefetch_submissions(assignments + [elsewhere], {1: {3}})
+    covered = fetch_students_submissions(assignments + [elsewhere], {1: {3}})
 
     assert covered[5] == []
     assert len(sent) == 1
+
+@responses.activate
+def test_a_course_mapped_to_none_is_left_to_its_listings(self):
+    assignments, sent = self.course([])
+
+    assert fetch_students_submissions(assignments, {1: None}) == {}
+    assert sent == []
+
+@responses.activate
+def test_as_many_students_as_allowed_are_asked_for(self):
+    assignments, sent = self.course([])
+
+    students = set(range(PREFETCH_MAX_STUDENTS))
+    fetch_students_submissions(assignments, {1: students})
+
+    assert len(sent) == 1
+    assert len(sent[0]["student_ids[]"]) == PREFETCH_MAX_STUDENTS
 
 @responses.activate
 def test_too_many_students_ask_nothing(self):
     assignments, sent = self.course([])
 
     students = set(range(PREFETCH_MAX_STUDENTS + 1))
-    assert prefetch_submissions(assignments, {1: students}) == {}
+    assert fetch_students_submissions(assignments, {1: students}) == {}
     assert sent == []
 
 @responses.activate
@@ -11151,10 +11183,19 @@ def test_a_refused_request_leaves_it_to_the_listings(self, caplog):
     assignments, sent = self.course([], status=403)
 
     with caplog.at_level(logging.INFO, logger="canvaslms.hacks.canvasapi"):
-        assert prefetch_submissions(assignments, {1: {3}}) == {}
+        assert fetch_students_submissions(assignments, {1: {3}}) == {}
 
     assert len(sent) == 1
     assert "course id=1" in caplog.text
+
+@responses.activate
+def test_a_failure_that_is_not_canvas_s_answer_is_raised(self):
+    requester = canvasapi.Canvas(self.URL, "a token")._Canvas__requester
+    assignment = Assignment(requester, {"id": 2, "course_id": 1,
+                                        "published": True})
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        fetch_students_submissions([assignment], {1: {3}})
 @
 
 The prefetch must not pass for a listing: reading the assignment afterwards
@@ -11164,7 +11205,7 @@ without naming students still fetches all of its submissions.
 @responses.activate
 def test_a_prefetch_is_not_a_listing(self):
     assignments, sent = self.course([self.row(2, 3)])
-    prefetch_submissions(assignments, {1: {3}})
+    fetch_students_submissions(assignments, {1: {3}})
     listing = f"{self.API}/courses/1/assignments/2/submissions"
     responses.get(listing, json=[self.row(2, 3), self.row(2, 5)])
 
@@ -11176,16 +11217,17 @@ def test_a_prefetch_is_not_a_listing(self):
 @
 
 What the cache can answer for is not asked for again, until it would
-refresh; then the request asks for that assignment only, and for the
-includes its cached submission already holds.
+refresh or is asked for an include it lacks; then the request asks for that
+assignment only, with the includes asked for and those its cached submission
+already holds, and the cache records them all.
 
 <<prefetch test methods>>=
 @responses.activate
 def test_a_fresh_cache_asks_nothing_again(self):
     assignments, sent = self.course([self.row(2, 3), self.row(3, 3)])
 
-    prefetch_submissions(assignments, {1: {3}})
-    covered = prefetch_submissions(assignments, {1: {3}})
+    fetch_students_submissions(assignments, {1: {3}})
+    covered = fetch_students_submissions(assignments, {1: {3}})
 
     assert sorted(covered) == [2, 3]
     assert len(sent) == 1
@@ -11193,15 +11235,27 @@ def test_a_fresh_cache_asks_nothing_again(self):
 @responses.activate
 def test_a_stale_submission_is_asked_for_with_its_includes(self):
     assignments, sent = self.course([self.row(2, 3), self.row(3, 3)])
-    prefetch_submissions(assignments, {1: {3}}, ["submission_history"])
+    fetch_students_submissions(assignments, {1: {3}}, ["submission_history"])
     stale = assignments[0].cached_submissions_of([3])[0]
     object.__setattr__(stale, "_last_refresh",
                        datetime.now() - timedelta(days=1))
 
-    covered = prefetch_submissions(assignments, {1: {3}})
+    covered = fetch_students_submissions(assignments, {1: {3}})
 
     assert sorted(covered) == [2, 3]
     assert len(sent) == 2
     assert sent[1]["assignment_ids[]"] == ["2"]
+    assert sent[1]["include[]"] == ["submission_history"]
+    assert assignments[0].cached_submissions_of(
+        [3], ["submission_history"]) is not None
+
+@responses.activate
+def test_an_include_the_cache_lacks_is_asked_for(self):
+    assignments, sent = self.course([self.row(2, 3), self.row(3, 3)])
+
+    fetch_students_submissions(assignments, {1: {3}})
+    fetch_students_submissions(assignments, {1: {3}}, ["submission_history"])
+
+    assert len(sent) == 2
     assert sent[1]["include[]"] == ["submission_history"]
 @

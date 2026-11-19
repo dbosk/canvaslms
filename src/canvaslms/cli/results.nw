@@ -565,9 +565,11 @@ up front, whereas the singular cache path sees one user at a time.
 A handful of students whose courses we know can be warmed more cheaply still:
 their submissions come in one request per course
 (\cref{sec:few-students-submissions}), which beats both the listings and the
-individual lookups.  [[list_submissions]] does that when it gets
-[[students_by_course]], so we warm such a handful too; only users whose course
-we do not know, such as members of a group, still skip the warming.
+individual lookups.  So for such a handful we warm through that request alone:
+what it does not cover, an unpublished assignment or a course Canvas refused
+to answer for, is left to the individual lookups, as before, rather than to
+whole listings.  Users whose course we do not know, such as members of a
+group, still skip the warming.
 
 We request [["submission_history"]] in [[include]], which is a superset of what
 every bundled summary module asks for, so their singular lookups find the cached
@@ -589,8 +591,10 @@ def prefetch_submissions(assignments_list, users_list):
   assignment's whole roster.
   """
   by_course = submissions.students_by_course(users_list)
-  if (by_course is None and
-      len(users_list) < canvaslms.hacks.canvasapi.BULK_REFRESH_MIN_COUNT):
+  if len(users_list) < canvaslms.hacks.canvasapi.BULK_REFRESH_MIN_COUNT:
+    if by_course is not None:
+      canvaslms.hacks.canvasapi.fetch_students_submissions(
+        assignments_list, by_course, ["submission_history"])
     return
 
   student_ids = {user.id for user in users_list}
@@ -652,12 +656,18 @@ def test_prefetch_submissions_warms_a_few_students_of_known_courses(
     results_module.canvaslms.hacks.canvasapi,
     "BULK_REFRESH_MIN_COUNT", 3)
 
+  fetched = []
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi, "fetch_students_submissions",
+    lambda *args: fetched.append(args) or {})
+  monkeypatch.setattr(results_module.users, "UNREAD_ROSTERS", set())
+
   course = SimpleNamespace(id=1)
   users = [SimpleNamespace(id=i, course=course) for i in range(2)]
   results_module.prefetch_submissions(["assignment"], users)
 
-  assert len(recorded) == 1
-  assert recorded[0]["students_by_course"] == {1: {0, 1}}
+  assert recorded == []
+  assert fetched == [(["assignment"], {1: {0, 1}}, ["submission_history"])]
 @
 
 \subsection{Scoping students to their course round}
@@ -1253,6 +1263,42 @@ def test_all_graders_names_a_student_without_user_by_id(caplog):
 
   assert [grader.id for grader in graders] == [91]
   assert "user id 3" in caplog.text
+@
+
+When the students are still in the course, the course's listing answers for
+them, and [[results -a]], which goes through
+[[<<create [[submissions_list]]>>]], must use it: here only that listing
+answers, so a request for the assignment's own listing would fail the test.
+<<test functions>>=
+@responses.activate
+def test_results_of_a_few_students_come_in_one_request(capsys, monkeypatch):
+  monkeypatch.setattr(results_module.users, "UNREAD_ROSTERS", set())
+  responses.get(f"{API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1,
+                       "assignment_group_id": 1, "published": True,
+                       "due_at": None}])
+  responses.get(f"{API}/courses/1/search_users", json=[student_json(1)])
+  responses.get(f"{API}/courses/1/users/90",
+                json={"id": 90, "name": "Grader A", "login_id": "gradera"})
+  course_listing = responses.get(
+    f"{API}/courses/1/students/submissions",
+    json=[graded_submission_json(1, 90,
+                                 history=[graded_submission_json(1, 90)])])
+
+  course = canvasapi.course.Course(
+    Canvas(SERVER, "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+  parser = argparse.ArgumentParser()
+  results_module.add_command(parser.add_subparsers())
+  args = parser.parse_args(["results", "-c", "SBX101", "-a", "Lab"])
+  args.delimiter = "\t"
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    results_module.results_command({}, None, args)
+
+  rows = capsys.readouterr().out.splitlines()
+  assert len(rows) == 1 and "int-1" in rows[0]
+  assert course_listing.call_count == 1
 @
 
 
