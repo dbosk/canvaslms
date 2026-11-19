@@ -92,6 +92,12 @@ from canvasapi.file import File
 from canvasapi.submission import Submission
 from canvasapi.user import User
 
+import canvasapi
+import responses
+import sys
+
+import canvaslms.cli
+
 from canvaslms.cli.submissions import (
     convert_to_md,
     extract_submission_text,
@@ -118,6 +124,7 @@ from canvaslms.cli.submissions import (
     rubric_specs_from_args,
     rubric_specs_from_data,
     speedgrader,
+    students_by_course,
     submissions_grade_command,
 )
 
@@ -365,12 +372,14 @@ if args.ungraded:
     assignment_list,
     include=to_include,
     check_bulk_refresh=True,
-    student_ids=student_ids)
+    student_ids=student_ids,
+    students_by_course=course_students)
 else:
   submissions = list_submissions(assignment_list,
     include=to_include,
     check_bulk_refresh=True,
-    student_ids=student_ids)
+    student_ids=student_ids,
+    students_by_course=course_students)
 <<add options for history>>=
 list_parser.add_argument("-H", "--history", action="store_true",
   help="Include submission history.")
@@ -396,9 +405,11 @@ and we skip filtering entirely.
 <<resolve user filter and student ids>>=
 user_list = None
 student_ids = None
+course_students = None
 if args.user is not None or args.category or args.group:
   user_list = users.process_user_or_group_option(canvas, args)
   student_ids = {user.id for user in user_list}
+  course_students = students_by_course(user_list)
 @
 
 That [[None]] branch is unreachable for this command today: the [[users]]
@@ -1352,19 +1363,22 @@ def process_submission_options(canvas, args):
   assignment_list = assignments.process_assignment_option(canvas, args)
   user_list = users.process_user_or_group_option(canvas, args)
   student_ids = {user.id for user in user_list}
+  course_students = students_by_course(user_list)
 
   if args.ungraded:
     submissions = list_ungraded_submissions(assignment_list,
       include=["submission_history", "submission_comments",
       "rubric_assessment"],
       check_bulk_refresh=True,
-      student_ids=student_ids)
+      student_ids=student_ids,
+      students_by_course=course_students)
   else:
     submissions = list_submissions(assignment_list,
       include=["submission_history", "submission_comments",
       "rubric_assessment"],
       check_bulk_refresh=True,
-      student_ids=student_ids)
+      student_ids=student_ids,
+      students_by_course=course_students)
 
   submission_list = list(filter_submissions(submissions, user_list))
   if not submission_list:
@@ -1419,31 +1433,78 @@ callers inspect every submission and can benefit from a collection-wide
 refresh, while narrower flows can stay with per-submission refreshes.  When a
 caller already knows which users it will read, it passes [[student_ids]] so the
 cache scopes its bulk-refresh decision to that subset.
+
+A caller that knows the course of each of those users can also pass
+[[students_by_course]], and then the submissions of a few students come in one
+request per course rather than as every student's submissions in every
+assignment (\cref{sec:few-students-submissions} in [[canvasapi.nw]]).
+The cache answers which assignments that request covered, and only the others
+are listed as before.
+Both helpers share this choice through [[submissions_by_assignment]], so the
+ungraded listing gets it too.
 <<functions>>=
-def list_submissions(assignments, include=["submission_comments"],
-                     check_bulk_refresh=False, student_ids=None):
+def submissions_by_assignment(assignments, include, check_bulk_refresh,
+                              student_ids, students_by_course):
+  """Yield each assignment with its submissions.
+
+  Where a few students' submissions could come in one request per course,
+  the assignment comes with the cached submissions of those students only.
+  """
+  assignments = list(assignments)
+  covered = canvaslms.hacks.canvasapi.prefetch_submissions(
+    assignments, students_by_course, include)
   for assignment in assignments:
-    submissions = assignment.get_submissions(
-      include=include,
-      check_bulk_refresh=check_bulk_refresh,
-      student_ids=student_ids)
+    if assignment.id in covered:
+      yield assignment, covered[assignment.id]
+    else:
+      yield assignment, assignment.get_submissions(
+        include=include,
+        check_bulk_refresh=check_bulk_refresh,
+        student_ids=student_ids)
+
+def list_submissions(assignments, include=["submission_comments"],
+                     check_bulk_refresh=False, student_ids=None,
+                     students_by_course=None):
+  for assignment, submissions in submissions_by_assignment(
+      assignments, include, check_bulk_refresh, student_ids,
+      students_by_course):
     for submission in submissions:
       submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
       yield submission
 
 def list_ungraded_submissions(assignments, include=["submission_comments"],
-                              check_bulk_refresh=False, student_ids=None):
-  for assignment in assignments:
-    submissions = assignment.get_submissions(
-      include=include,
-      check_bulk_refresh=check_bulk_refresh,
-      student_ids=student_ids)
+                              check_bulk_refresh=False, student_ids=None,
+                              students_by_course=None):
+  for assignment, submissions in submissions_by_assignment(
+      assignments, include, check_bulk_refresh, student_ids,
+      students_by_course):
     for submission in submissions:
       submission = canvaslms.cli.utils.ensure_submission_attrs(submission)
       submission.assignment = assignment
       if is_ungraded(submission):
         yield submission
+@
+
+A caller builds that mapping from the users it resolved: [[list_users]] in
+[[users.nw]] notes on each user the course it was listed in, and a student in
+two of the selected courses is listed once in each.
+A member of a group may lack it.
+We cannot tell which course to ask for such a user's submissions, and a
+mapping without them would leave their submissions out of what the cache
+hands back, so then there is no mapping at all, and everything is listed as
+before.
+<<functions>>=
+def students_by_course(user_list):
+  """Return {course ID: user IDs} of `user_list`, or None if some user does
+  not know the course it was listed in."""
+  by_course = {}
+  for user in user_list:
+    course = getattr(user, "course", None)
+    if course is None:
+      return None
+    by_course.setdefault(course.id, set()).add(user.id)
+  return by_course
 @
 
 \subsection{Verifying submission normalization}
@@ -1502,6 +1563,128 @@ class TestListSubmissions:
             check_bulk_refresh=True,
             student_ids={1, 2, 3},
         )
+@
+
+Now let's verify the way through the cache for a few students.
+The mapping follows the course each user was listed in, and one user without
+a course turns it off.
+A covered assignment is not listed: [[responses]] answers only the course's
+listing of students' submissions, so a request for the assignment's own
+listing would fail the test.
+<<test functions>>=
+def user_in(course_id, user_id):
+    """Return a user as list_users leaves it, listed in course_id if any."""
+    user = User(MagicMock(), {"id": user_id})
+    if course_id is not None:
+        user.course = Course(MagicMock(), {"id": course_id})
+    return user
+
+class TestStudentsByCourse:
+    """The mapping that lets a few students' submissions come per course."""
+
+    def test_groups_the_students_by_their_course(self):
+        users = [user_in(1, 3), user_in(1, 4), user_in(2, 3)]
+        assert students_by_course(users) == {1: {3, 4}, 2: {3}}
+
+    def test_a_user_without_a_course_turns_it_off(self):
+        assert students_by_course([user_in(1, 3), user_in(None, 4)]) is None
+
+URL = "https://canvas.example.org"
+API = f"{URL}/api/v1"
+
+@responses.activate
+def test_a_covered_assignment_is_not_listed():
+    responses.get(f"{API}/courses/1/students/submissions",
+                  json=[{"id": 1, "user_id": 3, "assignment_id": 2,
+                         "grade": "P", "workflow_state": "graded"}])
+    requester = canvasapi.Canvas(URL, "a token")._Canvas__requester
+    assignment = Assignment(requester, {"id": 2, "course_id": 1,
+                                        "published": True})
+
+    for listing in (list_submissions, list_ungraded_submissions):
+        result = list(listing([assignment], student_ids={3},
+                              students_by_course={1: {3}}))
+        if listing is list_submissions:
+            assert [s.user_id for s in result] == [3]
+            assert result[0].assignment is assignment
+            assert result[0].grade == "P"
+
+    assert len(responses.calls) == 1
+@
+
+And through the commands themselves: [[submissions list -u]], and
+[[submissions view -u]], which shares its way to the submissions with
+[[grade]], must hand the course of the student they resolved on to the
+listing, so that the student's submissions come in the course's one request
+and the assignment is never listed.
+We run the real [[main]], with the cache file in a temporary directory and
+HTTP stubbed by [[responses]] as in the tests of the command line in
+[[cli.nw]]; again any request not registered fails.
+<<test functions>>=
+@pytest.fixture
+def run_cli(monkeypatch, tmp_path, capsys):
+    """Return a function running canvaslms main, returning its stdout."""
+    import canvaslms.cli.cache
+    import canvaslms.cli.login
+    monkeypatch.setattr(canvaslms.cli.cache, "get_cache_path",
+                        lambda hostname: str(tmp_path / "cache.enc"))
+    monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
+                        lambda config: (URL, "token"))
+
+    def run(*arguments):
+        monkeypatch.setattr(sys, "argv", ["canvaslms", "--config-file",
+                                          str(tmp_path / "config.json"),
+                                          *arguments])
+        canvaslms.cli.main()
+        return capsys.readouterr().out
+
+    return run
+
+@responses.activate
+def test_listing_one_student_asks_the_course_once(run_cli):
+    responses.get(f"{API}/courses",
+                  json=[{"id": 1, "name": "Course", "course_code": "C1"}])
+    responses.get(f"{API}/courses/1/assignments",
+                  json=[{"id": 2, "name": "Lab", "course_id": 1,
+                         "published": True}])
+    responses.get(f"{API}/courses/1/search_users",
+                  json=[{"id": 3, "name": "Anna Andersson", "login_id": "anna",
+                         "enrollments": [{"type": "StudentEnrollment"}]}])
+    course_listing = responses.get(
+        f"{API}/courses/1/students/submissions",
+        json=[{"id": 9, "user_id": 3, "assignment_id": 2, "grade": "P",
+               "workflow_state": "graded", "submitted_at": None,
+               "graded_at": "2026-10-02T10:00:00Z"}])
+
+    output = run_cli("submissions", "list", "-c", "C1", "-u", "anna", "-l")
+
+    assert "anna" in output and "\tP\t" in output
+    assert course_listing.call_count == 1
+
+@responses.activate
+def test_viewing_one_student_asks_the_course_once(run_cli):
+    responses.get(f"{API}/courses",
+                  json=[{"id": 1, "name": "Course", "course_code": "C1"}])
+    responses.get(f"{API}/courses/1/assignments",
+                  json=[{"id": 2, "name": "Lab", "course_id": 1,
+                         "published": True}])
+    responses.get(f"{API}/courses/1/search_users",
+                  json=[{"id": 3, "name": "Anna Andersson", "login_id": "anna",
+                         "enrollments": [{"type": "StudentEnrollment"}]}])
+    course_listing = responses.get(
+        f"{API}/courses/1/students/submissions",
+        json=[{"id": 9, "user_id": 3, "assignment_id": 2, "grade": "P",
+               "workflow_state": "graded", "attempt": 1,
+               "submitted_at": "2026-10-01T10:00:00Z",
+               "graded_at": "2026-10-02T10:00:00Z",
+               "submission_history": [], "submission_comments": [],
+               "rubric_assessment": None}])
+
+    output = run_cli("submissions", "view", "-c", "C1", "-a", "Lab",
+                     "-u", "anna", "--no-fbf")
+
+    assert "Lab" in output
+    assert course_listing.call_count == 1
 @
 
 \subsection{Verifying local ungraded filtering}
