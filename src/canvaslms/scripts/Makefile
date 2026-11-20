@@ -1,10 +1,12 @@
 MODULES+=	ungraded.sh ungraded.tex
+MODULES+=	carryover.sh carryover.tex
 
 .PHONY: all
 all: ${MODULES}
 
-# cron runs the installed copy directly, so it must be executable.
-ungraded.sh: ungraded.nw
+# The scripts are run as installed, by cron among others, so they must be
+# executable.
+ungraded.sh carryover.sh: %.sh: %.nw
 	${NOTANGLE.sh}
 	chmod 755 $@
 

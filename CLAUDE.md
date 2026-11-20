@@ -874,10 +874,14 @@ Makefile) and weaves to a `\subsection` that `doc/intro.nw` `\input`s under
 "Workflow examples". Deployments (the rpi Ansible repo) copy every `*.sh` from
 `site-packages/canvaslms/` to run from cron, so the scripts must stay generic:
 personal settings go in a config file, never in the script. To add one: a
-`MODULES+=` line in `src/canvaslms/scripts/Makefile`, an include entry by name
-in `pyproject.toml`, the `\input` in `doc/intro.nw` and a `canvaslms.pdf:`
-line in `doc/Makefile`. Test the script by running it with stub `canvaslms`
-and `date` on `PATH` (see `ungraded.nw`).
+`MODULES+=` line and the name in the `%.sh: %.nw` static rule in
+`src/canvaslms/scripts/Makefile`, an include entry by name in `pyproject.toml`,
+the `\input` in `doc/intro.nw` and a `canvaslms.pdf:` line in `doc/Makefile`.
+Test the script by running it with stub `canvaslms` and `date` on `PATH` (see
+`ungraded.nw`). A script whose logic can work on files is sourceable (it runs
+its main function only when `BASH_SOURCE[0]` is `$0`), so tests call that logic
+directly: `carryover.sh`'s `carryover_plan` is also an interface edumail uses,
+so keep its arguments and its six input files stable.
 
 ## Configuration and Authentication
 

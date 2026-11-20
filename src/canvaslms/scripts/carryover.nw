@@ -1,0 +1,1599 @@
+\subsection{Start of a round: Carrying results over from earlier rounds}
+\label{sec:carryover}
+
+Every round of a course has some students who took it before.
+They only do the assignments they have not passed, and their earlier
+results stay in the Canvas room of the round they took.
+Everything that reads one room then gets them wrong:
+[[canvaslms results]] does not see the module complete, and a list of
+missing assignments names what the student passed a year ago.
+So at the start of a round we copy the passed results into the new room.
+
+This script decides what to copy, but it does not copy anything.
+It prints [[canvaslms grade]] commands for us to read, and we run them:
+\begin{minted}{bash}
+carryover.sh tilkry27 > carryover-commands.sh
+less carryover-commands.sh
+bash carryover-commands.sh
+\end{minted}
+The commands write grades to Canvas, which is all the more reason to read
+them first---and to run them soon after.
+They are made from what the new room held when we asked, and a submission
+that is graded or handed in after that is overwritten all the same.
+What cannot be carried over is printed as comments, starting with [[#]],
+so the output can go to the shell as it is.
+
+When a student writes to say they passed something in an earlier round,
+we need the commands for that one student only:
+\begin{minted}{bash}
+carryover.sh -u 'student@kth.se' tilkry27
+\end{minted}
+It prints only what concerns that student, and it is faster than a run
+for the whole round, though not as much faster as one would like
+(\cref{sec:carryover-fetch}).
+
+Like [[ungraded.sh]] in \cref{sec:cron-ungraded}, this script is shipped
+with [[canvaslms]], and that section shows where it is installed.
+And like that script, it keeps what is personal out of itself:
+how a course's assignments were renamed from one round to the next is
+known only to its teachers, so the rules for that live in a file of
+their own (\cref{sec:carryover-rules}).
+
+
+\subsubsection{The script as a whole}
+
+The script has three parts, and we present them from the inside out.
+\begin{description}
+\item[The decision] [[carryover_plan]] reads files that hold what
+  [[canvaslms]] printed about the new room and the earlier rounds, and
+  prints the commands.
+  It reads nothing from Canvas, so we can test it on rounds we make up.
+\item[The Canvas side] [[carryover]] finds the new room and the earlier
+  rounds of its course, fetches them into a temporary directory, and
+  hands that directory to [[carryover_plan]].
+\item[The command line] [[carryover_main]] reads the options and calls
+  [[carryover]].
+\end{description}
+The script runs [[carryover_main]] only when it is run as a program.
+When it is sourced, it just defines the functions, so that a test---ours
+below, or that of a program that keeps its own rules---can call
+[[carryover_plan]] on files of its own.
+<<[[carryover.sh]]>>=
+#!/bin/bash
+# carryover.sh - print canvaslms commands that carry returning students'
+# passes over from the course's earlier rounds into a new round
+#
+# Usage: carryover.sh [-u student] [-r rules] [-m message] course
+#
+# It only prints commands, and never writes to Canvas itself: read them,
+# then run them.  A rule line is a course code, spaces or tabs and a regex
+# matching the names that one assignment has had.  Rules come from -r and
+# then from ${CANVASLMS_CARRYOVER_RULES:-~/.config/canvaslms/carryover.rules}.
+#
+# Sourced, it only defines its functions, among them
+#   carryover_plan DIR CANVAS_ID COURSE_CODE [MESSAGE]
+# which decides on files instead of asking Canvas.
+
+<<constants>>
+<<functions>>
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  carryover_main "$@"
+fi
+@
+
+The tests run the real script in [[bash]].
+Only [[canvaslms]] is replaced, by made-up files for the decision and by
+a stub program for the Canvas side, since Canvas holds real students'
+grades and a test must never write to it.
+<<test [[carryover.py]]>>=
+"""Tests for the carry-over script carryover.sh."""
+
+import argparse
+import csv
+import json
+import logging
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import pytest
+import responses
+
+import canvaslms
+import canvaslms.cli
+import canvaslms.cli.assignments
+import canvaslms.cli.courses
+import canvaslms.cli.grade
+import canvaslms.cli.login
+import canvaslms.cli.cache
+import canvaslms.cli.submissions
+import canvaslms.cli.users
+import canvaslms.hacks.canvasapi
+
+SCRIPT = pathlib.Path(canvaslms.__file__).parent / "scripts" / "carryover.sh"
+
+<<test functions>>
+@
+
+First of all, the script must be valid [[bash]].
+<<test functions>>=
+def test_script_is_valid_bash():
+  subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
+@
+
+
+\subsubsection{Rules for renamed assignments}
+\label{sec:carryover-rules}
+
+An assignment is the same in two rounds when it has the same name.
+Often it has not:
+of the 48 assignments of one round of a cryptography course, only 30 had
+a name from the round before.
+Some were new, but many were only renamed, and how varies with the
+course:
+\begin{itemize}
+\item the date and the teachers of a seminar are in its name, and the
+  word for mandatory comes and goes:
+  \enquote{LIVE (MANDATORY) Seminar 4/2: usability (\ldots)} one year,
+  \enquote{MANDATORY Seminar (31/1): usability (\ldots) ON CAMPUS}
+  another;
+\item one round adds \enquote{(obligatorisk)} to every mandatory
+  assignment;
+\item a final seminar is dated: \enquote{The final seminar on 27/5 at
+  14:15}.
+\end{itemize}
+What stays is a core---\enquote{: usability}, \enquote{Excel labb 2},
+\enquote{The final seminar on}---and a regex can say what that core is.
+So a rule is a course code and a regex, separated by spaces or tabs:
+every name that the regex matches is the same assignment.
+\Cref{fig:carryover-rules} shows a few.
+\begin{figure}
+\begin{minted}{text}
+# course  names of one assignment
+DD2520  Seminar.*: usability|^Usability seminar$
+DD2520  ^INL1Written( Final| [0-9/-]+)?$
+DD1317  ^Excel labb 2( \(obligatorisk\))?$
+DA2215  ^The final seminar on
+\end{minted}
+\caption{A rules file.
+  Empty lines and lines starting with [[#]] are ignored; a regex may hold
+  spaces.}
+\label{fig:carryover-rules}
+\end{figure}
+The seminar shows why a rule names the core and not the variation:
+[[Seminar.*: usability]] matches every year's seminar but not the
+\enquote{Preparation for usability seminar}, which is an assignment of
+its own.
+The written assignment of the second rule became \enquote{INL1Written
+Final} when a peer review was added, \enquote{INL1Written Peer Review},
+which the rule must not match.
+
+A rule is used like this.
+A name that the new room has, once, is the same assignment there, rules
+or not.
+Otherwise we take the rules for the course in order, and the first one
+that matches the old name decides:
+if it matches exactly one name in the new room, that is the assignment;
+if it matches several, we cannot tell which, and report it.
+A rule that matches no name in the room decides nothing, and we try the
+next---so a rule for one run may be narrower than our usual one without
+hiding it.
+A name that the new room has twice is no assignment to copy to either:
+the command names an assignment by a regex on its name, and that would
+grade both.
+A room can have such names, for instance when the same assignments are
+imported into it twice.
+
+The rules are the teachers' knowledge of their courses, so the script
+has none of its own: a rule built into a script shipped with
+[[canvaslms]] would be someone else's course, and it would change only
+with a release.
+They come from two files, which are read in this order:
+\begin{enumerate}
+\item the file given with [[-r]], for one run;
+\item our own file, [[carryover.rules]] in [[~/.config/canvaslms]] (or
+  in [[canvaslms]] under [[XDG_CONFIG_HOME]]), where [[canvaslms]] keeps
+  its configuration on Linux, or the file that
+  [[CANVASLMS_CARRYOVER_RULES]] names.
+\end{enumerate}
+Either may be missing; without rules, an assignment is carried over only
+to the same name.
+<<functions>>=
+carryover_rules_path() {
+  echo "${CANVASLMS_CARRYOVER_RULES:-${XDG_CONFIG_HOME:-$HOME/.config}/canvaslms/carryover.rules}"
+}
+
+carryover_rules() {
+  local given="$1" own
+  own=$(carryover_rules_path)
+  if [[ -n "${given}" ]]; then
+    cat "${given}" || return 1
+    echo
+  fi
+  if [[ -e "${own}" ]]; then
+    cat "${own}" || return 1
+    echo
+  fi
+}
+@ The [[echo]] after each file is for a last line without its newline,
+which would otherwise run into the first rule of the next file and take
+it along.
+A file given with [[-r]] must be there, as must our own file when it
+exists but cannot be read: either is a mistake, and a silent run without
+the rules would carry less than we think.
+
+
+\subsubsection{Deciding what to carry over}
+\label{sec:carryover-plan}
+
+[[carryover_plan]] reads six files from a directory, each holding what one
+[[canvaslms]] command printed, as it printed it:
+\begin{description}
+\item[ [[rules]] ] the rules, from the files above;
+\item[ [[users]] ] [[canvaslms users -s]] of the new room;
+\item[ [[assignments]] ] [[canvaslms assignments list]] of the new room;
+\item[ [[submissions]] ] [[canvaslms submissions list -l]] of the new room;
+\item[ [[rounds]] ] [[canvaslms submissions list -l]] of the earlier rounds;
+\item[ [[room]] ] the new room's Canvas course code, such as
+  \enquote{DD2520 VT27 (tilkry27)}.
+\end{description}
+The other arguments are the new room's Canvas ID, which the commands name
+it by, and its course code, which selects the rules.
+A student is their login ID, the second column of [[canvaslms users]]
+and, with [[-l]], the third of [[canvaslms submissions list]].
+We do not go by the name, since two students can share one.
+A student without a login ID is printed with an empty one by
+[[canvaslms users]] but with another identifier by
+[[canvaslms submissions list]], so such a student's passes are left out,
+without a report.
+The other columns of [[submissions list]] are the room's Canvas course
+code, the assignment, the grade and the dates of submission and grading;
+a submission that nobody has graded has an empty grade, and a date that
+is not there is [[N/A]].
+
+All of the deciding is one [[awk]] program:
+<<functions>>=
+carryover_plan() {
+  local data="$1" id="$2" code="$3"
+  local message="${4:-${CARRYOVER_MESSAGE}}"
+  CARRYOVER_MESSAGE="${message}" \
+  awk -F '\t' -v OFS='\t' -v q="'" -v id="${id}" -v code="${code}" \
+      -v data="${data}" '
+    <<[[awk]] functions for the carry-over>>
+    BEGIN {
+      <<rank the passes>>
+      getline room < (data "/room")
+      message = ENVIRON["CARRYOVER_MESSAGE"]
+    }
+    { sub(/\r$/, "") }
+    <<read the rules>>
+    { unquote() }
+    <<read the new room>>
+    <<keep each student's best pass of each assignment>>
+    END {
+      <<print the commands that carry the grades over>>
+      <<print what could not be carried over>>
+    }' "${data}/rules" "${data}/users" "${data}/assignments" \
+       "${data}/submissions" "${data}/rounds" \
+  | sort -t $'\t' -k 1,1n -k 2,2nr -k 3 | cut -f 3-
+  carryover_status "${PIPESTATUS[@]}"
+}
+
+carryover_status() {
+  local status
+  for status in "$@"; do
+    [[ "${status}" -eq 0 ]] || return "${status}"
+  done
+}
+<<constants>>=
+CARRYOVER_MESSAGE="Result carried over from"
+@ The program prints each line behind two numbers, which the [[sort]]
+orders the lines by: what kind of line it is, the commands first and the
+comments after, and then a count, the largest first; the lines that tie
+on both are sorted as text.
+The function's status is that of the first program in the pipeline that
+failed, not that of [[cut]], which is the status of a pipeline:
+a program that sources the script and gives [[carryover_plan]] files of
+its own learns that way when [[awk]] could not read one.
+
+The message is what the students see as a comment on the grade, with the
+round's Canvas course code after it; it can be changed with [[-m]], for a
+course given in Swedish.
+The program gets it from its environment and not with [[-v]], which would
+read a backslash in it as the start of an escape.
+
+The first rule strips the carriage return from every line, since
+[[canvaslms]] writes its rows with [[csv.writer]], which ends them in
+one.
+It matters for the last column only, which is where the date of grading
+is, and there it matters a lot:
+[[N/A]] with a carriage return is not [[N/A]], and it would sort after
+every date.
+
+The files come in a fixed order, and we tell them apart by name.
+Each of the rules below ends in [[next]], so only the last file, the
+other rounds', reaches the rules after them.
+Counting files with [[FNR == 1]] would have been shorter than going by
+their names, but an empty file has no first line: a room where nothing is
+graded yet would have been taken for the other rounds.
+A rule line is split by hand, since its separator is spaces as well as
+tabs, and its regex may contain spaces.
+A line with a course code and only blanks after it would give the empty
+regex, which matches every name and would make every old name ambiguous,
+so it is no rule.
+<<read the rules>>=
+FILENAME == data "/rules" {
+  if ($0 ~ /^[ \t]*(#|$)/) next
+  if (match($0, /^[^ \t]+[ \t]+/) && substr($0, 1, RLENGTH) ~ "^" code "[ \t]") {
+    pattern = substr($0, RLENGTH + 1)
+    sub(/[ \t]+$/, "", pattern)
+    if (pattern != "") rule[++rules] = pattern
+  }
+  next
+}
+@ The other files are what [[canvaslms]] printed, and [[csv.writer]]
+puts a field in double quotes when it contains one, doubling the quotes
+inside: an assignment named [[Lab "AES"]] is printed as
+[["Lab ""AES"""]].
+We undo that in every field, so that a name is the name that
+[[canvaslms grade]] will match the command's regex against.
+Changing a field makes [[awk]] join the line again with [[OFS]], which is
+why the program sets it to a tab.
+<<[[awk]] functions for the carry-over>>=
+function unquote(   i, f) {
+  for (i = 1; i <= NF; i++) {
+    f = $i
+    if (f ~ /^".*"$/) {
+      f = substr(f, 2, length(f) - 2)
+      gsub(/""/, "\"", f)
+      $i = f
+    }
+  }
+}
+<<read the new room>>=
+FILENAME == data "/users" { student[$2] = 1; next }
+FILENAME == data "/assignments" { copies[$3]++; next }
+FILENAME == data "/submissions" {
+  if ($4 != "" || $5 != "N/A") taken[$2, $3] = 1
+  if (class($4) != "") scale[$2] = class($4)
+  next
+}
+@ What is graded or handed in in the new room already, we leave alone,
+even a fail:
+whoever graded it saw something we do not, and a student who hands in
+again wants it graded.
+The grades that are there also tell us the assignment's scale, which we
+come back to below.
+
+\paragraph{Made-up rounds to test with}
+
+Before we go into the decisions, we make up a new round of a course and
+two earlier ones to try them on, with a student for each decision.
+In the new room, we give each assignment that a mistake in a regex could
+hit instead a neighbour that differs by little: the same name with
+something before or after it, the parentheses without their meaning, a
+dot where any character would do.
+A student's login ID gets two, with something before and after it.
+<<test functions>>=
+ROOM = "DD2520 VT27 (tilkry27)"
+ROOM_ID = "67592"
+R25, R26 = "DD2520 VT25 (tilkry25)", "DD2520 VT26 (tilkry26)"
+ASSIGNMENTS = ["LAB1 Implement AES", "LAB1 Implement AES (2025)",
+               "Old LAB1 Implement AES",
+               "Seminar (Bob's part)", "Seminar Bob's part",
+               "Quiz 1.0", "Quiz 110",
+               "INL1Written Final", "INL1Written Peer Review",
+               "INL1Quiz Ciphers", "INL1Quiz Hash functions", "INL1Quiz AES",
+               "MANDATORY Seminar (29, 30/1): usability ON CAMPUS",
+               "Optional: Side channels (C, B, A)",
+               "The terminal", "The terminal", 'Lab "AES"']
+STUDENTS = ["returning", "again", "second", "weak", "failed", "graded",
+            "submitted", "lettered", "spelled", "both", "mixed", "new"]
+NEAR_MISSES = ["xreturning@kth.se", "returning@kth.sex"]
+
+def login(student):
+  return f"{student}@kth.se"
+
+LOGINS = [login(s) for s in STUDENTS] + NEAR_MISSES
+
+# assignment, student, grade, handed in, graded
+IN_ROOM = [
+  ("LAB1 Implement AES",   "returning", "",         "N/A", "N/A"),
+  ("LAB1 Implement AES",   "graded",    "F",        "2027-01-20 10:00",
+                                                    "2027-01-21 10:00"),
+  ("LAB1 Implement AES",   "submitted", "",         "2027-01-20 10:00", "N/A"),
+  ("Seminar (Bob's part)", "new",       "complete", "N/A",
+                                                    "2027-01-22 10:00"),
+]
+RULES = """\
+# rules for the test
+DD1317  ^Usability seminar$|Peer Review
+DD25200  ^AES presentation$|^Seminar Bob
+DD2520   
+DD2520  Usability
+DD2520  Seminar.*: usability|^Usability seminar$   
+DD2520  ^INL1Written( Final| [0-9/-]+)?$
+DD2520  ^INL1Quiz
+"""
+@ The earlier rounds hold the passes and the fails:
+<<test functions>>=
+# round, assignment, student, grade, graded
+ROUNDS = [
+  (R25, "LAB1 Implement AES",   "returning", "P",  "2025-02-03 10:00"),
+  (R25, "INL1Written",          "returning", "B",  "2025-03-05 10:00"),
+  (R25, "Seminar (Bob's part)", "returning", "complete", "2025-02-10 10:00"),
+  (R25, "Quiz 1.0",             "returning", "P",  "2025-02-12 10:00"),
+  (R25, "Usability seminar",    "returning", "P",  "2025-02-13 10:00"),
+  (R25, "INL1Quiz Cryptographic Concepts",
+                                "returning", "P",  "2025-02-01 11:00"),
+  (R25, "The terminal",         "returning", "P",  "2025-02-14 10:00"),
+  (R25, "AES presentation",     "returning", "P",  "2025-02-11 10:00"),
+  (R25, 'Lab "AES"',            "returning", "P",  "2025-02-15 10:00"),
+  (R25, "LAB1 Implement AES",   "again",     "P+", "2025-03-01 10:00"),
+  (R26, "LAB1 Implement AES",   "again",     "P",  "2026-03-01 10:00"),
+  (R25, "INL1Written",          "again",     "A",  "2025-03-05 10:00"),
+  (R26, "INL1Written",          "again",     "B",  "2026-03-05 10:00"),
+  (R25, "INL1Quiz Ciphers",     "again",     "P",  "2025-02-01 11:00"),
+  (R26, "INL1Quiz Ciphers",     "again",     "P",  "N/A"),
+  (R25, "Optional: Side channels (C, B, A)", "again", "10",
+                                                   "2025-03-10 10:00"),
+  (R26, "Optional: Side channels (C, B, A)", "again", "9.5",
+                                                   "2026-03-10 10:00"),
+  (R25, "LAB1 Implement AES",   "second",    "P",  "2025-02-04 10:00"),
+  (R25, "The terminal",         "second",    "P",  "2025-02-14 10:00"),
+  (R26, "LAB1 Implement AES",   "weak",      "E",  "2026-02-02 10:00"),
+  (R25, "Quiz 1.0",             "weak",      "P",  "2025-02-12 10:00"),
+  (R26, "Quiz 1.0",             "weak",      "P",  "2026-02-12 10:00"),
+  (R26, "LAB1 Implement AES",   "failed",    "F",  "2026-02-02 10:00"),
+  (R26, "Quiz 1.0",             "failed",    "0",  "2026-02-02 10:00"),
+  (R26, "LAB1 Implement AES",   "graded",    "P",  "2026-02-02 10:00"),
+  (R26, "LAB1 Implement AES",   "submitted", "P",  "2026-02-02 10:00"),
+  (R26, "Seminar (Bob's part)", "lettered",  "B",  "2026-02-10 10:00"),
+  (R26, "Seminar (Bob's part)", "spelled",   "P",  "2026-02-10 10:00"),
+  (R25, "Seminar (Bob's part)", "both",      "complete", "2025-02-10 10:00"),
+  (R26, "Seminar (Bob's part)", "both",      "B",  "2026-02-10 10:00"),
+  (R25, "INL1Written",          "mixed",     "P",  "2025-03-05 10:00"),
+  (R26, "INL1Written",          "mixed",     "A",  "2026-03-05 10:00"),
+  (R26, "LAB1 Implement AES",   "left",      "P",  "2026-02-02 10:00"),
+]
+@ We write the files in the columns of [[canvaslms]], as the Canvas side
+would have fetched them, and the way [[canvaslms]] writes them: with
+[[csv.writer]], tabs between the columns, carriage returns and quoted
+names.
+<<test functions>>=
+def write_canvas_files(directory):
+  """Write what canvaslms prints about the made-up rounds into directory."""
+  def write(name, rows):
+    with open(directory / name, "w", newline="") as file:
+      csv.writer(file, delimiter="\t").writerows(rows)
+  write("users", ([ROOM, user, user] for user in LOGINS))
+  write("assignments", ([ROOM, "LAB1", a, "", "", ""] for a in ASSIGNMENTS))
+  write("submissions", ([ROOM, a, login(s), g, h, d]
+                        for a, s, g, h, d in IN_ROOM))
+  write("rounds", ([r, a, login(s), g, "2025-01-01 10:00", d]
+                   for r, a, s, g, d in ROUNDS))
+@ The script runs whichever [[awk]] the system has, so the decisions must
+not depend on which one that is.
+Every test of the decisions therefore runs three times, with GNU
+[[awk]], with [[mawk]] and with BusyBox's, each put first on [[PATH]]
+under the name [[awk]]; an [[awk]] that is not installed is skipped, and
+the skip says so.
+BusyBox picks the program by the name it is called by, so the link named
+[[awk]] is its [[awk]].
+<<test functions>>=
+@pytest.fixture(params=["gawk", "mawk", "busybox"])
+def awk_path(request, tmp_path):
+  """Return a PATH whose awk is the parametrized implementation."""
+  found = shutil.which(request.param)
+  if not found:
+    pytest.skip(f"{request.param} is not installed")
+  bin_dir = tmp_path / "awk-bin"
+  bin_dir.mkdir()
+  (bin_dir / "awk").symlink_to(found)
+  return f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+
+@pytest.fixture
+def plan(tmp_path, awk_path):
+  """Return a function running carryover_plan on the made-up rounds."""
+  data = tmp_path / "data"
+  data.mkdir()
+  write_canvas_files(data)
+  (data / "rules").write_text(RULES)
+  (data / "room").write_text(ROOM + "\n")
+
+  def run(*message):
+    result = subprocess.run(
+      ["bash", "-c", 'source "$1" && carryover_plan "${@:2}"', "carryover",
+       str(SCRIPT), str(data), ROOM_ID, "DD2520", *message],
+      env=dict(os.environ, PATH=awk_path),
+      capture_output=True, text=True, check=True)
+    return result.stdout
+
+  return run
+@ The output is meant for the shell, so the tests give it to one.
+In place of [[canvaslms]] we define a function that prints its arguments,
+run each command line, and parse the arguments with the real parser of
+[[canvaslms grade]].
+Its regexes we then match as [[canvaslms]] would, with Python's [[re]],
+against all the names in the room, neighbours and copies counted, and all
+the students, without regard to case.
+Among the students we count one without a login ID, whom [[canvaslms]]
+matches as an empty string, and the student who is not in the new room.
+<<test functions>>=
+def grade_parser():
+  parser = argparse.ArgumentParser()
+  canvaslms.cli.grade.add_command(parser.add_subparsers(dest="command"))
+  return parser
+
+def commands(output):
+  """Return the arguments of each command in output, as the shell gives them."""
+  found = []
+  for line in output.splitlines():
+    if line.startswith("#"):
+      continue
+    printed = subprocess.run(
+      ["bash", "-c", 'canvaslms() { printf "%s\\0" "$@"; }; ' + line],
+      capture_output=True, text=True, check=True).stdout
+    found.append(printed.split("\0")[:-1])
+  return found
+
+MESSAGE = "Result carried over from"
+
+def graded(output, message=MESSAGE):
+  """Return, per student, what the commands give them: assignment -> grade.
+
+  An assignment is a name if the command names exactly one in the room,
+  otherwise the tuple of all the names it matches.  The grade is the pair of
+  the grade and the round it comes from.
+  """
+  everyone = LOGINS + [login("left"), ""]
+  result = {}
+  for arguments in commands(output):
+    args = grade_parser().parse_args(arguments)
+    assert args.command == "grade" and args.course == f"^{ROOM_ID}$"
+    names = tuple(a for a in ASSIGNMENTS if re.search(args.assignment, a))
+    name = names[0] if len(names) == 1 else names
+    assert args.message.startswith(message + " ")
+    assert args.message.endswith(".")
+    round_ = args.message[len(message) + 1:-1]
+    for user in everyone:
+      if re.search(args.user, user, re.IGNORECASE):
+        student = (user.removesuffix("@kth.se") if user.endswith("@kth.se")
+                   else user or "(no login ID)")
+        result.setdefault(student, {})[name] = (args.grade, round_)
+  return result
+
+def reports(output):
+  return [line for line in output.splitlines() if line.startswith("#")]
+@
+
+\paragraph{Which grades count}
+
+A grade is worth carrying over if it passes.
+There are four kinds of them:
+\begin{description}
+\item[Letters] A to E.
+\item[Passes] P, and the P+ that some courses use for a pass with
+  distinction.
+\item[Completes] \enquote{complete}, the pass of an assignment graded
+  complete or incomplete.
+\item[Points] above zero, for assignments scored in points whose sum sets
+  a grade.
+\end{description}
+P and \enquote{complete} are both a pass, but they are spellings of
+different scales, and we keep them apart for the scale check below rather
+than guess whether Canvas would take the one for the other.
+Everything else stays: a fail, zero points, an empty grade.
+That includes a survey that was handed in for no points: the survey
+modules of [[canvaslms]] count it as done for being submitted, but there
+is no passing grade to carry over, and it is not reported either.
+<<[[awk]] functions for the carry-over>>=
+function class(grade) {
+  if (toupper(grade) ~ /^[A-E]$/) return "letter"
+  if (toupper(grade) ~ /^(P|P\+)$/) return "pass"
+  if (toupper(grade) == "COMPLETE") return "complete"
+  if (grade ~ /^[0-9]+(\.[0-9]+)?$/ && grade + 0 > 0) return "points"
+  return ""
+}
+@ Of several passes of the same assignment, from different rounds or a
+redone one, we take the best of its kind: the higher letter, the more
+points, and P+ before P; one complete is as good as another.
+<<rank the passes>>=
+split("E D C B A", letters, " ")
+for (i = 1; i <= 5; i++) letter_value[letters[i]] = i
+<<[[awk]] functions for the carry-over>>=
+function value(grade, kind) {
+  if (kind == "letter") return letter_value[toupper(grade)]
+  if (kind == "pass") return (toupper(grade) == "P+" ? 2 : 1)
+  if (kind == "complete") return 1
+  return grade + 0
+}
+@ Between equal passes, we take the one graded last.
+[[canvaslms]] prints the dates as [[YYYY-MM-DD HH:mm]], which sort as
+strings, but it prints [[N/A]] when there is none, and that would sort
+after every date; so we read it as no date.
+
+Passes of different kinds do not compare, and they do not mix either:
+a letter written into an assignment graded pass or fail is not a grade it
+can have.
+So when the new room has graded the assignment already, its grades tell
+us the kind, and a pass of another kind is reported rather than carried;
+when it has not, a student whose passes are of different kinds is
+reported too.
+At the start of a round, though, nothing is graded yet, and we cannot
+tell the kind: [[canvaslms assignments list]] does not show how an
+assignment is graded.
+A pass of one kind then goes where it went before, which is right as long
+as the assignment is graded as it was; if its scale has changed, it is
+the commands for it that we must read with care.
+
+\paragraph{The best pass}
+
+With that, the other rounds' file is read line by line.
+<<keep each student's best pass of each assignment>>=
+{
+  <<skip what we shouldn't carry over>>
+  pair = name SUBSEP $3
+  if (!((pair, kind) in best)) kinds[pair]++
+  key = pair SUBSEP kind
+  date = ($6 == "N/A" ? "" : $6)
+  v = value($4, kind)
+  if (!(key in best) || v > best_value[key] \
+      || (v == best_value[key] && date > best_date[key])) {
+    best[key] = $4; best_value[key] = v; best_date[key] = date
+    from[key] = $1
+  }
+}
+@ We skip the lines of students who are not in the new room, and the
+grades that do not pass.
+If the old name gives no assignment in the new room, we note the student
+under the old name, to report it later.
+<<skip what we shouldn't carry over>>=
+if (!($3 in student)) next
+kind = class($4)
+if (kind == "") next
+name = assignment_in_room($2)
+if (name == "") { missed[$2, $3] = 1; next }
+if ((name, $3) in taken) { kept[name, $3] = 1; next }
+@ Let's verify the choice of grades on the students who have more than
+one pass, or none.
+[[again]] passed the lab twice (P+, then P), the written assignment twice
+(A, then B), a quiz twice, the second time without a date, and an
+optional lab twice (10 points, then 9.5, which comes first as text);
+[[weak]] passed the lab with an E and a quiz twice with a P, the second
+time later; [[failed]] failed the lab and got no
+points in the quiz; and [[left]] passed the lab but is not in the new
+room.
+<<test functions>>=
+def test_the_best_pass_of_each_kind_is_carried(plan):
+  carried = graded(plan())
+  assert carried["again"] == {
+    "LAB1 Implement AES": ("P+", R25),
+    "INL1Written Final": ("A", R25),
+    "INL1Quiz Ciphers": ("P", R25),
+    "Optional: Side channels (C, B, A)": ("10", R25),
+  }
+  assert carried["weak"] == {"LAB1 Implement AES": ("E", R26),
+                            "Quiz 1.0": ("P", R26)}
+
+def test_fails_and_students_who_left_get_nothing(plan):
+  carried = graded(plan())
+  assert "failed" not in carried
+  assert "left" not in carried
+@
+
+\paragraph{Which assignment an old name is}
+
+Which assignment an old name is in the new room is what the rules in
+\cref{sec:carryover-rules} decide.
+We remember each answer, as an old name comes once for every student of
+its round; and why there was none, for the report.
+<<[[awk]] functions for the carry-over>>=
+function assignment_in_room(old,   i, a, n, found, names) {
+  if (old in resolved) return resolved[old]
+  if (old in copies) return resolved[old] = once(old, old)
+  for (i = 1; i <= rules; i++) {
+    if (old !~ rule[i]) continue
+    n = 0
+    for (a in copies)
+      if (a ~ rule[i]) names[++n] = found = a
+    if (n == 1) return resolved[old] = once(old, found)
+    if (n > 1) {
+      trouble[old] = "which matches several in " room ": " listed(names, n)
+      return resolved[old] = ""
+    }
+  }
+  trouble[old] = "which " room " does not have"
+  return resolved[old] = ""
+}
+function once(old, a) {
+  if (copies[a] == 1) return a
+  trouble[old] = "but " room " has " shown(a) " twice"
+  return ""
+}
+@ The names are listed in order, so that the report is the same from one
+run to the next; [[for (a in copies)]] goes through them in no order that
+[[awk]] promises.
+<<[[awk]] functions for the carry-over>>=
+function listed(names, n,   i, s) {
+  sorted(names, n)
+  for (i = 1; i <= n; i++) s = s (i > 1 ? ", " : "") shown(names[i])
+  return s
+}
+function sorted(a, n,   i, j, t) {
+  for (i = 2; i <= n; i++)
+    for (j = i; j > 1 && a[j - 1] > a[j]; j--) {
+      t = a[j]; a[j] = a[j - 1]; a[j - 1] = t
+    }
+  return n
+}
+@ Now let's verify the rules on [[returning]], who passed eight
+assignments in the first earlier round:
+the lab, which is in the new room, ungraded;
+the written assignment, renamed, and the usability seminar, renamed in a
+way that the first of the test's rules for it does not match;
+the seminar, the quiz and a lab, whose names need escaping, the lab's
+with double quotes, which [[csv.writer]] quotes;
+a quiz that has become two, an assignment that the new room has twice,
+and one that it does not have.
+The test's rules also have one for another course, whose
+\enquote{Peer Review} would have matched an assignment in the room, one
+for a course whose code starts with this one's, a line with nothing
+after its course code, and one with blanks after its regex.
+[[second]] passed the lab in the same round as [[returning]].
+<<test functions>>=
+def test_rules_map_renamed_assignments(plan):
+  carried = graded(plan())
+  assert carried["returning"] == {
+    "LAB1 Implement AES": ("P", R25),
+    "INL1Written Final": ("B", R25),
+    "Seminar (Bob's part)": ("complete", R25),
+    "Quiz 1.0": ("P", R25),
+    "MANDATORY Seminar (29, 30/1): usability ON CAMPUS": ("P", R25),
+    'Lab "AES"': ("P", R25),
+  }
+  assert carried["second"] == {"LAB1 Implement AES": ("P", R25)}
+@
+
+\paragraph{The commands}
+
+For each student and assignment we have now the best pass of each kind.
+If the room has graded the assignment, its kind is the one to carry;
+otherwise the student's passes must all be of one kind.
+<<print the commands that carry the grades over>>=
+for (key in best) {
+  split(key, part, SUBSEP)
+  pair = part[1] SUBSEP part[2]
+  if (part[1] in scale) {
+    if (part[3] != scale[part[1]]) {
+      if (!((pair, scale[part[1]]) in best)) misfit[pair] = 1
+      continue
+    }
+  } else if (kinds[pair] > 1) {
+    mixed[pair] = 1
+    continue
+  }
+  cmd = part[1] SUBSEP best[key] SUBSEP from[key]
+  if (cmd in users) users[cmd] = users[cmd] SUBSEP part[2]
+  else users[cmd] = part[2]
+}
+@ The students who get the same grade from the same round in the same
+assignment can share a command, since [[canvaslms grade]] grades every
+student its [[-u]] regex matches.
+That makes far fewer calls to Canvas than one per student and assignment.
+We sort the students of a command, so that the output is the same from
+one run to the next; the regex would not mind.
+The [[if]] could have been a conditional expression, but not every
+[[awk]] evaluates [[cmd in users]] before the assignment creates the
+element it tests for: [[mawk]] and BusyBox's [[awk]] do not, and the
+regex would start with an empty alternative, which matches every student
+without a login ID.
+<<print the commands that carry the grades over>>=
+for (cmd in users) {
+  split(cmd, part, SUBSEP)
+  n = sorted(who, split(users[cmd], who, SUBSEP))
+  logins = regex(who[1])
+  for (i = 2; i <= n; i++) logins = logins "|" regex(who[i])
+  printf "1\t0\tcanvaslms grade -c %s -a %s -g %s -m %s -u %s\n",
+    quote("^" id "$"), quote("^" regex(part[1]) "$"), quote(part[2]),
+    quote(message " " part[3] "."), quote("^(" logins ")$")
+}
+@ The names in the commands are regexes, and they are read by the shell
+first.
+An assignment name may hold anything---[[(]], a dot, an apostrophe---so
+we escape what a regex would read as an operator, anchor it, and put it
+in single quotes, which leave everything alone but a single quote.
+That one we end the quote for, escape and start the quote again.
+We do that with [[index]] and [[substr]] rather than [[gsub]]: how a
+backslash in the replacement of [[gsub]] is read differs between the
+[[awk]]s, and BusyBox's drops the one we need, which leaves the quote
+open and garbles every command after it.
+The program itself stands in single quotes in the script, so it cannot
+contain one; it gets it as the variable [[q]] instead.
+<<[[awk]] functions for the carry-over>>=
+function regex(s) {
+  gsub(/[][\\.^$*+?(){}|\/]/, "\\\\&", s)
+  return s
+}
+function quote(s,   out, i) {
+  out = ""
+  while ((i = index(s, q)) > 0) {
+    out = out substr(s, 1, i - 1) q "\\" q q
+    s = substr(s, i + 1)
+  }
+  return q out s q
+}
+@ The comments are never run, so they show the names as they are.
+<<[[awk]] functions for the carry-over>>=
+function shown(s) {
+  return q s q
+}
+@ Let's verify that the commands do what we want, and only that.
+Each must name exactly one assignment in the room, and grade exactly the
+students we meant: [[graded]] would otherwise give a tuple of names, or a
+neighbour, a student not in the room or the student without a login ID.
+The students who share a grade share one command.
+<<test functions>>=
+def test_each_command_grades_exactly_what_it_should(plan):
+  carried = graded(plan())
+  assert sorted(carried) == ["again", "both", "returning", "second",
+                             "weak"]
+  assert all(isinstance(name, str)
+             for grades in carried.values() for name in grades)
+
+def test_students_with_the_same_grade_share_a_command(plan):
+  lab = [args for args in commands(plan())
+         if args[args.index("-a") + 1] == "^LAB1 Implement AES$"
+         and args[args.index("-g") + 1] == "P"]
+  assert [args[args.index("-u") + 1] for args in lab] == [
+    r"^(returning@kth\.se|second@kth\.se)$"]
+@ The message reaches the command as it was given, a backslash included.
+<<test functions>>=
+def test_the_message_is_passed_on_untouched(plan):
+  message = r"Resultat från tidigare (se \n)"
+  carried = graded(plan(message), message)
+  assert carried["weak"]["LAB1 Implement AES"] == ("E", R26)
+@
+
+\paragraph{What could not be carried over}
+
+What we cannot carry over, we report as comments.
+A pass in an assignment that we found no place for in the new room is
+what a rule is for, so we list those names with the number of students
+who passed them; the most common ones first, as they are the ones most
+worth a rule.
+<<print what could not be carried over>>=
+for (key in missed) {
+  split(key, part, SUBSEP)
+  passed[part[1]]++
+}
+for (old in passed)
+  printf "2\t%d\t# %d passed %s, %s\n",
+    passed[old], passed[old], shown(old), trouble[old]
+@ Then the passes of the wrong kind, per assignment, and what we left
+alone.
+<<print what could not be carried over>>=
+for (pair in misfit) { split(pair, part, SUBSEP); wrong[part[1]]++ }
+for (a in wrong)
+  printf "3\t%d\t# %d not carried into %s: %s grades it otherwise\n",
+    wrong[a], wrong[a], shown(a), room
+for (pair in mixed) { split(pair, part, SUBSEP); unsure[part[1]]++ }
+for (a in unsure)
+  printf "3\t%d\t# %d not carried into %s: passes of different kinds\n",
+    unsure[a], unsure[a], shown(a)
+for (pair in kept) left_alone++
+if (left_alone)
+  printf "4\t0\t# %d left alone in %s, already graded or handed in\n",
+    left_alone, room
+@ Let's verify the report, and that a plan whose files cannot be read
+says so with its status, not only on standard error.
+Three of [[returning]]'s passes have no place: the quiz that became
+several, the assignment the room has twice, which [[second]] passed too,
+and the one it does not have.
+The names that more students passed come first.
+[[lettered]] got a B in the seminar, which the new room grades complete
+or not, and [[spelled]] a P; [[both]] got a complete and a B, so the
+complete is carried and nothing reported; [[mixed]] got P and then A in the written assignment, which the
+new room has not graded yet.
+[[graded]] passed the lab, which is graded, F, in the new room, and
+[[submitted]] has handed it in again there; both are left alone.
+<<test functions>>=
+def test_what_is_not_carried_is_reported(plan):
+  assert reports(plan()) == [
+    f"# 2 passed 'The terminal', but {ROOM} has 'The terminal' twice",
+    f"# 1 passed 'AES presentation', which {ROOM} does not have",
+    f"# 1 passed 'INL1Quiz Cryptographic Concepts', which matches several "
+    f"in {ROOM}: 'INL1Quiz AES', 'INL1Quiz Ciphers', "
+    f"'INL1Quiz Hash functions'",
+    f"# 2 not carried into 'Seminar (Bob's part)': {ROOM} grades it "
+    f"otherwise",
+    f"# 1 not carried into 'INL1Written Final': passes of different kinds",
+    f"# 2 left alone in {ROOM}, already graded or handed in",
+  ]
+
+def test_a_failing_awk_fails_the_plan(tmp_path, awk_path):
+  data = tmp_path / "data"
+  data.mkdir()
+  write_canvas_files(data)
+  (data / "room").write_text(ROOM + "\n")
+  (data / "submissions").unlink()
+  result = subprocess.run(
+    ["bash", "-c", 'source "$1" && carryover_plan "${@:2}"', "carryover",
+     str(SCRIPT), str(data), ROOM_ID, "DD2520"],
+    env=dict(os.environ, PATH=awk_path), capture_output=True, text=True)
+  assert result.returncode != 0
+
+def test_comments_come_after_the_commands(plan):
+  lines = plan().splitlines()
+  first_comment = next(i for i, line in enumerate(lines)
+                       if line.startswith("#"))
+  assert all(line.startswith("#") for line in lines[first_comment:])
+  assert first_comment > 0
+@
+
+
+\subsubsection{The other rounds}
+
+Now to the Canvas side.
+A course has a Canvas room for each round, and the rooms share nothing
+reliable but the course code at the start of their Canvas course code:
+the rooms of one course include [[DD1301 HT20 (50850)]], [[DD1301HT21]]
+and [[DD1301 HT23 (datintro23p2)]].
+So we look up the room that [[course]] names and take its course code:
+two letters and three digits, then a digit or a letter, as in
+[[DA150X]].
+<<constants>>=
+KTH_COURSE_CODE="[A-Z]{2}[0-9]{3}[0-9A-Z]"
+@ The grades will be written to the room that [[course]] matches, so it
+must match exactly one.
+We keep the room's Canvas ID, which the commands will name it by: a regex
+on the name, such as [[tilkry27]], is easy to get wrong in a way that
+matches another room too.
+<<find the room of [[course]] and its other rounds>>=
+if ! room=$(canvaslms courses -a -i "${course}"); then
+  echo "${0##*/}: canvaslms courses -a -i ${course} failed" >&2
+  exit 1
+fi
+room=$(tr -d '\r' <<< "${room}")
+if [[ -z "${room}" || $(wc -l <<< "${room}") -ne 1 ]]; then
+  echo "${course}: must match exactly one Canvas room" >&2
+  exit 1
+fi
+id=$(cut -f 1 <<< "${room}")
+room_name=$(cut -f 2 <<< "${room}")
+code=$(grep -oE "^${KTH_COURSE_CODE}" <<< "${room_name}")
+if [[ -z "${code}" ]]; then
+  echo "${course}: no course code in ${room_name}" >&2
+  exit 1
+fi
+@ The [[tr]] removes the carriage returns of [[csv.writer]], as in
+\cref{sec:carryover-plan}; it runs on its own, after [[canvaslms]], so
+that a failing [[canvaslms]] is not taken for a course that matches no
+room.
+
+Not every room with that code is a round, though.
+Each sitting of a computer exam may have a room of its own, such as
+\enquote{DD1310 LAB2 [2025-01-07] Examination i datorsal}, some of them
+shared by two courses, and those results are reported from there.
+A round is a term after the code, [[HT25]] or [[VT26]], with or without a
+space between.
+Every other round is one to copy from, whatever its dates:
+some rooms have none, parallel rounds overlap, and a room of a round that
+has not started holds no grades, so it costs nothing to include.
+The two digits are written out rather than as [[{2}]], since some
+[[mawk]]s do not know interval expressions, and the regex would then
+match no room.
+<<constants>>=
+TERM_OF_ROUND="[HV]T[0-9][0-9]"
+<<find the room of [[course]] and its other rounds>>=
+if ! rooms=$(canvaslms courses -a -i); then
+  echo "${0##*/}: canvaslms courses failed" >&2
+  exit 1
+fi
+rounds=$(tr -d '\r' <<< "${rooms}" \
+         | awk -F '\t' -v round="^${code} ?${TERM_OF_ROUND}" \
+             -v id="${id}" '$2 ~ round && $1 != id { print $1 }')
+if [[ -z "${rounds}" ]]; then
+  echo "# ${course}: no other rounds of ${code} in Canvas"
+  exit 0
+fi
+@ Without the [[-a]], [[canvaslms courses]] lists only the current rooms,
+and the other rounds are mostly the ones that are over.
+The guard for no rounds is not only for the message:
+the regex we make of the rounds below would be [[^()$]], and we would
+rather not find out what Canvas makes of that.
+
+
+\subsubsection{What the rounds hold}
+\label{sec:carryover-fetch}
+
+From the new room we need its students, its assignments and its
+submissions; from the other rounds, their submissions.
+We keep the output of each [[canvaslms]] command in a file of its own, as
+it is, and that directory is all that [[carryover_plan]] gets.
+The [[student]] filter, when there is one, narrows the students of the
+new room and the submissions of every room to the students it matches,
+as the positional regex of [[canvaslms users]] and the [[-u]] of
+[[canvaslms submissions list]].
+<<fetch the room and the other rounds into [[data]]>>=
+student_regex=()
+student_option=()
+if [[ -n "${student}" ]]; then
+  student_regex=("${student}")
+  student_option=(-u "${student}")
+fi
+carryover_fetch "${data}/users" \
+  users -sc "^${id}$" "${student_regex[@]}" || exit 1
+carryover_fetch "${data}/assignments" \
+  assignments list -c "^${id}$" || exit 1
+carryover_fetch "${data}/submissions" \
+  submissions list -c "^${id}$" -l "${student_option[@]}" || exit 1
+<<fetch the other rounds' submissions>>
+echo "${room_name}" > "${data}/room"
+@ A fetch that fails must stop us.
+Say the new room's submissions do not come: then nothing in it looks
+graded, and we would print commands that overwrite what is.
+[[canvaslms]] fails also when there is nothing to list---a room without
+assignments yet---and then there is nothing to carry over into either.
+<<functions>>=
+carryover_fetch() {
+  local file="$1"
+  shift
+  if ! canvaslms "$@" > "${file}"; then
+    echo "${0##*/}: canvaslms $* failed" >&2
+    return 1
+  fi
+}
+@
+
+The other rounds are another matter.
+Canvas has a submission for every student and assignment, submitted or
+not---a round of 87 students and 39 assignments has 3393---so without a
+filter the rounds' file holds every student's grade in every assignment
+of those rounds.
+Reading them all takes a while: for tilkry26, with its earlier rounds,
+a run took over fifteen minutes.
+
+A student filter cuts that less than one would think.
+[[canvaslms submissions list]] fetches each assignment's submissions as a
+whole and only then picks the students that [[-u]] matches; the filter
+narrows which of the cached submissions it checks for freshness, not
+what it asks Canvas for when nothing is cached.
+Right after the run for the whole round, with everything in the cache,
+the same course took under three minutes for one student, and over five
+for a filter that matched a part of the class.
+Without the cache, that filter had not finished after fifteen minutes.
+
+But then it is normal that the earlier rounds hold nothing: the student
+may have been in none of them.
+[[canvaslms]] exits with status~1 when it finds nothing to list, but it
+does so also when it fails, so the status cannot tell the two apart.
+What it prints can: when nothing is found, the message ends in
+\enquote{found matching the criteria}, as for the users or the
+submissions, while a failure prints something else, a traceback for
+instance.
+So we keep what this one fetch prints on standard error, and an empty
+earlier round is a comment and a normal end.
+It need not be a student filter that makes them empty, so we do not ask
+whether there is one: the rounds having nothing to carry is an answer,
+not an error.
+Anything else is a failure, and we show what [[canvaslms]] said.
+<<fetch the other rounds' submissions>>=
+if ! canvaslms submissions list \
+       -c "^($(paste -sd '|' <<< "${rounds}"))$" -l \
+       "${student_option[@]}" > "${data}/rounds" 2> "${data}/errors"; then
+  if grep -q "found matching the criteria" "${data}/errors"; then
+    echo "# ${student:-${course}}: nothing in the other rounds of ${code}"
+    exit 0
+  fi
+  cat "${data}/errors" >&2
+  echo "${0##*/}: canvaslms submissions list of the other rounds failed" >&2
+  exit 1
+fi
+cat "${data}/errors" >&2
+@ The warnings of a fetch that worked, such as a note that a listing was
+fetched again, still reach us on standard error.
+The new room's fetches get no such leniency: an empty new room is no room
+to carry into, and its submissions must be there for us to know what not
+to overwrite.
+
+The test of the script depends on that message, so we check it against
+the real [[canvaslms]], with HTTP stubbed by [[responses]] as in the
+tests of the command line in [[cli.nw]]: a recording of Canvas cannot
+contain a student who is not there.
+The course has an assignment but no students, and a course without
+assignments has no submissions either.
+[[canvaslms]] prints its errors through [[logging]], which
+[[basicConfig]] sends to standard error; under pytest, which installs
+handlers of its own first, we read them from [[caplog]] instead.
+<<test functions>>=
+CANVAS_HOST = "https://canvas.example"
+CANVAS_API = f"{CANVAS_HOST}/api/v1"
+OLD_COURSE = {"id": 1, "name": "Old course", "course_code": "OLD"}
+LAB = {"id": 5, "name": "Lab", "course_id": 1}
+
+@pytest.fixture
+def run_cli(monkeypatch, tmp_path, caplog):
+  """Return a function running the real canvaslms main, giving its errors."""
+  monkeypatch.setattr(canvaslms.cli.cache, "get_cache_path",
+                      lambda hostname: str(tmp_path / "cache.enc"))
+  monkeypatch.setattr(canvaslms.cli.login, "load_credentials",
+                      lambda config: (CANVAS_HOST, "token"))
+  monkeypatch.setattr(canvaslms.hacks.canvasapi,
+                      "MISS_REFRESH_MIN_AGE_MINUTES", 0)
+
+  def run(*arguments):
+    monkeypatch.setattr(sys, "argv", ["canvaslms", "--config-file",
+                                      str(tmp_path / "config.json"),
+                                      *arguments])
+    caplog.clear()
+    with pytest.raises(SystemExit) as exit_info:
+      canvaslms.cli.main()
+    assert exit_info.value.code == 1
+    return "\n".join(record.getMessage() for record in caplog.records
+                     if record.levelno >= logging.ERROR)
+
+  return run
+
+@responses.activate
+def test_canvaslms_says_when_a_student_has_nothing(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[LAB])
+  responses.get(f"{CANVAS_API}/courses/1/search_users", json=[])
+  responses.get(f"{CANVAS_API}/courses/1/users", json=[])
+  errors = run_cli("submissions", "list", "-c", "Old", "-l",
+                   "-u", "nobody@kth.se")
+  assert "found matching the criteria" in errors
+
+@responses.activate
+def test_canvaslms_says_when_a_round_has_nothing(run_cli):
+  responses.get(f"{CANVAS_API}/courses", json=[OLD_COURSE])
+  responses.get(f"{CANVAS_API}/courses/1/assignments", json=[])
+  errors = run_cli("submissions", "list", "-c", "Old", "-l")
+  assert "found matching the criteria" in errors
+@
+
+
+\subsubsection{Putting the Canvas side together}
+
+[[carryover]] collects the rules, finds the rooms, fetches them and hands
+the files to [[carryover_plan]]:
+<<functions>>=
+carryover() {
+  local course="$1" student="$2" rules="$3" message="$4"
+  (
+    data=$(mktemp -d)
+    trap 'rm -rf "${data}"' EXIT
+    trap 'exit 130' INT
+    carryover_rules "${rules}" > "${data}/rules" || exit 1
+    <<find the room of [[course]] and its other rounds>>
+    <<fetch the room and the other rounds into [[data]]>>
+    carryover_plan "${data}" "${id}" "${code}" "${message}"
+  )
+}
+@ The rules come first, before any call to Canvas: a misspelt [[-r]]
+should not cost the twenty minutes of a whole fetch.
+
+The files hold every student's grades, so they must not outlive the run,
+not even one we interrupt:
+reading the rounds takes minutes, which is time enough to press Ctrl-C.
+The body runs in a subshell, whose [[EXIT]] trap removes the files
+however it ends, an interrupt included.
+An interrupt also reaches the [[canvaslms]] that is running, and
+[[bash]], left to itself, waits to see how that ends: a program that
+catches the interrupt and exits normally lets the script go on, with half
+the data.
+The [[INT]] trap ends the subshell instead, with the status that the
+interrupt would have given it.
+A termination needs no trap of its own: [[bash]] dies of it, without
+waiting, and still runs the [[EXIT]] trap on its way out.
+A [[TERM]] trap would only make it wait for the program to end first.
+The subshell also keeps the variables to itself, and a failure can simply
+[[exit]] it.
+
+To test the Canvas side, a stub stands in for [[canvaslms]].
+It prints the files of the made-up rounds, as [[canvaslms]] would have
+printed them, and notes how it was called.
+The list of rooms holds the three rounds, an exam room with the same
+course code and a round of another course.
+The environment makes it fail, find nothing or hang, for one listing:
+[[room]] is the new room's submissions and [[rounds]] the other rounds'.
+When it hangs, it catches an interrupt or a termination and exits
+normally, the case in which [[bash]] would go on; it can also warn on
+standard error and still succeed.
+<<test functions>>=
+COURSES = [("52629", R25), ("59543", R26), (ROOM_ID, ROOM),
+           ("70001", "DD2520 INL1 [2026-03-02] Examination"),
+           ("56121", "DD1310 HT25 (CELTE)")]
+
+CANVASLMS_STUB = """#!{python}
+import json, os, re, signal, sys, time
+args = sys.argv[1:]
+with open({log!r}, "a") as log:
+  log.write(json.dumps(args) + "\\n")
+data = {data!r}
+def show(name):
+  with open(os.path.join(data, name), "rb") as file:
+    sys.stdout.buffer.write(file.read())
+listing = (args[0] if args[0] in ("users", "assignments")
+           else "room" if args[:2] == ["submissions", "list"]
+                          and args[args.index("-c") + 1] == "^{room_id}$"
+           else "rounds" if args[0] == "submissions" else args[0])
+if os.environ.get("STUB_FAIL") == listing:
+  sys.stderr.write("Traceback (most recent call last): ...\\n")
+  sys.exit(1)
+if os.environ.get("STUB_EMPTY") == listing:
+  sys.stderr.write("canvaslms: No submissions found matching the criteria\\n")
+  sys.exit(1)
+if os.environ.get("STUB_WARN") == listing:
+  sys.stderr.write("canvaslms: a warning about the listing\\n")
+if os.environ.get("STUB_HANG") == listing:
+  signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+  open(os.path.join(data, "hanging"), "w").close()
+  time.sleep(60)
+if args[:2] == ["courses", "-a"]:
+  with open(os.path.join(data, "courses"), newline="") as file:
+    rows = file.readlines()
+  if len(args) > 3:
+    rows = [row for row in rows if re.search(args[3], row)]
+  sys.stdout.write("".join(rows))
+elif listing == "room":
+  show("submissions")
+else:
+  show(listing)
+"""
+
+@pytest.fixture
+def run(tmp_path):
+  """Return a function running carryover.sh against the stub canvaslms.
+
+  It returns the result, the recorded calls and what is left in TMPDIR.
+  """
+  data = tmp_path / "canvas"
+  data.mkdir()
+  write_canvas_files(data)
+  with open(data / "courses", "w", newline="") as file:
+    for cid, code in COURSES:
+      file.write(f"{cid}\t{code}\t{code}\t\t\r\n")
+  bin_dir = tmp_path / "bin"
+  bin_dir.mkdir()
+  log = tmp_path / "calls.jsonl"
+  (bin_dir / "canvaslms").write_text(CANVASLMS_STUB.format(
+    python=sys.executable, log=str(log), data=str(data), room_id=ROOM_ID))
+  (bin_dir / "canvaslms").chmod(0o755)
+  tmp = tmp_path / "tmp"
+  tmp.mkdir()
+
+  def run_script(*args, env=None, canvaslms=True):
+    run_env = dict(os.environ, TMPDIR=str(tmp),
+                   XDG_CONFIG_HOME=str(tmp_path / "xdg"))
+    run_env.pop("CANVASLMS_CARRYOVER_RULES", None)
+    run_env["PATH"] = (f"{bin_dir}{os.pathsep}{run_env['PATH']}"
+                       if canvaslms else "/nonexistent")
+    run_env.update(env or {})
+    result = subprocess.run([shutil.which("bash"), str(SCRIPT), *args],
+                            env=run_env, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True)
+    calls = ([json.loads(line) for line in log.read_text().splitlines()]
+             if log.exists() else [])
+    if log.exists():
+      log.unlink()
+    return result, calls, os.listdir(tmp)
+
+  run_script.data = data
+  run_script.tmp = tmp
+  run_script.env = lambda: dict(os.environ, TMPDIR=str(tmp),
+                                XDG_CONFIG_HOME=str(tmp_path / "xdg"),
+                                PATH=f"{bin_dir}{os.pathsep}"
+                                     f"{os.environ['PATH']}")
+  return run_script
+@ Let's verify which rooms the script asks for.
+The rounds are the two earlier ones, by their IDs: not the new room, not
+the exam room and not the other course; and the new room is named by its
+ID too.
+We read the calls with the real parsers of [[canvaslms]], since the
+options may be bundled, as in [[-sc]].
+<<test functions>>=
+def option(call, name):
+  return call[call.index(name) + 1]
+
+def parsed(calls):
+  """Return the calls parsed by the real canvaslms parsers."""
+  parser = argparse.ArgumentParser()
+  subp = parser.add_subparsers(dest="command")
+  for module in (canvaslms.cli.courses, canvaslms.cli.users,
+                 canvaslms.cli.assignments, canvaslms.cli.submissions):
+    module.add_command(subp)
+  return [parser.parse_args(call) for call in calls]
+
+def test_the_rounds_are_the_other_terms_of_the_course(run):
+  result, calls, _ = run("tilkry27")
+  assert result.returncode == 0, result.stderr
+  listings = [args for args in parsed(calls) if args.command != "courses"]
+  assert [(args.command, args.course) for args in listings] == [
+    ("users", f"^{ROOM_ID}$"), ("assignments", f"^{ROOM_ID}$"),
+    ("submissions", f"^{ROOM_ID}$"), ("submissions", "^(52629|59543)$")]
+  assert "canvaslms grade -c '^67592$' -a '^LAB1 Implement AES$'" \
+    in result.stdout
+
+def test_the_course_must_be_one_room(run):
+  result, calls, left = run("tilkry")
+  assert result.returncode != 0
+  assert "must match exactly one Canvas room" in result.stderr
+  assert result.stdout == ""
+  assert [call[0] for call in calls] == ["courses"]
+  assert left == []
+
+def test_a_course_without_other_rounds_is_no_error(run):
+  result, calls, _ = run("CELTE")
+  assert result.returncode == 0, result.stderr
+  assert result.stdout == "# CELTE: no other rounds of DD1310 in Canvas\n"
+  assert all(call[0] == "courses" for call in calls)
+@ The rules come from the two files, in order.
+Without rules, the old written assignment of [[returning]] has no place,
+since the room has no assignment by that name.
+A rule in our own file sends it to the peer review, and one for this run,
+given with [[-r]], to the seminar's neighbour without parentheses; neither
+file ends its last line with a newline.
+<<test functions>>=
+def written_assignment(output):
+  """Return where returning's B from the old written assignment goes."""
+  return [name for name, grade in graded(output).get("returning", {}).items()
+          if grade == ("B", R25)]
+
+def test_rules_come_from_the_run_then_our_own_file(run, tmp_path):
+  own = tmp_path / "xdg" / "canvaslms" / "carryover.rules"
+  own.parent.mkdir(parents=True)
+  once = tmp_path / "once.rules"
+  once.write_text("DD2520  ^INL1Written$|^Seminar Bob")
+
+  result, _, _ = run("tilkry27")
+  assert written_assignment(result.stdout) == []
+  assert "passed 'INL1Written', which" in result.stdout
+
+  own.write_text("# my rules\nDD2520  ^INL1Written$|Peer Review")
+  result, _, _ = run("tilkry27")
+  assert written_assignment(result.stdout) == ["INL1Written Peer Review"]
+
+  result, _, _ = run("-r", str(once), "tilkry27")
+  assert written_assignment(result.stdout) == ["Seminar Bob's part"]
+
+def test_the_environment_names_our_own_rules(run, tmp_path):
+  mine = tmp_path / "mine.rules"
+  mine.write_text("DD2520  ^INL1Written$|Peer Review\n")
+  result, _, _ = run("tilkry27",
+                     env={"CANVASLMS_CARRYOVER_RULES": str(mine)})
+  assert written_assignment(result.stdout) == ["INL1Written Peer Review"]
+@ A rules file that is not there must stop the run before it asks Canvas
+anything, and so must our own file when it is there but cannot be read.
+<<test functions>>=
+def test_a_missing_rules_file_stops_before_canvas(run, tmp_path):
+  result, calls, left = run("-r", str(tmp_path / "nowhere.rules"),
+                            "tilkry27")
+  assert result.returncode != 0
+  assert "nowhere.rules" in result.stderr
+  assert calls == []
+  assert left == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_an_unreadable_own_rules_file_stops_too(run, tmp_path):
+  own = tmp_path / "xdg" / "canvaslms" / "carryover.rules"
+  own.parent.mkdir(parents=True)
+  own.write_text("DD2520  ^INL1Written$|Peer Review\n")
+  own.chmod(0)
+  result, calls, _ = run("tilkry27")
+  assert result.returncode != 0
+  assert calls == []
+@ Then the student filter: it must reach the new room's students and the
+submissions of both the new room and the other rounds, and nothing else.
+When the other rounds have nothing for the student, that is a comment
+and a normal end.
+<<test functions>>=
+def test_the_student_filter_reaches_every_roster(run):
+  result, calls, _ = run("-u", "returning@kth", "tilkry27")
+  assert result.returncode == 0, result.stderr
+  users, assignments, room, rounds = [call for call in calls
+                                      if call[0] != "courses"]
+  assert users[-1] == "returning@kth"
+  assert "returning@kth" not in assignments
+  assert option(room, "-u") == "returning@kth"
+  assert option(rounds, "-u") == "returning@kth"
+
+def test_nothing_in_the_other_rounds_is_no_error(run):
+  result, _, left = run("-u", "new@kth.se", "tilkry27",
+                        env={"STUB_EMPTY": "rounds"})
+  assert result.returncode == 0, result.stderr
+  assert result.stdout == ("# new@kth.se: nothing in the other rounds "
+                           "of DD2520\n")
+  assert left == []
+@ But a failure of the other rounds' fetch stops us, and shows what
+[[canvaslms]] said; so does the new room's submissions failing, whether
+they fail or come back empty, and so does a failing lookup of the room.
+The warnings of a fetch that worked are shown too.
+Nothing is printed then, and nothing is left behind.
+<<test functions>>=
+@pytest.mark.parametrize("env", [{"STUB_FAIL": "rounds"},
+                                 {"STUB_FAIL": "room"},
+                                 {"STUB_EMPTY": "room"},
+                                 {"STUB_FAIL": "users"}])
+def test_a_failed_fetch_prints_nothing_and_leaves_nothing(run, env):
+  result, _, left = run("tilkry27", env=env)
+  assert result.returncode != 0
+  assert result.stdout == ""
+  assert "failed" in result.stderr
+  assert left == []
+
+def test_a_failed_rounds_fetch_shows_why(run):
+  result, _, _ = run("tilkry27", env={"STUB_FAIL": "rounds"})
+  assert "Traceback" in result.stderr
+
+def test_warnings_of_a_fetch_that_worked_get_through(run):
+  result, _, _ = run("tilkry27", env={"STUB_WARN": "rounds"})
+  assert result.returncode == 0, result.stderr
+  assert "a warning about the listing" in result.stderr
+
+def test_a_failed_room_lookup_says_so(run):
+  result, _, left = run("tilkry27", env={"STUB_FAIL": "courses"})
+  assert result.returncode != 0
+  assert "Traceback" in result.stderr
+  assert "canvaslms courses -a -i tilkry27 failed" in result.stderr
+  assert "must match exactly one" not in result.stderr
+  assert left == []
+@ An interrupted run must not leave the files behind either.
+We start the script in a session of its own, wait until the stub is
+fetching the other rounds, and signal the whole session, as the terminal
+does with Ctrl-C.
+The run must end without printing a command, with a failing status, and
+without its files.
+<<test functions>>=
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_an_interrupted_run_leaves_nothing(run, sig):
+  process = subprocess.Popen(
+    [shutil.which("bash"), str(SCRIPT), "tilkry27"],
+    env=dict(run.env(), STUB_HANG="rounds"), stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    start_new_session=True)
+  hanging = run.data / "hanging"
+  deadline = time.monotonic() + 30
+  while not hanging.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+  assert hanging.exists()
+  assert os.listdir(run.tmp) != []
+  os.killpg(process.pid, sig)
+  stdout, _ = process.communicate(timeout=30)
+  assert process.returncode != 0
+  assert "canvaslms grade" not in stdout
+  deadline = time.monotonic() + 10
+  while os.listdir(run.tmp) and time.monotonic() < deadline:
+    time.sleep(0.05)
+  assert os.listdir(run.tmp) == []
+@ Finally, the stub accepts any arguments, so we check the recorded calls
+against the real parsers of [[canvaslms]].
+If one of its options is renamed, this test fails, not the start of a
+round.
+<<test functions>>=
+def test_calls_parse_with_the_real_parsers(run):
+  _, calls, _ = run("-u", "returning@kth", "tilkry27")
+  calls = parsed(calls)
+  assert [args.command for args in calls] == [
+    "courses", "courses", "users", "assignments", "submissions",
+    "submissions"]
+  courses = calls[0]
+  assert courses.all and courses.id and courses.regex == "tilkry27"
+  assert calls[2].regex == "returning@kth"
+  assert all(args.login_id for args in calls[4:])
+@
+
+
+\subsubsection{The command line}
+
+The options say what [[carryover]] needs besides the course: a student
+filter, a rules file for this run, and the message.
+<<functions>>=
+carryover_main() {
+  local student="" rules="" message="${CARRYOVER_MESSAGE}" opt
+  OPTIND=1
+  while getopts "hu:r:m:" opt; do
+    case "${opt}" in
+      u) student="${OPTARG}" ;;
+      r) rules="${OPTARG}" ;;
+      m) message="${OPTARG}" ;;
+      h) carryover_usage; return 0 ;;
+      *) carryover_usage >&2; return 2 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  if [[ $# -ne 1 ]]; then
+    carryover_usage >&2
+    return 2
+  fi
+  if [[ "${message}" == *$'\n'* ]]; then
+    echo "${0##*/}: the message must be one line" >&2
+    return 2
+  fi
+  <<refuse to run without [[canvaslms]] on [[PATH]]>>
+  carryover "$1" "${student}" "${rules}" "${message}"
+}
+
+carryover_usage() {
+  cat <<_EOF
+Usage: ${0##*/} [-u student] [-r rules] [-m message] course
+
+Prints the canvaslms commands that carry passes over from the earlier
+rounds of course into it.  It never writes to Canvas; read, then run them.
+
+  -u student  only students matching this regex (name or login ID)
+  -r rules    rules file for this run, read before
+              $(carryover_rules_path)
+  -m message  comment on each grade, before the round's name
+              (default: ${CARRYOVER_MESSAGE})
+_EOF
+}
+@ The message must be one line, since each command is one line of the
+output and [[sort]] would part the lines of a command.
+
+As for [[ungraded.sh]], a [[canvaslms]] that cannot be found would make
+every fetch fail with a message that does not say why, so we check once,
+first, and say which [[PATH]] we searched.
+<<refuse to run without [[canvaslms]] on [[PATH]]>>=
+if ! command -v canvaslms > /dev/null; then
+  echo "${0##*/}: canvaslms is not on PATH ($PATH)" >&2
+  return 1
+fi
+@ Let's verify the command line: help, a wrong call, a message of two
+lines and a missing [[canvaslms]], none of which ask Canvas anything; and the [[-m]], which
+must reach the commands.
+<<test functions>>=
+def test_help_and_wrong_calls_show_the_usage(run):
+  result, calls, _ = run("-h")
+  assert result.returncode == 0
+  assert result.stdout.startswith("Usage: carryover.sh")
+  for args in [(), ("-x", "tilkry27"), ("tilkry27", "extra")]:
+    result, calls, _ = run(*args)
+    assert result.returncode == 2
+    assert "Usage: carryover.sh" in result.stderr
+    assert calls == []
+  result, calls, _ = run("-m", "two\nlines", "tilkry27")
+  assert result.returncode == 2
+  assert "one line" in result.stderr
+  assert calls == []
+
+def test_missing_canvaslms_is_an_error(run):
+  result, calls, left = run("tilkry27", canvaslms=False)
+  assert result.returncode != 0
+  assert result.stderr == ("carryover.sh: canvaslms is not on PATH "
+                           "(/nonexistent)\n")
+  assert left == []
+
+def test_the_message_option_reaches_the_commands(run):
+  result, _, _ = run("-m", "Resultat från", "tilkry27")
+  assert result.returncode == 0, result.stderr
+  weak = graded(result.stdout, "Resultat från")["weak"]
+  assert weak["LAB1 Implement AES"] == ("E", R26)
+@
+
+
+\subsubsection{Running it}
+
+The script needs only [[bash]], [[awk]] and [[canvaslms]], and it is
+found as [[ungraded.sh]] is (\cref{sec:cron-ungraded}).
+It is run by hand, with our own credentials, so none of the care that a
+[[cron]] job needs applies here.
+
+A program that knows a course's renames can keep its rules in a file of
+its own and pass it with [[-r]], or install it as our own file.
+To test such rules without Canvas, it can source the script and call
+[[carryover_plan]] on the six files of \cref{sec:carryover-plan}, as the
+tests above do:
+\begin{minted}{bash}
+source "$(python3 -c 'import canvaslms, pathlib
+print(pathlib.Path(canvaslms.__file__).parent / "scripts" / "carryover.sh")')"
+carryover_plan "$dir" 67592 DD2520
+\end{minted}
