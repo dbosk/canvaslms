@@ -518,16 +518,20 @@ As in the [[submissions list]] command, we resolve the users first and hand
 their [[student_ids]] to [[list_submissions]].  This scopes the cache's
 bulk-refresh pre-check to exactly the users we will report on, so a large stale
 cohort is refreshed with one bulk fetch instead of one request per student.
+Their courses go along too, so that the results of a few students come in one
+request per course (\cref{sec:few-students-submissions}).
 <<create [[submissions_list]]>>=
 assignments_list = assignments.process_assignment_option(canvas, args)
 users_list = users.process_user_or_group_option(canvas, args)
 student_ids = {user.id for user in users_list}
 
 submissions_list = submissions.filter_submissions(
-  submissions.list_submissions(assignments_list,
-                               include=["submission_history"],
-                               check_bulk_refresh=True,
-                               student_ids=student_ids),
+  submissions.list_submissions(
+    assignments_list,
+    include=["submission_history"],
+    check_bulk_refresh=True,
+    student_ids=student_ids,
+    students_by_course=submissions.students_by_course(users_list)),
   users_list)
 @
 
@@ -550,14 +554,22 @@ singular lookups become cache hits.  We therefore \emph{warm} the cache with
 one bulk fetch per assignment before entering the per-user loop, which collapses
 the cost back to $a$ requests.
 
-The warming only pays off when there are enough students to amortise it.  A cold
-bulk fetch always pulls the assignment's whole roster---Canvas has no cheap
-per-student bulk endpoint---so for a handful of students the individual lookups
-are actually cheaper.  We gate on [[BULK_REFRESH_MIN_COUNT]], the same threshold
-the cache layer uses to choose between many individual refreshes and one bulk
-refresh; the caller is the natural place for this decision because only it knows
-the total student count up front, whereas the singular cache path sees one user
-at a time.
+The warming by whole listings only pays off when there are enough students to
+amortise it.  A cold listing pulls the assignment's whole roster, so for a
+handful of students the individual lookups are actually cheaper.  We gate on
+[[BULK_REFRESH_MIN_COUNT]], the same threshold the cache layer uses to choose
+between many individual refreshes and one bulk refresh; the caller is the
+natural place for this decision because only it knows the total student count
+up front, whereas the singular cache path sees one user at a time.
+
+A handful of students whose courses we know can be warmed more cheaply still:
+their submissions come in one request per course
+(\cref{sec:few-students-submissions}), which beats both the listings and the
+individual lookups.  So for such a handful we warm through that request alone:
+what it does not cover, an unpublished assignment or a course Canvas refused
+to answer for, is left to the individual lookups, as before, rather than to
+whole listings.  Users whose course we do not know, such as members of a
+group, still skip the warming.
 
 We request [["submission_history"]] in [[include]], which is a superset of what
 every bundled summary module asks for, so their singular lookups find the cached
@@ -573,10 +585,16 @@ def prefetch_submissions(assignments_list, users_list):
   user at a time; warming the cache first turns those lookups into cache hits
   instead of one request per (user, assignment).
 
-  Skipped for small user sets, where the per-user lookups the cache already
-  performs are cheaper than pulling each assignment's whole roster.
+  A few students whose courses are known are warmed with one request per
+  course.  Small user sets without known courses are skipped, since the
+  per-user lookups the cache already performs are cheaper than pulling each
+  assignment's whole roster.
   """
+  by_course = submissions.students_by_course(users_list)
   if len(users_list) < canvaslms.hacks.canvasapi.BULK_REFRESH_MIN_COUNT:
+    if by_course is not None:
+      canvaslms.hacks.canvasapi.fetch_students_submissions(
+        assignments_list, by_course, ["submission_history"])
     return
 
   student_ids = {user.id for user in users_list}
@@ -584,13 +602,15 @@ def prefetch_submissions(assignments_list, users_list):
       assignments_list,
       include=["submission_history"],
       check_bulk_refresh=True,
-      student_ids=student_ids):
+      student_ids=student_ids,
+      students_by_course=by_course):
     pass
 @
 
-Let's verify the guard and the scoping.  Below the threshold we must not touch
-the network at all; at or above it we must issue exactly one scoped bulk fetch
-carrying the history include.
+Let's verify the guard and the scoping.  Below the threshold, students whose
+course we do not know must not touch the network at all; at or above it we must
+issue exactly one scoped bulk fetch carrying the history include.  A handful
+whose courses we know is warmed, with their courses handed on.
 
 <<test functions>>=
 def test_prefetch_submissions_skips_small_user_sets(monkeypatch):
@@ -624,6 +644,30 @@ def test_prefetch_submissions_warms_large_user_sets(monkeypatch):
   assert recorded[0]["check_bulk_refresh"] is True
   assert recorded[0]["include"] == ["submission_history"]
   assert recorded[0]["student_ids"] == {0, 1, 2}
+
+
+def test_prefetch_submissions_warms_a_few_students_of_known_courses(
+    monkeypatch):
+  recorded = []
+  monkeypatch.setattr(
+    results_module.submissions, "list_submissions",
+    lambda *args, **kwargs: recorded.append(kwargs) or iter([]))
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi,
+    "BULK_REFRESH_MIN_COUNT", 3)
+
+  fetched = []
+  monkeypatch.setattr(
+    results_module.canvaslms.hacks.canvasapi, "fetch_students_submissions",
+    lambda *args: fetched.append(args) or {})
+  monkeypatch.setattr(results_module.users, "UNREAD_ROSTERS", set())
+
+  course = SimpleNamespace(id=1)
+  users = [SimpleNamespace(id=i, course=course) for i in range(2)]
+  results_module.prefetch_submissions(["assignment"], users)
+
+  assert recorded == []
+  assert fetched == [(["assignment"], {1: {0, 1}}, ["submission_history"])]
 @
 
 \subsection{Scoping students to their course round}
@@ -1044,6 +1088,9 @@ Each student has a different set of graders, so the rows show which way each
 was handled: the history names two graders, the fallback only the current one.
 The report must hold all three rows, the 404 must be warned about by login, and
 the history fetched for the second must be kept in the cache.
+Since students have left, Canvas refuses the course's listing of the class's
+submissions, which [[results]] asks for first; we set that up with
+[[refuse_a_course_listing_naming_a_student_who_left]], below.
 <<test functions>>=
 SERVER = "https://canvas.example.invalid"
 API = f"{SERVER}/api/v1"
@@ -1098,6 +1145,7 @@ def test_results_survive_submissions_without_history(capsys, caplog):
   departed = responses.get(
     f"{API}/courses/1/assignments/7/submissions/3", status=404,
     json={"errors": [{"message": "The specified resource does not exist."}]})
+  refuse_a_course_listing_naming_a_student_who_left()
 
   course = canvasapi.course.Course(
     Canvas(SERVER, "token")._Canvas__requester,
@@ -1129,6 +1177,20 @@ def test_results_survive_submissions_without_history(capsys, caplog):
   assert single_fetch.call_count == 1
 @
 
+A student who has left also changes what the course's listing of a few
+students' submissions answers, which [[results]] tries first for a small class
+(\cref{sec:few-students-submissions}): Canvas refuses a request that names a
+student not in the course, and the submissions are then listed as before.
+These tests are about what follows, so their Canvas refuses it too.
+<<test functions>>=
+def refuse_a_course_listing_naming_a_student_who_left():
+  """Answer the course's listing of some students' submissions as Canvas
+  does when one of them has left the course."""
+  responses.get(f"{API}/courses/1/students/submissions", status=403,
+                json={"status": "unauthorized", "errors": [
+                  {"message": "user not authorised to perform that action"}]})
+@
+
 Two more cases test the edges of that fallback, each with a single student who
 has left.
 We set up that course once.
@@ -1155,6 +1217,7 @@ def departed_student_course(single_fetch_status):
   responses.get(f"{API}/courses/1/assignments/7/submissions/3",
                 status=single_fetch_status,
                 json={"errors": [{"message": "Canvas error"}]})
+  refuse_a_course_listing_naming_a_student_who_left()
 
   course = canvasapi.course.Course(
     Canvas(SERVER, "token")._Canvas__requester,
@@ -1200,6 +1263,42 @@ def test_all_graders_names_a_student_without_user_by_id(caplog):
 
   assert [grader.id for grader in graders] == [91]
   assert "user id 3" in caplog.text
+@
+
+When the students are still in the course, the course's listing answers for
+them, and [[results -a]], which goes through
+[[<<create [[submissions_list]]>>]], must use it: here only that listing
+answers, so a request for the assignment's own listing would fail the test.
+<<test functions>>=
+@responses.activate
+def test_results_of_a_few_students_come_in_one_request(capsys, monkeypatch):
+  monkeypatch.setattr(results_module.users, "UNREAD_ROSTERS", set())
+  responses.get(f"{API}/courses/1/assignments",
+                json=[{"id": 7, "name": "Lab", "course_id": 1,
+                       "assignment_group_id": 1, "published": True,
+                       "due_at": None}])
+  responses.get(f"{API}/courses/1/search_users", json=[student_json(1)])
+  responses.get(f"{API}/courses/1/users/90",
+                json={"id": 90, "name": "Grader A", "login_id": "gradera"})
+  course_listing = responses.get(
+    f"{API}/courses/1/students/submissions",
+    json=[graded_submission_json(1, 90,
+                                 history=[graded_submission_json(1, 90)])])
+
+  course = canvasapi.course.Course(
+    Canvas(SERVER, "token")._Canvas__requester,
+    {"id": 1, "course_code": "SBX101", "name": "Sandbox"})
+  parser = argparse.ArgumentParser()
+  results_module.add_command(parser.add_subparsers())
+  args = parser.parse_args(["results", "-c", "SBX101", "-a", "Lab"])
+  args.delimiter = "\t"
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    results_module.results_command({}, None, args)
+
+  rows = capsys.readouterr().out.splitlines()
+  assert len(rows) == 1 and "int-1" in rows[0]
+  assert course_listing.call_count == 1
 @
 
 
@@ -1389,6 +1488,8 @@ Let's verify this with the grade from the report that prompted it, a
 The course is a real [[canvasapi]] course whose requests [[responses]]
 answers, like in the tests of the graders above, so the
 [[UnknownGradeError]] comes from the module itself, not from a stand-in.
+Its one student is still in the course, so the course's listing of that
+student's submissions answers with the same submission.
 <<test functions>>=
 @responses.activate
 def test_results_report_a_refused_grade_without_traceback(capsys, caplog):
@@ -1409,6 +1510,7 @@ def test_results_report_a_refused_grade_without_traceback(capsys, caplog):
                 json=[points])
   responses.get(f"{API}/courses/1/assignments/7/submissions/1",
                 json=points)
+  responses.get(f"{API}/courses/1/students/submissions", json=[points])
 
   course = canvasapi.course.Course(
     Canvas(SERVER, "token")._Canvas__requester,
