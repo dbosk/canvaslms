@@ -108,6 +108,11 @@ canvaslms quizzes attempts -c COURSE -a "Quiz title" --answers
 canvaslms quizzes attempts -c COURSE -a "Quiz title" --attempts first --table
 ```
 
+Each quiz opens with an overview of its attempts: how many answered all,
+some or none of the questions and, for a New Quiz with a time limit, how
+many ended at the limit. `--answered some` leaves out attempts that were
+opened and abandoned, and `--skip-unanswered` leaves out blank answers.
+
 It works for New Quizzes and for Classic Quizzes that have an assignment.
 
 ### Managing Quiz Content
