@@ -56,6 +56,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.content_migration import ContentMigration, MigrationIssue
 from canvasapi.course import Course
+from canvasapi.exceptions import CanvasException
 from canvasapi.grading_standard import GradingStandard
 from canvasapi.new_quiz import NewQuiz
 from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
@@ -1579,6 +1580,14 @@ make a direct API call using the Canvas [[_requester]] object.
 The report comes as CSV, which [[analyse]] reads, or as JSON, which
 [[quizzes attempts]] reads because its records keep the answers of each
 attempt apart (\cref{sec:quiz-attempts}).
+
+When Canvas refuses the request, we let its exception through rather than
+exit, for the reason [[list_new_quiz_items]] does
+(\cref{sec:list-quiz-items-or-exit}): only the command knows what a
+failure means to its user.
+Both callers go through several quizzes, and an earlier version, which
+exited, threw away the results of all the quizzes after the one that
+failed.
 <<functions>>=
 def create_new_quiz_report(course, assignment_id, requester,
                            report_format="csv"):
@@ -1593,6 +1602,9 @@ def create_new_quiz_report(course, assignment_id, requester,
 
   Returns:
     Progress object for polling
+
+  Raises:
+    CanvasException: if Canvas refused the request.
   """
   import canvasapi.progress
 
@@ -1601,18 +1613,15 @@ def create_new_quiz_report(course, assignment_id, requester,
 
   # Make the POST request with form parameters
   # Note: New Quiz API expects form-encoded parameters
-  try:
-    response = requester.request(
-      method='POST',
-      endpoint=endpoint,
-      _url="new_quizzes",
-      **{
-        'quiz_report[report_type]': 'student_analysis',
-        'quiz_report[format]': report_format
-      }
-    )
-  except Exception as e:
-    canvaslms.cli.err(1, f"Error creating New Quiz report: {e}")
+  response = requester.request(
+    method='POST',
+    endpoint=endpoint,
+    _url="new_quizzes",
+    **{
+      'quiz_report[report_type]': 'student_analysis',
+      'quiz_report[format]': report_format
+    }
+  )
 
   # The response is a Progress object
   return canvasapi.progress.Progress(requester, response.json()["progress"])
@@ -3586,8 +3595,20 @@ def fetch_new_quiz_attempts(quiz, requester):
   return list(new_quiz_attempt_responses(response.json(), items))
 @
 
-[[analyse]] still asks for the default format, CSV, which it parses.
+[[analyse]] still asks for the default format, CSV, which it parses, and a
+refused request reaches the caller as an exception instead of ending the
+program.
 <<test functions>>=
+@responses.activate
+def test_a_refused_new_quiz_report_raises():
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                 status=500, json={"errors": [{"message": "busy"}]})
+  with pytest.raises(CanvasException):
+    quizzes.create_new_quiz_report(make_course(requester=requester), "42",
+                                   requester)
+
 @responses.activate
 def test_new_quiz_report_is_csv_by_default():
   canvas = Canvas("https://canvas.example.invalid", "token")
@@ -4468,6 +4489,9 @@ settings; for a Classic Quiz there are no times to compare with it.
 A quiz without attempts to show raises [[EmptyListError]], which we turn
 into a warning so that the other quizzes are still shown; only when no
 quiz had any does the command fail.
+A quiz whose attempts Canvas would not give us, because a request failed
+or the report could not be downloaded, is treated the same way: one
+failing quiz must not hide the others.
 <<functions>>=
 def attempts_time_limit(quiz):
   """Returns the time limit of a New Quiz in seconds, else None"""
@@ -4488,6 +4512,9 @@ def attempts_command(config, canvas, args):
         responses = fetch_classic_attempts(quiz)
     except canvaslms.cli.EmptyListError as error:
       canvaslms.cli.warn(str(error))
+      continue
+    except (CanvasException, requests.RequestException) as error:
+      canvaslms.cli.warn(f"{quiz.title}: could not read the attempts: {error}")
       continue
     responses = select_attempts(filter_answered(responses, args.answered),
                                 args.attempts)
@@ -4629,6 +4656,20 @@ def test_attempts_command_warns_about_a_quiz_not_taken(caplog):
   with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
     run_attempts(course, "-a", "Honour")
   assert "Honour code: no submitted attempts" in caplog.text
+@
+
+When Canvas refuses one quiz's report, the command still shows the
+other quiz and names the one it could not read.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_goes_on_after_a_refused_report(capsys, caplog):
+  course = course_with_attempts()
+  responses.replace(responses.POST,
+                    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                    status=500, json={"errors": [{"message": "busy"}]})
+  run_attempts(course, "-a", ".")
+  assert "## Honour code" in capsys.readouterr().out
+  assert "Ciphers: could not read the attempts" in caplog.text
 @
 
 The options for abandoned attempts work through the command too.
