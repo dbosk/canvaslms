@@ -685,6 +685,8 @@ We need options for:
 \item Assignment/quiz selection (for Canvas API mode)
 \item Output format selection (markdown or LaTeX)
 \item AI-generated summaries of free-text responses
+\item Which attempts at a New Quiz to analyse
+  (\cref{sec:quiz-analyse-attempts})
 \end{itemize}
 <<add quizzes options>>=
 analyse_parser.add_argument("--csv", "-f",
@@ -1274,8 +1276,8 @@ With the source determination complete, we now process the data.
 Whether the rows came from the user's file or from Canvas, the processing
 is identical.
 
-A file given with [[--csv]] is read as it is; a missing or empty file is
-an error, since there is nothing else to analyse.
+A file given with [[--csv]] is read as it is; a missing, unreadable or
+empty file is an error, since there is nothing else to analyse.
 <<read the CSV file into [[row_sets]]>>=
 warn_attempt_options_ignored(args, args.csv)
 try:
@@ -1283,6 +1285,8 @@ try:
     rows = list(csv.DictReader(f))
 except FileNotFoundError:
   canvaslms.cli.err(1, f"CSV file not found: {args.csv}")
+except (OSError, UnicodeDecodeError, csv.Error) as e:
+  canvaslms.cli.err(1, f"Error reading CSV: {e}")
 if not rows:
   canvaslms.cli.err(1, "CSV file is empty")
 row_sets.append(rows)
@@ -1583,12 +1587,14 @@ def download_csv_report(file_url):
 
 
 \subsection{Creating New Quiz reports}
+\label{sec:quiz-new-quiz-report}
 
 New Quizzes use a different API endpoint for report generation. We need to
 make a direct API call using the Canvas [[_requester]] object.
-The report comes as CSV, which [[analyse]] reads, or as JSON, which
-[[quizzes attempts]] reads because its records keep the answers of each
-attempt apart (\cref{sec:quiz-attempts}).
+The report comes as CSV or as JSON.
+We ask for JSON, which both [[analyse]] and [[quizzes attempts]] read,
+because its records keep the answers of each attempt apart and its
+questions keep their HTML (\cref{sec:quiz-attempts,sec:quiz-new-rows}).
 
 When Canvas refuses the request, we let its exception through rather than
 exit, for the reason [[list_new_quiz_items]] does
@@ -1598,16 +1604,14 @@ Both callers go through several quizzes, and an earlier version, which
 exited, threw away the results of all the quizzes after the one that
 failed.
 <<functions>>=
-def create_new_quiz_report(course, assignment_id, requester,
-                           report_format="csv"):
+def create_new_quiz_report(course, assignment_id, requester):
   """
-  Create a student analysis report for a New Quiz.
+  Create a student analysis report in JSON for a New Quiz.
 
   Args:
     course: Course object
     assignment_id: The assignment ID of the New Quiz
     requester: Canvas _requester object for making API calls
-    report_format: "csv" or "json"
 
   Returns:
     Progress object for polling
@@ -1628,7 +1632,7 @@ def create_new_quiz_report(course, assignment_id, requester,
     _url="new_quizzes",
     **{
       'quiz_report[report_type]': 'student_analysis',
-      'quiz_report[format]': report_format
+      'quiz_report[format]': 'json'
     }
   )
 
@@ -1941,7 +1945,9 @@ For readability and LaTeX compatibility, we need to:
 \subsubsection{Extracting question IDs}
 
 Classic Quizzes use the format ``588913: Question text'' where the ID appears
-as a prefix. New Quizzes have no ID prefix. We extract the ID (if present)
+as a prefix, as do the rows we make of a New Quiz's records
+(\cref{sec:quiz-attempts-rows}); only the CSV of a New Quiz, given with
+[[--csv]], has none. We extract the ID (if present)
 for use in LaTeX labels, but remove it from the display title per user
 preference.
 <<functions>>=
@@ -2649,8 +2655,8 @@ The pipeline has five stages:
 @
 
 We start by separating any question ID prefix from the title text.
-Classic Quizzes use the format ``588913: Question text'', while New Quizzes
-have no prefix.
+Classic Quizzes and the rows of a New Quiz use the format ``588913:
+Question text'', while the CSV of a New Quiz has no prefix.
 <<extract question ID and title>>=
 question_id, full_title = extract_question_id(qcol)
 @
@@ -3002,6 +3008,9 @@ differ, so each gets its own path to the rows.
 A quiz whose report cannot be had is skipped with a warning, so that one
 failing quiz does not hide the others; only when no quiz gave any rows does
 the command fail.
+What we tolerate is a failure of Canvas or of the transfer.
+An answer of another shape than we expect is a bug in our reading of it,
+which should show rather than turn into a quiz silently left out.
 <<fill [[row_sets]] from Canvas>>=
 try:
   quiz_list = process_quiz_option(canvas, args)
@@ -3025,6 +3034,7 @@ if not row_sets:
 @
 
 \subsection{The rows of a New Quiz}
+\label{sec:quiz-new-rows}
 
 The New Quizzes report comes as CSV or JSON, and we read the JSON, through
 the same records that [[quizzes attempts]] uses
@@ -3063,6 +3073,17 @@ of the [[quizzes attempts]] tests (\cref{sec:quiz-attempts}), whose quiz
 here asks about code.
 The code must keep its line break, which the CSV's header would have lost.
 <<test functions>>=
+def run_analyse(course, *options):
+  """Run quizzes analyse on `course` with the command-line `options`"""
+  parser = argparse.ArgumentParser()
+  quizzes.add_command(parser.add_subparsers())
+  args = parser.parse_args(["quizzes", "analyse", *options])
+  canvas = MagicMock()
+  canvas._Canvas__requester = course._requester if course else None
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    args.func({}, canvas, args)
+
 @responses.activate
 def test_analyse_reads_a_new_quiz_with_its_code(capsys):
   course = course_with_attempts()
@@ -3070,20 +3091,28 @@ def test_analyse_reads_a_new_quiz_with_its_code(capsys):
     f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
     json=[listed_new_quiz_item(307, 185, 1,
             "<p>What prints?</p><pre>x = 1<br>print(x)</pre>")])
-  parser = argparse.ArgumentParser()
-  quizzes.add_command(parser.add_subparsers())
-  args = parser.parse_args(["quizzes", "analyse", "-c", "SBX", "-a", "Ciph"])
-  canvas = MagicMock()
-  canvas._Canvas__requester = course._requester
-  with patch("canvaslms.cli.courses.process_course_option",
-             return_value=[course]):
-    args.func({}, canvas, args)
+  run_analyse(course, "-c", "SBX", "-a", "Ciph")
   out = capsys.readouterr().out
   assert "x = 1print(x)" not in out and "\nprint(x)\n" in out
   assert "- DES: 1 (50.0%)" in out and "- AES: 1 (50.0%)" in out
 @
 
+A New Quiz whose report Canvas refuses is skipped with a warning, and
+when it was the only quiz, nothing is left and the command fails.
+<<test functions>>=
+@responses.activate
+def test_analyse_skips_a_refused_report(caplog):
+  course = course_with_attempts()
+  responses.replace(responses.POST,
+                    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                    status=500, json={"errors": [{"message": "busy"}]})
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_analyse(course, "-c", "SBX", "-a", "Ciph")
+  assert "Ciphers: could not read the report" in caplog.text
+@
+
 \subsection{Which attempts [[analyse]] counts}
+\label{sec:quiz-analyse-attempts}
 
 The two quiz systems' reports cover attempts differently.
 We measured both on 23 November 2026:
@@ -3117,8 +3146,8 @@ analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
          "answered some question, or those that answered all")
 @
 
-For a Classic Quiz, and for a CSV file, whose attempts we cannot tell
-apart, the selections cannot apply.
+For a Classic Quiz, whose report has one attempt per student, and for a
+CSV file, which we analyse as it is, the selections cannot apply.
 Rather than silently analysing something else than asked for, we say so,
 and point to the command that has every attempt of a Classic Quiz.
 <<functions>>=
@@ -3131,26 +3160,43 @@ def warn_attempt_options_ignored(args, source):
       "counts, and quizzes attempts reads all of them")
 @
 
-Let's verify that a selection reaches the New Quiz's rows, and that it is
-reported as ignored for a CSV file.
+Let's verify that each selection reaches the New Quiz's rows: student 5
+first answered one of two questions, wrongly, then both, rightly.
+For a Classic Quiz, whose report we download and parse, and for a CSV
+file, the selection is reported as ignored.
 <<test functions>>=
-def run_analyse(course, *options):
-  """Run quizzes analyse on `course` with the command-line `options`"""
-  parser = argparse.ArgumentParser()
-  quizzes.add_command(parser.add_subparsers())
-  args = parser.parse_args(["quizzes", "analyse", *options])
-  canvas = MagicMock()
-  canvas._Canvas__requester = course._requester if course else None
-  with patch("canvaslms.cli.courses.process_course_option",
-             return_value=[course]):
-    args.func({}, canvas, args)
+@pytest.mark.parametrize("options", [["--attempts", "first"],
+                                     ["--answered", "all"]])
+@responses.activate
+def test_analyse_selects_the_attempts_of_a_new_quiz(capsys, options):
+  first = new_quiz_attempt(5, 1, (185, "DES", 0.0), (186, "", 0.0))
+  course = course_with_attempts(report=[
+    first, new_quiz_attempt(5, 2, (185, "AES", 1.0), (186, "B", 1.0))])
+  responses.replace(responses.GET,
+    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+    json=[listed_new_quiz_item(307, 185, 1, "<p>Which cipher?</p>"),
+          listed_new_quiz_item(308, 186, 2, "<p>Which mode?</p>")])
+  run_analyse(course, "-c", "SBX", "-a", "Ciph", *options)
+  out = capsys.readouterr().out
+  if options[0] == "--attempts":
+    assert "- DES: 1 (100.0%)" in out and "AES" not in out
+  else:
+    assert "- AES: 1 (100.0%)" in out and "DES" not in out
 
 @responses.activate
-def test_analyse_selects_the_attempts_of_a_new_quiz(capsys):
-  run_analyse(course_with_attempts(), "-c", "SBX", "-a", "Ciph",
-              "--attempts", "first")
-  out = capsys.readouterr().out
-  assert "- DES: 1 (100.0%)" in out and "AES" not in out
+def test_analyse_reads_a_classic_report_and_says_options_do_not_apply(
+    capsys, caplog):
+  course = course_with_attempts()
+  report = {"id": 2, "quiz_id": 9, "report_type": "student_analysis",
+            "includes_all_versions": True,
+            "file": {"url": "https://files.example.invalid/c.csv"}}
+  responses.post(f"{CACHE_API}/courses/1/quizzes/9/reports", json=report)
+  responses.get(f"{CACHE_API}/courses/1/quizzes/9/reports/2", json=report)
+  responses.get("https://files.example.invalid/c.csv",
+                body='name,id,"11: Allowed?"\nStudent Seven,7,No\n')
+  run_analyse(course, "-c", "SBX", "-a", "Honour", "--answered", "some")
+  assert "- No: 1 (100.0%)" in capsys.readouterr().out
+  assert "Honour code: --attempts and --answered apply only" in caplog.text
 
 def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
                                                           capsys):
@@ -3159,6 +3205,13 @@ def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
   run_analyse(None, "--csv", str(report), "--attempts", "last")
   assert "apply only to New Quizzes read from Canvas" in caplog.text
   assert "- AES: 1 (100.0%)" in capsys.readouterr().out
+
+def test_analyse_refuses_an_unreadable_csv_file(tmp_path, caplog):
+  report = tmp_path / "report.csv"
+  report.write_bytes("name,id,\"1: Vad?\"\nSt\u00e5l,5,Ja\n".encode("latin-1"))
+  with pytest.raises(SystemExit):
+    run_analyse(None, "--csv", str(report))
+  assert "Error reading CSV" in caplog.text
 @
 
 \subsection{Downloading a Classic Quiz report}
@@ -3706,13 +3759,13 @@ def test_new_quiz_attempts_become_one_record_per_answer():
   assert records[0].elapsed == 300
 @
 
-To fetch the report, we reuse the report request of [[analyse]], asking for
-JSON, and poll it until Canvas has made the file.
+To fetch the report, we request it (\cref{sec:quiz-new-quiz-report}) and
+poll it until Canvas has made the file.
 <<functions>>=
 def fetch_new_quiz_attempts(quiz, requester):
   """Returns the `AttemptResponse`s of the attempts at New Quiz `quiz`"""
   progress = poll_progress(create_new_quiz_report(
-    quiz.course, quiz.id, requester, report_format="json"))
+    quiz.course, quiz.id, requester))
   results = getattr(progress, "results", None)
   url = results.get("url") if isinstance(results, dict) else None
   if not url:
@@ -3725,8 +3778,7 @@ def fetch_new_quiz_attempts(quiz, requester):
   return list(new_quiz_attempt_responses(response.json(), items))
 @
 
-[[analyse]] still asks for the default format, CSV, which it parses, and a
-refused request reaches the caller as an exception instead of ending the
+A refused request reaches the caller as an exception instead of ending the
 program.
 <<test functions>>=
 @responses.activate
@@ -3738,16 +3790,6 @@ def test_a_refused_new_quiz_report_raises():
   with pytest.raises(CanvasException):
     quizzes.create_new_quiz_report(make_course(requester=requester), "42",
                                    requester)
-
-@responses.activate
-def test_new_quiz_report_is_csv_by_default():
-  canvas = Canvas("https://canvas.example.invalid", "token")
-  requester = canvas._Canvas__requester
-  request = responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
-                           json={"progress": {"id": 3}})
-  quizzes.create_new_quiz_report(make_course(requester=requester), "42",
-                                 requester)
-  assert "quiz_report%5Bformat%5D=csv" in request.calls[0].request.body
 @
 
 Let's verify the whole way from the report request to the records, with
