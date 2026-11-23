@@ -3176,8 +3176,11 @@ Both sources hold submitted attempts, so the command shows how things stand
 when it runs; a teacher following a quiz in progress runs it again.
 The New Quizzes report is made anew on every run.
 The Classic submissions come from the cache, which refetches a submission
-with a numeric grade once it is older than five minutes by default;
-[[--refresh-cache]] fetches them at once.
+once it is older than [[SUBMISSION_TTL_MINUTES]], 20 minutes unless
+[[CANVASLMS_SUBMISSION_TTL_MINUTES]] says otherwise---but never a submission
+whose grade is one of [[NOREFRESH_GRADES]], such as [[complete]].
+A teacher following a pass-or-fail quiz while it is open, or wanting the
+attempts of the last minutes, should therefore give [[--refresh-cache]].
 
 \subsection{One record for each answer}
 
@@ -3197,6 +3200,10 @@ question \enquote{how many attempts until right?} needs.
 When we cannot tell---a New Quiz item replaced after students answered it
 is no longer among the quiz's items, so its worth is unknown---the record
 holds [[None]], and the views count the answer as neither right nor wrong.
+
+A question counts as answered when the record has an answer, but also when
+the answer was right or earned points: Canvas does not show every kind of
+answer as text, and a right answer must not be taken for a blank.
 
 The [[position]] of the question orders the questions as the quiz does.
 A question that is no longer in the quiz has none, and is placed last.
@@ -3220,7 +3227,7 @@ class AttemptResponse:
   @property
   def answered(self):
     """True if the student answered the question at all"""
-    return bool(self.answer)
+    return bool(self.answer) or self.right is True or self.points > 0
 <<constants>>=
 UNKNOWN_POSITION = sys.maxsize
 @
@@ -3248,7 +3255,7 @@ we have no attempts of, such as matching, the command shows Canvas's
 Right and wrong hold for every type all the same, since they come from
 [[correct]].
 A choice question left unanswered has neither an [[answer_id]] nor any
-[[text]].
+[[text]]; an [[answer_id]] of [[None]] we take as no answer too.
 <<functions>>=
 def classic_answer(datum, question):
   """Returns the answer in a Classic Quiz `submission_data` entry as text
@@ -3256,7 +3263,7 @@ def classic_answer(datum, question):
   `question` is the quiz question the entry answers, or None if the
   question is no longer in the quiz.  Returns None for no answer.
   """
-  if "answer_id" in datum:
+  if datum.get("answer_id") is not None:
     answers = {answer["id"]: answer
                for answer in getattr(question, "answers", None) or []}
     answer = answers.get(datum["answer_id"], {})
@@ -3333,6 +3340,7 @@ def test_classic_attempts_become_one_record_per_answer():
         classic_entry(1, (11, False, 0.0, "2", {"answer_id": 2}),
                       (11, False, 0.0, "3", {"answer_id": 3}),
                       (11, False, 0.0, "", {}),
+                      (11, False, 0.0, "", {"answer_id": None}),
                       (99, True, 1.0, "", {}),
                       (12, "undefined", 0.0, "<p>Maybe</p>", {}),
                       state="pending_review")],
@@ -3346,11 +3354,13 @@ def test_classic_attempts_become_one_record_per_answer():
           for r in records] \
     == [(2, "11", "Right", 1.0, True), (2, "12", "Because", 1.0, True),
         (1, "11", "Wrong one", 0.0, False), (1, "11", "3", 0.0, False),
-        (1, "11", None, 0.0, False), (1, "99", None, 1.0, True),
+        (1, "11", None, 0.0, False), (1, "11", None, 0.0, False),
+        (1, "99", None, 1.0, True),
         (1, "12", "Maybe", 0.0, None)]
   assert records[0].question == "Pick one"
   assert records[0].student == "Student One"
   assert [r.position for r in records[:2]] == [1, 2]
+  assert [r.answered for r in records[4:7]] == [False, False, True]
   placed = make_question(13, position=7)
   [record] = quizzes.classic_attempt_responses(
     {1: [classic_entry(1, (13, True, 1.0, "<p>Yes</p>", {}))]},
@@ -3410,20 +3420,46 @@ added to the quiz; such an entry is not caught.
 We compare the score with the item's worth with a tolerance, since Canvas
 computes partial scores in floating point.
 An item worth no points can be neither right nor wrong.
+
+An item can also take its question from an item bank.
+A [[BankEntry]] item holds one question of a bank, wrapped one level
+deeper: its [[entry]] is the bank entry, whose own [[entry]] is the
+question, and the report names the item by that inner entry's id.
+We saw this in two quizzes, where every response then matched an item.
+A [[Bank]] item instead draws questions at random from a whole bank, and
+its [[entry]] describes only the bank; which questions a student got is
+in the report alone.
+The one quiz of that kind we tried had no report to give---Canvas answered
+with an error---so we do not know how such responses are named, and they
+are shown as items not among the quiz's items, with unknown rightness.
 <<functions>>=
+def item_entries(items):
+  """Maps each entry ID a report can name to its (item, entry) in `items`
+
+  The entry of a `BankEntry` item is the bank entry; its question is the
+  entry inside it, which is the one returned.
+  """
+  entries = {}
+  for item in items:
+    entry = item.get("entry") or {}
+    if item.get("entry_type") == "BankEntry" and entry.get("entry"):
+      entry = entry["entry"]
+    if entry.get("id") is not None:
+      entries[str(entry["id"])] = (item, entry)
+  return entries
+
 def new_quiz_attempt_responses(report, items):
   """Yields an `AttemptResponse` for each answer in a New Quiz report
 
   `report` is the student analysis report in JSON, one record per attempt;
   `items` are the quiz's items as the New Quizzes API lists them.
   """
-  items_by_entry = {str(item["entry"]["id"]): item
-                    for item in items if item.get("entry")}
+  entries = item_entries(items)
   for record in report:
     student = record["student_data"]
     for response in record["item_responses"]:
-      item = items_by_entry.get(str(response["item_id"]))
-      if not shown_in_attempt(response, item, student.get("submitted_at")):
+      item, entry = entries.get(str(response["item_id"]), (None, None))
+      if not shown_in_attempt(response, entry, student.get("submitted_at")):
         continue
       score = response.get("score") or 0
       worth = item.get("points_possible") if item else None
@@ -3434,9 +3470,9 @@ def new_quiz_attempt_responses(report, items):
         position=(item.get("position") if item else None)
                  or UNKNOWN_POSITION,
         question_id=str(response["item_id"]),
-        question=(plain_text(item["entry"].get("item_body")) if item
+        question=(plain_text(entry.get("item_body")) if item
                   else f"Item {response['item_id']}, "
-                       "no longer in the quiz"),
+                       "not among the quiz's items"),
         answer=plain_text(response.get("answer")) or None,
         points=score,
         right=(score >= worth or math.isclose(score, worth)) if worth
@@ -3447,15 +3483,16 @@ def new_quiz_attempt_responses(report, items):
 We compare the times as instants, since Canvas writes them with and
 without fractions of a second.
 <<functions>>=
-def shown_in_attempt(response, item, submitted_at):
+def shown_in_attempt(response, entry, submitted_at):
   """Returns False for a response to an item the attempt did not show
 
-  `item` is the quiz item the response answers, None if it is no longer in
-  the quiz; `submitted_at` is when the attempt was submitted.
+  `entry` is the entry of the quiz item the response answers, None if it
+  is not among the quiz's items; `submitted_at` is when the attempt was
+  submitted.
   """
-  if item is None:
+  if entry is None:
     return bool(response.get("answer"))
-  created_at = item["entry"].get("created_at")
+  created_at = entry.get("created_at")
   if created_at and submitted_at:
     return arrow.get(created_at) <= arrow.get(submitted_at)
   return True
@@ -3472,6 +3509,8 @@ and answers an item worth no points.
 Item 189 was added after these attempts, which were submitted on
 20 November, and item 998 is no longer in the quiz; the report lists both
 with empty answers, and neither becomes a record.
+Item 312 is a bank entry, shaped as in the quizzes we saw, which the
+report names by its inner entry 166324.
 <<test functions>>=
 def listed_new_quiz_item(item_id, entry_id, position, body, points=1.0,
                          created_at="2026-08-12T12:48:23.094Z"):
@@ -3500,14 +3539,20 @@ def test_new_quiz_attempts_become_one_record_per_answer():
            listed_new_quiz_item(309, 187, 3, "<p>Sum</p>", points=0.1 * 3),
            listed_new_quiz_item(310, 188, 4, "<p>Opinion</p>", points=0.0),
            listed_new_quiz_item(311, 189, 5, "<p>Added later</p>",
-                                created_at="2026-11-21T09:00:00.5Z")]
+                                created_at="2026-11-21T09:00:00.5Z"),
+           {"id": "312", "position": 6, "entry_type": "BankEntry",
+            "points_possible": 1.0, "entry": {
+              "id": "26286", "bank_id": "7", "archived": False,
+              "entry_type": "Item", "created_at": "2026-08-01T00:00:00Z",
+              "entry": {"id": "166324", "item_body": "<p>From a bank</p>",
+                        "created_at": "2026-07-01T00:00:00Z"}}}]
   report = [new_quiz_attempt(5, 1, (185, "DES", 0.0),
                                    (186, "<pre>a</pre>,b", 10.0),
                                    (189, "", 0)),
             new_quiz_attempt(5, 2, (185, "AES", 1.0), (186, "", 0.0),
                                    (999, "Gone", 1.0), (998, "", 0)),
             new_quiz_attempt(6, 1, (186, "b,a", 5.0), (187, "0.3", 0.3),
-                                   (188, "Fine", 0.0))]
+                                   (188, "Fine", 0.0), (166324, "Yes", 1.0))]
 
   records = list(quizzes.new_quiz_attempt_responses(report, items))
 
@@ -3515,7 +3560,8 @@ def test_new_quiz_attempts_become_one_record_per_answer():
     (1, 1, "DES", False), (1, 2, "a,b", True),
     (2, 1, "AES", True), (2, 2, None, False),
     (2, quizzes.UNKNOWN_POSITION, "Gone", None), (1, 2, "b,a", False),
-    (1, 3, "0.3", True), (1, 4, "Fine", None)]
+    (1, 3, "0.3", True), (1, 4, "Fine", None), (1, 6, "Yes", True)]
+  assert records[-1].question == "From a bank"
   assert records[0].question == "Which cipher?"
   assert records[0].student == "Student 5"
   assert records[0].elapsed == 300
@@ -3676,270 +3722,6 @@ def test_select_attempts_keeps_the_named_attempts(selection, attempts):
   assert [r.attempt for r in selected if r.student_id == 2] == [4]
 @
 
-\subsection{Abandoned attempts and time}
-\label{sec:quiz-attempts-abandoned}
-
-The numbers above take every submitted attempt at face value, and an
-attempt can be submitted without having been tried.
-In the three practice exams of a programming course with a 60-minute
-limit, 56 of 119 attempts at one of them ended at exactly 60 minutes, and
-54 of those 56 had answered nothing or only some of the questions:
-students opened the quiz, looked, and let Canvas submit it when the time
-ran out.
-Counted as attempts, such submissions make every question look harder than
-it is.
-The command therefore opens each quiz with an overview of its attempts
-(\cref{sec:quiz-attempts-overview}), and offers two ways to leave the
-untried answers out:
-\begin{description}
-\item[ [[--answered some]] ] drops the attempts that answered no
-  question; [[--answered all]] keeps only the attempts that answered
-  every question.
-  The default, [[any]], keeps every submitted attempt.
-\item[ [[--skip-unanswered]] ] drops each question left unanswered, so
-  that a question skipped in an attempt counts as not attempted rather
-  than as not right.
-  The shares in the difficulty view then become shares among the students
-  who answered the question.
-\end{description}
-[[--answered]] works on whole attempts, so it applies before
-[[--attempts]] picks an attempt per student:
-[[--answered some --attempts first]] is each student's first attempt that
-answered anything.
-[[--skip-unanswered]] works on single answers, so it applies after the
-attempts are picked, and \enquote{first} remains the first attempt at the
-quiz.
-
-An attempt is the set of a student's answers with the same attempt number,
-so we count its answers per [[(student_id, attempt)]].
-<<constants>>=
-ANSWERED_SELECTIONS = ("any", "some", "all")
-<<functions>>=
-def filter_answered(responses, answered):
-  """Returns the `responses` of the attempts that `answered` keeps
-
-  `answered` is one of `ANSWERED_SELECTIONS`: every attempt (any), the
-  attempts that answered at least one question (some), or those that
-  answered every question (all).
-  """
-  if answered == "any":
-    return list(responses)
-  attempts = defaultdict(list)
-  for response in responses:
-    attempts[(response.student_id, response.attempt)].append(response)
-  keep = all if answered == "all" else any
-  return [response for answers in attempts.values()
-          if keep(answer.answered for answer in answers)
-          for response in answers]
-@
-
-Let's verify both filters on three attempts: one answering everything,
-one answering some questions and one answering none.
-<<test functions>>=
-def test_answered_filters_keep_the_attempts_tried():
-  responses = [answer_record(1, 1, 1, None, False),
-               answer_record(1, 1, 2, "B", False),
-               answer_record(1, 2, 1, "A"), answer_record(1, 2, 2, "B"),
-               answer_record(2, 1, 1, None, False),
-               answer_record(2, 1, 2, None, False)]
-
-  def attempts(selected):
-    return sorted({(r.student_id, r.attempt) for r in selected})
-
-  assert attempts(quizzes.filter_answered(responses, "any")) \
-    == [(1, 1), (1, 2), (2, 1)]
-  assert attempts(quizzes.filter_answered(responses, "some")) \
-    == [(1, 1), (1, 2)]
-  assert attempts(quizzes.filter_answered(responses, "all")) == [(1, 2)]
-@
-
-Skipping the unanswered questions is a filter on single answers.
-<<functions>>=
-def answered_only(responses):
-  """Returns the `responses` that answer their question"""
-  return [response for response in responses if response.answered]
-@
-
-Let's verify what it changes in the difficulty view: student 1 left
-question 1 blank in the first attempt and got it right in the second.
-Counted as a try, the blank makes the question take two attempts; skipped,
-it takes one.
-<<test functions>>=
-def test_skipping_unanswered_questions_counts_only_tries():
-  responses = [answer_record(1, 1, 1, None, False),
-               answer_record(1, 2, 1, "A")]
-  [counted] = quizzes.attempt_difficulty(responses)
-  [skipped] = quizzes.attempt_difficulty(quizzes.answered_only(responses))
-  assert counted["median_attempts"] == 2 and counted["first_right"] == 0
-  assert skipped["median_attempts"] == 1 and skipped["first_right"] == 1
-@
-
-\subsubsection{Time per attempt}
-\label{sec:quiz-attempts-time}
-
-Only the New Quizzes record how long an attempt took: the report gives each
-attempt an [[elapsed_time]] such as [[00:05:12]].
-A Classic Quiz's history has the time an attempt was submitted but not when
-it was started, so for Classic Quizzes the overview says nothing about time.
-We keep the time on every record of the attempt, in seconds, which also
-puts it in the table view.
-The hours can exceed 24---we have seen an attempt reported as 867 hours---so
-we parse the three fields ourselves rather than as a time of day.
-<<functions>>=
-def elapsed_seconds(elapsed_time):
-  """Returns an `HH:MM:SS` duration in seconds, or None if there is none"""
-  if not elapsed_time:
-    return None
-  hours, minutes, seconds = (int(part) for part in elapsed_time.split(":"))
-  return hours * 3600 + minutes * 60 + seconds
-@
-
-Let's verify the parsing on such a long attempt.
-<<test functions>>=
-def test_elapsed_seconds_allows_more_than_a_day():
-  assert quizzes.elapsed_seconds("867:16:49") == 867 * 3600 + 16 * 60 + 49
-  assert quizzes.elapsed_seconds("") is None
-@
-
-Elapsed times only make sense against the quiz's time limit.
-Without a limit, an attempt stays open until the student submits it, which
-can be days later, so a median of such times says little.
-With a limit, an attempt that took exactly the limit is one Canvas
-submitted when time ran out.
-An attempt can also be reported as longer than the limit: in one practice
-exam, 27 of 98 attempts were, the longest by weeks.
-The data do not say why, so we count those attempts as a group of their
-own rather than guess.
-<<functions>>=
-def time_class(elapsed, time_limit):
-  """Returns "before", "at" or "beyond" the `time_limit`, or None"""
-  if elapsed is None or not time_limit:
-    return None
-  if elapsed < time_limit:
-    return "before"
-  return "at" if elapsed == time_limit else "beyond"
-@
-
-\subsubsection{The overview of the attempts}
-\label{sec:quiz-attempts-overview}
-
-The overview counts the attempts and students, how many attempts answered
-all, some or none of their questions, and, for a New Quiz with a time
-limit, how many ended before, at or beyond the limit.
-For those that ended at the limit it repeats the answered breakdown, which
-is what shows whether they were abandoned.
-Finally it gives the median time of the attempts that answered every
-question before the limit, the time a student who did the whole quiz
-needed.
-The overview describes the attempts that [[--answered]] and
-[[--attempts]] kept, but before [[--skip-unanswered]], which would make
-every attempt look complete.
-<<functions>>=
-def attempt_overview(responses, time_limit=None):
-  """Returns a Markdown paragraph summarising the attempts in `responses`
-
-  `time_limit` is the quiz's time limit in seconds, None if it has none.
-  """
-  <<collect each attempt's answered count and time>>
-  <<write the attempt counts>>
-  <<write the time of the attempts>>
-  return " ".join(sentences) + "\n\n"
-@
-
-<<collect each attempt's answered count and time>>=
-attempts = defaultdict(lambda: {"answered": 0, "questions": 0,
-                                "elapsed": None})
-for response in responses:
-  attempt = attempts[(response.student_id, response.attempt)]
-  attempt["questions"] += 1
-  attempt["answered"] += response.answered
-  attempt["elapsed"] = response.elapsed
-
-def answered_class(attempt):
-  if attempt["answered"] == attempt["questions"]:
-    return "all"
-  return "none" if attempt["answered"] == 0 else "some"
-
-def breakdown(selected):
-  counts = Counter(answered_class(attempt) for attempt in selected)
-  return (f"{counts['all']} answered every question, "
-          f"{counts['some']} some and {counts['none']} none")
-
-def counted(number, noun):
-  return f"{number} {noun}" + ("" if number == 1 else "s")
-@
-
-<<write the attempt counts>>=
-students = {student_id for student_id, _ in attempts}
-sentences = [f"{counted(len(attempts), 'attempt')} by "
-             f"{counted(len(students), 'student')}: "
-             f"{breakdown(attempts.values())}."]
-@
-
-<<write the time of the attempts>>=
-classes = defaultdict(list)
-for attempt in attempts.values():
-  classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
-if any(attempt["elapsed"] is not None for attempt in attempts.values()):
-  if not time_limit:
-    sentences.append("The quiz has no time limit, so the time of the "
-                     "attempts is not summarised.")
-  else:
-    sentences.append(
-      f"With a time limit of {format_time_limit(time_limit)}, "
-      f"{len(classes['before'])} ended before the limit, "
-      f"{len(classes['at'])} at it and "
-      f"{len(classes['beyond'])} were reported as longer.")
-    if classes["at"]:
-      sentences.append(f"Of those that ended at the limit, "
-                       f"{breakdown(classes['at'])}.")
-    complete = [attempt["elapsed"] for attempt in classes["before"]
-                if answered_class(attempt) == "all"]
-    if complete:
-      sentences.append(
-        "The attempts that answered every question before the limit took "
-        f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
-        "(median).")
-@
-
-Let's verify the overview on a quiz with a 60-minute limit: one attempt
-answered everything in 20 minutes, one was submitted at the limit with
-nothing answered, one was reported as longer than the limit, and one
-answered only some questions in 10 minutes, which must not count towards
-the median time of a complete attempt.
-A Classic Quiz, whose records have no time, gets only the counts.
-<<test functions>>=
-def timed_answers(student, elapsed, *answers):
-  """The records of one attempt that took `elapsed` seconds"""
-  return [dataclasses.replace(answer_record(student, 1, position, answer,
-                                            answer is not None),
-                              elapsed=elapsed)
-          for position, answer in enumerate(answers, start=1)]
-
-def test_attempt_overview_separates_abandoned_attempts():
-  responses = (timed_answers(1, 1200, "A", "B")
-               + timed_answers(2, 3600, None, None)
-               + timed_answers(3, 7200, "A", None)
-               + timed_answers(4, 600, "A", None))
-
-  overview = quizzes.attempt_overview(responses, time_limit=3600)
-
-  assert overview.startswith("4 attempts by 4 students: 1 answered every "
-                             "question, 2 some and 1 none.")
-  assert "2 ended before the limit, 1 at it and 1 were reported as " \
-         "longer." in overview
-  assert "Of those that ended at the limit, 0 answered every question, " \
-         "0 some and 1 none." in overview
-  assert "took 20 minutes (median)" in overview
-  untimed = quizzes.attempt_overview([answer_record(1, 1, 1)])
-  assert untimed.startswith("1 attempt by 1 student:")
-  assert "limit" not in untimed
-
-def test_attempt_overview_ignores_time_without_a_limit():
-  overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
-  assert "no time limit" in overview and "ended" not in overview
-@
-
 \subsection{The difficulty of each question}
 
 The default view summarises each question in a few numbers.
@@ -4056,6 +3838,7 @@ def test_attempt_difficulty_counts_students_not_attempts():
   assert hardest["per_attempt"] == [(1, 0.0, 2), (2, 0.0, 2), (3, 1.0, 1)]
   assert easiest["first_right"] == 1 and easiest["median_attempts"] == 1
   assert unknown["students"] == 1 and unknown["first_right"] is None
+  assert unknown["never_right"] == 0
 @
 
 A Classic Quiz's history lists the latest attempt first, and the records
@@ -4228,7 +4011,7 @@ def format_wrong_answers(questions, title, overview=""):
     lines.append(f"### {position_label(summary['position'])} "
                  f"{markdown_cell(create_short_title(summary['question'], 100))}"
                  "\n\n")
-    if summary["all_unknown"]:
+    if summary["all_unknown"] and counts:
       lines.append("Whether these answers are right is unknown, "
                    "so all of them are listed.\n\n")
     if counts:
@@ -4256,6 +4039,9 @@ question 3 has one graded wrong answer and one awaiting grading, which is
 counted but not listed as wrong.
 Question 4 has only right answers, and the answers to question 5, which is
 no longer in the quiz, contain a [[|]].
+Question 6 has a right answer and one awaiting grading, so it has no wrong
+answers to list but must not claim that it has none; question 7 has only a
+blank, so there is nothing to list and nothing to explain.
 <<test functions>>=
 def test_wrong_answers_are_counted_per_attempt():
   unknown_position = quizzes.UNKNOWN_POSITION
@@ -4269,16 +4055,21 @@ def test_wrong_answers_are_counted_per_attempt():
                answer_record(1, 1, 4, "Yes"),
                answer_record(1, 1, 2, "x", None),
                answer_record(1, 1, 3, "Wrong", False),
-               answer_record(2, 1, 3, "Ungraded", None)]
+               answer_record(2, 1, 3, "Ungraded", None),
+               answer_record(1, 1, 6, "Right"),
+               answer_record(2, 1, 6, "Pending", None),
+               answer_record(1, 1, 7, None, None)]
 
-  first, second, third, fourth, last = \
+  first, second, third, fourth, sixth, seventh, last = \
     quizzes.wrong_answers_by_attempt(responses)
 
-  assert [q["position"] for q in (first, second, third, fourth, last)] \
-    == [1, 2, 3, 4, unknown_position]
+  assert [q["position"]
+          for q in (first, second, third, fourth, sixth, seventh, last)] \
+    == [1, 2, 3, 4, 6, 7, unknown_position]
   assert list(first["counts"]) == ["RSA", "DES"]
   assert first["counts"]["RSA"] == {1: 2, 2: 1} and first["skipped"] == 1
   assert second["all_unknown"] and list(second["counts"]) == ["x"]
+  assert second["unknown"] == 0
   assert not third["all_unknown"] and list(third["counts"]) == ["Wrong"]
   assert third["unknown"] == 1
   markdown = quizzes.format_wrong_answers(
@@ -4288,8 +4079,294 @@ def test_wrong_answers_are_counted_per_attempt():
   assert "Whether these answers are right is unknown" in markdown
   assert "Not listed: 1 answers whose rightness is unknown." in markdown
   assert "### 4 Question 4\n\nNo wrong answers." in markdown
+  assert "### 6 Question 6\n\nNot listed: 1 answers" in markdown
+  assert "### 7 Question 7\n\nLeft unanswered: 1." in markdown
   assert "| a\\|b | 1 |" in markdown
   assert f"### {unknown_position}" not in markdown
+@
+
+\subsection{Abandoned attempts and time}
+\label{sec:quiz-attempts-abandoned}
+
+The two views above take every submitted attempt at face value, and an
+attempt can be submitted without having been tried.
+In the three practice exams of a programming course with a 60-minute
+limit, 56 of 119 attempts at one of them ended at exactly 60 minutes, and
+54 of those 56 had answered nothing or only some of the questions:
+students opened the quiz, looked, and let Canvas submit it when the time
+ran out.
+Counted as attempts, such submissions make every question look harder than
+it is.
+The command therefore opens each quiz with an overview of its attempts
+(\cref{sec:quiz-attempts-overview}), and offers two ways to leave the
+untried answers out:
+\begin{description}
+\item[ [[--answered some]] ] drops the attempts that answered no
+  question; [[--answered all]] keeps only the attempts that answered
+  every question.
+  The default, [[any]], keeps every submitted attempt.
+\item[ [[--skip-unanswered]] ] drops each question left unanswered, so
+  that a question skipped in an attempt counts as not attempted rather
+  than as not right.
+  The shares in the difficulty view then become shares among the students
+  who answered the question.
+\end{description}
+[[--answered]] works on whole attempts, so it applies before
+[[--attempts]] picks an attempt per student:
+[[--answered some --attempts first]] is each student's first attempt that
+answered anything.
+[[--skip-unanswered]] works on single answers, so it applies after the
+attempts are picked, and \enquote{first} remains the first attempt at the
+quiz.
+
+An attempt is the set of a student's answers with the same attempt number,
+so we count its answers per [[(student_id, attempt)]].
+<<constants>>=
+ANSWERED_SELECTIONS = ("any", "some", "all")
+<<functions>>=
+def filter_answered(responses, answered):
+  """Returns the `responses` of the attempts that `answered` keeps
+
+  `answered` is one of `ANSWERED_SELECTIONS`: every attempt (any), the
+  attempts that answered at least one question (some), or those that
+  answered every question (all).
+  """
+  if answered == "any":
+    return list(responses)
+  attempts = defaultdict(list)
+  for response in responses:
+    attempts[(response.student_id, response.attempt)].append(response)
+  keep = all if answered == "all" else any
+  return [response for answers in attempts.values()
+          if keep(answer.answered for answer in answers)
+          for response in answers]
+@
+
+Let's verify both filters on three attempts: one answering everything,
+one answering some questions and one answering none.
+<<test functions>>=
+def test_answered_filters_keep_the_attempts_tried():
+  responses = [answer_record(1, 1, 1, None, False),
+               answer_record(1, 1, 2, "B", False),
+               answer_record(1, 2, 1, "A"), answer_record(1, 2, 2, "B"),
+               answer_record(2, 1, 1, None, False),
+               answer_record(2, 1, 2, None, False)]
+
+  def attempts(selected):
+    return sorted({(r.student_id, r.attempt) for r in selected})
+
+  assert attempts(quizzes.filter_answered(responses, "any")) \
+    == [(1, 1), (1, 2), (2, 1)]
+  assert attempts(quizzes.filter_answered(responses, "some")) \
+    == [(1, 1), (1, 2)]
+  assert attempts(quizzes.filter_answered(responses, "all")) == [(1, 2)]
+@
+
+Skipping the unanswered questions is a filter on single answers.
+<<functions>>=
+def answered_only(responses):
+  """Returns the `responses` that answer their question"""
+  return [response for response in responses if response.answered]
+@
+
+Let's verify what it changes in the difficulty view: student 1 left
+question 1 blank in the first attempt and got it right in the second.
+Counted as a try, the blank makes the question take two attempts; skipped,
+it takes one.
+<<test functions>>=
+def test_skipping_unanswered_questions_counts_only_tries():
+  responses = [answer_record(1, 1, 1, None, False),
+               answer_record(1, 2, 1, "A")]
+  [counted] = quizzes.attempt_difficulty(responses)
+  [skipped] = quizzes.attempt_difficulty(quizzes.answered_only(responses))
+  assert counted["median_attempts"] == 2 and counted["first_right"] == 0
+  assert skipped["median_attempts"] == 1 and skipped["first_right"] == 1
+@
+
+\subsubsection{Time per attempt}
+\label{sec:quiz-attempts-time}
+
+Only the New Quizzes record how long an attempt took: the report gives each
+attempt an [[elapsed_time]] such as [[00:05:12]].
+A Classic Quiz's history has the time an attempt was submitted but not when
+it was started, so for Classic Quizzes the overview says nothing about time.
+We keep the time on every record of the attempt, in seconds, which also
+puts it in the table view.
+The hours can exceed 24---we have seen an attempt reported as 867 hours---so
+we parse the three fields ourselves rather than as a time of day.
+<<functions>>=
+def elapsed_seconds(elapsed_time):
+  """Returns an `HH:MM:SS` duration in seconds, or None if there is none"""
+  if not elapsed_time:
+    return None
+  hours, minutes, seconds = (int(part) for part in elapsed_time.split(":"))
+  return hours * 3600 + minutes * 60 + seconds
+@
+
+Let's verify the parsing on such a long attempt.
+<<test functions>>=
+def test_elapsed_seconds_allows_more_than_a_day():
+  assert quizzes.elapsed_seconds("867:16:49") == 867 * 3600 + 16 * 60 + 49
+  assert quizzes.elapsed_seconds("") is None
+@
+
+Elapsed times only make sense against the quiz's time limit.
+Without a limit, an attempt stays open until the student submits it, which
+can be days later, so a median of such times says little.
+With a limit, an attempt that took exactly the limit is one Canvas
+submitted when time ran out.
+An attempt can also be reported as longer than the limit: in one practice
+exam, 27 of 98 attempts were, the longest by weeks.
+The data do not say why, so we count those attempts as a group of their
+own rather than guess.
+<<functions>>=
+def time_class(elapsed, time_limit):
+  """Returns "before", "at" or "beyond" the `time_limit`, or None"""
+  if elapsed is None or not time_limit:
+    return None
+  if elapsed < time_limit:
+    return "before"
+  return "at" if elapsed == time_limit else "beyond"
+@
+
+\subsubsection{The overview of the attempts}
+\label{sec:quiz-attempts-overview}
+
+The overview counts the attempts and students, how many attempts answered
+all, some or none of their questions, and, for a New Quiz with a time
+limit, how many ended before, at or beyond the limit.
+For those that ended at the limit it repeats the answered breakdown, which
+is what shows whether they were abandoned.
+Finally it gives the median time of the attempts that answered every
+question before the limit, the time a student who did the whole quiz
+needed.
+The overview describes the attempts that [[--answered]] and
+[[--attempts]] kept, but before [[--skip-unanswered]], which would make
+every attempt look complete.
+<<functions>>=
+def attempt_overview(responses, time_limit=None):
+  """Returns a Markdown paragraph summarising the attempts in `responses`
+
+  `time_limit` is the quiz's time limit in seconds, None if it has none.
+  """
+  <<collect each attempt's answered count and time>>
+  <<write the attempt counts>>
+  <<write the time of the attempts>>
+  return " ".join(sentences) + "\n\n"
+@
+
+The records are answers, so we first gather them into attempts, keyed by
+student and attempt number as in [[filter_answered]].
+All answers of an attempt carry the same time, so any of them gives it.
+<<collect each attempt's answered count and time>>=
+attempts = defaultdict(lambda: {"answered": 0, "questions": 0,
+                                "elapsed": None})
+for response in responses:
+  attempt = attempts[(response.student_id, response.attempt)]
+  attempt["questions"] += 1
+  attempt["answered"] += response.answered
+  attempt["elapsed"] = response.elapsed
+@
+
+An attempt answered all, some or none of its questions, and the overview
+gives that breakdown twice---for all attempts, and for those that ended at
+the limit---so it is a function of its own, as is the plural that the
+counts of one attempt or one student need.
+<<functions>>=
+def answered_class(attempt):
+  """Returns "all", "some" or "none": how much of `attempt` was answered"""
+  if attempt["answered"] == attempt["questions"]:
+    return "all"
+  return "none" if attempt["answered"] == 0 else "some"
+
+def answered_breakdown(attempts):
+  """Returns how many of `attempts` answered all, some or no questions"""
+  counts = Counter(answered_class(attempt) for attempt in attempts)
+  return (f"{counts['all']} answered every question, "
+          f"{counts['some']} some and {counts['none']} none")
+
+def counted(number, noun):
+  """Returns `number` and `noun`, in the plural unless `number` is 1"""
+  return f"{number} {noun}" + ("" if number == 1 else "s")
+@
+
+The first sentence counts the attempts and students and gives the
+breakdown.
+<<write the attempt counts>>=
+students = {student_id for student_id, _ in attempts}
+sentences = [f"{counted(len(attempts), 'attempt')} by "
+             f"{counted(len(students), 'student')}: "
+             f"{answered_breakdown(attempts.values())}."]
+@
+
+The sentences about time only make sense when the attempts have times,
+that is for a New Quiz, and they compare the times with the limit as
+[[time_class]] does.
+The median is taken over complete attempts before the limit only, since
+an attempt cut off by the limit, or answered only in part, says nothing
+about how long the whole quiz takes.
+<<write the time of the attempts>>=
+classes = defaultdict(list)
+for attempt in attempts.values():
+  classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
+if any(attempt["elapsed"] is not None for attempt in attempts.values()):
+  if not time_limit:
+    sentences.append("The quiz has no time limit, so the time of the "
+                     "attempts is not summarised.")
+  else:
+    sentences.append(
+      f"With a time limit of {format_time_limit(time_limit)}, "
+      f"{len(classes['before'])} ended before the limit, "
+      f"{len(classes['at'])} at it and "
+      f"{len(classes['beyond'])} were reported as longer.")
+    if classes["at"]:
+      sentences.append(f"Of those that ended at the limit, "
+                       f"{answered_breakdown(classes['at'])}.")
+    complete = [attempt["elapsed"] for attempt in classes["before"]
+                if answered_class(attempt) == "all"]
+    if complete:
+      sentences.append(
+        "The attempts that answered every question before the limit took "
+        f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
+        "(median).")
+@
+
+Let's verify the overview on a quiz with a 60-minute limit: one attempt
+answered everything in 20 minutes, one was submitted at the limit with
+nothing answered, one was reported as longer than the limit, and one
+answered only some questions in 10 minutes, which must not count towards
+the median time of a complete attempt.
+A Classic Quiz, whose records have no time, gets only the counts.
+<<test functions>>=
+def timed_answers(student, elapsed, *answers):
+  """The records of one attempt that took `elapsed` seconds"""
+  return [dataclasses.replace(answer_record(student, 1, position, answer,
+                                            answer is not None),
+                              elapsed=elapsed)
+          for position, answer in enumerate(answers, start=1)]
+
+def test_attempt_overview_separates_abandoned_attempts():
+  responses = (timed_answers(1, 1200, "A", "B")
+               + timed_answers(2, 3600, None, None)
+               + timed_answers(3, 7200, "A", None)
+               + timed_answers(4, 600, "A", None))
+
+  overview = quizzes.attempt_overview(responses, time_limit=3600)
+
+  assert overview.startswith("4 attempts by 4 students: 1 answered every "
+                             "question, 2 some and 1 none.")
+  assert "2 ended before the limit, 1 at it and 1 were reported as " \
+         "longer." in overview
+  assert "Of those that ended at the limit, 0 answered every question, " \
+         "0 some and 1 none." in overview
+  assert "took 20 minutes (median)" in overview
+  untimed = quizzes.attempt_overview([answer_record(1, 1, 1)])
+  assert untimed.startswith("1 attempt by 1 student:")
+  assert "limit" not in untimed
+
+def test_attempt_overview_ignores_time_without_a_limit():
+  overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
+  assert "no time limit" in overview and "ended" not in overview
 @
 
 \subsection{Every answer as a row}
@@ -4325,8 +4402,10 @@ Let's verify one row against its record.
 def test_attempt_table_writes_one_row_per_answer():
   out = io.StringIO()
   quizzes.write_attempt_table(
-    [answer_record(7, 2, 3, "AES", False)], "Quiz", "\t", file=out)
-  header, row = out.getvalue().splitlines()
+    [answer_record(7, 2, 3, "AES", False), answer_record(7, 3, 3, "x", None)],
+    "Quiz", "\t", file=out)
+  header, row, unknown = out.getvalue().splitlines()
+  assert unknown.split("\t")[-1] == ""
   assert header.split("\t")[:4] == ["quiz", "student_id", "student", "attempt"]
   assert row.split("\t") == ["Quiz", "7", "Student 7", "2", "", "3", "3",
                              "Question 3", "AES", "0", "0"]
