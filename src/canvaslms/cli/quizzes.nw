@@ -282,8 +282,11 @@ canvaslms quizzes items add --example
 The [[quizzes analyse]] command provides statistical analysis and AI-generated
 summaries of quiz and survey responses.  It supports two modes: fetching data
 directly from Canvas or analyzing a downloaded CSV file.
-It pools the answers of all students into one distribution per question;
-to see how students did over several attempts at a quiz, use
+It pools the answers of all students into one distribution per question.
+For a New Quiz it counts every attempt unless [[--attempts]] or
+[[--answered]] selects some; a Classic Quiz's report has only the attempt
+of each student that counts for the grade.
+To see how students did over several attempts at a quiz, use
 [[quizzes attempts]] instead (\cref{sec:quiz-attempts}).
 
 \subsection{Analyzing a CSV file}
@@ -707,6 +710,7 @@ analyse_parser.add_argument("--use-minted",
     metavar="LANG")
 
 <<AI summary options>>
+<<attempt options of analyse>>
 
 try:
   courses.add_course_option(analyse_parser, required=False)
@@ -1273,6 +1277,7 @@ is identical.
 A file given with [[--csv]] is read as it is; a missing or empty file is
 an error, since there is nothing else to analyse.
 <<read the CSV file into [[row_sets]]>>=
+warn_attempt_options_ignored(args, args.csv)
 try:
   with open(args.csv, 'r') as f:
     rows = list(csv.DictReader(f))
@@ -3041,8 +3046,10 @@ We compared the two formats of one report and found the answers identical,
 all 5580 of them, so reading JSON changes the titles but no answer.
 <<read the attempts at the New Quiz as [[rows]]>>=
 try:
-  rows = attempt_rows(fetch_new_quiz_attempts(
-    quiz, canvas._Canvas__requester))
+  rows = attempt_rows(select_attempts(
+    filter_answered(fetch_new_quiz_attempts(quiz, canvas._Canvas__requester),
+                    args.answered),
+    args.attempts))
 except canvaslms.cli.EmptyListError as error:
   canvaslms.cli.warn(str(error))
   continue
@@ -3076,6 +3083,84 @@ def test_analyse_reads_a_new_quiz_with_its_code(capsys):
   assert "- DES: 1 (50.0%)" in out and "- AES: 1 (50.0%)" in out
 @
 
+\subsection{Which attempts [[analyse]] counts}
+
+The two quiz systems' reports cover attempts differently.
+We measured both on 23 November 2026:
+\begin{description}
+\item[Classic Quizzes] The report has one row per student, even though we
+  ask for [[includes_all_versions]].
+  The row is the attempt that counts for the grade: in a quiz that keeps
+  the highest score, it was the attempt with the highest score for all 21
+  students who had made several attempts, and for one of them that was the
+  first attempt, not the latest.
+\item[New Quizzes] The records have every attempt, so by default
+  [[analyse]] pools them, and a student with eight attempts weighs eight
+  times as much as one with a single attempt.
+\end{description}
+For New Quizzes, [[analyse]] therefore takes the selections of
+[[quizzes attempts]] (\cref{sec:quiz-attempts-abandoned}):
+[[--attempts first]], [[last]] or [[best]] keeps one attempt per student,
+and [[--answered some]] or [[all]] drops abandoned or incomplete attempts.
+[[--attempts best]] comes closest to the row of a Classic Quiz that keeps
+the highest score.
+The default stays [[all]], as before.
+<<attempt options of analyse>>=
+analyse_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
+    default="all",
+    help="New Quizzes: which attempts to analyse: all (default), or each "
+         "student's first, last or best (most points). A Classic Quiz's "
+         "report has only the attempt that counts")
+analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
+    default="any",
+    help="New Quizzes: which attempts to keep: any (default), those that "
+         "answered some question, or those that answered all")
+@
+
+For a Classic Quiz, and for a CSV file, whose attempts we cannot tell
+apart, the selections cannot apply.
+Rather than silently analysing something else than asked for, we say so,
+and point to the command that has every attempt of a Classic Quiz.
+<<functions>>=
+def warn_attempt_options_ignored(args, source):
+  """Warns if `args` select attempts that `source` cannot be selected from"""
+  if args.attempts != "all" or args.answered != "any":
+    canvaslms.cli.warn(
+      f"{source}: --attempts and --answered apply only to New Quizzes read "
+      "from Canvas; a Classic Quiz's report has only the attempt that "
+      "counts, and quizzes attempts reads all of them")
+@
+
+Let's verify that a selection reaches the New Quiz's rows, and that it is
+reported as ignored for a CSV file.
+<<test functions>>=
+def run_analyse(course, *options):
+  """Run quizzes analyse on `course` with the command-line `options`"""
+  parser = argparse.ArgumentParser()
+  quizzes.add_command(parser.add_subparsers())
+  args = parser.parse_args(["quizzes", "analyse", *options])
+  canvas = MagicMock()
+  canvas._Canvas__requester = course._requester if course else None
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    args.func({}, canvas, args)
+
+@responses.activate
+def test_analyse_selects_the_attempts_of_a_new_quiz(capsys):
+  run_analyse(course_with_attempts(), "-c", "SBX", "-a", "Ciph",
+              "--attempts", "first")
+  out = capsys.readouterr().out
+  assert "- DES: 1 (100.0%)" in out and "AES" not in out
+
+def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
+                                                          capsys):
+  report = tmp_path / "report.csv"
+  report.write_text('name,id,"1: Which?"\nStudent,5,AES\n')
+  run_analyse(None, "--csv", str(report), "--attempts", "last")
+  assert "apply only to New Quizzes read from Canvas" in caplog.text
+  assert "- AES: 1 (100.0%)" in capsys.readouterr().out
+@
+
 \subsection{Downloading a Classic Quiz report}
 
 For a Classic Quiz, we generate the report, poll until it is ready and
@@ -3093,6 +3178,7 @@ An earlier version wrote each download to a temporary file, which the
 processing then read back, and never removed the files; we parse the
 downloaded text directly instead.
 <<download the Classic Quiz report as [[rows]]>>=
+warn_attempt_options_ignored(args, quiz.title)
 file_url = None
 try:
   report = quiz.create_report(report_type='student_analysis',
