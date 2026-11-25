@@ -5251,7 +5251,7 @@ def attempt_overview(responses, time_limit=None, builds_on_last=False):
 
   `time_limit` is the quiz's time limit in seconds, None if it has none;
   `builds_on_last` is true for a quiz whose attempts build on the last one,
-  whose times are then summarised over first attempts only.
+  whose times are then summarised over attempts that start afresh.
   """
   <<collect each attempt's answered count and time>>
   <<write the attempt counts>>
@@ -5318,41 +5318,70 @@ We saw this in the reports: in a quiz that builds on the last attempt, the
 median first attempt took 38 minutes and the median later one 18, and in
 another 13 and 2, whereas in a quiz that does not, the two were 60 and 57
 minutes.
-For such a quiz we summarise the times of first attempts only---attempt 1,
-not each student's earliest selected attempt, which after
-[[--attempts last]] would be a later one---and say so.
+For such a quiz we summarise the times only of attempts that start
+afresh, and say so.
+An attempt starts afresh when it is the student's attempt 1, or when every
+earlier attempt of the student is among those selected and answered
+nothing: it then builds on no answers, as is common after an attempt
+abandoned at the limit.
+It is not each student's earliest selected attempt, which after
+[[--attempts last]] would be a later one; after [[--attempts last]] or
+[[best]] only students whose selected attempt starts afresh are timed, and
+when none does, the overview says so instead of giving empty counts.
 The table view still gives every attempt's own time.
+<<functions>>=
+def starts_afresh(key, attempts):
+  """True if the attempt `key` (student, attempt) builds on no answers
+
+  `attempts` maps each (student, attempt) to its counts, as in
+  `attempt_overview`.
+  """
+  student, number = key
+  return all((student, earlier) in attempts
+             and attempts[(student, earlier)]["answered"] == 0
+             for earlier in range(1, number))
+@
 <<write the time of the attempts>>=
 timed = attempts
 if builds_on_last:
-  timed = {key: attempt for key, attempt in attempts.items() if key[1] == 1}
-classes = defaultdict(list)
-for attempt in timed.values():
-  classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
+  timed = {key: attempt for key, attempt in attempts.items()
+           if starts_afresh(key, attempts)}
 if any(attempt["elapsed"] is not None for attempt in attempts.values()):
-  if builds_on_last:
-    sentences.append("The quiz builds on each student's last attempt, so a "
-                     "later attempt's time covers only what it adds; the "
-                     f"times are of the {counted(len(timed), 'first attempt')}.")
   if not time_limit:
     sentences.append("The quiz has no time limit, so the time of the "
                      "attempts is not summarised.")
+  elif builds_on_last and not timed:
+    sentences.append("The quiz builds on each student's last attempt, and "
+                     "none of these attempts starts afresh, so their time "
+                     "is not summarised.")
   else:
-    sentences.append(
-      f"With a time limit of {format_time_limit(time_limit)}, "
-      f"{len(classes['before'])} ended before the limit, "
-      f"{len(classes['at'])} at it and "
-      f"{len(classes['beyond'])} were reported as longer.")
-    if classes["at"]:
-      sentences.append(f"Of those that ended at the limit, "
-                       f"{answered_breakdown(classes['at'])}.")
-    complete = [attempt["elapsed"] for attempt in classes["before"]
-                if answered_class(attempt) == "all"]
-    if complete:
+    if builds_on_last:
       sentences.append(
-        "The attempts that answered every question before the limit took "
-        f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
-        "(median).")
+        "The quiz builds on each student's last attempt, so a later "
+        "attempt's time covers only what it adds; the times are of the "
+        f"{counted(len(timed), 'attempt')} that started afresh.")
+    <<compare the times with the limit>>
+@
+
+<<compare the times with the limit>>=
+classes = defaultdict(list)
+for attempt in timed.values():
+  classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
+sentences.append(
+  f"With a time limit of {format_time_limit(time_limit)}, "
+  f"{len(classes['before'])} ended before the limit, "
+  f"{len(classes['at'])} at it and "
+  f"{len(classes['beyond'])} were reported as longer.")
+if classes["at"]:
+  sentences.append(f"Of those that ended at the limit, "
+                   f"{answered_breakdown(classes['at'])}.")
+complete = [attempt["elapsed"] for attempt in classes["before"]
+            if answered_class(attempt) == "all"]
+if complete:
+  sentences.append(
+    "The attempts that answered every question before the limit took "
+    f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
+    "(median).")
 @
 
 Let's verify the overview on a quiz with a 60-minute limit: one attempt
@@ -5388,16 +5417,29 @@ def test_attempt_overview_separates_abandoned_attempts():
   assert untimed.startswith("1 attempt by 1 student:")
   assert "limit" not in untimed
 
-def test_attempt_overview_times_only_first_attempts_that_are_built_on():
-  responses = (timed_answers(1, 1200, "A", "B")
-               + [dataclasses.replace(r, attempt=2)
-                  for r in timed_answers(1, 300, "A", "B")])
+def attempt_records(student, attempt, elapsed, *answers):
+  """The records of one attempt of `student` that took `elapsed` seconds"""
+  return [dataclasses.replace(r, attempt=attempt)
+          for r in timed_answers(student, elapsed, *answers)]
+
+def test_attempt_overview_times_attempts_that_start_afresh():
+  responses = (attempt_records(1, 1, 1200, "A", "B")
+               + attempt_records(1, 2, 300, "A", "B")
+               + attempt_records(2, 1, 3600, None, None)
+               + attempt_records(2, 2, 1800, "A", "B"))
   built_on = quizzes.attempt_overview(responses, 3600, builds_on_last=True)
-  assert "the times are of the 1 first attempt." in built_on
-  assert "took 20 minutes (median)" in built_on
-  assert "1 ended before the limit" in built_on
+  assert "the times are of the 3 attempts that started afresh." in built_on
+  assert "took 25 minutes (median)" in built_on
   plain = quizzes.attempt_overview(responses, 3600)
-  assert "took 12 minutes (median)" in plain and "first attempt" not in plain
+  assert "took 20 minutes (median)" in plain and "afresh" not in plain
+  last = quizzes.select_attempts(responses, "last")
+  assert "none of these attempts starts afresh" in \
+    quizzes.attempt_overview(last, 3600, builds_on_last=True)
+  later = [r for r in responses if r.attempt == 2]
+  assert "none of these attempts starts afresh" in \
+    quizzes.attempt_overview(later, 3600, builds_on_last=True)
+  untimed = quizzes.attempt_overview(responses, None, builds_on_last=True)
+  assert "no time limit" in untimed and "afresh" not in untimed
 
 def test_attempt_overview_ignores_time_without_a_limit():
   overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
@@ -5787,7 +5829,7 @@ def test_attempts_command_leaves_out_abandoned_attempts(
 @
 
 A quiz whose attempts build on the last one says so in its settings, and
-the overview then times only first attempts.
+the overview then times only attempts that start afresh.
 <<test functions>>=
 @responses.activate
 def test_attempts_command_reads_build_on_last_attempt(capsys):
