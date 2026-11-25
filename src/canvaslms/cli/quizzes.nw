@@ -3205,6 +3205,8 @@ analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
     help="Which attempts to keep: any (default), those that answered some "
          "question, or those that answered all. A Classic Quiz is then read "
          "from its submission history")
+parser = analyse_parser
+<<add the attempt period options to [[parser]]>>
 @
 
 The history of a Classic Quiz is the history of its assignment, so a
@@ -3221,7 +3223,9 @@ reads the same from both we have not seen.
 <<functions>>=
 def selects_attempts(args):
   """True if `args` ask for other attempts than all of them"""
-  return args.attempts != "all" or args.answered != "any"
+  return (args.attempts != "all" or args.answered != "any"
+          or bool(getattr(args, "started_after", None))
+          or bool(getattr(args, "started_before", None)))
 
 def has_attempt_history(quiz):
   """True if Classic `quiz` has a submission history we may read"""
@@ -4746,13 +4750,90 @@ def lacking_attempt_one(responses):
                          if response.attempt == 1})
 
 def pick_attempts(responses, args):
-  """Returns the `responses` that `--attempts` and `--answered` keep
+  """Returns the `responses` that the attempt options of `args` keep
 
-  `--attempts` picks an attempt per student first; `--answered` then
-  drops a picked attempt that did not answer enough.
+  `--started-after` and `--started-before` bound the attempts considered;
+  `--attempts` then picks an attempt per student, and `--answered` drops a
+  picked attempt that did not answer enough.
   """
+  responses = filter_started(responses,
+                             getattr(args, "started_after", None),
+                             getattr(args, "started_before", None))
   return filter_answered(select_attempts(responses, args.attempts),
                          args.answered)
+@
+
+\paragraph{Attempts started in a period.}
+A quiz's settings can change while students take it.
+One practice exam had no time limit until 23 November, when its author set
+one, so its earlier attempts were left open for up to 36 days---the
+attempts \enquote{reported as longer} than the limit in its overview---and
+compare to nothing after.
+[[--started-after]] and [[--started-before]] keep the attempts that
+started in a period, so that each setting's attempts can be analysed
+apart, and they apply before [[--attempts]], so that \enquote{first} is
+the first attempt of the period.
+An attempt started when it was submitted less the time it took; a Classic
+Quiz records no time per attempt, so there the submission time stands in.
+The times are read as everywhere in canvaslms ([[parse_date]] in
+\cref{sec:utils:date-parsing}), in local time unless a zone is given.
+<<functions>>=
+def attempt_start(response):
+  """Returns when the attempt of `response` started, or None if unknown"""
+  if not response.submitted:
+    return None
+  submitted = arrow.get(response.submitted)
+  if response.elapsed is None:
+    return submitted
+  return submitted.shift(seconds=-response.elapsed)
+
+def filter_started(responses, after=None, before=None):
+  """Returns the `responses` whose attempt started in [`after`, `before`)
+
+  `after` and `before` are times as canvaslms reads them, or None for no
+  bound.  An attempt whose start is unknown is left out when a bound is
+  given.
+  """
+  if not after and not before:
+    return list(responses)
+  after = arrow.get(canvaslms.cli.utils.parse_date(after)) if after else None
+  before = (arrow.get(canvaslms.cli.utils.parse_date(before)) if before
+            else None)
+  def within(response):
+    start = attempt_start(response)
+    return (start is not None and (after is None or start >= after)
+            and (before is None or start < before))
+  return [response for response in responses if within(response)]
+<<add the attempt period options to [[parser]]>>=
+parser.add_argument("--started-after", metavar="TIME",
+  help="Keep only attempts started at TIME or later (local time unless "
+       "a zone is given)")
+parser.add_argument("--started-before", metavar="TIME",
+  help="Keep only attempts started before TIME")
+@
+
+Let's verify the period on three attempts, which started at 10:00, 12:00
+and 14:00 UTC; the first took half an hour and the last an hour, so they
+were submitted at 10:30 and 15:00, and a period from 10:15 to 11:00 holds
+no start.
+<<test functions>>=
+def test_filter_started_keeps_the_attempts_of_a_period():
+  responses = [dataclasses.replace(answer_record(student, 1, 1),
+                                   submitted=submitted, elapsed=elapsed)
+               for student, submitted, elapsed in (
+                 (1, "2026-11-23T10:30:00Z", 1800),
+                 (2, "2026-11-23T12:00:00Z", None),
+                 (3, "2026-11-23T15:00:00Z", 3600))]
+  def students(after, before):
+    return [r.student_id
+            for r in quizzes.filter_started(responses, after, before)]
+  assert students(None, None) == [1, 2, 3]
+  assert students("2026-11-23T12:00:00Z", None) == [2, 3]
+  assert students(None, "2026-11-23T14:00:00+00:00") == [1, 2]
+  assert students("2026-11-23T11:00:00Z", "2026-11-23T13:00:00Z") == [2]
+  assert students("2026-11-23T10:15:00Z", "2026-11-23T11:00:00Z") == []
+  unknown = [answer_record(4, 1, 1)]
+  assert quizzes.filter_started(unknown, "2026-11-23T12:00:00Z") == []
 @
 
 Let's verify the four selections on two students: student 1 has three
@@ -5743,6 +5824,8 @@ attempts_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
 attempts_parser.add_argument("--skip-unanswered", action="store_true",
   help="Leave out questions left unanswered, so that a blank is not "
        "counted as a failed try")
+parser = attempts_parser
+<<add the attempt period options to [[parser]]>>
 @
 
 The selections apply in the order \cref{sec:quiz-attempts-abandoned}
@@ -6011,6 +6094,20 @@ def test_attempts_command_names_students_without_attempt_one(capsys):
   out = capsys.readouterr().out
   assert "1 attempt by 1 student:" in out
   assert "1 student with no attempt 1 in the report is left out." in out
+@
+
+The period options reach both quiz systems through the command: the
+attempts in these tests were submitted on 20 November.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_keeps_the_attempts_of_a_period(capsys, caplog):
+  run_attempts(course_with_attempts(), "-a", ".",
+               "--started-before", "2026-11-21")
+  assert "## Honour code" in capsys.readouterr().out
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_attempts(course_with_attempts(), "-a", ".",
+                 "--started-after", "2026-11-21")
+  assert "Ciphers: no submitted attempts" in caplog.text
 @
 
 The options keep the views apart and require a quiz.
