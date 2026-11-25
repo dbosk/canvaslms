@@ -1283,7 +1283,7 @@ is identical.
 A file given with [[--csv]] is read as it is; a missing, unreadable or
 empty file is an error, since there is nothing else to analyse.
 <<read the CSV file into [[row_sets]]>>=
-warn_attempt_options_ignored(args, args.csv)
+warn_attempt_options_ignored(args, args.csv, "a CSV file is analysed as it is")
 try:
   with open(args.csv, 'r') as f:
     rows = list(csv.DictReader(f))
@@ -3026,6 +3026,8 @@ except Exception as e:
 for quiz in quiz_list:
   if is_new_quiz(quiz):
     <<read the attempts at the New Quiz as [[rows]]>>
+  elif selects_attempts(args) and has_attempt_history(quiz):
+    <<read the attempts at the Classic Quiz as [[rows]]>>
   else:
     <<download the Classic Quiz report as [[rows]]>>
   if rows:
@@ -3131,13 +3133,18 @@ We measured both on 23 November 2026:
   [[analyse]] pools them, and a student with eight attempts weighs eight
   times as much as one with a single attempt.
 \end{description}
-For New Quizzes, [[analyse]] therefore takes the selections of
-[[quizzes attempts]] (\cref{sec:quiz-attempts-abandoned}):
-[[--attempts first]], [[last]] or [[best]] keeps one attempt per student,
-and [[--answered some]] or [[all]] drops abandoned or incomplete attempts.
-[[--attempts best]] comes closest to the row of a Classic Quiz that keeps
-the highest score.
-The default stays [[all]], as before.
+[[analyse]] therefore takes the selections of [[quizzes attempts]]
+(\cref{sec:quiz-attempts-abandoned}): [[--attempts first]], [[last]] or
+[[best]] keeps one attempt per student, and [[--answered some]] or [[all]]
+drops abandoned or incomplete attempts.
+For a New Quiz they apply to the report's records.
+For a Classic Quiz, whose report has only the attempt that counts, they
+make [[analyse]] read the attempts from the quiz's submission history
+instead, as [[quizzes attempts]] does (\cref{sec:quiz-attempts}).
+[[--attempts best]] comes closest to the report's row of a Classic Quiz
+that keeps the highest score.
+The default stays [[all]] and [[any]], so that without the options both
+systems are read as before.
 <<attempt options of analyse>>=
 analyse_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
     default="all",
@@ -3150,24 +3157,59 @@ analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
          "answered some question, or those that answered all")
 @
 
-For a Classic Quiz, whose report has one attempt per student, and for a
-CSV file, which we analyse as it is, the selections cannot apply.
-Rather than silently analysing something else than asked for, we say so,
-and point to the command that has every attempt of a Classic Quiz.
+The history of a Classic Quiz is the history of its assignment, so a
+quiz without an assignment, such as an ungraded survey, has none.
+Nor do we read it for a quiz with anonymous submissions: the history names
+each student, which the report of such a quiz is meant not to.
+A course evaluation in a programming course was both, and keeps its report.
+On two Classic Quizzes of the same course, the rows from the history gave
+the same answer distributions as the report, question by question, with
+[[--attempts best]]; those quizzes had multiple-choice questions only, so
+whether an essay's answer reads the same from both we have not seen.
 <<functions>>=
-def warn_attempt_options_ignored(args, source):
-  """Warns if `args` select attempts that `source` cannot be selected from"""
-  if args.attempts != "all" or args.answered != "any":
+def selects_attempts(args):
+  """True if `args` ask for other attempts than all of them"""
+  return args.attempts != "all" or args.answered != "any"
+
+def has_attempt_history(quiz):
+  """True if Classic `quiz` has a submission history we may read"""
+  return (bool(getattr(quiz, "assignment_id", None))
+          and not getattr(quiz, "anonymous_submissions", False))
+@
+
+The attempts are read and selected as for a New Quiz, and a quiz whose
+history Canvas would not give is skipped with a warning.
+<<read the attempts at the Classic Quiz as [[rows]]>>=
+try:
+  rows = attempt_rows(select_attempts(
+    filter_answered(fetch_classic_attempts(quiz), args.answered),
+    args.attempts))
+except canvaslms.cli.EmptyListError as error:
+  canvaslms.cli.warn(str(error))
+  continue
+except (CanvasException, requests.RequestException) as error:
+  canvaslms.cli.warn(f"{quiz.title}: could not read the attempts: {error}")
+  continue
+@
+
+For a Classic Quiz without such a history, and for a CSV file, which we
+analyse as it is, the selections cannot apply.
+Rather than silently analysing something else than asked for, we say so.
+<<functions>>=
+def warn_attempt_options_ignored(args, source, reason):
+  """Warns, giving `reason`, if `args` select attempts `source` lacks"""
+  if selects_attempts(args):
     canvaslms.cli.warn(
-      f"{source}: --attempts and --answered apply only to New Quizzes read "
-      "from Canvas; a Classic Quiz's report has only the attempt that "
-      "counts, and quizzes attempts reads all of them")
+      f"{source}: --attempts and --answered do not apply: {reason}")
 @
 
 Let's verify that each selection reaches the New Quiz's rows: student 5
 first answered one of two questions, wrongly, then both, rightly.
-For a Classic Quiz, whose report we download and parse, and for a CSV
-file, the selection is reported as ignored.
+A Classic Quiz is read from its report without the options and from its
+history with them: student 7 answered \enquote{Yes} first and
+\enquote{No} then.
+A Classic Quiz with anonymous submissions, and a CSV file, keep what they
+have, and the selection is reported as ignored.
 <<test functions>>=
 @pytest.mark.parametrize("options", [["--attempts", "first"],
                                      ["--answered", "all"]])
@@ -3187,27 +3229,46 @@ def test_analyse_selects_the_attempts_of_a_new_quiz(capsys, options):
   else:
     assert "- AES: 1 (100.0%)" in out and "DES" not in out
 
-@responses.activate
-def test_analyse_reads_a_classic_report_and_says_options_do_not_apply(
-    capsys, caplog):
-  course = course_with_attempts()
+def classic_report(answer):
+  """Answer Classic Quiz 9's report request with one row answering `answer`"""
   report = {"id": 2, "quiz_id": 9, "report_type": "student_analysis",
             "includes_all_versions": True,
             "file": {"url": "https://files.example.invalid/c.csv"}}
   responses.post(f"{CACHE_API}/courses/1/quizzes/9/reports", json=report)
   responses.get(f"{CACHE_API}/courses/1/quizzes/9/reports/2", json=report)
   responses.get("https://files.example.invalid/c.csv",
-                body='name,id,"11: Allowed?"\nStudent Seven,7,No\n')
-  run_analyse(course, "-c", "SBX", "-a", "Honour", "--answered", "some")
+                body=f'name,id,"11: Allowed?"\nStudent Seven,7,{answer}\n')
+
+@responses.activate
+def test_analyse_reads_a_classic_report_without_options(capsys, caplog):
+  course = course_with_attempts()
+  classic_report("No")
+  run_analyse(course, "-c", "SBX", "-a", "Honour")
   assert "- No: 1 (100.0%)" in capsys.readouterr().out
-  assert "Honour code: --attempts and --answered apply only" in caplog.text
+  assert "do not apply" not in caplog.text
+
+@responses.activate
+def test_analyse_selects_the_attempts_of_a_classic_quiz(capsys):
+  run_analyse(course_with_attempts(), "-c", "SBX", "-a", "Honour",
+              "--attempts", "first")
+  assert "- Yes: 1 (100.0%)" in capsys.readouterr().out
+
+@responses.activate
+def test_analyse_keeps_the_report_of_an_anonymous_quiz(capsys, caplog):
+  course = course_with_attempts({
+    "id": 9, "title": "Honour code", "course_id": 1, "assignment_id": 50,
+    "quiz_type": "graded_survey", "anonymous_submissions": True})
+  classic_report("No")
+  run_analyse(course, "-c", "SBX", "-a", "Honour", "--attempts", "first")
+  assert "- No: 1 (100.0%)" in capsys.readouterr().out
+  assert "Honour code: --attempts and --answered do not apply" in caplog.text
 
 def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
                                                           capsys):
   report = tmp_path / "report.csv"
   report.write_text('name,id,"1: Which?"\nStudent,5,AES\n')
   run_analyse(None, "--csv", str(report), "--attempts", "last")
-  assert "apply only to New Quizzes read from Canvas" in caplog.text
+  assert "do not apply: a CSV file is analysed as it is" in caplog.text
   assert "- AES: 1 (100.0%)" in capsys.readouterr().out
 
 def test_analyse_refuses_an_unreadable_csv_file(tmp_path, caplog):
@@ -3235,7 +3296,9 @@ An earlier version wrote each download to a temporary file, which the
 processing then read back, and never removed the files; we parse the
 downloaded text directly instead.
 <<download the Classic Quiz report as [[rows]]>>=
-warn_attempt_options_ignored(args, quiz.title)
+warn_attempt_options_ignored(
+  args, quiz.title, "the quiz has no assignment or has anonymous "
+  "submissions, so it has no history of attempts to read")
 file_url = None
 try:
   report = quiz.create_report(report_type='student_analysis',
