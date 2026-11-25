@@ -3195,6 +3195,9 @@ instead, as [[quizzes attempts]] does (\cref{sec:quiz-attempts}).
 that keeps the highest score.
 The default stays [[all]] and [[any]], so that without the options both
 systems are read as before.
+The period options [[--started-after]] and [[--started-before]]
+(\cref{sec:quiz-attempts-abandoned}) select attempts too, and also make
+[[analyse]] read a Classic Quiz from its history.
 <<attempt options of analyse>>=
 analyse_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
     default="all",
@@ -3206,6 +3209,8 @@ analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
     help="Which attempts to keep: any (default), those that answered some "
          "question, or those that answered all; applied after --attempts. A "
          "Classic Quiz is then read from its submission history")
+parser = analyse_parser
+<<add the attempt period options to [[parser]]>>
 @
 
 The history of a Classic Quiz is the history of its assignment, so a
@@ -3222,7 +3227,9 @@ reads the same from both we have not seen.
 <<functions>>=
 def selects_attempts(args):
   """True if `args` ask for other attempts than all of them"""
-  return args.attempts != "all" or args.answered != "any"
+  return (args.attempts != "all" or args.answered != "any"
+          or bool(getattr(args, "started_after", None))
+          or bool(getattr(args, "started_before", None)))
 
 def has_attempt_history(quiz):
   """True if Classic `quiz` has a submission history we may read"""
@@ -3250,8 +3257,14 @@ Rather than silently analysing something else than asked for, we say so.
 def warn_attempt_options_ignored(args, source, reason):
   """Warns, giving `reason`, if `args` select attempts `source` lacks"""
   if selects_attempts(args):
+    given = [option for option, given in (
+      ("--attempts", args.attempts != "all"),
+      ("--answered", args.answered != "any"),
+      ("--started-after", getattr(args, "started_after", None)),
+      ("--started-before", getattr(args, "started_before", None))) if given]
     canvaslms.cli.warn(
-      f"{source}: --attempts and --answered do not apply: {reason}")
+      f"{source}: {' and '.join(given)} do"
+      f"{'es' if len(given) == 1 else ''} not apply: {reason}")
 @
 
 Let's verify that each selection reaches the New Quiz's rows: student 5
@@ -3328,7 +3341,7 @@ def test_analyse_keeps_the_report_of_an_anonymous_quiz(capsys, caplog):
   classic_report("No")
   run_analyse(course, "-c", "SBX", "-a", "Honour", "--attempts", "first")
   assert "- No: 1 (100.0%)" in capsys.readouterr().out
-  assert ("Honour code: --attempts and --answered do not apply: the quiz "
+  assert ("Honour code: --attempts does not apply: the quiz "
           "has anonymous submissions") in caplog.text
 
 @responses.activate
@@ -3344,8 +3357,11 @@ def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
                                                           capsys):
   report = tmp_path / "report.csv"
   report.write_text('name,id,"1: Which?"\nStudent,5,AES\n')
+  run_analyse(None, "--csv", str(report), "--started-after", "2026-11-21")
+  assert "--started-after does not apply" in caplog.text
   run_analyse(None, "--csv", str(report), "--attempts", "last")
-  assert "do not apply: a CSV file is analysed as it is" in caplog.text
+  assert "--attempts does not apply: a CSV file is analysed as it is" \
+    in caplog.text
   assert "- AES: 1 (100.0%)" in capsys.readouterr().out
 
 def test_analyse_leaves_out_a_classic_reports_summary_columns(tmp_path,
@@ -3473,7 +3489,7 @@ While the quiz is open, as formative practice: which questions take
 students many attempts, and what do they try before they get them right?
 After a quiz or an exam: how many got each question right on their first
 try, which wrong answers were common, and where did the students end up?
-The [[quizzes attempts]] command answers both, in three views:
+The [[quizzes attempts]] command answers both, in five views:
 \begin{description}
 \item[Difficulty, the default] One row per question: how many students
   answered it, how many got it right on their first try, how many
@@ -3484,13 +3500,20 @@ The [[quizzes attempts]] command answers both, in three views:
   attempt number, which shows what students try.
 \item[ [[--table]] ] Every answer as a row---student, attempt, question,
   answer, points, right---for one's own scripts.
+\item[ [[--options]] ] Every answer to each question, the right ones
+  included, counted per attempt.
+\item[ [[--combinations]] ] Across the quizzes selected, how many students
+  tried each combination of them.
 \end{description}
-The two Markdown views open with an overview of the attempts: how many
-answered all, some or none of the questions and, for a New Quiz with a
-time limit, how many ended at the limit.
+The Markdown views of a quiz open with an overview of its attempts: how
+many answered all, some or none of the questions and, for a New Quiz with
+a time limit, how many ended at the limit and how the times of complete
+attempts spread.
 Attempts that were opened and abandoned can be left out with
 [[--answered]], and blank answers with [[--skip-unanswered]]
-(\cref{sec:quiz-attempts-abandoned}).
+(\cref{sec:quiz-attempts-abandoned}); attempts from a period, such as
+before or after a change of the quiz's settings, are kept with
+[[--started-after]] and [[--started-before]].
 For example:
 \begin{minted}{bash}
 canvaslms quizzes attempts -c tilkry26 -a "INL1Quiz Ciphers"
@@ -4756,20 +4779,116 @@ def lacking_attempt_one(responses):
                          if response.attempt == 1})
 
 def pick_attempts(responses, args, title=None):
-  """Returns the `responses` that `--attempts` and `--answered` keep
+  """Returns the `responses` that the attempt options of `args` keep
 
-  `--attempts` picks an attempt per student first; `--answered` then
-  drops a picked attempt that did not answer enough.  With `title`, warns
-  about the students `--attempts first` leaves out for want of attempt 1.
+  `--started-after` and `--started-before` bound the attempts considered;
+  `--attempts` then picks an attempt per student, and `--answered` drops a
+  picked attempt that did not answer enough.  With `title`, warns about
+  the students `--attempts first` leaves out for want of attempt 1.
   """
+  responses = in_period(responses, args)
   if title and args.attempts == "first":
     lacking = lacking_attempt_one(responses)
     if lacking:
       canvaslms.cli.warn(f"{title}: {counted(lacking, 'student')} with no "
-                         "attempt 1 in the report "
+                         f"attempt 1 {attempt_one_scope(args)} "
                          f"{'is' if lacking == 1 else 'are'} left out")
   return filter_answered(select_attempts(responses, args.attempts),
                          args.answered)
+@
+
+\paragraph{Attempts started in a period.}
+A quiz's settings can change while students take it.
+One practice exam had no time limit until 23 November, when its author set
+one, so its earlier attempts were left open for up to 36 days---the
+attempts \enquote{reported as longer} than the limit in its overview---and
+compare to nothing after.
+[[--started-after]] and [[--started-before]] keep the attempts that
+started in a period, so that each setting's attempts can be analysed
+apart, and they apply before [[--attempts]], which picks among the
+attempts of the period.
+[[first]] still means attempt 1, so a student whose attempt 1 started
+before the period has no first attempt in it and is left out, with the
+warning saying \enquote{no attempt 1 in the period}: their later attempts
+were made by someone who had already seen the quiz.
+An attempt started when it was submitted less the time it took; a Classic
+Quiz records no time per attempt, so there the submission time stands in.
+A time given as [[none]] or [[clear]], which [[parse_date]] reads as no
+time, sets no bound.
+The times are read as everywhere in canvaslms ([[parse_date]] in
+\cref{sec:utils:date-parsing}), in local time unless a zone is given.
+<<functions>>=
+def attempt_start(response):
+  """Returns when the attempt of `response` started, or None if unknown"""
+  if not response.submitted:
+    return None
+  submitted = arrow.get(response.submitted)
+  if response.elapsed is None:
+    return submitted
+  return submitted.shift(seconds=-response.elapsed)
+
+def attempt_one_scope(args):
+  """Returns where attempt 1 was looked for: in the report or the period"""
+  if (getattr(args, "started_after", None)
+      or getattr(args, "started_before", None)):
+    return "in the period"
+  return "in the report"
+
+def in_period(responses, args):
+  """Returns the `responses` in the period of `--started-after/before`"""
+  return filter_started(responses, getattr(args, "started_after", None),
+                        getattr(args, "started_before", None))
+
+def filter_started(responses, after=None, before=None):
+  """Returns the `responses` whose attempt started in [`after`, `before`)
+
+  `after` and `before` are times as canvaslms reads them, or None for no
+  bound.  An attempt whose start is unknown is left out when a bound is
+  given.
+  """
+  if not after and not before:
+    return list(responses)
+  after = canvaslms.cli.utils.parse_date(after) if after else None
+  before = canvaslms.cli.utils.parse_date(before) if before else None
+  after = arrow.get(after) if after else None
+  before = arrow.get(before) if before else None
+  def within(response):
+    start = attempt_start(response)
+    return (start is not None and (after is None or start >= after)
+            and (before is None or start < before))
+  return [response for response in responses if within(response)]
+<<add the attempt period options to [[parser]]>>=
+parser.add_argument("--started-after", metavar="TIME",
+  help="Keep only attempts started at TIME or later (local time unless "
+       "a zone is given)")
+parser.add_argument("--started-before", metavar="TIME",
+  help="Keep only attempts started before TIME (local time unless a "
+       "zone is given)")
+@
+
+Let's verify the period on three attempts, which started at 10:00, 12:00
+and 14:00 UTC; the first took half an hour and the last an hour, so they
+were submitted at 10:30 and 15:00, and a period from 10:15 to 11:00 holds
+no start.
+<<test functions>>=
+def test_filter_started_keeps_the_attempts_of_a_period():
+  responses = [dataclasses.replace(answer_record(student, 1, 1),
+                                   submitted=submitted, elapsed=elapsed)
+               for student, submitted, elapsed in (
+                 (1, "2026-11-23T10:30:00Z", 1800),
+                 (2, "2026-11-23T12:00:00Z", None),
+                 (3, "2026-11-23T15:00:00Z", 3600))]
+  def students(after, before):
+    return [r.student_id
+            for r in quizzes.filter_started(responses, after, before)]
+  assert students(None, None) == [1, 2, 3]
+  assert students("2026-11-23T12:00:00Z", None) == [2, 3]
+  assert students(None, "2026-11-23T14:00:00+00:00") == [1, 2]
+  assert students("2026-11-23T11:00:00Z", "2026-11-23T13:00:00Z") == [2]
+  assert students("2026-11-23T10:15:00Z", "2026-11-23T11:00:00Z") == []
+  unknown = [answer_record(4, 1, 1)]
+  assert quizzes.filter_started(unknown, "2026-11-23T12:00:00Z") == []
+  assert students("none", "clear") == [1, 2, 3]
 @
 
 Let's verify the four selections on two students: student 1 has three
@@ -5380,24 +5499,25 @@ def time_class(elapsed, time_limit):
 The overview counts the attempts and students, how many attempts answered
 all, some or none of their questions, and, for a New Quiz with a time
 limit, how many ended before, at or beyond the limit.
-For those that ended at the limit it repeats the answered breakdown, which
-is what shows whether they were abandoned.
-Finally it gives the median time of the attempts that answered every
-question before the limit, the time a student who did the whole quiz
-needed.
-The overview describes the attempts that [[--answered]] and
-[[--attempts]] kept, but before [[--skip-unanswered]], which would make
-every attempt look complete.
+For those that ended at the limit it breaks down how much they answered,
+which is what shows whether they were abandoned, as a paragraph below
+explains.
+Finally it gives how long the attempts that answered every question before
+the limit took---the median and its spread---the time a student who did
+the whole quiz needed.
+The overview describes the attempts that the period options, [[--attempts]]
+and [[--answered]] kept, but before [[--skip-unanswered]], which would
+make every attempt look complete.
 <<functions>>=
 def attempt_overview(responses, time_limit=None, builds_on_last=False,
-                     lacking_first=0):
+                     lacking_first=0, lacking_scope="in the report"):
   """Returns a Markdown paragraph summarising the attempts in `responses`
 
   `time_limit` is the quiz's time limit in seconds, None if it has none;
   `builds_on_last` is true for a quiz whose attempts build on the last one,
   whose times are then summarised over attempts that start afresh;
   `lacking_first` is how many students `--attempts first` left out for
-  want of an attempt 1.
+  want of an attempt 1 `lacking_scope` (in the report or the period).
   """
   <<collect each attempt's answered count and time>>
   <<write the attempt counts>>
@@ -5449,7 +5569,7 @@ sentences = [f"{counted(len(attempts), 'attempt')} by "
              f"{answered_breakdown(attempts.values())}."]
 if lacking_first:
   sentences.append(f"{counted(lacking_first, 'student')} with no attempt 1 "
-                   "in the report "
+                   f"{lacking_scope} "
                    f"{'is' if lacking_first == 1 else 'are'} left out.")
 @
 
@@ -5525,14 +5645,73 @@ sentences.append(
   f"{len(classes['beyond'])} were reported as longer.")
 if classes["at"]:
   sentences.append(f"Of those that ended at the limit, "
-                   f"{answered_breakdown(classes['at'])}.")
+                   f"{answered_share_breakdown(classes['at'])}.")
 complete = [attempt["elapsed"] for attempt in classes["before"]
             if answered_class(attempt) == "all"]
 if complete:
   sentences.append(
     "The attempts that answered every question before the limit took "
     f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
-    "(median).")
+    f"(median){duration_spread(complete)}.")
+@
+
+\paragraph{The spread of the times.}
+A median alone hides how the times spread: whether most students needed
+nearly the whole hour, or a few needed much longer than the rest.
+So the overview adds the quartiles and the 90th percentile when there are
+enough complete attempts to give them---four, so that each quarter has one.
+And of the attempts that ended at the limit, \enquote{some} answered can
+mean one question or nearly all; we tell them apart by whether at least
+half the questions were answered, which separates an attempt abandoned
+early from one that ran out of time.
+<<functions>>=
+def duration_spread(seconds):
+  """Returns the quartiles and 90th percentile of `seconds`, as a clause"""
+  if len(seconds) < 4:
+    return ""
+  lower, _, upper = statistics.quantiles(seconds, n=4, method="inclusive")
+  ninetieth = statistics.quantiles(seconds, n=10, method="inclusive")[-1]
+  minutes = [value / SECONDS_PER_MINUTE for value in (lower, upper, ninetieth)]
+  return (f"; a quarter took under {minutes[0]:.0f}, a quarter over "
+          f"{minutes[1]:.0f} and a tenth over {minutes[2]:.0f} minutes")
+
+def answered_share_breakdown(attempts):
+  """Returns how many `attempts` answered none, under half, half or all"""
+  def share(attempt):
+    if attempt["answered"] == 0:
+      return "none"
+    if attempt["answered"] == attempt["questions"]:
+      return "all"
+    return ("under half" if attempt["answered"] * 2 < attempt["questions"]
+            else "half or more")
+  counts = Counter(share(attempt) for attempt in attempts)
+  return (f"{counts['all']} answered every question, "
+          f"{counts['half or more']} at least half, "
+          f"{counts['under half']} under half and {counts['none']} none")
+@
+
+Let's verify both on five complete attempts and three cut off by the
+limit, one with no answer, one with one of three and one with two.
+An attempt with exactly half answered counts as at least half.
+<<test functions>>=
+def test_attempt_overview_spreads_times_and_cut_off_attempts():
+  responses = []
+  for student, minutes in enumerate((10, 20, 30, 40, 50), start=1):
+    responses += timed_answers(student, minutes * 60, "A", "B", "C")
+  responses += (timed_answers(6, 3600, None, None, None)
+                + timed_answers(7, 3600, "A", None, None)
+                + timed_answers(8, 3600, "A", "B", None))
+  overview = quizzes.attempt_overview(responses, time_limit=3600)
+  assert ("took 30 minutes (median); a quarter took under 20, a quarter "
+          "over 40 and a tenth over 46 minutes.") in overview
+  assert ("Of those that ended at the limit, 0 answered every question, "
+          "1 at least half, 1 under half and 1 none.") in overview
+  assert "(median)." in quizzes.attempt_overview(responses[:9], 3600)
+  assert "a quarter took under" in quizzes.attempt_overview(responses[:12],
+                                                             3600)
+  assert quizzes.answered_share_breakdown(
+    [{"answered": 2, "questions": 4}]).startswith(
+      "0 answered every question, 1 at least half")
 @
 
 Let's verify the overview on a quiz with a 60-minute limit: one attempt
@@ -5562,7 +5741,7 @@ def test_attempt_overview_separates_abandoned_attempts():
   assert "2 ended before the limit, 1 at it and 1 were reported as " \
          "longer." in overview
   assert "Of those that ended at the limit, 0 answered every question, " \
-         "0 some and 1 none." in overview
+         "0 at least half, 0 under half and 1 none." in overview
   assert "took 20 minutes (median)" in overview
   untimed = quizzes.attempt_overview([answer_record(1, 1, 1)])
   assert untimed.startswith("1 attempt by 1 student:")
@@ -5595,6 +5774,166 @@ def test_attempt_overview_times_attempts_that_start_afresh():
 def test_attempt_overview_ignores_time_without_a_limit():
   overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
   assert "no time limit" in overview and "ended" not in overview
+@
+
+\subsection{How often each answer was given}
+
+The wrong answers show what students try; for a choice question a teacher
+also wants the whole distribution, the key included---how many chose the
+right option against each distractor.
+The view [[--options]] counts every answer to each question, per attempt,
+and marks it right, wrong or, when the records do not say or disagree,
+unknown.
+It counts answers, like [[--answers]], not students, and leaves out the
+questions left blank, which it counts apart.
+<<functions>>=
+def answers_by_attempt(responses):
+  """Returns every answer to each question, counted per attempt
+
+  Returns a list with a dict for each question, in quiz order: its
+  `position`, `question`, `skipped` count and `counts`, which maps each
+  answer to its `attempts` (a Counter of attempt numbers) and `right`
+  (True, False or None when unknown or mixed), most frequent first.
+  """
+  questions = {}
+  for response in responses:
+    entry = questions.setdefault(
+      (response.position, response.question_id),
+      {"position": response.position, "question": response.question,
+       "answers": defaultdict(lambda: {"attempts": Counter(),
+                                       "rights": set()}),
+       "skipped": 0})
+    if not response.answered:
+      entry["skipped"] += 1
+      continue
+    answer = entry["answers"][response.answer or ""]
+    answer["attempts"][response.attempt] += 1
+    answer["rights"].add(response.right)
+  summaries = []
+  for _, entry in sorted(questions.items()):
+    counts = {text: {"attempts": answer["attempts"],
+                     "right": (next(iter(answer["rights"]))
+                               if len(answer["rights"]) == 1 else None)}
+              for text, answer in entry["answers"].items()}
+    summaries.append({
+      "position": entry["position"], "question": entry["question"],
+      "skipped": entry["skipped"],
+      "counts": dict(sorted(counts.items(), key=lambda item:
+                            -sum(item[1]["attempts"].values())))})
+  return summaries
+
+def format_answer_counts(questions, title, overview=""):
+  """Returns `questions` from `answers_by_attempt` as Markdown"""
+  marks = {True: "right", False: "wrong", None: "?"}
+  lines = [f"## {markdown_cell(title)}\n\n", overview]
+  for summary in questions:
+    lines.append(f"### {position_label(summary['position'])} "
+                 f"{markdown_cell(create_short_title(summary['question'], 100))}"
+                 "\n\n")
+    if summary["counts"]:
+      lines.append("| Answer | Right | Times | By attempt |\n|---|---|---|---|\n")
+      for answer, count in summary["counts"].items():
+        by_attempt = ", ".join(f"{number}: {times}" for number, times
+                               in sorted(count["attempts"].items()))
+        lines.append(f"| {markdown_cell(answer)} | {marks[count['right']]} "
+                     f"| {sum(count['attempts'].values())} | {by_attempt} |\n")
+      lines.append("\n")
+    if summary["skipped"]:
+      lines.append(f"Left unanswered: {summary['skipped']}.\n\n")
+  return "".join(lines)
+@
+
+Let's verify the counts on one question answered right twice and wrong
+once on the first attempt and right on the second, with one blank, an
+answer the records call right once and wrong once, and one of unknown
+rightness.
+<<test functions>>=
+def test_answer_counts_include_the_key():
+  responses = [answer_record(1, 1, 1, "AES"), answer_record(2, 1, 1, "AES"),
+               answer_record(3, 1, 1, "DES", False),
+               answer_record(3, 2, 1, "AES"),
+               answer_record(4, 1, 1, None, False),
+               answer_record(5, 1, 2, "x"), answer_record(6, 1, 2, "x", False),
+               answer_record(7, 1, 2, "y", None)]
+  first, second = quizzes.answers_by_attempt(responses)
+  assert list(first["counts"]) == ["AES", "DES"]
+  assert first["counts"]["AES"] == {"attempts": {1: 2, 2: 1}, "right": True}
+  assert first["counts"]["DES"]["right"] is False and first["skipped"] == 1
+  assert second["counts"]["x"]["right"] is None
+  assert second["counts"]["y"]["right"] is None
+  markdown = quizzes.format_answer_counts([first, second], "Quiz")
+  assert "| AES | right | 3 | 1: 2, 2: 1 |" in markdown
+  assert "| DES | wrong | 1 | 1: 1 |" in markdown
+  assert "| x | ? | 2 | 1: 2 |" in markdown
+  assert "Left unanswered: 1." in markdown
+@
+
+\subsection{Which quizzes students tried}
+
+With several practice quizzes, a teacher asks which students tried which:
+did those who took the third also take the first two?
+The view [[--combinations]] answers it for the quizzes [[-a]] selects,
+counting the students by the set of those quizzes they made a selected
+attempt at, so that [[--attempts]], [[--answered]] and the period options
+decide what counts as having tried.
+A student who tried none is in no report, so the view cannot count them.
+Quizzes are named by title; two quizzes with the same title in different
+courses would be counted as one.
+<<functions>>=
+def quiz_combinations(tried):
+  """Returns how many students tried each combination of quizzes
+
+  `tried` maps each quiz title to the IDs of the students who tried it.
+  Returns (titles, students) pairs, the most common combination first; the
+  titles keep the order of `tried`.
+  """
+  combinations = Counter()
+  for student in set().union(*tried.values()):
+    combinations[tuple(title for title, students in tried.items()
+                       if student in students)] += 1
+  return sorted(combinations.items(), key=lambda item: (-item[1], item[0]))
+
+def format_combinations(combinations):
+  """Returns `combinations` from `quiz_combinations` as a Markdown table"""
+  lines = ["## Students by the quizzes they tried\n\n",
+           "| Quizzes tried | Students |\n|---|---|\n"]
+  for titles, students in combinations:
+    lines.append(f"| {markdown_cell(', '.join(titles))} | {students} |\n")
+  return "".join(lines) + "\n"
+@
+
+Two quizzes with the same title, in this test a Classic and a New Quiz,
+are counted as one, and a student whose only attempt was blank has still
+tried the quiz, whatever [[--skip-unanswered]] says about the answers.
+Let's verify the counts on three quizzes and five students, two of whom
+tried the same pair, which comes first, then the others in the order of
+their titles; and through the command on its two quizzes, which
+different students tried.
+<<test functions>>=
+def test_quiz_combinations_count_students_per_set():
+  tried = {"Ep1": {1, 2, 3}, "Ep2": {1, 2}, "Ep3": {1, 4}}
+  tried["Ep2"].add(5)
+  tried["Ep1"].add(5)
+  assert quizzes.quiz_combinations(tried) == [
+    (("Ep1", "Ep2"), 2), (("Ep1",), 1), (("Ep1", "Ep2", "Ep3"), 1),
+    (("Ep3",), 1)]
+  assert "| Ep1, Ep2, Ep3 | 1 |" in quizzes.format_combinations(
+    quizzes.quiz_combinations(tried))
+
+@responses.activate
+def test_combinations_join_quizzes_of_one_title_and_ignore_blanks(capsys):
+  blank = new_quiz_attempt(5, 1, (185, "", 0.0))
+  course = course_with_attempts(new_quiz={"id": "42", "title": "Honour code"},
+                                report=[blank])
+  run_attempts(course, "-a", ".", "--combinations", "--skip-unanswered")
+  assert "| Honour code | 2 |" in capsys.readouterr().out
+
+@responses.activate
+def test_attempts_command_counts_quiz_combinations(capsys):
+  run_attempts(course_with_attempts(), "-a", ".", "--combinations")
+  out = capsys.readouterr().out
+  assert "| Honour code | 1 |" in out and "| Ciphers | 1 |" in out
+  assert "## Honour code" not in out
 @
 
 \subsection{Every answer as a row}
@@ -5732,7 +6071,9 @@ attempts_parser = subp.add_parser("attempts",
 by default, how hard each question was (how many got it right on their
 first try, how many attempts it took, how many never got it right);
 with --answers, the wrong answers students gave on each attempt; with
---table, every answer as a row. Works for New Quizzes and for Classic
+--options, every answer, the right ones included; with --table, every
+answer as a row; with --combinations, the students by which of the
+selected quizzes they tried. Works for New Quizzes and for Classic
 Quizzes that have an assignment, whose submission history holds the
 attempts.""")
 attempts_parser.set_defaults(func=attempts_command)
@@ -5743,6 +6084,11 @@ attempts_view.add_argument("--answers", action="store_true",
 attempts_view.add_argument("--table", action="store_true",
   help="Print every answer as a row: quiz, student, attempt, question, "
        "answer, points and whether it was right")
+attempts_view.add_argument("--options", action="store_true",
+  help="Count every answer to each question, the right ones included, "
+       "per attempt")
+attempts_view.add_argument("--combinations", action="store_true",
+  help="Count the students by which of the selected quizzes they tried")
 attempts_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
   default="all",
   help="Which attempts to count: all (default), or each student's first, "
@@ -5754,6 +6100,8 @@ attempts_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
 attempts_parser.add_argument("--skip-unanswered", action="store_true",
   help="Leave out questions left unanswered, so that a blank is not "
        "counted as a failed try")
+parser = attempts_parser
+<<add the attempt period options to [[parser]]>>
 @
 
 The selections apply in the order \cref{sec:quiz-attempts-abandoned}
@@ -5787,6 +6135,7 @@ def attempts_command(config, canvas, args):
   """Shows how students did over their attempts at the selected quizzes"""
   requester = canvas._Canvas__requester
   markdown = []
+  tried = {}
   found = False
   for quiz in process_quiz_option(canvas, args):
     try:
@@ -5800,15 +6149,21 @@ def attempts_command(config, canvas, args):
     except (CanvasException, requests.RequestException) as error:
       canvaslms.cli.warn(f"{quiz.title}: could not read the attempts: {error}")
       continue
-    lacking = (lacking_attempt_one(responses) if args.attempts == "first"
-               else 0)
+    lacking = (lacking_attempt_one(in_period(responses, args))
+               if args.attempts == "first" else 0)
     responses = pick_attempts(responses, args, quiz.title)
     if not responses:
       if not lacking:
         canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
       continue
     overview = attempt_overview(responses, attempts_time_limit(quiz),
-                                attempts_build_on_last(quiz), lacking)
+                                attempts_build_on_last(quiz), lacking,
+                                attempt_one_scope(args))
+    if args.combinations:
+      tried.setdefault(quiz.title, set()).update(
+        response.student_id for response in responses)
+      found = True
+      continue
     if args.skip_unanswered:
       responses = answered_only(responses)
     if args.table:
@@ -5817,6 +6172,9 @@ def attempts_command(config, canvas, args):
     elif args.answers:
       markdown.append(format_wrong_answers(
         wrong_answers_by_attempt(responses), quiz.title, overview))
+    elif args.options:
+      markdown.append(format_answer_counts(
+        answers_by_attempt(responses), quiz.title, overview))
     else:
       markdown.append(format_difficulty(
         attempt_difficulty(responses), quiz.title, overview))
@@ -5824,6 +6182,8 @@ def attempts_command(config, canvas, args):
   if not found:
     raise canvaslms.cli.EmptyListError(
       "No submitted attempts at the selected quizzes")
+  if args.combinations:
+    markdown.append(format_combinations(quiz_combinations(tried)))
   if markdown:
     page_markdown("".join(markdown))
 @
@@ -5989,7 +6349,7 @@ def test_attempts_command_leaves_out_abandoned_attempts(
   assert f"{attempts} by 1 student:" in out
   if attempts == "2 attempts":
     assert "Of those that ended at the limit, 0 answered every question, " \
-           "0 some and 1 none." in out
+           "0 at least half, 0 under half and 1 none." in out
 @
 
 A quiz whose attempts build on the last one says so in its settings, and
@@ -6037,6 +6397,65 @@ def test_analyse_warns_about_students_without_attempt_one(capsys, caplog):
     in caplog.text
 @
 
+The period options reach both quiz systems through the command: the
+attempts in these tests were submitted on 20 November.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_keeps_the_attempts_of_a_period(capsys, caplog):
+  run_attempts(course_with_attempts(), "-a", ".",
+               "--started-before", "2026-11-21")
+  assert "## Honour code" in capsys.readouterr().out
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_attempts(course_with_attempts(), "-a", ".",
+                 "--started-after", "2026-11-21")
+  assert "Ciphers: no submitted attempts" in caplog.text
+@
+
+The view [[--options]] works through the command, the right answer
+counted with the wrong one.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_counts_every_option(capsys):
+  run_attempts(course_with_attempts(), "-a", "Honour", "--options")
+  out = capsys.readouterr().out
+  assert "| No | right | 1 | 2: 1 |" in out and "| Yes | wrong | 1 | 1: 1 |" in out
+@
+
+A student whose attempt 1 started before the period has no first attempt
+in it: student 5's attempt 1 was on 20 November and attempt 2 on
+24 November, while student 6 made attempt 1 on 24 November.
+<<test functions>>=
+@responses.activate
+def test_first_attempts_of_a_period_must_start_in_it(capsys, caplog):
+  later = new_quiz_attempt(5, 2, (185, "AES", 1.0))
+  newcomer = new_quiz_attempt(6, 1, (185, "DES", 0.0))
+  for record in (later, newcomer):
+    record["student_data"]["submitted_at"] = "2026-11-24T12:00:00Z"
+  course = course_with_attempts(report=[
+    new_quiz_attempt(5, 1, (185, "DES", 0.0)), later, newcomer])
+  run_attempts(course, "-a", "Ciphers", "--attempts", "first",
+               "--started-after", "2026-11-23")
+  out = capsys.readouterr().out
+  assert "1 attempt by 1 student:" in out
+  assert "1 student with no attempt 1 in the period is left out." in out
+  assert "1 student with no attempt 1 in the period is left out" \
+    in caplog.text
+
+@pytest.mark.parametrize("bound, shown", [("--started-before", True),
+                                          ("--started-after", False)])
+@responses.activate
+def test_analyse_keeps_the_attempts_of_a_period(capsys, caplog, bound, shown):
+  course = course_with_attempts()
+  if shown:
+    run_analyse(course, "-c", "SBX", "-a", ".", bound, "2026-11-21")
+    out = capsys.readouterr().out
+    assert "- AES: 1 (50.0%)" in out and "- No: 1 (50.0%)" in out
+  else:
+    with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+      run_analyse(course, "-c", "SBX", "-a", ".", bound, "2026-11-21")
+    assert "Honour code: no submitted attempts" in caplog.text
+@
+
 The options keep the views apart and require a quiz.
 <<test functions>>=
 @pytest.mark.parametrize("options", [
@@ -6052,7 +6471,8 @@ def test_attempts_command_counts_all_attempts_by_default():
   parser = argparse.ArgumentParser()
   quizzes.add_command(parser.add_subparsers())
   args = parser.parse_args(["quizzes", "attempts", "-c", "SBX", "-a", "Q"])
-  assert (args.attempts, args.answers, args.table) == ("all", False, False)
+  assert (args.attempts, args.answers, args.table, args.options,
+          args.combinations) == ("all", False, False, False, False)
   assert (args.answered, args.skip_unanswered) == ("any", False)
 @
 

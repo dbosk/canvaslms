@@ -110,8 +110,17 @@ canvaslms quizzes attempts -c COURSE -a "Quiz title" --attempts first --table
 
 Each quiz opens with an overview of its attempts: how many answered all,
 some or none of the questions and, for a New Quiz with a time limit, how
-many ended at the limit. `--answered some` leaves out attempts that were
-opened and abandoned, and `--skip-unanswered` leaves out blank answers.
+many ended at the limit and how long complete attempts took. `--answered
+some` leaves out attempts that were opened and abandoned,
+`--skip-unanswered` leaves out blank answers, and `--started-after` /
+`--started-before` keep the attempts of a period, for example after the
+quiz's settings changed. `--options` counts every answer, the right ones
+included, and `--combinations` counts students by which of several quizzes
+they tried:
+
+```bash
+canvaslms quizzes attempts -c COURSE -a "Exempelprov" --combinations
+```
 
 It works for New Quizzes and for Classic Quizzes that have an assignment.
 
