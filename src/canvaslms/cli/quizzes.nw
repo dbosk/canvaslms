@@ -5737,6 +5737,98 @@ def test_attempt_overview_ignores_time_without_a_limit():
   assert "no time limit" in overview and "ended" not in overview
 @
 
+\subsection{How often each answer was given}
+
+The wrong answers show what students try; for a choice question a teacher
+also wants the whole distribution, the key included---how many chose the
+right option against each distractor.
+The view [[--options]] counts every answer to each question, per attempt,
+and marks it right, wrong or, when the records do not say or disagree,
+unknown.
+It counts answers, like [[--answers]], not students, and leaves out the
+questions left blank, which it counts apart.
+<<functions>>=
+def answers_by_attempt(responses):
+  """Returns every answer to each question, counted per attempt
+
+  Returns a list with a dict for each question, in quiz order: its
+  `position`, `question`, `skipped` count and `counts`, which maps each
+  answer to its `attempts` (a Counter of attempt numbers) and `right`
+  (True, False or None when unknown or mixed), most frequent first.
+  """
+  questions = {}
+  for response in responses:
+    entry = questions.setdefault(
+      (response.position, response.question_id),
+      {"position": response.position, "question": response.question,
+       "answers": defaultdict(lambda: {"attempts": Counter(),
+                                       "rights": set()}),
+       "skipped": 0})
+    if not response.answered:
+      entry["skipped"] += 1
+      continue
+    answer = entry["answers"][response.answer or ""]
+    answer["attempts"][response.attempt] += 1
+    answer["rights"].add(response.right)
+  summaries = []
+  for _, entry in sorted(questions.items()):
+    counts = {text: {"attempts": answer["attempts"],
+                     "right": (next(iter(answer["rights"]))
+                               if len(answer["rights"]) == 1 else None)}
+              for text, answer in entry["answers"].items()}
+    summaries.append({
+      "position": entry["position"], "question": entry["question"],
+      "skipped": entry["skipped"],
+      "counts": dict(sorted(counts.items(), key=lambda item:
+                            -sum(item[1]["attempts"].values())))})
+  return summaries
+
+def format_answer_counts(questions, title, overview=""):
+  """Returns `questions` from `answers_by_attempt` as Markdown"""
+  marks = {True: "right", False: "wrong", None: "?"}
+  lines = [f"## {markdown_cell(title)}\n\n", overview]
+  for summary in questions:
+    lines.append(f"### {position_label(summary['position'])} "
+                 f"{markdown_cell(create_short_title(summary['question'], 100))}"
+                 "\n\n")
+    if summary["counts"]:
+      lines.append("| Answer | Right | Times | By attempt |\n|---|---|---|---|\n")
+      for answer, count in summary["counts"].items():
+        by_attempt = ", ".join(f"{number}: {times}" for number, times
+                               in sorted(count["attempts"].items()))
+        lines.append(f"| {markdown_cell(answer)} | {marks[count['right']]} "
+                     f"| {sum(count['attempts'].values())} | {by_attempt} |\n")
+      lines.append("\n")
+    if summary["skipped"]:
+      lines.append(f"Left unanswered: {summary['skipped']}.\n\n")
+  return "".join(lines)
+@
+
+Let's verify the counts on one question answered right twice and wrong
+once on the first attempt and right on the second, with one blank, an
+answer the records call right once and wrong once, and one of unknown
+rightness.
+<<test functions>>=
+def test_answer_counts_include_the_key():
+  responses = [answer_record(1, 1, 1, "AES"), answer_record(2, 1, 1, "AES"),
+               answer_record(3, 1, 1, "DES", False),
+               answer_record(3, 2, 1, "AES"),
+               answer_record(4, 1, 1, None, False),
+               answer_record(5, 1, 2, "x"), answer_record(6, 1, 2, "x", False),
+               answer_record(7, 1, 2, "y", None)]
+  first, second = quizzes.answers_by_attempt(responses)
+  assert list(first["counts"]) == ["AES", "DES"]
+  assert first["counts"]["AES"] == {"attempts": {1: 2, 2: 1}, "right": True}
+  assert first["counts"]["DES"]["right"] is False and first["skipped"] == 1
+  assert second["counts"]["x"]["right"] is None
+  assert second["counts"]["y"]["right"] is None
+  markdown = quizzes.format_answer_counts([first, second], "Quiz")
+  assert "| AES | right | 3 | 1: 2, 2: 1 |" in markdown
+  assert "| DES | wrong | 1 | 1: 1 |" in markdown
+  assert "| x | ? | 2 | 1: 2 |" in markdown
+  assert "Left unanswered: 1." in markdown
+@
+
 \subsection{Every answer as a row}
 
 The view [[--table]] prints the records themselves, so that a teacher can
@@ -5883,6 +5975,9 @@ attempts_view.add_argument("--answers", action="store_true",
 attempts_view.add_argument("--table", action="store_true",
   help="Print every answer as a row: quiz, student, attempt, question, "
        "answer, points and whether it was right")
+attempts_view.add_argument("--options", action="store_true",
+  help="Count every answer to each question, the right ones included, "
+       "per attempt")
 attempts_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
   default="all",
   help="Which attempts to count: all (default), or each student's first, "
@@ -5959,6 +6054,9 @@ def attempts_command(config, canvas, args):
     elif args.answers:
       markdown.append(format_wrong_answers(
         wrong_answers_by_attempt(responses), quiz.title, overview))
+    elif args.options:
+      markdown.append(format_answer_counts(
+        answers_by_attempt(responses), quiz.title, overview))
     else:
       markdown.append(format_difficulty(
         attempt_difficulty(responses), quiz.title, overview))
@@ -6193,6 +6291,16 @@ def test_attempts_command_keeps_the_attempts_of_a_period(capsys, caplog):
   assert "Ciphers: no submitted attempts" in caplog.text
 @
 
+The view [[--options]] works through the command, the right answer
+counted with the wrong one.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_counts_every_option(capsys):
+  run_attempts(course_with_attempts(), "-a", "Honour", "--options")
+  out = capsys.readouterr().out
+  assert "| No | right | 1 | 2: 1 |" in out and "| Yes | wrong | 1 | 1: 1 |" in out
+@
+
 The options keep the views apart and require a quiz.
 <<test functions>>=
 @pytest.mark.parametrize("options", [
@@ -6208,7 +6316,8 @@ def test_attempts_command_counts_all_attempts_by_default():
   parser = argparse.ArgumentParser()
   quizzes.add_command(parser.add_subparsers())
   args = parser.parse_args(["quizzes", "attempts", "-c", "SBX", "-a", "Q"])
-  assert (args.attempts, args.answers, args.table) == ("all", False, False)
+  assert (args.attempts, args.answers, args.table, args.options) \
+    == ("all", False, False, False)
   assert (args.answered, args.skip_unanswered) == ("any", False)
 @
 
