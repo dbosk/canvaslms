@@ -3837,13 +3837,15 @@ class BankDraws:
   attempt, item ID), all strings, to Canvas's status of that question in
   that attempt.  The rest is what `settle_bank_rightness` finds out:
   `value`, the worth of every drawn question when all banks have the same;
-  `best`, the best score on each question; and `full`, which maps a
-  question to True when its best score is its worth and False when its
-  worth is more.
+  `best`, the best score on each question; `full`, which maps a question
+  to True when its best score is its worth and False when its worth is
+  more; and `zero_possible`, whether a bank is worth no points, so that a
+  score of 0 may be full points.
   """
   titles: dict
   statuses: dict
   value: float | None = None
+  zero_possible: bool = False
   best: dict = field(default_factory=dict)
   full: dict = field(default_factory=dict)
 
@@ -3864,7 +3866,9 @@ class BankDraws:
     if self.value is not None:
       return score >= self.value or math.isclose(score, self.value)
     best = self.best.get(item_id, 0)
-    if score <= 0 or (score < best and not math.isclose(score, best)):
+    if score <= 0:
+      return None if self.zero_possible else False
+    if score < best and not math.isclose(score, best):
       return False
     return self.full.get(item_id)
 <<constants>>=
@@ -3919,7 +3923,7 @@ and leave the rest unknown:
   the number of answers that earned their question's full points, in all
   620 attempts.
   The answers that may be right in an attempt are those equal to their
-  question's best score.
+  question's best score, when that is more than 0.
   If they are exactly as many as the attempt's right answers still
   unaccounted for, all of them are right, so each of their questions is
   worth its best score; if no right answers are unaccounted for, none of
@@ -3934,7 +3938,8 @@ A review showed that this takes a partial score for a full one---a best of
 10 on a question worth 100, with banks worth 1, 10 and 100---and that
 solving the other worths from the attempt's total then hides the mistake,
 so the partial answer was marked right.
-The counts of right answers cannot err that way.
+The counts of right answers cannot err that way, provided every right
+answer of an attempt is one we can see, which the next paragraph ensures.
 On the three practice exams they settled 125 of 147, 46 of 63 and 63 of
 63 drawn answers; the others are neither right nor wrong.
 <<functions>>=
@@ -3949,36 +3954,52 @@ def settle_bank_rightness(report, items, bank):
   if len(values) == 1:
     bank.value = values.pop()
     return
+  bank.zero_possible = any(math.isclose(value, 0) for value in values)
   <<collect each attempt's drawn answers and known right answers>>
   <<settle the questions from the attempts' counts>>
 @
 
 For each attempt we keep its count of right answers, how many of them we
 already know---those to the quiz's own items---and its drawn answers.
+The step that marks all candidates right holds only if every other right
+answer in the attempt is accounted for: one more that we cannot see would
+leave a right answer over, which would pin a partial best score as right.
+A review found such answers: to an item worth no points, or of unknown
+worth, or no longer in the quiz, and a score of 0 on a bank question when
+some bank is worth no points, which may be full points.
+An attempt with any of them is \emph{uncertain}, and only the step that
+marks no candidate right applies to it: more right answers that we cannot
+see only make fewer bank answers right, so that step stays sound.
 <<collect each attempt's drawn answers and known right answers>>=
 entries = item_entries(items)
 attempts = []
 for record in report:
   student = record["student_data"]
-  known_right, drawn = 0, []
+  known_right, drawn, uncertain = 0, [], False
   for response in record["item_responses"]:
     item_id, score = str(response["item_id"]), response.get("score") or 0
     if item_id in entries:
       worth = entries[item_id][0].get("points_possible")
-      known_right += bool(worth) and (score >= worth
-                                      or math.isclose(score, worth))
-    elif item_id in bank.titles and bank.drawn(student, item_id, response):
-      drawn.append((item_id, score))
-      bank.best[item_id] = max(bank.best.get(item_id, 0), score)
+      if worth:
+        known_right += score >= worth or math.isclose(score, worth)
+      else:
+        uncertain = True
+    elif item_id in bank.titles:
+      if bank.drawn(student, item_id, response):
+        drawn.append((item_id, score))
+        bank.best[item_id] = max(bank.best.get(item_id, 0), score)
+        uncertain |= score <= 0 and bank.zero_possible
+    elif response.get("answer") or score > 0:
+      uncertain = True
   attempts.append((record.get("summary", {}).get("number_of_correct"),
-                   known_right, drawn))
+                   known_right, drawn, uncertain))
 @
 
 <<settle the questions from the attempts' counts>>=
 settled = True
 while settled:
   settled = False
-  for correct, known_right, drawn in attempts:
+  for correct, known_right, drawn, uncertain in attempts:
     if correct is None:
       continue
     candidates = {item_id for item_id, score in drawn
@@ -3988,7 +4009,7 @@ while settled:
     open_questions = candidates - bank.full.keys()
     if not open_questions:
       continue
-    if correct - right == len(open_questions):
+    if not uncertain and correct - right == len(open_questions):
       bank.full.update(dict.fromkeys(open_questions, True))
       settled = True
     elif correct == right:
@@ -4042,6 +4063,40 @@ def test_settling_never_takes_a_partial_score_for_right():
   assert bank.right("802", 0.5) is False
   assert bank.right("803", 5.0) is None
 
+def test_settling_needs_every_right_answer_accounted_for():
+  zero = [bank_item(1, 0.0), bank_item(2, 10.0)]
+  answered_zero = new_quiz_attempt(5, 1, (700, "x", 0.0), (701, "x", 1.0))
+  answered_zero["summary"] = {"number_of_correct": 1}
+  bank = settled_bank([answered_zero], zero, [700, 701])
+  assert bank.right("701", 1.0) is None and bank.right("700", 0.0) is None
+  banks = [bank_item(1, 1.0), bank_item(2, 10.0)]
+  gone = bank_attempt(5, 1, (701, 1.0))
+  gone["item_responses"].append(
+    {"item_id": "999", "answer": "Gone", "item_type": "choice", "score": 1.0})
+  assert settled_bank([gone], banks, [701]).right("701", 1.0) is None
+  free = bank_attempt(5, 1, (185, 1.0), (701, 1.0))
+  items = banks + [listed_new_quiz_item(307, 185, 1, "<p>Opinion</p>",
+                                        points=0.0)]
+  assert settled_bank([free], items, [701]).right("701", 1.0) is None
+  none_right = bank_attempt(5, 0, (185, 1.0), (701, 1.0))
+  assert settled_bank([none_right], items, [701]).right("701", 1.0) is False
+
+@pytest.mark.parametrize("report, question, score, expected", [
+  ([bank_attempt(5, 1, (801, 5.0), (802, 3.0)),
+    bank_attempt(6, 1, (801, 5.0))], "802", 3.0, False),
+  ([bank_attempt(7, 1, (803, 4.0), (804, 2.0)),
+    bank_attempt(8, 0, (804, 2.0))], "803", 4.0, True),
+  ([bank_attempt(9, 0, (805, 10.0), (806, 0.0)),
+    bank_attempt(10, 1, (805, 1.0), (806, 1.0))], "806", 1.0, True),
+  ([dict(new_quiz_attempt(11, 1, (807, "x", 0.0), (808, "y", 5.0)),
+         summary={"number_of_correct": 1})], "808", 5.0, True)])
+def test_settling_repeats_and_uses_the_best_score(report, question, score,
+                                                  expected):
+  banks = [bank_item(1, 1.0), bank_item(2, 10.0)]
+  ids = {int(r["item_id"]) for record in report
+         for r in record["item_responses"]}
+  assert settled_bank(report, banks, ids).right(question, score) is expected
+
 def test_settling_uses_the_quizs_own_items_and_equal_banks():
   items = [bank_item(1, 10.0), bank_item(2, 100.0),
            listed_new_quiz_item(307, 185, 1, "<p>Fixed</p>", points=5.0)]
@@ -4052,6 +4107,16 @@ def test_settling_uses_the_quizs_own_items_and_equal_banks():
                        [bank_item(1, 2.0), bank_item(2, 2.0)], [901])
   assert equal.right("901", 2.0) is True and equal.right("901", 1.0) is False
 @
+
+Whenever an attempt has an answer we cannot judge---to a bank question
+when a bank is worth no points, to an item no longer in the quiz, or to an
+item worth no points---its count cannot mark candidates right, but it can
+still mark them wrong.
+And what one attempt settles must reach the others in a later pass, after
+either kind of settling: in the first two cases of the next test, the
+first attempt is settled only once the second has been.
+In the third case the best score, 10, comes before a lower one, and in the
+fourth a question nobody scored on is no candidate, so the other one is.
 
 A missing status must not make a question count as drawn: then only an
 answered question does, so that a question the attempt did not draw is
@@ -4067,6 +4132,8 @@ def test_a_missing_status_counts_only_answers_as_drawn():
 With the draws known, the records of such a quiz leave out the questions
 an attempt did not draw, keep a drawn question left blank, and take the
 questions' texts and rightness from the [[BankDraws]].
+The CSV lists the quiz's own items too, so one of them worth no points is
+among the titles, yet it is judged as an item, not as a bank question.
 <<test functions>>=
 def test_bank_draws_become_records():
   items = [bank_item(1, 10.0)]
@@ -4079,6 +4146,12 @@ def test_bank_draws_become_records():
   records = list(quizzes.new_quiz_attempt_responses(report, items, bank))
   assert [(r.question, r.answer, r.right, r.answered) for r in records] == [
     ("Which loop?", "for", True, True), ("Which call?", None, False, False)]
+  own = [listed_new_quiz_item(307, 185, 1, "<p>Opinion</p>", points=0.0)]
+  titles = {"185": "Opinion"}
+  [opinion] = quizzes.new_quiz_attempt_responses(
+    [new_quiz_attempt(5, 1, (185, "Fine", 0.0))], own,
+    quizzes.BankDraws(titles, {}, value=10.0))
+  assert opinion.right is None
 @
 
 To fetch the report, we request it (\cref{sec:quiz-new-quiz-report}) and
