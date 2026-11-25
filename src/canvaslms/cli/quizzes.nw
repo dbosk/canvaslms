@@ -3516,10 +3516,13 @@ def plain_text(html):
 
 An answer to a choice question is an [[answer_id]], whose text we look up
 among the question's answers.
-Any other answer we take from [[text]], which holds an essay's HTML.
-These are the only two shapes we have seen in attempts; for a question type
-we have no attempts of, such as matching, the command shows Canvas's
-[[text]] as it is.
+An essay's answer is its [[text]], as HTML.
+Six other types are decoded by the question's type
+(\cref{sec:quiz-classic-answer-types}): four keep their answer in keys of
+their own, with [[text]] empty, and two carry an [[answer_id]] beside what
+the student wrote.
+For any other type the command shows the matched answer if there is an
+[[answer_id]], and Canvas's [[text]] as it is otherwise.
 Right and wrong hold for every type all the same, since they come from
 [[correct]].
 A choice question left unanswered has neither an [[answer_id]] nor any
@@ -3531,6 +3534,9 @@ def classic_answer(datum, question):
   `question` is the quiz question the entry answers, or None if the
   question is no longer in the quiz.  Returns None for no answer.
   """
+  decode = CLASSIC_ANSWER_DECODERS.get(getattr(question, "question_type", None))
+  if decode:
+    return decode(datum, question) or None
   if datum.get("answer_id") is not None:
     answers = {answer["id"]: answer
                for answer in getattr(question, "answers", None) or []}
@@ -3538,6 +3544,177 @@ def classic_answer(datum, question):
     return (plain_text(answer.get("html") or answer.get("text"))
             or str(datum["answer_id"]))
   return plain_text(datum.get("text")) or None
+@
+
+\subsubsection{The other question types}
+\label{sec:quiz-classic-answer-types}
+We read the shapes of four more types from the attempts of two courses'
+Classic Quizzes in November 2026, and of two more from Canvas's source
+code.
+Each decoder writes the answer as its parts joined by semicolons, in the
+order of the question's answers, so that two students who answered alike
+get the same text, which [[--answers]] counts; we join with semicolons
+rather than commas, since answers often contain commas, and leave out
+empty parts.
+A question with nothing chosen or written gives no answer.
+The ids in [[submission_data]] are strings in some types and numbers in
+others, while the question's own ids are numbers, so we compare them as
+strings.
+An answer written in Canvas's rich editor keeps its text in [[html]] (in
+[[left_html]] for a matching item's left side) and may leave [[text]]
+empty, so we prefer the HTML, as for a choice question above.
+<<functions>>=
+def answer_text(answer, key="text"):
+  """Returns the text of a Classic Quiz answer, its HTML if it has any"""
+  html_key = "html" if key == "text" else f"{key}_html"
+  return plain_text(answer.get(html_key) or answer.get(key))
+
+def joined(parts):
+  """Returns the non-empty `parts` joined by semicolons"""
+  return "; ".join(part for part in parts if part)
+@
+
+\paragraph{Multiple answers.}
+A key [[answer_]]\emph{id} for each of the question's answers is
+\enquote{1} if the student chose it and \enquote{0} if not---530 and 1150
+such keys in the attempts we read.
+<<functions>>=
+def multiple_answers_answer(datum, question):
+  """Returns the answers chosen in a multiple answers question"""
+  return joined(answer_text(answer) for answer in question.answers
+                if str(datum.get(f"answer_{answer['id']}")) == "1")
+@
+
+\paragraph{Matching.}
+A key [[answer_]]\emph{id} for each left-hand item holds the [[match_id]]
+of the right-hand item chosen for it, or is empty if none was---8585 and
+2701 keys; the question's [[matches]] give the right-hand texts.
+<<functions>>=
+def matching_answer(datum, question):
+  """Returns the pairs matched in a matching question"""
+  rights = {str(match["match_id"]): match.get("text", "")
+            for match in getattr(question, "matches", None) or []}
+  return joined(
+    f"{answer_text(answer, 'left')} → {rights.get(str(chosen), chosen)}"
+    for answer in question.answers
+    if (chosen := datum.get(f"answer_{answer['id']}")) not in (None, ""))
+@
+
+\paragraph{Blanks and dropdowns.}
+A question with blanks has a key [[answer_for_]]\emph{blank} for each
+blank: what the student wrote, in fill in multiple blanks, beside an
+[[answer_id_for_]]\emph{blank} naming the accepted answer it matched; the
+id of the answer chosen, in multiple dropdowns.
+A blank left empty is an empty string, which we leave out; Canvas treats a
+blank of spaces as empty too, so we strip what was written, which also
+keeps trailing spaces from splitting equal answers.
+<<functions>>=
+def blanks_of(question):
+  """Returns the blanks of `question` in the order of its answers"""
+  return list(dict.fromkeys(answer["blank_id"] for answer in question.answers
+                            if answer.get("blank_id")))
+
+def fill_in_blanks_answer(datum, question):
+  """Returns what was written in each blank of a fill-in question"""
+  return joined(
+    f"{blank}: {written}" for blank in blanks_of(question)
+    if (written := str(datum.get(f"answer_for_{blank}") or "").strip()))
+
+def dropdowns_answer(datum, question):
+  """Returns the answer chosen in each dropdown of a question"""
+  texts = {str(answer["id"]): answer_text(answer)
+           for answer in question.answers}
+  return joined(f"{blank}: {texts.get(str(chosen), chosen)}"
+                for blank in blanks_of(question)
+                if (chosen := datum.get(f"answer_for_{blank}"))
+                not in (None, ""))
+@
+
+\paragraph{Short answer and numerical.}
+These carry an [[answer_id]] when the student's answer matched an accepted
+one, so the choice branch above would show the accepted answer rather
+than what the student wrote.
+Canvas's grader keeps what was written in [[text]]
+([[Quizzes::SubmissionGrader]] and [[UserAnswer#answer_details]], read
+2026-11-25), and a wrong answer is as telling as a right one, so for these
+types we show [[text]].
+<<functions>>=
+def written_answer(datum, question):
+  """Returns what the student wrote, for short answer and numerical"""
+  return plain_text(datum.get("text"))
+
+CLASSIC_ANSWER_DECODERS = {
+  "multiple_answers_question": multiple_answers_answer,
+  "matching_question": matching_answer,
+  "fill_in_multiple_blanks_question": fill_in_blanks_answer,
+  "multiple_dropdowns_question": dropdowns_answer,
+  "short_answer_question": written_answer,
+  "numerical_question": written_answer,
+}
+@
+
+Let's verify each decoder on entries shaped as those attempts had them,
+with made-up values, and that a question with nothing answered gives no
+answer; also answers kept as rich text, a fill-in question with one blank
+left empty and one padded with spaces, and a numerical answer that matched
+an accepted answer, whose number written is shown, not the accepted one.
+<<test functions>>=
+def test_classic_answers_of_the_other_question_types():
+  multiple = make_question(21, question_type="multiple_answers_question",
+                           answers=[{"id": 1, "text": "AES, 128"},
+                                    {"id": 2, "text": "DES"},
+                                    {"id": 3, "text": "RSA"}])
+  matching = make_question(22, question_type="matching_question",
+                           answers=[{"id": 4, "left": "Lisp", "match_id": 7},
+                                    {"id": 5, "left": "C", "match_id": 8}],
+                           matches=[{"match_id": 7, "text": "McCarthy"},
+                                    {"match_id": 8, "text": "Ritchie"}])
+  blanks = make_question(23, question_type="fill_in_multiple_blanks_question",
+                         answers=[{"id": 9, "blank_id": "year", "text": "1946"},
+                                  {"id": 10, "blank_id": "name",
+                                   "text": "ENIAC"}])
+  dropdowns = make_question(24, question_type="multiple_dropdowns_question",
+                            answers=[{"id": 11, "blank_id": "svar",
+                                      "text": "Ja"},
+                                     {"id": 12, "blank_id": "svar",
+                                      "text": "Nej"}])
+  rich = make_question(25, question_type="multiple_answers_question",
+                       answers=[{"id": 1, "text": "", "html": "<p>AES</p>"},
+                                {"id": 2, "text": "", "html": "<p>DES</p>"}])
+  rich_matching = make_question(26, question_type="matching_question",
+                                answers=[{"id": 4, "left": "",
+                                          "left_html": "<p>Lisp</p>",
+                                          "match_id": 7}],
+                                matches=[{"match_id": 7, "text": "McCarthy"}])
+  textless = make_question(28, question_type="multiple_answers_question",
+                           answers=[{"id": 1, "text": ""},
+                                    {"id": 2, "text": "DES"}])
+  numerical = make_question(27, question_type="numerical_question",
+                            answers=[{"id": 13, "text": ""}])
+  cases = [
+    (multiple, {"answer_1": "1", "answer_2": "0", "answer_3": "1"},
+     "AES, 128; RSA"),
+    (matching, {"answer_4": "7", "answer_5": ""}, "Lisp → McCarthy"),
+    (blanks, {"answer_for_year": "1946", "answer_id_for_year": 9,
+              "answer_for_name": "Eniac", "answer_id_for_name": 10},
+     "year: 1946; name: Eniac"),
+    (dropdowns, {"answer_for_svar": 12, "answer_id_for_svar": 12},
+     "svar: Nej"),
+    (multiple, {"answer_1": "0", "answer_2": "0", "answer_3": "0"}, None),
+    (dropdowns, {}, None),
+    (rich, {"answer_1": "1", "answer_2": "1"}, "AES; DES"),
+    (rich_matching, {"answer_4": "7"}, "Lisp → McCarthy"),
+    (blanks, {"answer_for_year": "", "answer_id_for_year": None,
+              "answer_for_name": " Eniac ", "answer_id_for_name": 10},
+     "name: Eniac"),
+    (blanks, {"answer_for_year": "  ", "answer_for_name": ""}, None),
+    (numerical, {"answer_id": 13, "text": "42"}, "42"),
+    (numerical, {"text": "41"}, "41"),
+    (textless, {"answer_1": "1", "answer_2": "1"}, "DES")]
+  for question, data, expected in cases:
+    datum = {"question_id": question.id, "correct": False, "points": 0.0,
+             "text": "", **data}
+    assert quizzes.classic_answer(datum, question) == expected
 @
 
 A student who has not taken the quiz still has a submission, whose history
