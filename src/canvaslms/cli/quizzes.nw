@@ -1599,6 +1599,9 @@ The report comes as CSV or as JSON.
 We ask for JSON, which both [[analyse]] and [[quizzes attempts]] read,
 because its records keep the answers of each attempt apart and its
 questions keep their HTML (\cref{sec:quiz-attempts,sec:quiz-new-rows}).
+Only for questions drawn at random from item banks do we also ask for the
+CSV, which says which questions an attempt drew
+(\cref{sec:quiz-bank-draws}).
 
 When Canvas refuses the request, we let its exception through rather than
 exit, for the reason [[list_new_quiz_items]] does
@@ -1608,14 +1611,16 @@ Both callers go through several quizzes, and an earlier version, which
 exited, threw away the results of all the quizzes after the one that
 failed.
 <<functions>>=
-def create_new_quiz_report(course, assignment_id, requester):
+def create_new_quiz_report(course, assignment_id, requester,
+                           report_format="json"):
   """
-  Create a student analysis report in JSON for a New Quiz.
+  Create a student analysis report for a New Quiz.
 
   Args:
     course: Course object
     assignment_id: The assignment ID of the New Quiz
     requester: Canvas _requester object for making API calls
+    report_format: "json", or "csv" for the questions drawn from banks
 
   Returns:
     Progress object for polling
@@ -1636,7 +1641,7 @@ def create_new_quiz_report(course, assignment_id, requester):
     _url="new_quizzes",
     **{
       'quiz_report[report_type]': 'student_analysis',
-      'quiz_report[format]': 'json'
+      'quiz_report[format]': report_format
     }
   )
 
@@ -3623,9 +3628,11 @@ We saw this in two quizzes, where every response then matched an item.
 A [[Bank]] item instead draws questions at random from a whole bank, and
 its [[entry]] describes only the bank; which questions a student got is
 in the report alone.
-The one quiz of that kind we tried had no report to give---Canvas answered
-with an error---so we do not know how such responses are named, and they
-are shown as items not among the quiz's items, with unknown rightness.
+Such questions need more than the quiz's items, which
+\cref{sec:quiz-bank-draws} explains; [[bank]] carries what it finds, and
+is [[None]] for a quiz without [[Bank]] items.
+A response that matches neither is shown as an item not among the quiz's
+items, with unknown rightness.
 <<functions>>=
 def item_entries(items):
   """Maps each entry ID a report can name to its (item, entry) in `items`
@@ -3642,33 +3649,50 @@ def item_entries(items):
       entries[str(entry["id"])] = (item, entry)
   return entries
 
-def new_quiz_attempt_responses(report, items):
+def new_quiz_attempt_responses(report, items, bank=None):
   """Yields an `AttemptResponse` for each answer in a New Quiz report
 
   `report` is the student analysis report in JSON, one record per attempt;
-  `items` are the quiz's items as the New Quizzes API lists them.
+  `items` are the quiz's items as the New Quizzes API lists them; `bank`
+  is the `BankDraws` of a quiz that draws questions from item banks.
   """
   entries = item_entries(items)
   for record in report:
     student = record["student_data"]
     for response in record["item_responses"]:
-      item, entry = entries.get(str(response["item_id"]), (None, None))
-      if not shown_in_attempt(response, entry, student.get("submitted_at")):
-        continue
+      item_id = str(response["item_id"])
+      item, entry = entries.get(item_id, (None, None))
+      if item is not None:
+        if not shown_in_attempt(response, entry, student.get("submitted_at")):
+          continue
+        question_html = entry.get("item_body") or ""
+        question = plain_text(question_html)
+        position = item.get("position") or UNKNOWN_POSITION
+        worth = item.get("points_possible")
+      elif bank is not None and item_id in bank.titles:
+        if not bank.drawn(student, item_id):
+          continue
+        question_html = bank.titles[item_id]
+        question = plain_text(question_html)
+        position = UNKNOWN_POSITION
+        worth = bank.worths.get(item_id)
+      else:
+        if not shown_in_attempt(response, None, student.get("submitted_at")):
+          continue
+        question_html = ""
+        question = f"Item {item_id}, not among the quiz's items"
+        position = UNKNOWN_POSITION
+        worth = None
       score = response.get("score") or 0
-      worth = item.get("points_possible") if item else None
       yield AttemptResponse(
         student_id=student["id"],
         student=student.get("name") or str(student["id"]),
         attempt=student["attempt"],
-        position=(item.get("position") if item else None)
-                 or UNKNOWN_POSITION,
-        question_id=str(response["item_id"]),
-        question=(plain_text(entry.get("item_body")) if item
-                  else f"Item {response['item_id']}, "
-                       "not among the quiz's items"),
+        position=position,
+        question_id=item_id,
+        question=question,
         answer=plain_text(response.get("answer")) or None,
-        question_html=entry.get("item_body") or "" if item else "",
+        question_html=question_html,
         points=score,
         right=(score >= worth or math.isclose(score, worth)) if worth
               else None,
@@ -3763,13 +3787,267 @@ def test_new_quiz_attempts_become_one_record_per_answer():
   assert records[0].elapsed == 300
 @
 
+\subsubsection{Questions drawn at random from a bank}
+\label{sec:quiz-bank-draws}
+
+A [[Bank]] item draws questions at random from an item bank, so the quiz's
+items do not say which questions there are.
+We studied three such quizzes, practice exams of 21 [[Bank]] items that
+each draw one question, in November 2026.
+\begin{description}
+\item[The banks are closed to us] Listing a bank's entries gave
+  \enquote{404 Not Found} for every one of the 21 banks, so the questions'
+  texts and which bank each belongs to cannot come from the banks.
+\item[The JSON report lists every question drawn by anyone] For every
+  attempt, it lists each question that any attempt drew: 100 of the banks'
+  184 entries, in one quiz.
+  The 21 an attempt drew have a float score; the 79 others have an empty
+  answer and the integer 0.
+\item[The CSV report says which were drawn] Its [[Status]] for each
+  question and attempt is \enquote{Not Attempted} for the questions not
+  drawn---all 553 of them, the very responses with the integer 0---and
+  \enquote{Graded} or \enquote{No Answer} for those drawn.
+  Its header also gives every question's text.
+\end{description}
+So for a quiz with [[Bank]] items we read the CSV report too, for the
+questions' texts and to leave out the questions an attempt did not draw,
+which keeps a drawn question left blank as a blank.
+We rely on [[Status]], a field Canvas names, rather than on the type of a
+score.
+The texts are Canvas's plain-text renderings, which lose the line breaks in
+code (\cref{sec:quiz-new-rows}), but they are all there is.
+Which bank, and so which position, a drawn question belongs to remains
+unknown, so these questions have no number.
+
+The CSV repeats its column names for each question, so we read it by
+position, not with [[csv.DictReader]]: each question is a group of five
+columns, [[ItemID]], [[ItemType]], the question, [[EarnedPoints]] and
+[[Status]], and the student and attempt are in [[ID]] and [[Attempt]].
+<<functions>>=
+@dataclass
+class BankDraws:
+  """The questions a New Quiz drew from item banks, read from its CSV report
+
+  `titles` maps an item ID to its question; `statuses` maps (student ID,
+  attempt, item ID), all strings, to Canvas's status of that question in
+  that attempt; `worths` maps an item ID to its points, where known.
+  """
+  titles: dict
+  statuses: dict
+  worths: dict
+
+  def drawn(self, student, item_id):
+    """True unless the attempt of `student` did not draw `item_id`"""
+    key = (str(student["id"]), str(student["attempt"]), item_id)
+    return self.statuses.get(key) != NOT_DRAWN
+<<constants>>=
+NOT_DRAWN = "Not Attempted"
+<<functions>>=
+def read_bank_draws(csv_text):
+  """Returns the titles and statuses of a New Quiz report in CSV"""
+  header, *rows = list(csv.reader(io.StringIO(csv_text)))
+  student, attempt = header.index("ID"), header.index("Attempt")
+  groups = [column for column, name in enumerate(header) if name == "ItemID"]
+  titles, statuses = {}, {}
+  for row in rows:
+    for column in groups:
+      titles[row[column]] = header[column + 2]
+      statuses[(row[student], row[attempt], row[column])] = row[column + 4]
+  return titles, statuses
+@
+
+Let's verify the reading on a report shaped as Canvas sent it, with
+made-up values: two questions, of which the attempt drew only the first,
+whose text runs over several lines as in Canvas's headers.
+<<test functions>>=
+BANK_CSV = (
+  "Name,ID,SectionIDs,SectionNames,Submitted,ElapsedTime,Attempt,"
+  "ItemID,ItemType,Which loop?,EarnedPoints,Status,"
+  "ItemID,ItemType,Which type?,EarnedPoints,Status,"
+  "NumberOfCorrect,NumberOfIncorrect,NoResponse,PointsPossible,OverallScore\n"
+  "Student 5,5,1,S,2026-04-09 10:00:00 UTC,00:30:00,1,"
+  "501,choice,for,10.0,Graded,502,choice,,,Not Attempted,1,0,0,10.0,10.0\n")
+BANK_CSV = BANK_CSV.replace("Which loop?", '"Which loop?\n\xa0\nfor i in x"')
+
+def test_read_bank_draws_reads_titles_and_statuses():
+  titles, statuses = quizzes.read_bank_draws(BANK_CSV)
+  assert titles == {"501": "Which loop?\n\xa0\nfor i in x",
+                    "502": "Which type?"}
+  assert statuses == {("5", "1", "501"): "Graded",
+                      ("5", "1", "502"): "Not Attempted"}
+@
+
+\paragraph{The worth of a drawn question.}
+Whether an answer is right needs the question's worth, which is the
+[[points_possible]] of the [[Bank]] item that drew it---unknown, since we
+do not know which bank that is.
+When all [[Bank]] items are worth the same, that is the worth.
+Otherwise we infer it, in three steps.
+\begin{enumerate}
+\item The worth is one of the [[Bank]] items' values, and at least the
+  best score anyone got on the question, so we take the smallest value
+  that is at least that score.
+  This is right when someone got the question fully right, and also when
+  the best score is a partial one above the next smaller value.
+  A question nobody scored on stays unknown.
+\item Each attempt's [[points_possible]] in the report is the sum of the
+  worths of the questions it drew.
+  An attempt in which a single question's worth is unknown thus gives that
+  worth, provided the difference is one of the values; a worth found this
+  way may unlock another attempt, so we repeat until nothing changes.
+\item An attempt whose questions all have a worth must add up to its
+  total.
+  If it does not, a worth from the first step was a partial score taken
+  for a full one, and we forget the worths of that attempt's questions
+  rather than show wrong answers as right.
+\end{enumerate}
+On the three practice exams, this gave a worth to 91 of 100, 54 of 54 and
+47 of 53 questions, every one consistent with the totals.
+Questions left without a worth are neither right nor wrong.
+<<functions>>=
+def bank_worths(report, items, bank):
+  """Returns the inferred worth of the drawn questions in `report`
+
+  `items` are the quiz's items and `bank` the `BankDraws` without worths.
+  Returns a dict from item ID to points; unknown worths are left out.
+  """
+  values = sorted({item["points_possible"] for item in items
+                   if item.get("entry_type") == "Bank"})
+  attempts = [(record["summary"].get("points_possible"),
+               [response for response in record["item_responses"]
+                if str(response["item_id"]) in bank.titles
+                and bank.drawn(record["student_data"],
+                               str(response["item_id"]))])
+              for record in report]
+  <<take each worth from the values and the best score>>
+  <<solve the remaining worths from the attempts' totals>>
+  <<forget the worths that contradict a total>>
+  return worths
+
+def is_value(number, values):
+  """True if `number` is one of `values`, allowing floating-point error"""
+  return any(math.isclose(number, value) for value in values)
+@
+
+<<take each worth from the values and the best score>>=
+best = defaultdict(float)
+for _, drawn in attempts:
+  for response in drawn:
+    item_id = str(response["item_id"])
+    best[item_id] = max(best[item_id], response.get("score") or 0)
+worths = {}
+for item_id, score in best.items():
+  if len(values) == 1:
+    worths[item_id] = values[0]
+    continue
+  candidates = [value for value in values
+                if value >= score or math.isclose(value, score)]
+  if score > 0 and candidates:
+    worths[item_id] = candidates[0]
+@
+
+<<solve the remaining worths from the attempts' totals>>=
+solved = True
+while solved:
+  solved = False
+  for total, drawn in attempts:
+    unknown = {str(r["item_id"]) for r in drawn} - worths.keys()
+    if total is None or len(unknown) != 1:
+      continue
+    rest = total - sum(worths[str(r["item_id"])] for r in drawn
+                       if str(r["item_id"]) in worths)
+    if is_value(rest, values):
+      worths[unknown.pop()] = rest
+      solved = True
+@
+
+<<forget the worths that contradict a total>>=
+for total, drawn in attempts:
+  ids = {str(r["item_id"]) for r in drawn}
+  if total is None or not ids <= worths.keys():
+    continue
+  if not math.isclose(total, sum(worths[item_id] for item_id in ids)):
+    for item_id in ids:
+      worths.pop(item_id, None)
+@
+
+Let's verify the three steps on banks worth 1, 10 and 100 points.
+Question 601 was fully right once, so its worth is 10; question 602 was
+never scored, but the attempt drawing it has 601 and 602 and a total of
+110, so 602 is worth 100; question 603 had a best score of 5, whose
+inference 10 contradicts the total of its attempt, 100.
+<<test functions>>=
+def bank_attempt(student, total, *responses):
+  """A report record of an attempt drawing `responses` (id, score)"""
+  record = new_quiz_attempt(student, 1, *[(i, "x" if score else "", score)
+                                          for i, score in responses])
+  record["summary"] = {"points_possible": total}
+  return record
+
+def bank_item(item_id, points):
+  """A New Quiz `Bank` item as the New Quizzes API lists it"""
+  return {"id": str(item_id), "position": 1, "entry_type": "Bank",
+          "points_possible": points, "properties": {"sample_num": "1"},
+          "entry": {"id": str(item_id + 1000), "title": "Bank",
+                    "entry_count": 5, "item_entry_count": 5,
+                    "archived": False}}
+
+def test_bank_worths_infers_and_checks_worths():
+  items = [bank_item(1, 1.0), bank_item(2, 10.0), bank_item(3, 100.0)]
+  report = [bank_attempt(5, 110.0, (601, 10.0), (602, 0.0)),
+            bank_attempt(6, 100.0, (603, 5.0))]
+  bank = quizzes.BankDraws({"601": "a", "602": "b", "603": "c"}, {}, {})
+  assert quizzes.bank_worths(report, items, bank) == {"601": 10.0,
+                                                       "602": 100.0}
+
+def test_bank_worths_of_equal_banks_are_their_value():
+  items = [bank_item(1, 2.0), bank_item(2, 2.0)]
+  report = [bank_attempt(5, 4.0, (601, 0.0), (602, 0.0))]
+  bank = quizzes.BankDraws({"601": "a", "602": "b"}, {}, {})
+  assert quizzes.bank_worths(report, items, bank) == {"601": 2.0, "602": 2.0}
+@
+
+With the draws known, the records of such a quiz leave out the questions
+an attempt did not draw, keep a drawn question left blank, and take the
+questions' texts and worths from the [[BankDraws]].
+<<test functions>>=
+def test_bank_draws_become_records():
+  items = [bank_item(1, 10.0)]
+  report = [new_quiz_attempt(5, 1, (501, "for", 10.0), (502, "", 0),
+                                   (503, "", 0.0))]
+  bank = quizzes.BankDraws(
+    {"501": "Which loop?", "502": "Which type?", "503": "Which call?"},
+    {("5", "1", "501"): "Graded", ("5", "1", "502"): "Not Attempted",
+     ("5", "1", "503"): "No Answer"},
+    {"501": 10.0, "503": 10.0})
+  records = list(quizzes.new_quiz_attempt_responses(report, items, bank))
+  assert [(r.question, r.answer, r.right, r.answered) for r in records] == [
+    ("Which loop?", "for", True, True), ("Which call?", None, False, False)]
+@
+
 To fetch the report, we request it (\cref{sec:quiz-new-quiz-report}) and
-poll it until Canvas has made the file.
+poll it until Canvas has made the file; for a quiz with [[Bank]] items we
+fetch it as CSV too (\cref{sec:quiz-bank-draws}).
+The CSV starts with a byte-order mark, which [[utf-8-sig]] removes; it
+would otherwise stick to the name of the first column, which we do not
+read, so this is tidiness rather than need.
 <<functions>>=
 def fetch_new_quiz_attempts(quiz, requester):
   """Returns the `AttemptResponse`s of the attempts at New Quiz `quiz`"""
+  report = json.loads(download_new_quiz_report(quiz, requester, "json"))
+  items = get_new_quizzes_list(
+    requester, f"courses/{quiz.course.id}/quizzes/{quiz.id}/items")
+  bank = None
+  if any(item.get("entry_type") == "Bank" for item in items):
+    bank = BankDraws(*read_bank_draws(download_new_quiz_report(
+      quiz, requester, "csv").decode("utf-8-sig")), {})
+    bank.worths = bank_worths(report, items, bank)
+  return list(new_quiz_attempt_responses(report, items, bank))
+
+def download_new_quiz_report(quiz, requester, report_format):
+  """Returns the bytes of New Quiz `quiz`'s report in `report_format`"""
   progress = poll_progress(create_new_quiz_report(
-    quiz.course, quiz.id, requester))
+    quiz.course, quiz.id, requester, report_format))
   results = getattr(progress, "results", None)
   url = results.get("url") if isinstance(results, dict) else None
   if not url:
@@ -3777,9 +4055,7 @@ def fetch_new_quiz_attempts(quiz, requester):
       f"{quiz.title}: the student analysis report was not ready in time")
   response = requests.get(url)
   response.raise_for_status()
-  items = get_new_quizzes_list(
-    requester, f"courses/{quiz.course.id}/quizzes/{quiz.id}/items")
-  return list(new_quiz_attempt_responses(response.json(), items))
+  return response.content
 @
 
 A refused request reaches the caller as an exception instead of ending the
@@ -3821,6 +4097,38 @@ def test_fetching_new_quiz_attempts_reads_the_json_report():
   assert [(r.student_id, r.attempt, r.answer, r.right) for r in records] \
     == [(5, 1, "AES", True)]
   assert "quiz_report%5Bformat%5D=json" in report_request.calls[0].request.body
+@
+
+For a quiz with [[Bank]] items, the CSV is requested too, and its
+statuses and texts reach the records.
+<<test functions>>=
+@responses.activate
+def test_fetching_a_quiz_with_bank_items_reads_the_csv_too():
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  quiz = make_new_quiz(make_course(requester=requester), id="42")
+  reports = f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports"
+  for number, ending in ((3, "json"), (4, "csv")):
+    progress = {"id": number, "workflow_state": "completed",
+                "results": {"url": f"https://files.example.invalid/r.{ending}"}}
+    responses.post(reports, json={"progress": progress},
+                   match=[responses.matchers.urlencoded_params_matcher(
+                     {"quiz_report[report_type]": "student_analysis",
+                      "quiz_report[format]": ending})])
+    responses.get(f"https://canvas.example.invalid/api/v1/progress/{number}",
+                  json=progress)
+  record = new_quiz_attempt(5, 1, (501, "for", 10.0), (502, "", 0))
+  record["summary"] = {"points_possible": 10.0}
+  responses.get("https://files.example.invalid/r.json", json=[record])
+  responses.get("https://files.example.invalid/r.csv",
+                body=("﻿" + BANK_CSV).encode("utf-8"))
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+                json=[bank_item(1, 10.0)])
+
+  records = quizzes.fetch_new_quiz_attempts(quiz, requester)
+
+  assert [(r.question, r.answer, r.right) for r in records] \
+    == [("Which loop? for i in x", "for", True)]
 @
 
 A report that Canvas did not finish has no file to read, and a file that
