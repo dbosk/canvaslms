@@ -3114,7 +3114,8 @@ all 5580 of them, so reading JSON changes the titles but no answer.
 <<read the attempts at the New Quiz as [[rows]]>>=
 try:
   rows = attempt_rows(pick_attempts(
-    fetch_new_quiz_attempts(quiz, canvas._Canvas__requester), args))
+    fetch_new_quiz_attempts(quiz, canvas._Canvas__requester), args,
+    quiz.title))
 except canvaslms.cli.EmptyListError as error:
   canvaslms.cli.warn(str(error))
   continue
@@ -3203,8 +3204,8 @@ analyse_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
 analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
     default="any",
     help="Which attempts to keep: any (default), those that answered some "
-         "question, or those that answered all. A Classic Quiz is then read "
-         "from its submission history")
+         "question, or those that answered all; applied after --attempts. A "
+         "Classic Quiz is then read from its submission history")
 parser = analyse_parser
 <<add the attempt period options to [[parser]]>>
 @
@@ -3236,7 +3237,8 @@ The attempts are read and selected as for a New Quiz, and a quiz whose
 history Canvas would not give is skipped with a warning.
 <<read the attempts at the Classic Quiz as [[rows]]>>=
 try:
-  rows = attempt_rows(pick_attempts(fetch_classic_attempts(quiz), args))
+  rows = attempt_rows(pick_attempts(fetch_classic_attempts(quiz), args,
+                                    quiz.title))
 except canvaslms.cli.EmptyListError as error:
   canvaslms.cli.warn(str(error))
   continue
@@ -4709,8 +4711,15 @@ The first attempt is the one Canvas numbers 1, not the earliest the
 report has: in one quiz three students had no attempt 1 in the report,
 yet had seen the questions in it, so their earliest attempt there tells
 nothing about what they knew beforehand.
-Such students are left out of [[first]], and the overview says how many
-(\cref{sec:quiz-attempts-overview}).
+Such students are left out of [[first]]; the commands warn about how
+many, and the overview says it too (\cref{sec:quiz-attempts-overview}).
+For [[analyse]] this changes what [[--attempts first]] counts: a student
+whose report lacks attempt 1 was counted with their earliest attempt
+before, and is now left out, with the warning.
+Elsewhere, \enquote{first} keeps its plainer sense: the difficulty view's
+\enquote{first try} is a student's earliest attempt at a question in the
+records, since it describes the tries made, not what was known
+beforehand.
 Of two submissions with the same number, the earlier counts first.
 <<constants>>=
 ATTEMPT_SELECTIONS = ("all", "first", "last", "best")
@@ -4719,7 +4728,8 @@ def select_attempts(responses, selection):
   """Returns the `responses` of the attempts that `selection` names
 
   `selection` is one of `ATTEMPT_SELECTIONS`: all attempts, or each
-  student's first, last or best (most points, earliest on a tie).
+  student's attempt 1, last or best (most points, earliest on a tie);
+  of two submissions with one number, the earlier comes first.
   """
   if selection == "all":
     return list(responses)
@@ -4749,16 +4759,21 @@ def lacking_attempt_one(responses):
   return len(students - {response.student_id for response in responses
                          if response.attempt == 1})
 
-def pick_attempts(responses, args):
+def pick_attempts(responses, args, title=None):
   """Returns the `responses` that the attempt options of `args` keep
 
   `--started-after` and `--started-before` bound the attempts considered;
   `--attempts` then picks an attempt per student, and `--answered` drops a
-  picked attempt that did not answer enough.
+  picked attempt that did not answer enough.  With `title`, warns about
+  the students `--attempts first` leaves out for want of attempt 1.
   """
-  responses = filter_started(responses,
-                             getattr(args, "started_after", None),
-                             getattr(args, "started_before", None))
+  responses = in_period(responses, args)
+  if title and args.attempts == "first":
+    lacking = lacking_attempt_one(responses)
+    if lacking:
+      canvaslms.cli.warn(f"{title}: {counted(lacking, 'student')} with no "
+                         "attempt 1 in the report "
+                         f"{'is' if lacking == 1 else 'are'} left out")
   return filter_answered(select_attempts(responses, args.attempts),
                          args.answered)
 @
@@ -4786,6 +4801,11 @@ def attempt_start(response):
   if response.elapsed is None:
     return submitted
   return submitted.shift(seconds=-response.elapsed)
+
+def in_period(responses, args):
+  """Returns the `responses` in the period of `--started-after/before`"""
+  return filter_started(responses, getattr(args, "started_after", None),
+                        getattr(args, "started_before", None))
 
 def filter_started(responses, after=None, before=None):
   """Returns the `responses` whose attempt started in [`after`, `before`)
@@ -4839,10 +4859,15 @@ def test_filter_started_keeps_the_attempts_of_a_period():
 Let's verify the four selections on two students: student 1 has three
 attempts, of which the second and third have the most points, and student 2
 has only attempt 4, which every selection but [[first]] keeps.
-Then that two submissions numbered 2 count as two attempts, the later one
-being the last, and that [[--attempts last --answered all]] keeps a
-student's last attempt only if it was complete, rather than turning to the
-complete attempt before it.
+Then that two submissions numbered 2 count as two attempts everywhere---
+in the selection, the filter, the overview, the difficulty view, given
+the later one first, and the report rows---and that of two attempts 1 the
+earlier is the first; that a later submission with the same number as an
+earlier one does not start afresh; and that both readers keep the
+submission times that tell such attempts apart.
+Last, [[--attempts last --answered all]] keeps a student's last attempt
+only if it was complete, rather than turning to the complete attempt
+before it.
 <<test functions>>=
 def answer_record(student=1, attempt=1, position=1, answer="A", right=True,
              points=None):
@@ -4866,16 +4891,49 @@ def test_select_attempts_keeps_the_named_attempts(selection, attempts,
   assert [r.attempt for r in selected if r.student_id == 2] == others
   assert quizzes.lacking_attempt_one(responses) == 1
 
+def submission(attempt, day, *answers):
+  """The records of student 5's `attempt` submitted on `day` (answer, right)"""
+  return [dataclasses.replace(answer_record(5, attempt, position, answer,
+                                            right),
+                              submitted=f"2026-11-{day}T12:00:00Z")
+          for position, (answer, right) in enumerate(answers, start=1)]
+
 def test_two_submissions_with_one_number_stay_apart():
-  twice = [dataclasses.replace(answer_record(5, 2, 1, answer, right),
-                               submitted=day)
-           for answer, right, day in (("A", False, "2026-11-23T14:20:00Z"),
-                                      ("B", True, "2026-11-24T12:02:00Z"))]
-  assert [r.answer for r in quizzes.select_attempts(twice, "last")] == ["B"]
+  later, earlier = (submission(2, 24, ("B", True), ("C", True)),
+                    submission(2, 23, ("A", False), (None, False)))
+  twice = later + earlier
+  assert [r.answer for r in quizzes.select_attempts(twice, "last")] \
+    == ["B", "C"]
   assert quizzes.attempt_overview(twice).startswith(
     "2 attempts by 1 student:")
-  [summary] = quizzes.attempt_difficulty(twice)
-  assert summary["median_attempts"] == 2
+  question_one = [r for r in twice if r.position == 1]
+  [summary] = quizzes.attempt_difficulty(question_one)
+  assert summary["first_right"] == 0 and summary["median_attempts"] == 2
+  assert len(quizzes.filter_answered(twice, "all")) == 2
+  assert [row["attempt"] for row in quizzes.attempt_rows(twice)] == ["2", "2"]
+  firsts = submission(1, 24, ("B", True)) + submission(1, 23, ("A", False))
+  assert [r.answer for r in quizzes.select_attempts(firsts, "first")] == ["A"]
+
+def test_a_later_submission_with_the_same_number_does_not_start_afresh():
+  responses = [dataclasses.replace(r, elapsed=600)
+               for r in (submission(1, 22, (None, False))
+                         + submission(2, 23, ("A", True))
+                         + submission(2, 24, ("B", True)))]
+  overview = quizzes.attempt_overview(responses, 3600, builds_on_last=True)
+  assert "the times are of the 2 attempts that started afresh." in overview
+
+def test_report_records_keep_their_submission_times():
+  first = new_quiz_attempt(5, 2, (185, "AES", 1.0))
+  second = new_quiz_attempt(5, 2, (185, "DES", 0.0))
+  second["student_data"]["submitted_at"] = "2026-11-24T12:00:00Z"
+  records = list(quizzes.new_quiz_attempt_responses(
+    [first, second], [listed_new_quiz_item(307, 185, 1, "<p>Which?</p>")]))
+  assert quizzes.attempt_overview(records).startswith("2 attempts")
+  history = [classic_entry(2, (11, True, 1.0, "1", {"answer_id": 1})),
+             classic_entry(2, (11, False, 0.0, "2", {"answer_id": 2}))]
+  history[1]["submitted_at"] = "2026-11-24T12:00:00Z"
+  classic = list(quizzes.classic_attempt_responses({7: history}, [], {}))
+  assert quizzes.attempt_overview(classic).startswith("2 attempts")
 
 def test_attempts_are_picked_before_they_are_filtered():
   responses = [answer_record(5, 1, 1, "A"), answer_record(5, 1, 2, "B"),
@@ -5289,8 +5347,9 @@ own, complete or not.
 [[--skip-unanswered]] works on single answers, so it applies last, and
 \enquote{first} remains the first attempt at the quiz.
 
-An attempt is the set of a student's answers with the same attempt number,
-so we count its answers per [[attempt_key]].
+An attempt is the set of a student's answers with the same [[attempt_key]]:
+student, attempt number and submission time (\cref{sec:quiz-attempts}),
+so we count its answers per key.
 <<constants>>=
 ANSWERED_SELECTIONS = ("any", "some", "all")
 <<functions>>=
@@ -5431,7 +5490,7 @@ def attempt_overview(responses, time_limit=None, builds_on_last=False,
 @
 
 The records are answers, so we first gather them into attempts, keyed by
-student and attempt number as in [[filter_answered]].
+[[attempt_key]] as in [[filter_answered]].
 All answers of an attempt carry the same time, so any of them gives it.
 <<collect each attempt's answered count and time>>=
 attempts = defaultdict(lambda: {"answered": 0, "questions": 0,
@@ -5685,7 +5744,9 @@ ask questions the two summaries do not, such as how one student
 progressed.
 It follows the TSV conventions of the other commands: no Markdown, a
 header row, and the delimiter of [[-d]].
-The time of the attempt, in seconds, is empty for Classic Quizzes.
+The time the attempt was submitted tells two submissions with the same
+number apart, as the [[attempt_key]] does; the time it took, in seconds,
+is empty for Classic Quizzes.
 Rightness is written as 1 or 0, empty when unknown, which a spreadsheet or
 [[awk]] can sum.
 <<functions>>=
@@ -5693,14 +5754,15 @@ def write_attempt_table(responses, title, delimiter, header=True, file=None):
   """Writes `responses` to `file` (stdout by default) as delimited rows"""
   writer = csv.writer(file or sys.stdout, delimiter=delimiter)
   if header:
-    writer.writerow(["quiz", "student_id", "student", "attempt", "elapsed",
-                     "position",
+    writer.writerow(["quiz", "student_id", "student", "attempt",
+                     "submitted", "elapsed", "position",
                      "question_id", "question", "answer", "points", "right"])
   for response in sorted(responses, key=lambda r: (
       r.student, r.student_id, r.attempt, r.submitted, r.position)):
     writer.writerow([
       title, response.student_id, response.student, response.attempt,
-      number_label(response.elapsed), position_label(response.position),
+      response.submitted, number_label(response.elapsed),
+      position_label(response.position),
       response.question_id,
       response.question, response.answer or "", number_label(response.points),
       {True: "1", False: "0"}.get(response.right, "")])
@@ -5716,8 +5778,16 @@ def test_attempt_table_writes_one_row_per_answer():
   header, row, unknown = out.getvalue().splitlines()
   assert unknown.split("\t")[-1] == ""
   assert header.split("\t")[:4] == ["quiz", "student_id", "student", "attempt"]
-  assert row.split("\t") == ["Quiz", "7", "Student 7", "2", "", "3", "3",
-                             "Question 3", "AES", "0", "0"]
+  assert row.split("\t") == ["Quiz", "7", "Student 7", "2", "", "", "3",
+                             "3", "Question 3", "AES", "0", "0"]
+
+def test_attempt_table_orders_submissions_of_one_number_by_time():
+  out = io.StringIO()
+  later, earlier = (submission(2, 24, ("B", True)), submission(2, 23, ("A", True)))
+  quizzes.write_attempt_table(later + earlier, "Quiz", ",", header=False,
+                              file=out)
+  assert [row.split(",")[9] for row in out.getvalue().splitlines()] \
+    == ["A", "B"]
 
 def test_attempt_table_sorts_by_student_and_attempt():
   out = io.StringIO()
@@ -5829,8 +5899,8 @@ parser = attempts_parser
 @
 
 The selections apply in the order \cref{sec:quiz-attempts-abandoned}
-explains: [[--answered]], then [[--attempts]], then the overview, then
-[[--skip-unanswered]].
+explains: [[--attempts]], then [[--answered]] (both in [[pick_attempts]]),
+then the overview, then [[--skip-unanswered]].
 The time limit, which only the overview needs, is read from a New Quiz's
 settings, as is whether its attempts build on the last one; for a Classic
 Quiz there are no times to summarise.
@@ -5872,11 +5942,12 @@ def attempts_command(config, canvas, args):
     except (CanvasException, requests.RequestException) as error:
       canvaslms.cli.warn(f"{quiz.title}: could not read the attempts: {error}")
       continue
-    lacking = (lacking_attempt_one(responses) if args.attempts == "first"
-               else 0)
-    responses = pick_attempts(responses, args)
+    lacking = (lacking_attempt_one(in_period(responses, args))
+               if args.attempts == "first" else 0)
+    responses = pick_attempts(responses, args, quiz.title)
     if not responses:
-      canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
+      if not lacking:
+        canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
       continue
     overview = attempt_overview(responses, attempts_time_limit(quiz),
                                 attempts_build_on_last(quiz), lacking)
@@ -6094,6 +6165,18 @@ def test_attempts_command_names_students_without_attempt_one(capsys):
   out = capsys.readouterr().out
   assert "1 attempt by 1 student:" in out
   assert "1 student with no attempt 1 in the report is left out." in out
+  run_attempts(course, "-a", "Ciphers", "--attempts", "last")
+  assert "no attempt 1" not in capsys.readouterr().out
+
+@responses.activate
+def test_analyse_warns_about_students_without_attempt_one(capsys, caplog):
+  course = course_with_attempts(report=[
+    new_quiz_attempt(5, 1, (185, "AES", 1.0)),
+    new_quiz_attempt(6, 2, (185, "DES", 0.0))])
+  run_analyse(course, "-c", "SBX", "-a", "Ciph", "--attempts", "first")
+  assert "- AES: 1 (100.0%)" in capsys.readouterr().out
+  assert "Ciphers: 1 student with no attempt 1 in the report is left out" \
+    in caplog.text
 @
 
 The period options reach both quiz systems through the command: the
