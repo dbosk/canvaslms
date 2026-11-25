@@ -4441,10 +4441,12 @@ The overview describes the attempts that [[--answered]] and
 [[--attempts]] kept, but before [[--skip-unanswered]], which would make
 every attempt look complete.
 <<functions>>=
-def attempt_overview(responses, time_limit=None):
+def attempt_overview(responses, time_limit=None, builds_on_last=False):
   """Returns a Markdown paragraph summarising the attempts in `responses`
 
-  `time_limit` is the quiz's time limit in seconds, None if it has none.
+  `time_limit` is the quiz's time limit in seconds, None if it has none;
+  `builds_on_last` is true for a quiz whose attempts build on the last one,
+  whose times are then summarised over first attempts only.
   """
   <<collect each attempt's answered count and time>>
   <<write the attempt counts>>
@@ -4502,11 +4504,31 @@ that is for a New Quiz, and they compare the times with the limit as
 The median is taken over complete attempts before the limit only, since
 an attempt cut off by the limit, or answered only in part, says nothing
 about how long the whole quiz takes.
+
+A New Quiz can let each attempt build on the last one
+([[build_on_last_attempt]] in its [[quiz_settings]]): a later attempt then
+starts from the previous answers, and its time covers only what the
+student adds.
+We saw this in the reports: in a quiz that builds on the last attempt, the
+median first attempt took 38 minutes and the median later one 18, and in
+another 13 and 2, whereas in a quiz that does not, the two were 60 and 57
+minutes.
+For such a quiz we summarise the times of first attempts only---attempt 1,
+not each student's earliest selected attempt, which after
+[[--attempts last]] would be a later one---and say so.
+The table view still gives every attempt's own time.
 <<write the time of the attempts>>=
+timed = attempts
+if builds_on_last:
+  timed = {key: attempt for key, attempt in attempts.items() if key[1] == 1}
 classes = defaultdict(list)
-for attempt in attempts.values():
+for attempt in timed.values():
   classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
 if any(attempt["elapsed"] is not None for attempt in attempts.values()):
+  if builds_on_last:
+    sentences.append("The quiz builds on each student's last attempt, so a "
+                     "later attempt's time covers only what it adds; the "
+                     f"times are of the {counted(len(timed), 'first attempt')}.")
   if not time_limit:
     sentences.append("The quiz has no time limit, so the time of the "
                      "attempts is not summarised.")
@@ -4560,6 +4582,17 @@ def test_attempt_overview_separates_abandoned_attempts():
   untimed = quizzes.attempt_overview([answer_record(1, 1, 1)])
   assert untimed.startswith("1 attempt by 1 student:")
   assert "limit" not in untimed
+
+def test_attempt_overview_times_only_first_attempts_that_are_built_on():
+  responses = (timed_answers(1, 1200, "A", "B")
+               + [dataclasses.replace(r, attempt=2)
+                  for r in timed_answers(1, 300, "A", "B")])
+  built_on = quizzes.attempt_overview(responses, 3600, builds_on_last=True)
+  assert "the times are of the 1 first attempt." in built_on
+  assert "took 20 minutes (median)" in built_on
+  assert "1 ended before the limit" in built_on
+  plain = quizzes.attempt_overview(responses, 3600)
+  assert "took 12 minutes (median)" in plain and "first attempt" not in plain
 
 def test_attempt_overview_ignores_time_without_a_limit():
   overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
@@ -4718,7 +4751,8 @@ The selections apply in the order \cref{sec:quiz-attempts-abandoned}
 explains: [[--answered]], then [[--attempts]], then the overview, then
 [[--skip-unanswered]].
 The time limit, which only the overview needs, is read from a New Quiz's
-settings; for a Classic Quiz there are no times to compare with it.
+settings, as is whether its attempts build on the last one; for a Classic
+Quiz there are no times to summarise.
 A quiz without attempts to show raises [[EmptyListError]], which we turn
 into a warning so that the other quizzes are still shown; only when no
 quiz had any does the command fail.
@@ -4731,6 +4765,14 @@ def attempts_time_limit(quiz):
   if not is_new_quiz(quiz):
     return None
   return quiz_settings_time_limit(getattr(quiz, "quiz_settings", None))
+
+def attempts_build_on_last(quiz):
+  """True if `quiz` is a New Quiz whose attempts build on the last one"""
+  if not is_new_quiz(quiz):
+    return False
+  settings = getattr(quiz, "quiz_settings", None) or {}
+  return bool((settings.get("multiple_attempts") or {})
+              .get("build_on_last_attempt"))
 
 def attempts_command(config, canvas, args):
   """Shows how students did over their attempts at the selected quizzes"""
@@ -4754,7 +4796,8 @@ def attempts_command(config, canvas, args):
     if not responses:
       canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
       continue
-    overview = attempt_overview(responses, attempts_time_limit(quiz))
+    overview = attempt_overview(responses, attempts_time_limit(quiz),
+                                attempts_build_on_last(quiz))
     if args.skip_unanswered:
       responses = answered_only(responses)
     if args.table:
@@ -4936,6 +4979,25 @@ def test_attempts_command_leaves_out_abandoned_attempts(
   if attempts == "2 attempts":
     assert "Of those that ended at the limit, 0 answered every question, " \
            "0 some and 1 none." in out
+@
+
+A quiz whose attempts build on the last one says so in its settings, and
+the overview then times only first attempts.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_reads_build_on_last_attempt(capsys):
+  first = new_quiz_attempt(5, 1, (185, "AES", 1.0))
+  first["student_data"]["elapsed_time"] = "00:40:00"
+  course = course_with_attempts(
+    new_quiz={"id": "42", "title": "Ciphers", "quiz_settings": {
+      "has_time_limit": True, "session_time_limit_in_seconds": 3600,
+      "multiple_attempts": {"multiple_attempts_enabled": True,
+                            "build_on_last_attempt": True}}},
+    report=[first, new_quiz_attempt(5, 2, (185, "AES", 1.0))])
+  run_attempts(course, "-a", "Ciphers")
+  out = capsys.readouterr().out
+  assert "builds on each student's last attempt" in out
+  assert "took 40 minutes (median)" in out
 @
 
 The options keep the views apart and require a quiz.
