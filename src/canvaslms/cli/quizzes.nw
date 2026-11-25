@@ -503,7 +503,7 @@ import zipfile
 import requests
 import yaml
 from collections import defaultdict, Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
@@ -3670,12 +3670,12 @@ def new_quiz_attempt_responses(report, items, bank=None):
         position = item.get("position") or UNKNOWN_POSITION
         worth = item.get("points_possible")
       elif bank is not None and item_id in bank.titles:
-        if not bank.drawn(student, item_id):
+        if not bank.drawn(student, item_id, response):
           continue
         question_html = bank.titles[item_id]
         question = plain_text(question_html)
         position = UNKNOWN_POSITION
-        worth = bank.worths.get(item_id)
+        worth = None
       else:
         if not shown_in_attempt(response, None, student.get("submitted_at")):
           continue
@@ -3684,6 +3684,12 @@ def new_quiz_attempt_responses(report, items, bank=None):
         position = UNKNOWN_POSITION
         worth = None
       score = response.get("score") or 0
+      if worth:
+        right = score >= worth or math.isclose(score, worth)
+      elif bank is not None and item is None and item_id in bank.titles:
+        right = bank.right(item_id, score)
+      else:
+        right = None
       yield AttemptResponse(
         student_id=student["id"],
         student=student.get("name") or str(student["id"]),
@@ -3694,8 +3700,7 @@ def new_quiz_attempt_responses(report, items, bank=None):
         answer=plain_text(response.get("answer")) or None,
         question_html=question_html,
         points=score,
-        right=(score >= worth or math.isclose(score, worth)) if worth
-              else None,
+        right=right,
         elapsed=elapsed_seconds(student.get("elapsed_time")))
 @
 
@@ -3830,16 +3835,38 @@ class BankDraws:
 
   `titles` maps an item ID to its question; `statuses` maps (student ID,
   attempt, item ID), all strings, to Canvas's status of that question in
-  that attempt; `worths` maps an item ID to its points, where known.
+  that attempt.  The rest is what `settle_bank_rightness` finds out:
+  `value`, the worth of every drawn question when all banks have the same;
+  `best`, the best score on each question; and `full`, which maps a
+  question to True when its best score is its worth and False when its
+  worth is more.
   """
   titles: dict
   statuses: dict
-  worths: dict
+  value: float | None = None
+  best: dict = field(default_factory=dict)
+  full: dict = field(default_factory=dict)
 
-  def drawn(self, student, item_id):
-    """True unless the attempt of `student` did not draw `item_id`"""
+  def drawn(self, student, item_id, response):
+    """True unless the attempt of `student` did not draw `item_id`
+
+    Without a status for the attempt, only an answered question counts as
+    drawn.
+    """
     key = (str(student["id"]), str(student["attempt"]), item_id)
-    return self.statuses.get(key) != NOT_DRAWN
+    status = self.statuses.get(key)
+    if status is None:
+      return bool(response.get("answer"))
+    return status != NOT_DRAWN
+
+  def right(self, item_id, score):
+    """True or False if `score` is certainly right or wrong, else None"""
+    if self.value is not None:
+      return score >= self.value or math.isclose(score, self.value)
+    best = self.best.get(item_id, 0)
+    if score <= 0 or (score < best and not math.isclose(score, best)):
+      return False
+    return self.full.get(item_id)
 <<constants>>=
 NOT_DRAWN = "Not Attempted"
 <<functions>>=
@@ -3877,111 +3904,115 @@ def test_read_bank_draws_reads_titles_and_statuses():
                       ("5", "1", "502"): "Not Attempted"}
 @
 
-\paragraph{The worth of a drawn question.}
-Whether an answer is right needs the question's worth, which is the
-[[points_possible]] of the [[Bank]] item that drew it---unknown, since we
-do not know which bank that is.
+\paragraph{Whether a drawn answer is right.}
+An answer is right when it earned all the points its question is worth,
+and a drawn question is worth the [[points_possible]] of the [[Bank]] item
+that drew it---which we cannot tell, since we do not know its bank.
 When all [[Bank]] items are worth the same, that is the worth.
-Otherwise we infer it, in three steps.
-\begin{enumerate}
-\item The worth is one of the [[Bank]] items' values, and at least the
-  best score anyone got on the question, so we take the smallest value
-  that is at least that score.
-  This is right when someone got the question fully right, and also when
-  the best score is a partial one above the next smaller value.
-  A question nobody scored on stays unknown.
-\item Each attempt's [[points_possible]] in the report is the sum of the
-  worths of the questions it drew.
-  An attempt in which a single question's worth is unknown thus gives that
-  worth, provided the difference is one of the values; a worth found this
-  way may unlock another attempt, so we repeat until nothing changes.
-\item An attempt whose questions all have a worth must add up to its
-  total.
-  If it does not, a worth from the first step was a partial score taken
-  for a full one, and we forget the worths of that attempt's questions
-  rather than show wrong answers as right.
-\end{enumerate}
-On the three practice exams, this gave a worth to 91 of 100, 54 of 54 and
-47 of 53 questions, every one consistent with the totals.
-Questions left without a worth are neither right nor wrong.
+Otherwise we take as right or wrong only what the reports make certain,
+and leave the rest unknown:
+\begin{itemize}
+\item A question is worth at least the best score anyone got on it, so a
+  score below that best, or no score at all, is certainly not right.
+\item The report counts each attempt's right answers, as
+  [[number_of_correct]]; on a quiz whose worths we know, that count was
+  the number of answers that earned their question's full points, in all
+  620 attempts.
+  The answers that may be right in an attempt are those equal to their
+  question's best score.
+  If they are exactly as many as the attempt's right answers still
+  unaccounted for, all of them are right, so each of their questions is
+  worth its best score; if no right answers are unaccounted for, none of
+  them is, and each of their questions is worth more.
+  The answers to the quiz's own items count with their known worths.
+\item What one attempt settles about a question holds in the others, so we
+  repeat until nothing changes.
+\end{itemize}
+An earlier version guessed a question's worth as the smallest bank value
+at least its best score.
+A review showed that this takes a partial score for a full one---a best of
+10 on a question worth 100, with banks worth 1, 10 and 100---and that
+solving the other worths from the attempt's total then hides the mistake,
+so the partial answer was marked right.
+The counts of right answers cannot err that way.
+On the three practice exams they settled 125 of 147, 46 of 63 and 63 of
+63 drawn answers; the others are neither right nor wrong.
 <<functions>>=
-def bank_worths(report, items, bank):
-  """Returns the inferred worth of the drawn questions in `report`
+def settle_bank_rightness(report, items, bank):
+  """Finds out in `bank` which drawn answers of `report` are right
 
-  `items` are the quiz's items and `bank` the `BankDraws` without worths.
-  Returns a dict from item ID to points; unknown worths are left out.
+  `items` are the quiz's items; the findings go into `bank` (`value`,
+  `best` and `full`).
   """
-  values = sorted({item["points_possible"] for item in items
-                   if item.get("entry_type") == "Bank"})
-  attempts = [(record["summary"].get("points_possible"),
-               [response for response in record["item_responses"]
-                if str(response["item_id"]) in bank.titles
-                and bank.drawn(record["student_data"],
-                               str(response["item_id"]))])
-              for record in report]
-  <<take each worth from the values and the best score>>
-  <<solve the remaining worths from the attempts' totals>>
-  <<forget the worths that contradict a total>>
-  return worths
-
-def is_value(number, values):
-  """True if `number` is one of `values`, allowing floating-point error"""
-  return any(math.isclose(number, value) for value in values)
-@
-
-<<take each worth from the values and the best score>>=
-best = defaultdict(float)
-for _, drawn in attempts:
-  for response in drawn:
-    item_id = str(response["item_id"])
-    best[item_id] = max(best[item_id], response.get("score") or 0)
-worths = {}
-for item_id, score in best.items():
+  values = {item["points_possible"] for item in items
+            if item.get("entry_type") == "Bank"}
   if len(values) == 1:
-    worths[item_id] = values[0]
-    continue
-  candidates = [value for value in values
-                if value >= score or math.isclose(value, score)]
-  if score > 0 and candidates:
-    worths[item_id] = candidates[0]
+    bank.value = values.pop()
+    return
+  <<collect each attempt's drawn answers and known right answers>>
+  <<settle the questions from the attempts' counts>>
 @
 
-<<solve the remaining worths from the attempts' totals>>=
-solved = True
-while solved:
-  solved = False
-  for total, drawn in attempts:
-    unknown = {str(r["item_id"]) for r in drawn} - worths.keys()
-    if total is None or len(unknown) != 1:
+For each attempt we keep its count of right answers, how many of them we
+already know---those to the quiz's own items---and its drawn answers.
+<<collect each attempt's drawn answers and known right answers>>=
+entries = item_entries(items)
+attempts = []
+for record in report:
+  student = record["student_data"]
+  known_right, drawn = 0, []
+  for response in record["item_responses"]:
+    item_id, score = str(response["item_id"]), response.get("score") or 0
+    if item_id in entries:
+      worth = entries[item_id][0].get("points_possible")
+      known_right += bool(worth) and (score >= worth
+                                      or math.isclose(score, worth))
+    elif item_id in bank.titles and bank.drawn(student, item_id, response):
+      drawn.append((item_id, score))
+      bank.best[item_id] = max(bank.best.get(item_id, 0), score)
+  attempts.append((record.get("summary", {}).get("number_of_correct"),
+                   known_right, drawn))
+@
+
+<<settle the questions from the attempts' counts>>=
+settled = True
+while settled:
+  settled = False
+  for correct, known_right, drawn in attempts:
+    if correct is None:
       continue
-    rest = total - sum(worths[str(r["item_id"])] for r in drawn
-                       if str(r["item_id"]) in worths)
-    if is_value(rest, values):
-      worths[unknown.pop()] = rest
-      solved = True
+    candidates = {item_id for item_id, score in drawn
+                  if score > 0 and math.isclose(score, bank.best[item_id])}
+    right = known_right + sum(bank.full.get(item_id) is True
+                              for item_id in candidates)
+    open_questions = candidates - bank.full.keys()
+    if not open_questions:
+      continue
+    if correct - right == len(open_questions):
+      bank.full.update(dict.fromkeys(open_questions, True))
+      settled = True
+    elif correct == right:
+      bank.full.update(dict.fromkeys(open_questions, False))
+      settled = True
 @
 
-<<forget the worths that contradict a total>>=
-for total, drawn in attempts:
-  ids = {str(r["item_id"]) for r in drawn}
-  if total is None or not ids <= worths.keys():
-    continue
-  if not math.isclose(total, sum(worths[item_id] for item_id in ids)):
-    for item_id in ids:
-      worths.pop(item_id, None)
-@
-
-Let's verify the three steps on banks worth 1, 10 and 100 points.
-Question 601 was fully right once, so its worth is 10; question 602 was
-never scored, but the attempt drawing it has 601 and 602 and a total of
-110, so 602 is worth 100; question 603 had a best score of 5, whose
-inference 10 contradicts the total of its attempt, 100.
+Let's verify the settling on banks worth 1, 10 and 100 points, including
+the two cases where the earlier guess marked a partial answer right.
+Student 5 scored 1 on question 701 and 0 on 702, with no right answer:
+701 is worth more than 1, so the 1 is not right.
+Student 6 scored 10 on 801 and 1 on 802 with one right answer, and
+student 7 scored 1 on 802 with one right answer: the second attempt shows
+that 802's best, 1, is right, so the first attempt's right answer is
+802's, and 801's 10 is not right.
+A score of 0.5 on 802, below its best, is not right even though 802's
+best is.
+Question 803 is drawn once with no count, so it stays unknown.
 <<test functions>>=
-def bank_attempt(student, total, *responses):
+def bank_attempt(student, correct, *responses):
   """A report record of an attempt drawing `responses` (id, score)"""
   record = new_quiz_attempt(student, 1, *[(i, "x" if score else "", score)
                                           for i, score in responses])
-  record["summary"] = {"points_possible": total}
+  record["summary"] = {"number_of_correct": correct}
   return record
 
 def bank_item(item_id, points):
@@ -3992,24 +4023,50 @@ def bank_item(item_id, points):
                     "entry_count": 5, "item_entry_count": 5,
                     "archived": False}}
 
-def test_bank_worths_infers_and_checks_worths():
-  items = [bank_item(1, 1.0), bank_item(2, 10.0), bank_item(3, 100.0)]
-  report = [bank_attempt(5, 110.0, (601, 10.0), (602, 0.0)),
-            bank_attempt(6, 100.0, (603, 5.0))]
-  bank = quizzes.BankDraws({"601": "a", "602": "b", "603": "c"}, {}, {})
-  assert quizzes.bank_worths(report, items, bank) == {"601": 10.0,
-                                                       "602": 100.0}
+def settled_bank(report, items, ids):
+  """The `BankDraws` of `report` for questions `ids`, settled"""
+  bank = quizzes.BankDraws({str(i): f"Q{i}" for i in ids}, {})
+  quizzes.settle_bank_rightness(report, items, bank)
+  return bank
 
-def test_bank_worths_of_equal_banks_are_their_value():
-  items = [bank_item(1, 2.0), bank_item(2, 2.0)]
-  report = [bank_attempt(5, 4.0, (601, 0.0), (602, 0.0))]
-  bank = quizzes.BankDraws({"601": "a", "602": "b"}, {}, {})
-  assert quizzes.bank_worths(report, items, bank) == {"601": 2.0, "602": 2.0}
+def test_settling_never_takes_a_partial_score_for_right():
+  items = [bank_item(1, 1.0), bank_item(2, 10.0), bank_item(3, 100.0)]
+  report = [bank_attempt(5, 0, (701, 1.0), (702, 0.0)),
+            bank_attempt(6, 1, (801, 10.0), (802, 1.0)),
+            bank_attempt(7, 1, (802, 1.0)),
+            bank_attempt(8, None, (803, 5.0))]
+  report[3]["summary"] = {}
+  bank = settled_bank(report, items, [701, 702, 801, 802, 803])
+  assert bank.right("701", 1.0) is False and bank.right("702", 0.0) is False
+  assert bank.right("801", 10.0) is False and bank.right("802", 1.0) is True
+  assert bank.right("802", 0.5) is False
+  assert bank.right("803", 5.0) is None
+
+def test_settling_uses_the_quizs_own_items_and_equal_banks():
+  items = [bank_item(1, 10.0), bank_item(2, 100.0),
+           listed_new_quiz_item(307, 185, 1, "<p>Fixed</p>", points=5.0)]
+  report = [bank_attempt(5, 1, (185, 5.0), (901, 10.0))]
+  bank = settled_bank(report, items, [901])
+  assert bank.right("901", 10.0) is False
+  equal = settled_bank([bank_attempt(5, 0, (901, 1.0))],
+                       [bank_item(1, 2.0), bank_item(2, 2.0)], [901])
+  assert equal.right("901", 2.0) is True and equal.right("901", 1.0) is False
+@
+
+A missing status must not make a question count as drawn: then only an
+answered question does, so that a question the attempt did not draw is
+not taken for a blank.
+<<test functions>>=
+def test_a_missing_status_counts_only_answers_as_drawn():
+  bank = quizzes.BankDraws({"501": "a"}, {})
+  student = {"id": 5, "attempt": 2}
+  assert bank.drawn(student, "501", {"answer": "for"})
+  assert not bank.drawn(student, "501", {"answer": ""})
 @
 
 With the draws known, the records of such a quiz leave out the questions
 an attempt did not draw, keep a drawn question left blank, and take the
-questions' texts and worths from the [[BankDraws]].
+questions' texts and rightness from the [[BankDraws]].
 <<test functions>>=
 def test_bank_draws_become_records():
   items = [bank_item(1, 10.0)]
@@ -4018,8 +4075,7 @@ def test_bank_draws_become_records():
   bank = quizzes.BankDraws(
     {"501": "Which loop?", "502": "Which type?", "503": "Which call?"},
     {("5", "1", "501"): "Graded", ("5", "1", "502"): "Not Attempted",
-     ("5", "1", "503"): "No Answer"},
-    {"501": 10.0, "503": 10.0})
+     ("5", "1", "503"): "No Answer"}, value=10.0)
   records = list(quizzes.new_quiz_attempt_responses(report, items, bank))
   assert [(r.question, r.answer, r.right, r.answered) for r in records] == [
     ("Which loop?", "for", True, True), ("Which call?", None, False, False)]
@@ -4040,8 +4096,8 @@ def fetch_new_quiz_attempts(quiz, requester):
   bank = None
   if any(item.get("entry_type") == "Bank" for item in items):
     bank = BankDraws(*read_bank_draws(download_new_quiz_report(
-      quiz, requester, "csv").decode("utf-8-sig")), {})
-    bank.worths = bank_worths(report, items, bank)
+      quiz, requester, "csv").decode("utf-8-sig")))
+    settle_bank_rightness(report, items, bank)
   return list(new_quiz_attempt_responses(report, items, bank))
 
 def download_new_quiz_report(quiz, requester, report_format):
@@ -4118,7 +4174,7 @@ def test_fetching_a_quiz_with_bank_items_reads_the_csv_too():
     responses.get(f"https://canvas.example.invalid/api/v1/progress/{number}",
                   json=progress)
   record = new_quiz_attempt(5, 1, (501, "for", 10.0), (502, "", 0))
-  record["summary"] = {"points_possible": 10.0}
+  record["summary"] = {"number_of_correct": 1}
   responses.get("https://files.example.invalid/r.json", json=[record])
   responses.get("https://files.example.invalid/r.csv",
                 body=("﻿" + BANK_CSV).encode("utf-8"))
