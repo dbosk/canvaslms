@@ -1565,8 +1565,13 @@ def test_poll_progress_completes_on_file_without_sleeping(monkeypatch):
 
 \subsection{CSV report downloading}
 
-Both Classic and New Quizzes provide CSV reports via a file URL. This helper
-downloads and decodes the CSV with proper UTF-8 encoding.
+A Classic Quiz's report is a CSV file at a URL, which [[analyse]] reads
+(\cref{sec:quiz-classic-report}); New Quizzes' reports we read as JSON
+instead (\cref{sec:quiz-new-rows}).
+This helper downloads the file and decodes its bytes as UTF-8 itself:
+[[requests]]' [[response.text]] decodes a [[text/csv]] response that names
+no character set as ISO-8859-1, which turns \enquote{Stål} into
+\enquote{StÃ¥l} (requests 2.34, tried 2026-11-25).
 <<functions>>=
 def download_csv_report(file_url):
   """
@@ -3219,6 +3224,7 @@ def test_analyse_refuses_an_unreadable_csv_file(tmp_path, caplog):
 @
 
 \subsection{Downloading a Classic Quiz report}
+\label{sec:quiz-classic-report}
 
 For a Classic Quiz, we generate the report, poll until it is ready and
 parse the CSV we download.
@@ -3233,7 +3239,7 @@ has no between---so all thirty requests fired back-to-back.
 
 An earlier version wrote each download to a temporary file, which the
 processing then read back, and never removed the files; we parse the
-downloaded text directly instead.
+downloaded text directly instead, with [[download_csv_report]].
 <<download the Classic Quiz report as [[rows]]>>=
 warn_attempt_options_ignored(args, quiz.title)
 file_url = None
@@ -3260,12 +3266,40 @@ if not file_url:
   continue
 
 try:
-  response = requests.get(file_url)
-  response.raise_for_status()
-  rows = list(csv.DictReader(io.StringIO(response.content.decode('utf-8'))))
+  rows = list(download_csv_report(file_url))
 except Exception as e:
   canvaslms.cli.warn(f"Error downloading report for quiz '{quiz.title}': {e}")
   continue
+@
+
+The download keeps international characters, and a report that cannot be
+downloaded is skipped with a warning.
+<<test functions>>=
+@responses.activate
+def test_classic_report_keeps_international_characters(capsys):
+  course = course_with_attempts()
+  report = {"id": 2, "quiz_id": 9, "report_type": "student_analysis",
+            "file": {"url": "https://files.example.invalid/c.csv"}}
+  responses.post(f"{CACHE_API}/courses/1/quizzes/9/reports", json=report)
+  responses.get(f"{CACHE_API}/courses/1/quizzes/9/reports/2", json=report)
+  responses.get("https://files.example.invalid/c.csv",
+                body='name,id,"11: Tillåtet?"\nStål,7,Ja då\n'.encode("utf-8"),
+                content_type="text/csv")
+  run_analyse(course, "-c", "SBX", "-a", "Honour")
+  assert "- Ja då: 1 (100.0%)" in capsys.readouterr().out
+
+@responses.activate
+def test_classic_report_that_cannot_be_downloaded_is_skipped(caplog):
+  course = course_with_attempts()
+  report = {"id": 2, "quiz_id": 9, "report_type": "student_analysis",
+            "file": {"url": "https://files.example.invalid/c.csv"}}
+  responses.post(f"{CACHE_API}/courses/1/quizzes/9/reports", json=report)
+  responses.get(f"{CACHE_API}/courses/1/quizzes/9/reports/2", json=report)
+  responses.get("https://files.example.invalid/c.csv", status=404,
+                body="name,id\n")
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_analyse(course, "-c", "SBX", "-a", "Honour")
+  assert "Error downloading report for quiz 'Honour code'" in caplog.text
 @
 
 
