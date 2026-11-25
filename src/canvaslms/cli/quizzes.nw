@@ -17,6 +17,7 @@ The [[quizzes]] command has the following subcommands:
 \item[ [[list]] ] Lists all quizzes in a course (Classic, New Quizzes, and surveys)
 \item[ [[view]] ] Displays full quiz content including questions and answers
 \item[ [[analyse]] ] Summarizes quiz/survey evaluation data with statistics and AI
+\item[ [[attempts]] ] Shows how students did over all their attempts
 \item[ [[create]] ] Creates a new quiz from JSON (settings and optionally questions)
 \item[ [[edit]] ] Modifies quiz settings and instructions
 \item[ [[delete]] ] Removes a quiz
@@ -38,6 +39,8 @@ access.
 """Tests for canvaslms.cli.quizzes."""
 
 import argparse
+import dataclasses
+import io
 import json
 import logging
 import sys
@@ -53,6 +56,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 from canvasapi.assignment import Assignment, AssignmentGroup
 from canvasapi.content_migration import ContentMigration, MigrationIssue
 from canvasapi.course import Course
+from canvasapi.exceptions import CanvasException
 from canvasapi.grading_standard import GradingStandard
 from canvasapi.new_quiz import NewQuiz
 from canvasapi.quiz import Quiz, QuizQuestion, QuizReport
@@ -278,11 +282,21 @@ canvaslms quizzes items add --example
 The [[quizzes analyse]] command provides statistical analysis and AI-generated
 summaries of quiz and survey responses.  It supports two modes: fetching data
 directly from Canvas or analyzing a downloaded CSV file.
+It pools the answers of all students into one distribution per question.
+For a New Quiz it counts every attempt unless [[--attempts]] or
+[[--answered]] selects some; a Classic Quiz's report has only the attempt
+of each student that counts for the grade.
+To see how students did over several attempts at a quiz, use
+[[quizzes attempts]] instead (\cref{sec:quiz-attempts}).
 
 \subsection{Analyzing a CSV file}
 
-The most reliable method is to download the Student Analysis Report CSV from
-Canvas and analyze it locally:
+The command can fetch the report from Canvas itself, with [[-c]] and
+[[-a]]; for a New Quiz that is the better way, since it keeps the line
+breaks of code in the questions and can select attempts
+(\cref{sec:quiz-new-rows,sec:quiz-analyse-attempts}).
+A Student Analysis Report CSV downloaded from Canvas can also be analysed
+locally:
 \begin{minted}{bash}
 canvaslms quizzes analyse --csv survey_results.csv
 \end{minted}
@@ -455,6 +469,8 @@ subcommands:
 \item[ [[add_command()]] ] Registers the parent [[quizzes]] command
 \item[ [[add_list_command()]] ] Registers the [[quizzes list]] subcommand
 \item[ [[add_analyse_command()]] ] Registers the [[quizzes analyse]] subcommand
+\item[ [[add_attempts_command()]] ] Registers the [[quizzes attempts]]
+  subcommand
 \item[ [[add_create_command()]] ] Registers the [[quizzes create]] subcommand
 \item[ [[add_edit_command()]] ] Registers the [[quizzes edit]] subcommand
 \item[ [[add_delete_command()]] ] Registers the [[quizzes delete]] subcommand
@@ -487,6 +503,7 @@ import zipfile
 import requests
 import yaml
 from collections import defaultdict, Counter
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
@@ -528,6 +545,10 @@ def add_list_command(subp):
 def add_analyse_command(subp):
   """Adds the quizzes analyse subcommand to argparse parser subp"""
   <<add quizzes analyse command to subp>>
+
+def add_attempts_command(subp):
+  """Adds the quizzes attempts subcommand to argparse parser subp"""
+  <<add quizzes attempts command to subp>>
 
 def add_create_command(subp):
   """Adds the quizzes create subcommand to argparse parser subp"""
@@ -575,7 +596,8 @@ The subcommands are organized by workflow:
 \item[Discovery] [[list]] shows available quizzes; [[view]] displays full quiz
   content including questions (\cref{quiz-view}).
 \item[Analysis] [[analyse]] provides statistical summaries and AI-generated
-  insights for quiz/survey responses.
+  insights for quiz/survey responses; [[attempts]] follows how students do
+  over their attempts at a quiz (\cref{sec:quiz-attempts}).
 \item[Management] [[create]], [[edit]], [[delete]], and [[export]] handle quiz
   lifecycle, including backup and migration; [[accommodations]] gives
   students extra time or attempts (\cref{sec:quizzes-accommodations}); [[import]] and
@@ -596,6 +618,7 @@ quizzes_subp = quizzes_parser.add_subparsers(
 
 add_list_command(quizzes_subp)
 add_analyse_command(quizzes_subp)
+add_attempts_command(quizzes_subp)
 add_view_command(quizzes_subp)
 add_create_command(quizzes_subp)
 add_edit_command(quizzes_subp)
@@ -666,6 +689,8 @@ We need options for:
 \item Assignment/quiz selection (for Canvas API mode)
 \item Output format selection (markdown or LaTeX)
 \item AI-generated summaries of free-text responses
+\item Which attempts at a New Quiz to analyse
+  (\cref{sec:quiz-analyse-attempts})
 \end{itemize}
 <<add quizzes options>>=
 analyse_parser.add_argument("--csv", "-f",
@@ -691,6 +716,7 @@ analyse_parser.add_argument("--use-minted",
     metavar="LANG")
 
 <<AI summary options>>
+<<attempt options of analyse>>
 
 try:
   courses.add_course_option(analyse_parser, required=False)
@@ -1231,48 +1257,55 @@ The analysis can receive data from two sources:
   This can process multiple quizzes in one invocation.
 \end{description}
 
-Both paths converge on the same CSV processing logic---the Canvas API path
-downloads reports and saves them as temporary CSV files.
+Both paths converge on the same processing: each quiz becomes a set of
+rows like those of the report's CSV, a dictionary per row keyed by the
+column names, and every set is summarised the same way.
 
 <<functions>>=
 def analyse_command(config, canvas, args):
   """Analyzes quiz or survey data from CSV file or Canvas"""
-  csv_files = []
+  row_sets = []
   if args.csv:
-    csv_files.append(args.csv)
+    <<read the CSV file into [[row_sets]]>>
   else:
-    <<fill [[csv_files]] from Canvas>>
+    <<fill [[row_sets]] from Canvas>>
 
-  <<process [[csv_files]]>>
+  <<process [[row_sets]]>>
 @
 
 
 \section{CSV file processing}
 
-With the source determination complete, we now process the CSV data.
-Whether the file came from the user or was downloaded from Canvas, the
-processing is identical.
+With the source determination complete, we now process the data.
+Whether the rows came from the user's file or from Canvas, the processing
+is identical.
 
-When processing a CSV file, we need to:
+A file given with [[--csv]] is read as it is; a missing, unreadable or
+empty file is an error, since there is nothing else to analyse.
+<<read the CSV file into [[row_sets]]>>=
+warn_attempt_options_ignored(args, args.csv)
+try:
+  with open(args.csv, 'r') as f:
+    rows = list(csv.DictReader(f))
+except FileNotFoundError:
+  canvaslms.cli.err(1, f"CSV file not found: {args.csv}")
+except (OSError, UnicodeDecodeError, csv.Error) as e:
+  canvaslms.cli.err(1, f"Error reading CSV: {e}")
+if not rows:
+  canvaslms.cli.err(1, "CSV file is empty")
+row_sets.append(rows)
+@
+
+When processing a set of rows, we need to:
 \begin{enumerate}
-\item Parse the CSV structure
 \item Identify question columns
 \item Separate quantitative and qualitative questions
 \item Generate summaries
 \end{enumerate}
-<<process [[csv_files]]>>=
-for csv_file in csv_files:
+<<process [[row_sets]]>>=
+for rows in row_sets:
   try:
-    with open(csv_file, 'r') as f:
-      reader = csv.DictReader(f)
-      rows = list(reader)
-      
-      if not rows:
-        canvaslms.cli.err(1, "CSV file is empty")
-      
-      <<parse and summarize CSV data [[rows]]>>
-  except FileNotFoundError:
-    canvaslms.cli.err(1, f"CSV file not found: {csv_file}")
+    <<parse and summarize CSV data [[rows]]>>
   except Exception as e:
     canvaslms.cli.err(1, f"Error processing CSV: {e}")
 @
@@ -1558,13 +1591,26 @@ def download_csv_report(file_url):
 
 
 \subsection{Creating New Quiz reports}
+\label{sec:quiz-new-quiz-report}
 
 New Quizzes use a different API endpoint for report generation. We need to
 make a direct API call using the Canvas [[_requester]] object.
+The report comes as CSV or as JSON.
+We ask for JSON, which both [[analyse]] and [[quizzes attempts]] read,
+because its records keep the answers of each attempt apart and its
+questions keep their HTML (\cref{sec:quiz-attempts,sec:quiz-new-rows}).
+
+When Canvas refuses the request, we let its exception through rather than
+exit, for the reason [[list_new_quiz_items]] does
+(\cref{sec:list-quiz-items-or-exit}): only the command knows what a
+failure means to its user.
+Both callers go through several quizzes, and an earlier version, which
+exited, threw away the results of all the quizzes after the one that
+failed.
 <<functions>>=
 def create_new_quiz_report(course, assignment_id, requester):
   """
-  Create a student analysis report for a New Quiz.
+  Create a student analysis report in JSON for a New Quiz.
 
   Args:
     course: Course object
@@ -1573,6 +1619,9 @@ def create_new_quiz_report(course, assignment_id, requester):
 
   Returns:
     Progress object for polling
+
+  Raises:
+    CanvasException: if Canvas refused the request.
   """
   import canvasapi.progress
 
@@ -1581,18 +1630,15 @@ def create_new_quiz_report(course, assignment_id, requester):
 
   # Make the POST request with form parameters
   # Note: New Quiz API expects form-encoded parameters
-  try:
-    response = requester.request(
-      method='POST',
-      endpoint=endpoint,
-      _url="new_quizzes",
-      **{
-        'quiz_report[report_type]': 'student_analysis',
-        'quiz_report[format]': 'csv'
-      }
-    )
-  except Exception as e:
-    canvaslms.cli.err(1, f"Error creating New Quiz report: {e}")
+  response = requester.request(
+    method='POST',
+    endpoint=endpoint,
+    _url="new_quizzes",
+    **{
+      'quiz_report[report_type]': 'student_analysis',
+      'quiz_report[format]': 'json'
+    }
+  )
 
   # The response is a Progress object
   return canvasapi.progress.Progress(requester, response.json()["progress"])
@@ -1881,6 +1927,7 @@ if avg_length < 30:
 
 
 \subsection{Question title processing}
+\label{sec:quiz-question-titles}
 
 Quiz question titles can be very long, especially in New Quizzes where the
 entire question text becomes the column header. These long titles can include:
@@ -1902,7 +1949,9 @@ For readability and LaTeX compatibility, we need to:
 \subsubsection{Extracting question IDs}
 
 Classic Quizzes use the format ``588913: Question text'' where the ID appears
-as a prefix. New Quizzes have no ID prefix. We extract the ID (if present)
+as a prefix, as do the rows we make of a New Quiz's records
+(\cref{sec:quiz-attempts-rows}); only the CSV of a New Quiz, given with
+[[--csv]], has none. We extract the ID (if present)
 for use in LaTeX labels, but remove it from the display title per user
 preference.
 <<functions>>=
@@ -2529,30 +2578,27 @@ if args.format == "latex" and args.standalone:
   output_text = generate_latex_preamble(args.use_minted) + output_text + generate_latex_postamble()
 
 if args.format == "markdown":
-  # Use rich to render markdown
-  console = Console()
-  md = Markdown(output_text)
-
-  if sys.stdout.isatty():
-    # Output to terminal with pager
-    pager = ""
-    if "MANPAGER" in os.environ:
-      pager = os.environ["MANPAGER"]
-    elif "PAGER" in os.environ:
-      pager = os.environ["PAGER"]
-
-    styles = False
-    if "less" in pager and ("-R" in pager or "-r" in pager):
-      styles = True
-
-    with console.pager(styles=styles):
-      console.print(md)
-  else:
-    # Piped to file, output plain markdown
-    print(output_text)
+  page_markdown(output_text)
 else:  # latex
   # Output raw LaTeX (no pager, always goes to file)
   print(output_text)
+@
+
+The Markdown part is a function of its own, since [[quizzes attempts]]
+(\cref{sec:quiz-attempts}) prints its views the same way.
+The pager shows colours only when it is [[less]] told to pass them
+through ([[-R]] or [[-r]]); otherwise the escape codes would show as text.
+<<functions>>=
+def page_markdown(text):
+  """Prints Markdown `text`: rendered in a pager on a terminal, else plain"""
+  if not sys.stdout.isatty():
+    print(text)
+    return
+  pager = os.environ.get("MANPAGER") or os.environ.get("PAGER") or ""
+  styles = "less" in pager and ("-R" in pager or "-r" in pager)
+  console = Console()
+  with console.pager(styles=styles):
+    console.print(Markdown(text))
 @
 
 
@@ -2613,8 +2659,8 @@ The pipeline has five stages:
 @
 
 We start by separating any question ID prefix from the title text.
-Classic Quizzes use the format ``588913: Question text'', while New Quizzes
-have no prefix.
+Classic Quizzes and the rows of a New Quiz use the format ``588913:
+Question text'', while the CSV of a New Quiz has no prefix.
 <<extract question ID and title>>=
 question_id, full_title = extract_question_id(qcol)
 @
@@ -2961,105 +3007,1954 @@ We need to search for quizzes in two places:
 \end{enumerate}
 
 Both quiz types are handled by generating a student analysis report, polling
-until complete, and downloading the resulting CSV for processing.
-<<fill [[csv_files]] from Canvas>>=
+until complete, and downloading the result, but the two systems' reports
+differ, so each gets its own path to the rows.
+A quiz whose report cannot be had is skipped with a warning, so that one
+failing quiz does not hide the others; only when no quiz gave any rows does
+the command fail.
+What we tolerate is a failure of Canvas or of the transfer.
+An answer of another shape than we expect is a bug in our reading of it,
+which should show rather than turn into a quiz silently left out.
+<<fill [[row_sets]] from Canvas>>=
 try:
-  # Use the unified quiz selection pattern
   quiz_list = process_quiz_option(canvas, args)
-
-  # Download report for each matching quiz
-  for quiz in quiz_list:
-    <<download quiz report and add file to [[csv_files]]>>
-
 except canvaslms.cli.EmptyListError as e:
   canvaslms.cli.err(1, str(e))
 except Exception as e:
   canvaslms.cli.err(1, f"Error fetching from Canvas: {e}")
+
+for quiz in quiz_list:
+  if is_new_quiz(quiz):
+    <<read the attempts at the New Quiz as [[rows]]>>
+  else:
+    <<download the Classic Quiz report as [[rows]]>>
+  if rows:
+    row_sets.append(rows)
+  else:
+    canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
+
+if not row_sets:
+  raise canvaslms.cli.EmptyListError("No results at the selected quizzes")
 @
 
-\subsection{Downloading quiz reports to temporary files}
+\subsection{The rows of a New Quiz}
+\label{sec:quiz-new-rows}
 
-For each quiz, we need to generate a report, poll until it's ready, download the
-CSV, and save it to a temporary file. The approach differs slightly between
-Classic Quizzes and New Quizzes, but both result in a CSV file URL that we
-download and add to our [[csv_files]] list.
+The New Quizzes report comes as CSV or JSON, and we read the JSON, through
+the same records that [[quizzes attempts]] uses
+(\cref{sec:quiz-attempts}).
+The CSV has two flaws for us.
+Its question headers are Canvas's plain-text rendering of the questions,
+which loses the line breaks in code: a question whose body is
+[[<pre>hastighet = 50<br>if hastighet > 70:...]] gets the header
+[[hastighet = 50if hastighet > 70:...]], so the code detection of
+\cref{sec:quiz-question-titles} gets the code as one line.
+And it repeats the column names [[ItemID]], [[ItemType]],
+[[EarnedPoints]] and [[Status]] once for every question, of which
+[[csv.DictReader]] keeps only the last.
+The records instead keep each item's body as HTML, and they leave out the
+answers to items that an attempt never showed.
 
-The two quiz types poll differently.
-New Quizzes give us a self-refreshing Progress object, so
-[[poll_progress(progress)]] suffices.
-Classic Quizzes' [[create_report]] returns a static [[QuizReport]] snapshot,
-so we pass [[poll_progress]] a [[refresh]] callback that re-fetches the
-report by id between attempts.
-In both cases we hand [[poll_progress]] the whole attempt budget in a single
-call: an earlier version looped here, calling [[poll_progress]] with
+The records become rows by [[attempt_rows]] (\cref{sec:quiz-attempts-rows}).
+We compared the two formats of one report and found the answers identical,
+all 5580 of them, so reading JSON changes the titles but no answer.
+<<read the attempts at the New Quiz as [[rows]]>>=
+try:
+  rows = attempt_rows(select_attempts(
+    filter_answered(fetch_new_quiz_attempts(quiz, canvas._Canvas__requester),
+                    args.answered),
+    args.attempts))
+except canvaslms.cli.EmptyListError as error:
+  canvaslms.cli.warn(str(error))
+  continue
+except (CanvasException, requests.RequestException) as error:
+  canvaslms.cli.warn(f"{quiz.title}: could not read the report: {error}")
+  continue
+@
+
+Let's verify the New Quiz path of [[analyse]] end to end, with the course
+of the [[quizzes attempts]] tests (\cref{sec:quiz-attempts}), whose quiz
+here asks about code.
+The code must keep its line break, which the CSV's header would have lost.
+<<test functions>>=
+def run_analyse(course, *options):
+  """Run quizzes analyse on `course` with the command-line `options`"""
+  parser = argparse.ArgumentParser()
+  quizzes.add_command(parser.add_subparsers())
+  args = parser.parse_args(["quizzes", "analyse", *options])
+  canvas = MagicMock()
+  canvas._Canvas__requester = course._requester if course else None
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    args.func({}, canvas, args)
+
+@responses.activate
+def test_analyse_reads_a_new_quiz_with_its_code(capsys):
+  course = course_with_attempts()
+  responses.replace(responses.GET,
+    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+    json=[listed_new_quiz_item(307, 185, 1,
+            "<p>What prints?</p><pre>x = 1<br>print(x)</pre>")])
+  run_analyse(course, "-c", "SBX", "-a", "Ciph")
+  out = capsys.readouterr().out
+  assert "x = 1print(x)" not in out and "\nprint(x)\n" in out
+  assert "- DES: 1 (50.0%)" in out and "- AES: 1 (50.0%)" in out
+@
+
+A New Quiz whose report Canvas refuses is skipped with a warning, and
+when it was the only quiz, nothing is left and the command fails.
+<<test functions>>=
+@responses.activate
+def test_analyse_skips_a_refused_report(caplog):
+  course = course_with_attempts()
+  responses.replace(responses.POST,
+                    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                    status=500, json={"errors": [{"message": "busy"}]})
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_analyse(course, "-c", "SBX", "-a", "Ciph")
+  assert "Ciphers: could not read the report" in caplog.text
+@
+
+\subsection{Which attempts [[analyse]] counts}
+\label{sec:quiz-analyse-attempts}
+
+The two quiz systems' reports cover attempts differently.
+We measured both on 23 November 2026:
+\begin{description}
+\item[Classic Quizzes] The report has one row per student, even though we
+  ask for [[includes_all_versions]].
+  The row is the attempt that counts for the grade: in a quiz that keeps
+  the highest score, it was the attempt with the highest score for all 21
+  students who had made several attempts, and for one of them that was the
+  first attempt, not the latest.
+\item[New Quizzes] The records have every attempt, so by default
+  [[analyse]] pools them, and a student with eight attempts weighs eight
+  times as much as one with a single attempt.
+\end{description}
+For New Quizzes, [[analyse]] therefore takes the selections of
+[[quizzes attempts]] (\cref{sec:quiz-attempts-abandoned}):
+[[--attempts first]], [[last]] or [[best]] keeps one attempt per student,
+and [[--answered some]] or [[all]] drops abandoned or incomplete attempts.
+[[--attempts best]] comes closest to the row of a Classic Quiz that keeps
+the highest score.
+The default stays [[all]], as before.
+<<attempt options of analyse>>=
+analyse_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
+    default="all",
+    help="New Quizzes: which attempts to analyse: all (default), or each "
+         "student's first, last or best (most points). A Classic Quiz's "
+         "report has only the attempt that counts")
+analyse_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
+    default="any",
+    help="New Quizzes: which attempts to keep: any (default), those that "
+         "answered some question, or those that answered all")
+@
+
+For a Classic Quiz, whose report has one attempt per student, and for a
+CSV file, which we analyse as it is, the selections cannot apply.
+Rather than silently analysing something else than asked for, we say so,
+and point to the command that has every attempt of a Classic Quiz.
+<<functions>>=
+def warn_attempt_options_ignored(args, source):
+  """Warns if `args` select attempts that `source` cannot be selected from"""
+  if args.attempts != "all" or args.answered != "any":
+    canvaslms.cli.warn(
+      f"{source}: --attempts and --answered apply only to New Quizzes read "
+      "from Canvas; a Classic Quiz's report has only the attempt that "
+      "counts, and quizzes attempts reads all of them")
+@
+
+Let's verify that each selection reaches the New Quiz's rows: student 5
+first answered one of two questions, wrongly, then both, rightly.
+For a Classic Quiz, whose report we download and parse, and for a CSV
+file, the selection is reported as ignored.
+<<test functions>>=
+@pytest.mark.parametrize("options", [["--attempts", "first"],
+                                     ["--answered", "all"]])
+@responses.activate
+def test_analyse_selects_the_attempts_of_a_new_quiz(capsys, options):
+  first = new_quiz_attempt(5, 1, (185, "DES", 0.0), (186, "", 0.0))
+  course = course_with_attempts(report=[
+    first, new_quiz_attempt(5, 2, (185, "AES", 1.0), (186, "B", 1.0))])
+  responses.replace(responses.GET,
+    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+    json=[listed_new_quiz_item(307, 185, 1, "<p>Which cipher?</p>"),
+          listed_new_quiz_item(308, 186, 2, "<p>Which mode?</p>")])
+  run_analyse(course, "-c", "SBX", "-a", "Ciph", *options)
+  out = capsys.readouterr().out
+  if options[0] == "--attempts":
+    assert "- DES: 1 (100.0%)" in out and "AES" not in out
+  else:
+    assert "- AES: 1 (100.0%)" in out and "DES" not in out
+
+@responses.activate
+def test_analyse_reads_a_classic_report_and_says_options_do_not_apply(
+    capsys, caplog):
+  course = course_with_attempts()
+  report = {"id": 2, "quiz_id": 9, "report_type": "student_analysis",
+            "includes_all_versions": True,
+            "file": {"url": "https://files.example.invalid/c.csv"}}
+  responses.post(f"{CACHE_API}/courses/1/quizzes/9/reports", json=report)
+  responses.get(f"{CACHE_API}/courses/1/quizzes/9/reports/2", json=report)
+  responses.get("https://files.example.invalid/c.csv",
+                body='name,id,"11: Allowed?"\nStudent Seven,7,No\n')
+  run_analyse(course, "-c", "SBX", "-a", "Honour", "--answered", "some")
+  assert "- No: 1 (100.0%)" in capsys.readouterr().out
+  assert "Honour code: --attempts and --answered apply only" in caplog.text
+
+def test_analyse_says_a_csv_file_has_no_attempts_to_select(tmp_path, caplog,
+                                                          capsys):
+  report = tmp_path / "report.csv"
+  report.write_text('name,id,"1: Which?"\nStudent,5,AES\n')
+  run_analyse(None, "--csv", str(report), "--attempts", "last")
+  assert "apply only to New Quizzes read from Canvas" in caplog.text
+  assert "- AES: 1 (100.0%)" in capsys.readouterr().out
+
+def test_analyse_refuses_an_unreadable_csv_file(tmp_path, caplog):
+  report = tmp_path / "report.csv"
+  report.write_bytes("name,id,\"1: Vad?\"\nSt\u00e5l,5,Ja\n".encode("latin-1"))
+  with pytest.raises(SystemExit):
+    run_analyse(None, "--csv", str(report))
+  assert "Error reading CSV" in caplog.text
+@
+
+\subsection{Downloading a Classic Quiz report}
+
+For a Classic Quiz, we generate the report, poll until it is ready and
+parse the CSV we download.
+A Classic Quiz's [[create_report]] returns a static [[QuizReport]]
+snapshot, so we pass [[poll_progress]] a [[refresh]] callback that
+re-fetches the report by id between attempts.
+We hand [[poll_progress]] the whole attempt budget in a single call: an
+earlier version looped here, calling [[poll_progress]] with
 [[max_attempts=1]] each time, which disabled the poller's pacing---the sleep
 sits between attempts inside [[poll_progress]], and a single-attempt call
 has no between---so all thirty requests fired back-to-back.
-<<download quiz report and add file to [[csv_files]]>>=
-import tempfile
 
-# Fetch the report based on quiz type
+An earlier version wrote each download to a temporary file, which the
+processing then read back, and never removed the files; we parse the
+downloaded text directly instead.
+<<download the Classic Quiz report as [[rows]]>>=
+warn_attempt_options_ignored(args, quiz.title)
 file_url = None
-
-if is_new_quiz(quiz):
-  # New Quiz - use New Quiz Reports API
-  try:
-    progress = create_new_quiz_report(quiz.course, quiz.id,
-                                      canvas._Canvas__requester)
-    progress = poll_progress(progress)
-
-    if progress and hasattr(progress, 'results'):
-      if isinstance(progress.results, dict):
-        file_url = progress.results.get('url')
-  except Exception as e:
-    canvaslms.cli.warn(
-      f"Error creating New Quiz report for '{quiz.title}': {e}"
-    )
-    continue
-else:
-  # Classic Quiz - use create_report()
-  try:
-    report = quiz.create_report(report_type='student_analysis',
-                               includes_all_versions=True)
-
-    final_report = poll_progress(
-      report,
-      refresh=lambda current: quiz.get_quiz_report(current.id))
-    if final_report:
-      report = final_report
-
-    # Extract file URL
-    if hasattr(report, 'file'):
-      if hasattr(report.file, 'url'):
-        file_url = report.file.url
-      elif isinstance(report.file, dict):
-        file_url = report.file.get('url')
-  except Exception as e:
-    canvaslms.cli.warn(
-      f"Error creating Classic Quiz report for '{quiz.title}': {e}"
-    )
-    continue
-
-if not file_url:
+try:
+  report = quiz.create_report(report_type='student_analysis',
+                              includes_all_versions=True)
+  final_report = poll_progress(
+    report,
+    refresh=lambda current: quiz.get_quiz_report(current.id))
+  if final_report:
+    report = final_report
+  if hasattr(report, 'file'):
+    if hasattr(report.file, 'url'):
+      file_url = report.file.url
+    elif isinstance(report.file, dict):
+      file_url = report.file.get('url')
+except Exception as e:
   canvaslms.cli.warn(
-    f"Report file URL not available for quiz '{quiz.title}'"
-  )
+    f"Error creating Classic Quiz report for '{quiz.title}': {e}")
   continue
 
-# Download CSV to temporary file
+if not file_url:
+  canvaslms.cli.warn(f"Report file URL not available for quiz '{quiz.title}'")
+  continue
+
 try:
   response = requests.get(file_url)
   response.raise_for_status()
-
-  # Create temp file and write CSV data
-  temp_fd, temp_path = tempfile.mkstemp(suffix='.csv', text=True)
-  with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-    f.write(response.content.decode('utf-8'))
-
-  csv_files.append(temp_path)
+  rows = list(csv.DictReader(io.StringIO(response.content.decode('utf-8'))))
 except Exception as e:
   canvaslms.cli.warn(f"Error downloading report for quiz '{quiz.title}': {e}")
   continue
+@
+
+
+\section{Following students over their attempts}
+\label{sec:quiz-attempts}
+
+[[quizzes analyse]] answers the question \enquote{what did the class
+answer?}.
+A quiz that students may take again raises other questions, and teachers
+ask them at two different times.
+While the quiz is open, as formative practice: which questions take
+students many attempts, and what do they try before they get them right?
+After a quiz or an exam: how many got each question right on their first
+try, which wrong answers were common, and where did the students end up?
+The [[quizzes attempts]] command answers both, in three views:
+\begin{description}
+\item[Difficulty, the default] One row per question: how many students
+  answered it, how many got it right on their first try, how many
+  attempts it took those who got it right, how many never did, and the
+  share right on each attempt.
+  The hardest questions come first.
+\item[ [[--answers]] ] The wrong answers to each question, counted per
+  attempt number, which shows what students try.
+\item[ [[--table]] ] Every answer as a row---student, attempt, question,
+  answer, points, right---for one's own scripts.
+\end{description}
+The two Markdown views open with an overview of the attempts: how many
+answered all, some or none of the questions and, for a New Quiz with a
+time limit, how many ended at the limit.
+Attempts that were opened and abandoned can be left out with
+[[--answered]], and blank answers with [[--skip-unanswered]]
+(\cref{sec:quiz-attempts-abandoned}).
+For example:
+\begin{minted}{bash}
+canvaslms quizzes attempts -c tilkry26 -a "INL1Quiz Ciphers"
+canvaslms quizzes attempts -c tilkry26 -a "INL1Quiz Ciphers" --answers
+canvaslms quizzes attempts -c prgi26 -a "^Exempelprov 1$" --attempts first
+\end{minted}
+The rest of this section first explains why [[analyse]] cannot answer
+these questions and where the attempts are kept instead, then translates
+both quiz systems' attempts into one kind of record, and finally builds the
+views on those records.
+
+\subsection{Why [[analyse]] cannot answer this}
+
+[[quizzes analyse]] reads Canvas's student analysis report, which is
+shaped differently for the two quiz systems.
+We measured both on real quizzes on 23 November 2026:
+\begin{description}
+\item[Classic Quizzes] The report has one row per student and no attempt
+  column, even though [[analyse]] asks for [[includes_all_versions]]:
+  for a quiz on which 21 students had made more than one attempt, it gave
+  75 rows for 75 distinct students.
+\item[New Quizzes] The report has one row per attempt, with an
+  [[Attempt]] column: 620 rows for 83 students.
+\end{description}
+So the earlier attempts at a Classic Quiz are in no report at all.
+The New Quizzes report has them, but [[analyse]] pools its rows into one
+distribution per question, in which a student with eight attempts weighs
+eight times as much as a student with one.
+Neither tells how students did on their first attempt, or how many
+attempts a question took.
+
+\subsection{Where the attempts are}
+
+The attempts at a Classic Quiz are in the [[submission_history]] of the
+quiz's assignment, which canvaslms already fetches and caches for other
+commands.
+Each submitted attempt is one entry, with its [[attempt]] number and a
+[[submission_data]] list holding, for each question, the [[question_id]],
+whether the answer was [[correct]], the [[points]] it earned and the
+answer: an [[answer_id]] for a choice question, the [[text]] for an essay.
+We tried two other sources and rejected them.
+The quiz submissions endpoint is documented to return \enquote{all
+completed submissions, including previous attempts}, but it returned one
+submission per student; and the event log of an earlier attempt, which
+could have held its answers, came back empty.
+
+A Classic Quiz without an [[assignment_id]] has no assignment whose
+history we could read, so the command cannot follow attempts at it, and it
+says so instead of printing an empty analysis.
+
+The New Quizzes keep no per-question data in [[submission_history]]: there
+each attempt has a score and a time, nothing more.
+The student analysis report is the only source, and we ask for it in JSON
+rather than in CSV.
+The CSV repeats the column names [[ItemID]], [[ItemType]],
+[[EarnedPoints]] and [[Status]] once for every question, and
+[[csv.DictReader]] silently keeps only the last column of each name.
+In the JSON each record is one attempt, with a list of [[item_responses]]
+that each give an [[item_id]], the [[answer]] and its [[score]].
+That [[item_id]] is the id of the item's \emph{entry}, not of the item
+itself, and the report does not say how many points an item is worth;
+both we get from the quiz's items.
+
+Both sources hold submitted attempts, so the command shows how things stand
+when it runs; a teacher following a quiz in progress runs it again.
+The New Quizzes report is made anew on every run.
+The Classic submissions come from the cache, which refetches a submission
+once it is older than [[SUBMISSION_TTL_MINUTES]], 20 minutes unless
+[[CANVASLMS_SUBMISSION_TTL_MINUTES]] says otherwise---but never a submission
+whose grade is one of [[NOREFRESH_GRADES]], such as [[complete]].
+A teacher following a pass-or-fail quiz while it is open, or wanting the
+attempts of the last minutes, should therefore give [[--refresh-cache]].
+
+\subsection{One record for each answer}
+
+The two sources differ in every detail, so we translate both into the same
+record before computing anything: one [[AttemptResponse]] for each
+student, attempt and question.
+The views then never ask which quiz system the data came from, and their
+tests can use records written by hand.
+
+Whether an answer is right is decided when the record is made, not by the
+views, since the two systems say it differently.
+A Classic Quiz states it: [[correct]] is [[True]] or [[False]].
+A New Quiz gives only the score, so an answer is right when it earned all
+the points the item is worth.
+Partial credit is thus not right in either system, which is what the
+question \enquote{how many attempts until right?} needs.
+When we cannot tell---a New Quiz item replaced after students answered it
+is no longer among the quiz's items, so its worth is unknown---the record
+holds [[None]], and the views count the answer as neither right nor wrong.
+
+A question counts as answered when the record has an answer, but also when
+the answer was right or earned points: Canvas does not show every kind of
+answer as text, and a right answer must not be taken for a blank.
+
+The [[position]] of the question orders the questions as the quiz does.
+A question that is no longer in the quiz has none, and is placed last.
+The [[elapsed]] time of the attempt, in seconds, is known only for New
+Quizzes (\cref{sec:quiz-attempts-time}).
+The [[question_html]] keeps the question as Canvas sends it, with the line
+breaks of any code in it, for [[analyse]], which formats code itself
+(\cref{sec:quiz-attempts-rows}).
+<<functions>>=
+@dataclass(frozen=True)
+class AttemptResponse:
+  """One student's answer to one question in one attempt at a quiz"""
+  student_id: int
+  student: str
+  attempt: int
+  position: int
+  question_id: str
+  question: str
+  answer: str | None
+  points: float
+  right: bool | None
+  elapsed: float | None = None
+  question_html: str = ""
+
+  @property
+  def answered(self):
+    """True if the student answered the question at all"""
+    return bool(self.answer) or self.right is True or self.points > 0
+<<constants>>=
+UNKNOWN_POSITION = sys.maxsize
+@
+
+Questions and answers come as HTML from both systems.
+The views print them on one line each, in a table or a TSV row, so we
+reuse the conversion that [[analyse]] applies to the report's cells and
+then join the lines.
+<<functions>>=
+def plain_text(html):
+  """Returns `html` as one line of plain text"""
+  if not html:
+    return ""
+  return clean_newlines(process_html_formatting(html)[0])
+@
+
+\subsection{The attempts at a Classic Quiz}
+
+An answer to a choice question is an [[answer_id]], whose text we look up
+among the question's answers.
+Any other answer we take from [[text]], which holds an essay's HTML.
+These are the only two shapes we have seen in attempts; for a question type
+we have no attempts of, such as matching, the command shows Canvas's
+[[text]] as it is.
+Right and wrong hold for every type all the same, since they come from
+[[correct]].
+A choice question left unanswered has neither an [[answer_id]] nor any
+[[text]]; an [[answer_id]] of [[None]] we take as no answer too.
+<<functions>>=
+def classic_answer(datum, question):
+  """Returns the answer in a Classic Quiz `submission_data` entry as text
+
+  `question` is the quiz question the entry answers, or None if the
+  question is no longer in the quiz.  Returns None for no answer.
+  """
+  if datum.get("answer_id") is not None:
+    answers = {answer["id"]: answer
+               for answer in getattr(question, "answers", None) or []}
+    answer = answers.get(datum["answer_id"], {})
+    return (plain_text(answer.get("html") or answer.get("text"))
+            or str(datum["answer_id"]))
+  return plain_text(datum.get("text")) or None
+@
+
+A student who has not taken the quiz still has a submission, whose history
+is a single entry in state [[unsubmitted]], without an [[attempt]] number
+and with [[None]] as its [[submission_data]], so it yields no records.
+An essay that awaits grading has the string [[undefined]] as [[correct]],
+so we take only [[True]] and [[False]] as known; any other value counts as
+unknown.
+Canvas leaves the [[position]] of a Classic Quiz question empty (we saw no
+other value in two quizzes), so we number the questions in the order Canvas
+lists them, which is the order of the columns in its own report.
+<<functions>>=
+def classic_attempt_responses(histories, questions, names):
+  """Yields an `AttemptResponse` for each answer in a Classic Quiz attempt
+
+  `histories` maps a user ID to the `submission_history` of that user's
+  submission, `questions` are the quiz's questions, and `names` maps user
+  IDs to names.
+  """
+  questions_by_id = {question.id: question for question in questions}
+  positions = {question.id: getattr(question, "position", None) or number
+               for number, question in enumerate(questions, start=1)}
+  for user_id, history in histories.items():
+    for entry in history:
+      for datum in entry.get("submission_data") or []:
+        question = questions_by_id.get(datum["question_id"])
+        yield AttemptResponse(
+          student_id=user_id,
+          student=names.get(user_id, str(user_id)),
+          attempt=entry["attempt"],
+          position=positions.get(datum["question_id"], UNKNOWN_POSITION),
+          question_id=str(datum["question_id"]),
+          question=(plain_text(question.question_text) if question
+                    else f"Question {datum['question_id']}"),
+          answer=classic_answer(datum, question),
+          question_html=question.question_text if question else "",
+          points=datum.get("points") or 0,
+          right={True: True, False: False}.get(datum.get("correct")))
+@
+
+Let's verify the translation on entries shaped as Canvas sent them for a
+real Classic Quiz, with made-up values.
+Student 1 took the quiz twice and student 2 not at all.
+The test checks the six kinds of answer: a choice found among the
+question's answers, where the HTML of an answer is preferred to its plain
+text, a choice that is no longer among them, an essay, a choice left
+unanswered, a question no longer in the quiz, and an essay that awaits
+grading.
+<<test functions>>=
+def classic_entry(attempt, *data, state="graded"):
+  """A `submission_history` entry of a Classic Quiz as Canvas sends it"""
+  return {"attempt": attempt, "workflow_state": state, "score": 1.0,
+          "submitted_at": "2026-11-20T10:00:00Z", "submission_data": [
+            {"question_id": qid, "correct": correct, "points": points,
+             "text": text, **extra}
+            for qid, correct, points, text, extra in data]}
+
+def test_classic_attempts_become_one_record_per_answer():
+  choice = make_question(11, question_type="multiple_choice_question",
+                         question_text="<p>Pick <b>one</b></p>", position=None,
+                         answers=[{"id": 1, "text": "Right", "weight": 100,
+                                   "html": ""},
+                                  {"id": 2, "text": "Wrong", "weight": 0,
+                                   "html": "<p>Wrong <i>one</i></p>"}])
+  essay = make_question(12, position=None)
+  histories = {
+    1: [classic_entry(2, (11, True, 1.0, "1", {"answer_id": 1}),
+                      (12, True, 1.0, "<p>Because</p>", {})),
+        classic_entry(1, (11, False, 0.0, "2", {"answer_id": 2}),
+                      (11, False, 0.0, "3", {"answer_id": 3}),
+                      (11, False, 0.0, "", {}),
+                      (11, False, 0.0, "", {"answer_id": None}),
+                      (99, True, 1.0, "", {}),
+                      (12, "undefined", 0.0, "<p>Maybe</p>", {}),
+                      state="pending_review")],
+    2: [{"attempt": None, "workflow_state": "unsubmitted",
+         "submission_data": None}]}
+
+  records = list(quizzes.classic_attempt_responses(
+    histories, [choice, essay], {1: "Student One"}))
+
+  assert [(r.attempt, r.question_id, r.answer, r.points, r.right)
+          for r in records] \
+    == [(2, "11", "Right", 1.0, True), (2, "12", "Because", 1.0, True),
+        (1, "11", "Wrong one", 0.0, False), (1, "11", "3", 0.0, False),
+        (1, "11", None, 0.0, False), (1, "11", None, 0.0, False),
+        (1, "99", None, 1.0, True),
+        (1, "12", "Maybe", 0.0, None)]
+  assert records[0].question == "Pick one"
+  assert records[0].student == "Student One"
+  assert [r.position for r in records[:2]] == [1, 2]
+  assert [r.answered for r in records[4:7]] == [False, False, True]
+  placed = make_question(13, position=7)
+  [record] = quizzes.classic_attempt_responses(
+    {1: [classic_entry(1, (13, True, 1.0, "<p>Yes</p>", {}))]},
+    [choice, placed], {})
+  assert record.position == 7 and record.student == "1"
+  assert records[-2].position == quizzes.UNKNOWN_POSITION
+@
+
+Fetching is then a matter of reading the history from the assignment's
+submissions and the questions from the quiz.
+The names come from the course's users; a student who has left the course
+is no longer among them, and is shown by ID.
+<<functions>>=
+def fetch_classic_attempts(quiz):
+  """Returns the `AttemptResponse`s of the attempts at Classic `quiz`
+
+  Raises `canvaslms.cli.EmptyListError` for a quiz without an assignment,
+  whose attempts we cannot read.
+  """
+  assignment_id = getattr(quiz, "assignment_id", None)
+  if not assignment_id:
+    raise canvaslms.cli.EmptyListError(
+      f"{quiz.title}: the quiz has no assignment, "
+      "whose submission history would hold its attempts")
+  assignment = quiz.course.get_assignment(assignment_id)
+  histories = {
+    submission.user_id: getattr(submission, "submission_history", None) or []
+    for submission in assignment.get_submissions(
+      include=["submission_history"])}
+  names = {user.id: user.name for user in quiz.course.get_users()}
+  return list(classic_attempt_responses(
+    histories, quiz.get_questions(), names))
+@
+
+\subsection{The attempts at a New Quiz}
+
+The report names items by their entry, so we index the quiz's items by
+[[entry]] [[id]].
+
+The report lists every item for every attempt, also items the attempt
+never showed.
+We saw this when an item was added to a practice exam that 98 attempts had
+already been made at: each of those attempts then had the new item, with
+an empty answer, and the newest attempt had the item that the new one
+replaced, also empty.
+Counted as blanks, such items would make every earlier attempt look
+incomplete, and the new item look hard.
+So we leave out a response to an item whose entry was created after the
+attempt was submitted, and an empty response to an item that is no longer
+in the quiz, since that is indistinguishable from one the attempt did not
+show.
+(The scores of those responses were the integer 0, where every other score
+in the five reports we looked at, including those of blanks, was a float,
+but we do not rely on a number's type.)
+An entry reused from an item bank may have been created before it was
+added to the quiz; such an entry is not caught.
+We compare the score with the item's worth with a tolerance, since Canvas
+computes partial scores in floating point.
+An item worth no points can be neither right nor wrong.
+
+An item can also take its question from an item bank.
+A [[BankEntry]] item holds one question of a bank, wrapped one level
+deeper: its [[entry]] is the bank entry, whose own [[entry]] is the
+question, and the report names the item by that inner entry's id.
+We saw this in two quizzes, where every response then matched an item.
+A [[Bank]] item instead draws questions at random from a whole bank, and
+its [[entry]] describes only the bank; which questions a student got is
+in the report alone.
+The one quiz of that kind we tried had no report to give---Canvas answered
+with an error---so we do not know how such responses are named, and they
+are shown as items not among the quiz's items, with unknown rightness.
+<<functions>>=
+def item_entries(items):
+  """Maps each entry ID a report can name to its (item, entry) in `items`
+
+  The entry of a `BankEntry` item is the bank entry; its question is the
+  entry inside it, which is the one returned.
+  """
+  entries = {}
+  for item in items:
+    entry = item.get("entry") or {}
+    if item.get("entry_type") == "BankEntry" and entry.get("entry"):
+      entry = entry["entry"]
+    if entry.get("id") is not None:
+      entries[str(entry["id"])] = (item, entry)
+  return entries
+
+def new_quiz_attempt_responses(report, items):
+  """Yields an `AttemptResponse` for each answer in a New Quiz report
+
+  `report` is the student analysis report in JSON, one record per attempt;
+  `items` are the quiz's items as the New Quizzes API lists them.
+  """
+  entries = item_entries(items)
+  for record in report:
+    student = record["student_data"]
+    for response in record["item_responses"]:
+      item, entry = entries.get(str(response["item_id"]), (None, None))
+      if not shown_in_attempt(response, entry, student.get("submitted_at")):
+        continue
+      score = response.get("score") or 0
+      worth = item.get("points_possible") if item else None
+      yield AttemptResponse(
+        student_id=student["id"],
+        student=student.get("name") or str(student["id"]),
+        attempt=student["attempt"],
+        position=(item.get("position") if item else None)
+                 or UNKNOWN_POSITION,
+        question_id=str(response["item_id"]),
+        question=(plain_text(entry.get("item_body")) if item
+                  else f"Item {response['item_id']}, "
+                       "not among the quiz's items"),
+        answer=plain_text(response.get("answer")) or None,
+        question_html=entry.get("item_body") or "" if item else "",
+        points=score,
+        right=(score >= worth or math.isclose(score, worth)) if worth
+              else None,
+        elapsed=elapsed_seconds(student.get("elapsed_time")))
+@
+
+We compare the times as instants, since Canvas writes them with and
+without fractions of a second.
+<<functions>>=
+def shown_in_attempt(response, entry, submitted_at):
+  """Returns False for a response to an item the attempt did not show
+
+  `entry` is the entry of the quiz item the response answers, None if it
+  is not among the quiz's items; `submitted_at` is when the attempt was
+  submitted.
+  """
+  if entry is None:
+    return bool(response.get("answer"))
+  created_at = entry.get("created_at")
+  if created_at and submitted_at:
+    return arrow.get(created_at) <= arrow.get(submitted_at)
+  return True
+@
+
+Let's verify it on records shaped as Canvas sent them, with made-up
+values.
+The item and entry IDs differ, as they do in Canvas, so that indexing by
+the item's own ID would find nothing, and student 6 earns half the points
+of an item, which is not right.
+Student 6 also earns all the points of an item worth $3 \times 0.1$,
+which floating point makes slightly more than the 0.3 the student earns,
+and answers an item worth no points.
+Item 189 was added after these attempts, which were submitted on
+20 November, and item 998 is no longer in the quiz; the report lists both
+with empty answers, and neither becomes a record.
+Item 312 is a bank entry, shaped as in the quizzes we saw, which the
+report names by its inner entry 166324.
+<<test functions>>=
+def listed_new_quiz_item(item_id, entry_id, position, body, points=1.0,
+                         created_at="2026-08-12T12:48:23.094Z"):
+  """A New Quiz item as the New Quizzes API lists it"""
+  return {"id": str(item_id), "position": position, "entry_type": "Item",
+          "points_possible": points,
+          "entry": {"id": str(entry_id), "title": "Shared title",
+                    "item_body": body, "interaction_type_slug": "choice",
+                    "created_at": created_at}}
+
+def new_quiz_attempt(student_id, attempt, *answers):
+  """One record of a New Quiz student analysis report in JSON"""
+  return {"created_timestamp": "2026-11-20T10:00:00Z",
+          "student_data": {"id": student_id, "name": f"Student {student_id}",
+                           "uuid": "u", "sis_id": "", "attempt": attempt,
+                           "submitted_at": "2026-11-20T10:00:00Z",
+                           "elapsed_time": "00:05:00", "section_info": {}},
+          "item_responses": [{"item_id": str(entry_id), "answer": answer,
+                              "item_type": "choice", "score": score}
+                             for entry_id, answer, score in answers],
+          "summary": {}}
+
+def test_new_quiz_attempts_become_one_record_per_answer():
+  items = [listed_new_quiz_item(307, 185, 1, "<p>Which cipher?</p>"),
+           listed_new_quiz_item(308, 186, 2, "<p>Order them</p>", points=10.0),
+           listed_new_quiz_item(309, 187, 3, "<p>Sum</p>", points=0.1 * 3),
+           listed_new_quiz_item(310, 188, 4, "<p>Opinion</p>", points=0.0),
+           listed_new_quiz_item(311, 189, 5, "<p>Added later</p>",
+                                created_at="2026-11-21T09:00:00.5Z"),
+           {"id": "312", "position": 6, "entry_type": "BankEntry",
+            "points_possible": 1.0, "entry": {
+              "id": "26286", "bank_id": "7", "archived": False,
+              "entry_type": "Item", "created_at": "2026-08-01T00:00:00Z",
+              "entry": {"id": "166324", "item_body": "<p>From a bank</p>",
+                        "created_at": "2026-07-01T00:00:00Z"}}}]
+  report = [new_quiz_attempt(5, 1, (185, "DES", 0.0),
+                                   (186, "<pre>a</pre>,b", 10.0),
+                                   (189, "", 0)),
+            new_quiz_attempt(5, 2, (185, "AES", 1.0), (186, "", 0.0),
+                                   (999, "Gone", 1.0), (998, "", 0)),
+            new_quiz_attempt(6, 1, (186, "b,a", 5.0), (187, "0.3", 0.3),
+                                   (188, "Fine", 0.0), (166324, "Yes", 1.0))]
+
+  records = list(quizzes.new_quiz_attempt_responses(report, items))
+
+  assert [(r.attempt, r.position, r.answer, r.right) for r in records] == [
+    (1, 1, "DES", False), (1, 2, "a,b", True),
+    (2, 1, "AES", True), (2, 2, None, False),
+    (2, quizzes.UNKNOWN_POSITION, "Gone", None), (1, 2, "b,a", False),
+    (1, 3, "0.3", True), (1, 4, "Fine", None), (1, 6, "Yes", True)]
+  assert records[-1].question == "From a bank"
+  assert records[-1].question_html == "<p>From a bank</p>"
+  assert records[0].question == "Which cipher?"
+  assert records[0].student == "Student 5"
+  assert records[0].elapsed == 300
+@
+
+To fetch the report, we request it (\cref{sec:quiz-new-quiz-report}) and
+poll it until Canvas has made the file.
+<<functions>>=
+def fetch_new_quiz_attempts(quiz, requester):
+  """Returns the `AttemptResponse`s of the attempts at New Quiz `quiz`"""
+  progress = poll_progress(create_new_quiz_report(
+    quiz.course, quiz.id, requester))
+  results = getattr(progress, "results", None)
+  url = results.get("url") if isinstance(results, dict) else None
+  if not url:
+    raise canvaslms.cli.EmptyListError(
+      f"{quiz.title}: the student analysis report was not ready in time")
+  response = requests.get(url)
+  response.raise_for_status()
+  items = get_new_quizzes_list(
+    requester, f"courses/{quiz.course.id}/quizzes/{quiz.id}/items")
+  return list(new_quiz_attempt_responses(response.json(), items))
+@
+
+A refused request reaches the caller as an exception instead of ending the
+program.
+<<test functions>>=
+@responses.activate
+def test_a_refused_new_quiz_report_raises():
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                 status=500, json={"errors": [{"message": "busy"}]})
+  with pytest.raises(CanvasException):
+    quizzes.create_new_quiz_report(make_course(requester=requester), "42",
+                                   requester)
+@
+
+Let's verify the whole way from the report request to the records, with
+Canvas's answers replayed by [[responses]].
+<<test functions>>=
+@responses.activate
+def test_fetching_new_quiz_attempts_reads_the_json_report():
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  quiz = make_new_quiz(make_course(requester=requester), id="42")
+  progress = {"id": 3, "workflow_state": "completed",
+              "results": {"url": "https://files.example.invalid/r.json"}}
+  report_request = responses.post(
+    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+    json={"progress": progress})
+  responses.get("https://canvas.example.invalid/api/v1/progress/3",
+                json=progress)
+  responses.get("https://files.example.invalid/r.json",
+                json=[new_quiz_attempt(5, 1, (185, "AES", 1.0))])
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+                json=[listed_new_quiz_item(307, 185, 1, "<p>Which?</p>")])
+
+  records = quizzes.fetch_new_quiz_attempts(quiz, requester)
+
+  assert [(r.student_id, r.attempt, r.answer, r.right) for r in records] \
+    == [(5, 1, "AES", True)]
+  assert "quiz_report%5Bformat%5D=json" in report_request.calls[0].request.body
+@
+
+A report that Canvas did not finish has no file to read, and a file that
+cannot be downloaded must not pass for an empty report.
+<<test functions>>=
+def requested_new_quiz_report(results):
+  """A New Quiz whose report request Canvas answers with `results`"""
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  progress = {"id": 3, "workflow_state": "completed", "results": results}
+  responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                 json={"progress": progress})
+  responses.get("https://canvas.example.invalid/api/v1/progress/3",
+                json=progress)
+  return make_new_quiz(make_course(requester=requester), id="42"), requester
+
+@responses.activate
+def test_fetching_new_quiz_attempts_without_a_report_file_fails():
+  quiz, requester = requested_new_quiz_report({})
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    quizzes.fetch_new_quiz_attempts(quiz, requester)
+
+@responses.activate
+def test_fetching_new_quiz_attempts_reports_a_failed_download():
+  quiz, requester = requested_new_quiz_report(
+    {"url": "https://files.example.invalid/r.json"})
+  responses.get("https://files.example.invalid/r.json", status=403,
+                json={"errors": [{"message": "expired"}]})
+  with pytest.raises(requests.HTTPError):
+    quizzes.fetch_new_quiz_attempts(quiz, requester)
+@
+
+\subsection{Which attempts to count}
+
+By default the command counts every attempt, which is what a teacher
+following a formative quiz wants to see.
+After a quiz, two other questions come up: what did the students know
+before they practised, and where did they end up?
+The option [[--attempts]] answers them by keeping one attempt per student:
+\begin{description}
+\item[ [[first]] ] each student's first attempt;
+\item[ [[last]] ] each student's latest attempt;
+\item[ [[best]] ] each student's attempt with the most points, the earliest
+  of them on a tie.
+\end{description}
+We do not follow the quiz's own scoring policy instead, since a quiz that
+keeps the average score has no single attempt that counts.
+<<constants>>=
+ATTEMPT_SELECTIONS = ("all", "first", "last", "best")
+<<functions>>=
+def select_attempts(responses, selection):
+  """Returns the `responses` of the attempts that `selection` names
+
+  `selection` is one of `ATTEMPT_SELECTIONS`: all attempts, or each
+  student's first, last or best (most points, earliest on a tie).
+  """
+  if selection == "all":
+    return list(responses)
+  attempts = defaultdict(lambda: defaultdict(list))
+  for response in responses:
+    attempts[response.student_id][response.attempt].append(response)
+  selected = []
+  for by_attempt in attempts.values():
+    if selection == "first":
+      chosen = min(by_attempt)
+    elif selection == "last":
+      chosen = max(by_attempt)
+    else:
+      chosen = max(by_attempt, key=lambda attempt: (
+        sum(response.points for response in by_attempt[attempt]), -attempt))
+    selected.extend(by_attempt[chosen])
+  return selected
+@
+
+Let's verify the four selections on two students: student 1 has three
+attempts, of which the second and third have the most points, and student 2
+has one, which every selection keeps.
+<<test functions>>=
+def answer_record(student=1, attempt=1, position=1, answer="A", right=True,
+             points=None):
+  """An `AttemptResponse` with the given fields and made-up others"""
+  return quizzes.AttemptResponse(
+    student_id=student, student=f"Student {student}", attempt=attempt,
+    position=position, question_id=str(position),
+    question=f"Question {position}", answer=answer,
+    points=(1.0 if right else 0.0) if points is None else points,
+    right=right)
+
+@pytest.mark.parametrize("selection, attempts", [
+  ("all", [1, 2, 3]), ("first", [1]), ("last", [3]), ("best", [2])])
+def test_select_attempts_keeps_the_named_attempts(selection, attempts):
+  responses = [answer_record(attempt=1, points=0.0), answer_record(attempt=2),
+               answer_record(attempt=3), answer_record(student=2, attempt=4)]
+  selected = quizzes.select_attempts(responses, selection)
+  assert [r.attempt for r in selected if r.student_id == 1] == attempts
+  assert [r.attempt for r in selected if r.student_id == 2] == [4]
+@
+
+\subsection{The difficulty of each question}
+
+The default view summarises each question in a few numbers.
+Every one of them is about students rather than attempts, because a
+student who takes the quiz eight times must not count eight times:
+\begin{description}
+\item[Students] how many students had the question in an attempt.
+\item[First try] the share of them who got it right on their first
+  attempt at it.
+\item[Attempts to right] for those who got it right at some point, the
+  median number of attempts that took, the right one included.
+\item[Never right] how many students never got it right.
+\item[Per attempt] the share right among those who made a first attempt,
+  a second, and so on, which shows how fast a question is learnt.
+\end{description}
+The [[--attempts]] selection has been applied before, so these numbers
+describe the selected attempts: with [[--attempts first]], each student
+has one attempt, and \enquote{first try} is just the share right.
+Answers whose rightness is unknown count as neither right nor wrong; a
+question with only such answers shows no shares.
+
+We collect each student's answers to a question in attempt order, then
+compute the numbers from those sequences.
+<<functions>>=
+def attempt_difficulty(responses):
+  """Returns a summary of how hard each question was, hardest first
+
+  Each summary is a dict with the question's `position`, `question_id`
+  and `question`, the number of `students` who answered it, the share
+  `first_right` right on their first attempt, the `median_attempts` until
+  right, the number of students `never_right` and `per_attempt`, a list of
+  (attempt number, share right, students) tuples.  Shares are None when
+  no answer to the question is known to be right or wrong.
+  """
+  <<group the answers by question and student>>
+  summaries = []
+  for (position, question_id), by_student in questions.items():
+    <<summarise one question>>
+  <<order the questions hardest first>>
+  return summaries
+@
+
+A question left blank in an attempt is in the records, as an answer that
+is not right, so by default a blank counts as a failed try at the question.
+We number each student's tries at a question by their order rather than by
+Canvas's attempt numbers, since those can have gaps: in one quiz, a
+student's attempts were numbered 1, 2, 3, 5 and on.
+We sort by attempt first, because a Classic Quiz's history lists the latest
+attempt first.
+Unknown answers are dropped here, so that they count as neither right nor
+wrong.
+<<group the answers by question and student>>=
+questions = defaultdict(lambda: defaultdict(list))
+texts = {}
+for response in sorted(responses, key=lambda r: r.attempt):
+  key = (response.position, response.question_id)
+  texts[key] = response.question
+  questions[key][response.student_id]
+  if response.right is not None:
+    questions[key][response.student_id].append(response.right)
+@
+
+A student with no known answer still counts among the students who
+answered, which is why we create the student's list before the check
+above.
+<<summarise one question>>=
+known = [rights for rights in by_student.values() if rights]
+until_right = [rights.index(True) + 1 for rights in known if True in rights]
+per_attempt = []
+for index in range(max((len(rights) for rights in known), default=0)):
+  reached = [rights[index] for rights in known if len(rights) > index]
+  per_attempt.append((index + 1, sum(reached) / len(reached), len(reached)))
+summaries.append({
+  "position": position, "question_id": question_id,
+  "question": texts[(position, question_id)],
+  "students": len(by_student),
+  "first_right": (sum(rights[0] for rights in known) / len(known)
+                  if known else None),
+  "median_attempts": (statistics.median(until_right)
+                      if until_right else None),
+  "never_right": sum(True not in rights for rights in known),
+  "per_attempt": per_attempt})
+@
+
+The hardest question is the one fewest got right on their first try; among
+equally hard ones, the one more students never got right comes first.
+Questions with unknown shares go last, in quiz order.
+<<order the questions hardest first>>=
+summaries.sort(key=lambda summary: (
+  summary["first_right"] is None,
+  summary["first_right"] or 0,
+  -summary["never_right"],
+  summary["position"]))
+@
+
+Let's verify the numbers on two questions.
+Question 1 is easy: both students get it right at once.
+Question 2 takes student 1 three attempts, while student 2 never gets it
+right in two.
+Question 3 has only an unknown answer.
+<<test functions>>=
+def test_attempt_difficulty_counts_students_not_attempts():
+  responses = [
+    answer_record(1, 1, 1), answer_record(2, 1, 1),
+    answer_record(1, 1, 2, right=False), answer_record(1, 2, 2, right=False),
+    answer_record(1, 3, 2), answer_record(2, 1, 2, right=False),
+    answer_record(2, 2, 2, right=False), answer_record(1, 1, 3, right=None)]
+
+  hardest, easiest, unknown = quizzes.attempt_difficulty(responses)
+
+  assert hardest["position"] == 2
+  assert hardest["students"] == 2 and hardest["first_right"] == 0
+  assert hardest["median_attempts"] == 3 and hardest["never_right"] == 1
+  assert hardest["per_attempt"] == [(1, 0.0, 2), (2, 0.0, 2), (3, 1.0, 1)]
+  assert easiest["first_right"] == 1 and easiest["median_attempts"] == 1
+  assert unknown["students"] == 1 and unknown["first_right"] is None
+  assert unknown["never_right"] == 0
+@
+
+A Classic Quiz's history lists the latest attempt first, and the records
+keep that order, so the first try must still be attempt 1.
+<<test functions>>=
+def test_attempt_difficulty_orders_the_attempts():
+  latest_first = [answer_record(1, 2, 1), answer_record(1, 1, 1, right=False)]
+  [summary] = quizzes.attempt_difficulty(latest_first)
+  assert summary["first_right"] == 0 and summary["median_attempts"] == 2
+@
+
+The summaries are printed as a Markdown table, which [[page_markdown]]
+renders like the output of [[analyse]].
+The per-attempt shares would need a column for every attempt number,
+which a quiz with unlimited attempts has no bound on, so we write them in
+one column as \enquote{1: 62\,\% (83)}, the attempt number, the share right
+and how many students made that attempt, up to [[ATTEMPTS_SHOWN]]
+attempts.
+Most students who keep trying get the question right within a few
+attempts, so the later ones add little.
+<<constants>>=
+ATTEMPTS_SHOWN = 5
+<<functions>>=
+def format_difficulty(summaries, title, overview=""):
+  """Returns `summaries` from `attempt_difficulty` as a Markdown table
+
+  `overview` is a paragraph to put between the title and the table.
+  """
+  lines = [f"## {markdown_cell(title)}\n\n", overview,
+           "| # | Question | Students | First try | Attempts to right "
+           "| Never right | Per attempt |\n",
+           "|---|---|---|---|---|---|---|\n"]
+  for summary in summaries:
+    per_attempt = ", ".join(
+      f"{number}: {share:.0%} ({students})"
+      for number, share, students in summary["per_attempt"][:ATTEMPTS_SHOWN])
+    lines.append(
+      f"| {position_label(summary['position'])} "
+      f"| {markdown_cell(create_short_title(summary['question'], 60))} "
+      f"| {summary['students']} "
+      f"| {percentage(summary['first_right'])} "
+      f"| {number_label(summary['median_attempts'])} "
+      f"| {summary['never_right']} | {per_attempt} |\n")
+  return "".join(lines) + "\n"
+@
+
+Each cell is written by a small helper.
+A question that is no longer in the quiz has no number to show, and an
+unknown share or median is left empty rather than shown as zero.
+A [[|]] in a question or an answer would end the Markdown cell early, so
+we escape it.
+<<functions>>=
+def markdown_cell(text):
+  """Returns `text` safe to put in a Markdown table cell"""
+  return str(text).replace("|", "\\|").replace("\n", " ")
+
+def position_label(position):
+  """Returns the question number to show for `position`"""
+  return "" if position == UNKNOWN_POSITION else str(position)
+
+def percentage(share):
+  """Returns `share` as a percentage, or nothing if it is unknown"""
+  return "" if share is None else f"{share:.0%}"
+
+def number_label(number):
+  """Returns `number` without trailing zeros, or nothing if it is None"""
+  return "" if number is None else f"{number:g}"
+@
+
+Let's verify that the table has a row per question, hardest first, and
+that unknown values leave their cells empty.
+<<test functions>>=
+def test_format_difficulty_writes_one_row_per_question():
+  responses = [answer_record(1, 1, 1), answer_record(1, 1, 2, right=False),
+               answer_record(1, 1, 3, answer="a|b", right=None)]
+  table = quizzes.format_difficulty(
+    quizzes.attempt_difficulty(responses), "Quiz")
+  rows = [line for line in table.splitlines() if line.startswith("| 2")
+          or line.startswith("| 1") or line.startswith("| 3")]
+  assert [row.split("|")[1].strip() for row in rows] == ["2", "1", "3"]
+  assert "| 0% |  | 1 | 1: 0% (1) |" in rows[0]
+  assert "| 1 | 100% | 1 | 0 | 1: 100% (1) |" in rows[1]
+@
+
+Only the first [[ATTEMPTS_SHOWN]] attempts are shown, and among questions
+equally hard on the first try, the one more students never got right
+comes first.
+<<test functions>>=
+def test_format_difficulty_shows_the_first_attempts_hardest_first():
+  many = [answer_record(1, attempt, 1, right=False)
+          for attempt in range(1, quizzes.ATTEMPTS_SHOWN + 2)]
+  later = [answer_record(2, 1, 2, right=False), answer_record(2, 2, 2)]
+  summaries = quizzes.attempt_difficulty(many + later)
+  assert [summary["position"] for summary in summaries] == [1, 2]
+  table = quizzes.format_difficulty(summaries, "Quiz")
+  assert f"{quizzes.ATTEMPTS_SHOWN}: 0% (1)" in table
+  assert f"{quizzes.ATTEMPTS_SHOWN + 1}: " not in table
+@
+
+\subsection{What students answer}
+
+The view [[--answers]] lists, for each question in quiz order, the wrong
+answers and how often each was given on each attempt.
+A wrong answer given on the first attempt shows a misconception students
+came with; one still given on the third attempt, a misconception the
+quiz's feedback did not correct.
+We count no answer at all separately, since a student who skips a question
+has not tried anything.
+Answers whose rightness is unknown, such as essays awaiting grading, are
+not wrong answers either, so we count them apart too.
+Only for a question none of whose answers is known to be right or wrong do
+we list them, since otherwise the question would show nothing; the
+Markdown says so.
+
+Here the attempt numbers are Canvas's, since the question is what students
+answered on their second attempt at the quiz, not at the question.
+<<functions>>=
+def wrong_answers_by_attempt(responses):
+  """Returns the wrong answers to each question, counted per attempt
+
+  Returns a list with a dict for each question, in quiz order: its
+  `position` and `question`; `counts`, which maps each wrong answer to a
+  Counter of the attempt numbers it was given in, most frequent answer
+  first; `unknown`, the number of answers whose rightness is unknown; and
+  `skipped`, the number of answers left empty.  When no answer to the
+  question is known to be right or wrong, `all_unknown` is true and
+  `counts` holds the answers of unknown rightness instead.
+  """
+  questions = {}
+  for response in responses:
+    entry = questions.setdefault(
+      (response.position, response.question_id),
+      {"position": response.position, "question": response.question,
+       "wrong": defaultdict(Counter), "unknown": defaultdict(Counter),
+       "known": False, "skipped": 0})
+    if not response.answered:
+      entry["skipped"] += 1
+    elif response.right is None:
+      entry["unknown"][response.answer][response.attempt] += 1
+    elif not response.right:
+      entry["wrong"][response.answer][response.attempt] += 1
+    entry["known"] |= response.right is not None
+  return [answer_summary(entry) for _, entry in sorted(questions.items())]
+
+def answer_summary(entry):
+  """Returns the summary of one question for `wrong_answers_by_attempt`"""
+  def by_frequency(counts):
+    return dict(sorted(counts.items(),
+                       key=lambda item: -sum(item[1].values())))
+  unknown = sum(sum(attempts.values())
+                for attempts in entry["unknown"].values())
+  return {"position": entry["position"], "question": entry["question"],
+          "all_unknown": not entry["known"],
+          "counts": by_frequency(entry["wrong"] if entry["known"]
+                                 else entry["unknown"]),
+          "unknown": unknown if entry["known"] else 0,
+          "skipped": entry["skipped"]}
+@
+
+The Markdown has a heading per question and a table per heading.
+<<functions>>=
+def format_wrong_answers(questions, title, overview=""):
+  """Returns `questions` from `wrong_answers_by_attempt` as Markdown
+
+  `overview` is a paragraph to put after the title.
+  """
+  lines = [f"## {markdown_cell(title)}\n\n", overview]
+  for summary in questions:
+    counts, skipped = summary["counts"], summary["skipped"]
+    lines.append(f"### {position_label(summary['position'])} "
+                 f"{markdown_cell(create_short_title(summary['question'], 100))}"
+                 "\n\n")
+    if summary["all_unknown"] and counts:
+      lines.append("Whether these answers are right is unknown, "
+                   "so all of them are listed.\n\n")
+    if counts:
+      lines.append("| Answer | Times | By attempt |\n|---|---|---|\n")
+      for answer, attempts in counts.items():
+        by_attempt = ", ".join(f"{number}: {times}"
+                               for number, times in sorted(attempts.items()))
+        lines.append(f"| {markdown_cell(answer)} "
+                     f"| {sum(attempts.values())} | {by_attempt} |\n")
+      lines.append("\n")
+    elif not skipped and not summary["unknown"]:
+      lines.append("No wrong answers.\n\n")
+    if summary["unknown"]:
+      lines.append(f"Not listed: {summary['unknown']} answers whose "
+                   "rightness is unknown.\n\n")
+    if skipped:
+      lines.append(f"Left unanswered: {skipped}.\n\n")
+  return "".join(lines)
+@
+
+Let's verify that right answers are left out, wrong ones are counted per
+attempt with the most frequent first, and skipped ones are counted apart.
+Question 2 has only an answer of unknown rightness, so it is listed;
+question 3 has one graded wrong answer and one awaiting grading, which is
+counted but not listed as wrong.
+Question 4 has only right answers, and the answers to question 5, which is
+no longer in the quiz, contain a [[|]].
+Question 6 has a right answer and one awaiting grading, so it has no wrong
+answers to list but must not claim that it has none; question 7 has only a
+blank, so there is nothing to list and nothing to explain.
+<<test functions>>=
+def test_wrong_answers_are_counted_per_attempt():
+  unknown_position = quizzes.UNKNOWN_POSITION
+  responses = [answer_record(1, 1, 1, "DES", False),
+               answer_record(2, 1, 1, "RSA", False),
+               answer_record(3, 1, 1, "RSA", False),
+               answer_record(1, 2, 1, "RSA", False),
+               answer_record(1, 3, 1, "AES"),
+               answer_record(2, 2, 1, None, False),
+               answer_record(1, 1, unknown_position, "a|b", False),
+               answer_record(1, 1, 4, "Yes"),
+               answer_record(1, 1, 2, "x", None),
+               answer_record(1, 1, 3, "Wrong", False),
+               answer_record(2, 1, 3, "Ungraded", None),
+               answer_record(1, 1, 6, "Right"),
+               answer_record(2, 1, 6, "Pending", None),
+               answer_record(1, 1, 7, None, None)]
+
+  first, second, third, fourth, sixth, seventh, last = \
+    quizzes.wrong_answers_by_attempt(responses)
+
+  assert [q["position"]
+          for q in (first, second, third, fourth, sixth, seventh, last)] \
+    == [1, 2, 3, 4, 6, 7, unknown_position]
+  assert list(first["counts"]) == ["RSA", "DES"]
+  assert first["counts"]["RSA"] == {1: 2, 2: 1} and first["skipped"] == 1
+  assert second["all_unknown"] and list(second["counts"]) == ["x"]
+  assert second["unknown"] == 0
+  assert not third["all_unknown"] and list(third["counts"]) == ["Wrong"]
+  assert third["unknown"] == 1
+  markdown = quizzes.format_wrong_answers(
+    quizzes.wrong_answers_by_attempt(responses), "Quiz")
+  assert "| RSA | 3 | 1: 2, 2: 1 |" in markdown
+  assert "Left unanswered: 1." in markdown
+  assert "Whether these answers are right is unknown" in markdown
+  assert "Not listed: 1 answers whose rightness is unknown." in markdown
+  assert "### 4 Question 4\n\nNo wrong answers." in markdown
+  assert "### 6 Question 6\n\nNot listed: 1 answers" in markdown
+  assert "### 7 Question 7\n\nLeft unanswered: 1." in markdown
+  assert "| a\\|b | 1 |" in markdown
+  assert f"### {unknown_position}" not in markdown
+@
+
+\subsection{Abandoned attempts and time}
+\label{sec:quiz-attempts-abandoned}
+
+The two views above take every submitted attempt at face value, and an
+attempt can be submitted without having been tried.
+In the three practice exams of a programming course with a 60-minute
+limit, 56 of 119 attempts at one of them ended at exactly 60 minutes, and
+54 of those 56 had answered nothing or only some of the questions:
+students opened the quiz, looked, and let Canvas submit it when the time
+ran out.
+Counted as attempts, such submissions make every question look harder than
+it is.
+The command therefore opens each quiz with an overview of its attempts
+(\cref{sec:quiz-attempts-overview}), and offers two ways to leave the
+untried answers out:
+\begin{description}
+\item[ [[--answered some]] ] drops the attempts that answered no
+  question; [[--answered all]] keeps only the attempts that answered
+  every question.
+  The default, [[any]], keeps every submitted attempt.
+\item[ [[--skip-unanswered]] ] drops each question left unanswered, so
+  that a question skipped in an attempt counts as not attempted rather
+  than as not right.
+  The shares in the difficulty view then become shares among the students
+  who answered the question.
+\end{description}
+[[--answered]] works on whole attempts, so it applies before
+[[--attempts]] picks an attempt per student:
+[[--answered some --attempts first]] is each student's first attempt that
+answered anything.
+[[--skip-unanswered]] works on single answers, so it applies after the
+attempts are picked, and \enquote{first} remains the first attempt at the
+quiz.
+
+An attempt is the set of a student's answers with the same attempt number,
+so we count its answers per [[(student_id, attempt)]].
+<<constants>>=
+ANSWERED_SELECTIONS = ("any", "some", "all")
+<<functions>>=
+def filter_answered(responses, answered):
+  """Returns the `responses` of the attempts that `answered` keeps
+
+  `answered` is one of `ANSWERED_SELECTIONS`: every attempt (any), the
+  attempts that answered at least one question (some), or those that
+  answered every question (all).
+  """
+  if answered == "any":
+    return list(responses)
+  attempts = defaultdict(list)
+  for response in responses:
+    attempts[(response.student_id, response.attempt)].append(response)
+  keep = all if answered == "all" else any
+  return [response for answers in attempts.values()
+          if keep(answer.answered for answer in answers)
+          for response in answers]
+@
+
+Let's verify both filters on three attempts: one answering everything,
+one answering some questions and one answering none.
+<<test functions>>=
+def test_answered_filters_keep_the_attempts_tried():
+  responses = [answer_record(1, 1, 1, None, False),
+               answer_record(1, 1, 2, "B", False),
+               answer_record(1, 2, 1, "A"), answer_record(1, 2, 2, "B"),
+               answer_record(2, 1, 1, None, False),
+               answer_record(2, 1, 2, None, False)]
+
+  def attempts(selected):
+    return sorted({(r.student_id, r.attempt) for r in selected})
+
+  assert attempts(quizzes.filter_answered(responses, "any")) \
+    == [(1, 1), (1, 2), (2, 1)]
+  assert attempts(quizzes.filter_answered(responses, "some")) \
+    == [(1, 1), (1, 2)]
+  assert attempts(quizzes.filter_answered(responses, "all")) == [(1, 2)]
+@
+
+Skipping the unanswered questions is a filter on single answers.
+<<functions>>=
+def answered_only(responses):
+  """Returns the `responses` that answer their question"""
+  return [response for response in responses if response.answered]
+@
+
+Let's verify what it changes in the difficulty view: student 1 left
+question 1 blank in the first attempt and got it right in the second.
+Counted as a try, the blank makes the question take two attempts; skipped,
+it takes one.
+<<test functions>>=
+def test_skipping_unanswered_questions_counts_only_tries():
+  responses = [answer_record(1, 1, 1, None, False),
+               answer_record(1, 2, 1, "A")]
+  [counted] = quizzes.attempt_difficulty(responses)
+  [skipped] = quizzes.attempt_difficulty(quizzes.answered_only(responses))
+  assert counted["median_attempts"] == 2 and counted["first_right"] == 0
+  assert skipped["median_attempts"] == 1 and skipped["first_right"] == 1
+@
+
+\subsubsection{Time per attempt}
+\label{sec:quiz-attempts-time}
+
+Only the New Quizzes record how long an attempt took: the report gives each
+attempt an [[elapsed_time]] such as [[00:05:12]].
+A Classic Quiz's history has the time an attempt was submitted but not when
+it was started, so for Classic Quizzes the overview says nothing about time.
+We keep the time on every record of the attempt, in seconds, which also
+puts it in the table view.
+The hours can exceed 24---we have seen an attempt reported as 867 hours---so
+we parse the three fields ourselves rather than as a time of day.
+<<functions>>=
+def elapsed_seconds(elapsed_time):
+  """Returns an `HH:MM:SS` duration in seconds, or None if there is none"""
+  if not elapsed_time:
+    return None
+  hours, minutes, seconds = (int(part) for part in elapsed_time.split(":"))
+  return hours * 3600 + minutes * 60 + seconds
+@
+
+Let's verify the parsing on such a long attempt.
+<<test functions>>=
+def test_elapsed_seconds_allows_more_than_a_day():
+  assert quizzes.elapsed_seconds("867:16:49") == 867 * 3600 + 16 * 60 + 49
+  assert quizzes.elapsed_seconds("") is None
+@
+
+Elapsed times only make sense against the quiz's time limit.
+Without a limit, an attempt stays open until the student submits it, which
+can be days later, so a median of such times says little.
+With a limit, an attempt that took exactly the limit is one Canvas
+submitted when time ran out.
+An attempt can also be reported as longer than the limit: in one practice
+exam, 27 of 98 attempts were, the longest by weeks.
+The data do not say why, so we count those attempts as a group of their
+own rather than guess.
+<<functions>>=
+def time_class(elapsed, time_limit):
+  """Returns "before", "at" or "beyond" the `time_limit`, or None"""
+  if elapsed is None or not time_limit:
+    return None
+  if elapsed < time_limit:
+    return "before"
+  return "at" if elapsed == time_limit else "beyond"
+@
+
+\subsubsection{The overview of the attempts}
+\label{sec:quiz-attempts-overview}
+
+The overview counts the attempts and students, how many attempts answered
+all, some or none of their questions, and, for a New Quiz with a time
+limit, how many ended before, at or beyond the limit.
+For those that ended at the limit it repeats the answered breakdown, which
+is what shows whether they were abandoned.
+Finally it gives the median time of the attempts that answered every
+question before the limit, the time a student who did the whole quiz
+needed.
+The overview describes the attempts that [[--answered]] and
+[[--attempts]] kept, but before [[--skip-unanswered]], which would make
+every attempt look complete.
+<<functions>>=
+def attempt_overview(responses, time_limit=None):
+  """Returns a Markdown paragraph summarising the attempts in `responses`
+
+  `time_limit` is the quiz's time limit in seconds, None if it has none.
+  """
+  <<collect each attempt's answered count and time>>
+  <<write the attempt counts>>
+  <<write the time of the attempts>>
+  return " ".join(sentences) + "\n\n"
+@
+
+The records are answers, so we first gather them into attempts, keyed by
+student and attempt number as in [[filter_answered]].
+All answers of an attempt carry the same time, so any of them gives it.
+<<collect each attempt's answered count and time>>=
+attempts = defaultdict(lambda: {"answered": 0, "questions": 0,
+                                "elapsed": None})
+for response in responses:
+  attempt = attempts[(response.student_id, response.attempt)]
+  attempt["questions"] += 1
+  attempt["answered"] += response.answered
+  attempt["elapsed"] = response.elapsed
+@
+
+An attempt answered all, some or none of its questions, and the overview
+gives that breakdown twice---for all attempts, and for those that ended at
+the limit---so it is a function of its own, as is the plural that the
+counts of one attempt or one student need.
+<<functions>>=
+def answered_class(attempt):
+  """Returns "all", "some" or "none": how much of `attempt` was answered"""
+  if attempt["answered"] == attempt["questions"]:
+    return "all"
+  return "none" if attempt["answered"] == 0 else "some"
+
+def answered_breakdown(attempts):
+  """Returns how many of `attempts` answered all, some or no questions"""
+  counts = Counter(answered_class(attempt) for attempt in attempts)
+  return (f"{counts['all']} answered every question, "
+          f"{counts['some']} some and {counts['none']} none")
+
+def counted(number, noun):
+  """Returns `number` and `noun`, in the plural unless `number` is 1"""
+  return f"{number} {noun}" + ("" if number == 1 else "s")
+@
+
+The first sentence counts the attempts and students and gives the
+breakdown.
+<<write the attempt counts>>=
+students = {student_id for student_id, _ in attempts}
+sentences = [f"{counted(len(attempts), 'attempt')} by "
+             f"{counted(len(students), 'student')}: "
+             f"{answered_breakdown(attempts.values())}."]
+@
+
+The sentences about time only make sense when the attempts have times,
+that is for a New Quiz, and they compare the times with the limit as
+[[time_class]] does.
+The median is taken over complete attempts before the limit only, since
+an attempt cut off by the limit, or answered only in part, says nothing
+about how long the whole quiz takes.
+<<write the time of the attempts>>=
+classes = defaultdict(list)
+for attempt in attempts.values():
+  classes[time_class(attempt["elapsed"], time_limit)].append(attempt)
+if any(attempt["elapsed"] is not None for attempt in attempts.values()):
+  if not time_limit:
+    sentences.append("The quiz has no time limit, so the time of the "
+                     "attempts is not summarised.")
+  else:
+    sentences.append(
+      f"With a time limit of {format_time_limit(time_limit)}, "
+      f"{len(classes['before'])} ended before the limit, "
+      f"{len(classes['at'])} at it and "
+      f"{len(classes['beyond'])} were reported as longer.")
+    if classes["at"]:
+      sentences.append(f"Of those that ended at the limit, "
+                       f"{answered_breakdown(classes['at'])}.")
+    complete = [attempt["elapsed"] for attempt in classes["before"]
+                if answered_class(attempt) == "all"]
+    if complete:
+      sentences.append(
+        "The attempts that answered every question before the limit took "
+        f"{statistics.median(complete) / SECONDS_PER_MINUTE:.0f} minutes "
+        "(median).")
+@
+
+Let's verify the overview on a quiz with a 60-minute limit: one attempt
+answered everything in 20 minutes, one was submitted at the limit with
+nothing answered, one was reported as longer than the limit, and one
+answered only some questions in 10 minutes, which must not count towards
+the median time of a complete attempt.
+A Classic Quiz, whose records have no time, gets only the counts.
+<<test functions>>=
+def timed_answers(student, elapsed, *answers):
+  """The records of one attempt that took `elapsed` seconds"""
+  return [dataclasses.replace(answer_record(student, 1, position, answer,
+                                            answer is not None),
+                              elapsed=elapsed)
+          for position, answer in enumerate(answers, start=1)]
+
+def test_attempt_overview_separates_abandoned_attempts():
+  responses = (timed_answers(1, 1200, "A", "B")
+               + timed_answers(2, 3600, None, None)
+               + timed_answers(3, 7200, "A", None)
+               + timed_answers(4, 600, "A", None))
+
+  overview = quizzes.attempt_overview(responses, time_limit=3600)
+
+  assert overview.startswith("4 attempts by 4 students: 1 answered every "
+                             "question, 2 some and 1 none.")
+  assert "2 ended before the limit, 1 at it and 1 were reported as " \
+         "longer." in overview
+  assert "Of those that ended at the limit, 0 answered every question, " \
+         "0 some and 1 none." in overview
+  assert "took 20 minutes (median)" in overview
+  untimed = quizzes.attempt_overview([answer_record(1, 1, 1)])
+  assert untimed.startswith("1 attempt by 1 student:")
+  assert "limit" not in untimed
+
+def test_attempt_overview_ignores_time_without_a_limit():
+  overview = quizzes.attempt_overview(timed_answers(1, 99999, "A"))
+  assert "no time limit" in overview and "ended" not in overview
+@
+
+\subsection{Every answer as a row}
+
+The view [[--table]] prints the records themselves, so that a teacher can
+ask questions the two summaries do not, such as how one student
+progressed.
+It follows the TSV conventions of the other commands: no Markdown, a
+header row, and the delimiter of [[-d]].
+The time of the attempt, in seconds, is empty for Classic Quizzes.
+Rightness is written as 1 or 0, empty when unknown, which a spreadsheet or
+[[awk]] can sum.
+<<functions>>=
+def write_attempt_table(responses, title, delimiter, header=True, file=None):
+  """Writes `responses` to `file` (stdout by default) as delimited rows"""
+  writer = csv.writer(file or sys.stdout, delimiter=delimiter)
+  if header:
+    writer.writerow(["quiz", "student_id", "student", "attempt", "elapsed",
+                     "position",
+                     "question_id", "question", "answer", "points", "right"])
+  for response in sorted(responses, key=lambda r: (
+      r.student, r.student_id, r.attempt, r.position)):
+    writer.writerow([
+      title, response.student_id, response.student, response.attempt,
+      number_label(response.elapsed), position_label(response.position),
+      response.question_id,
+      response.question, response.answer or "", number_label(response.points),
+      {True: "1", False: "0"}.get(response.right, "")])
+@
+
+Let's verify one row against its record.
+<<test functions>>=
+def test_attempt_table_writes_one_row_per_answer():
+  out = io.StringIO()
+  quizzes.write_attempt_table(
+    [answer_record(7, 2, 3, "AES", False), answer_record(7, 3, 3, "x", None)],
+    "Quiz", "\t", file=out)
+  header, row, unknown = out.getvalue().splitlines()
+  assert unknown.split("\t")[-1] == ""
+  assert header.split("\t")[:4] == ["quiz", "student_id", "student", "attempt"]
+  assert row.split("\t") == ["Quiz", "7", "Student 7", "2", "", "3", "3",
+                             "Question 3", "AES", "0", "0"]
+
+def test_attempt_table_sorts_by_student_and_attempt():
+  out = io.StringIO()
+  quizzes.write_attempt_table(
+    [answer_record(8, 2, 1), answer_record(7, 3, 1), answer_record(7, 1, 1)],
+    "Quiz", ",", header=False, file=out)
+  assert [row.split(",")[1:4] + row.split(",")[-1:]
+          for row in out.getvalue().splitlines()] == [
+    ["7", "Student 7", "1", "1"], ["7", "Student 7", "3", "1"],
+    ["8", "Student 8", "2", "1"]]
+@
+
+\subsection{The attempts as report rows}
+\label{sec:quiz-attempts-rows}
+
+[[quizzes analyse]] summarises rows shaped like those of the student
+analysis report's CSV: one row per attempt, one column per question
+(\cref{sec:quiz-question-titles}).
+It reads a New Quiz's attempts through our records
+(\cref{sec:quiz-attempts}), so we turn the records back into such rows.
+The question columns are named as in a Classic Quiz's report,
+\enquote{ID: question}, which [[analyse]] already parses, with the question
+as HTML so that code keeps its lines.
+The metadata columns---[[name]], [[id]] and [[attempt]]---contain no space,
+so [[analyse]] does not take them for questions.
+A question an attempt did not answer, or did not show, gets an empty cell,
+which [[analyse]] skips.
+<<functions>>=
+def attempt_rows(responses):
+  """Returns `responses` as rows of a student analysis report
+
+  One row per attempt, a dict with the metadata columns `name`, `id` and
+  `attempt`, then one column per question in quiz order, named
+  "ID: question" with the question as HTML.  Unanswered questions are empty.
+  """
+  columns = {}
+  rows = {}
+  for response in responses:
+    column = columns.setdefault(
+      (response.position, response.question_id),
+      f"{response.question_id}: {response.question_html or response.question}")
+    row = rows.setdefault((response.student_id, response.attempt), {
+      "name": response.student, "id": str(response.student_id),
+      "attempt": str(response.attempt)})
+    row[column] = response.answer or ""
+  ordered = [columns[key] for key in sorted(columns)]
+  return [{**{key: row[key] for key in ("name", "id", "attempt")},
+           **{column: row.get(column, "") for column in ordered}}
+          for _, row in sorted(rows.items())]
+@
+
+Let's verify the rows for two attempts, one of which did not show the
+second question, and that [[analyse]] reads the columns as we intend.
+<<test functions>>=
+def test_attempt_rows_have_one_column_per_question():
+  def which(attempt, answer):
+    return dataclasses.replace(answer_record(5, attempt, 1, answer),
+                               question_html="<p>Which?</p>")
+  rows = quizzes.attempt_rows([
+    which(2, None), which(1, "AES"), answer_record(5, 2, 2, "B")])
+  assert rows == [
+    {"name": "Student 5", "id": "5", "attempt": "1",
+     "1: <p>Which?</p>": "AES", "2: Question 2": ""},
+    {"name": "Student 5", "id": "5", "attempt": "2",
+     "1: <p>Which?</p>": "", "2: Question 2": "B"}]
+  assert quizzes.extract_question_id("1: <p>Which?</p>") \
+    == ("1", "<p>Which?</p>")
+@
+
+\subsection{The [[quizzes attempts]] command}
+
+The command reads the attempts at each matching quiz, keeps those that
+[[--attempts]] selects, and prints the view asked for, with one heading or
+one value in the [[quiz]] column for each quiz.
+We require [[-a]]: making a report for every quiz in a course, as the
+default [[.*]] of the other quiz commands would, takes long and is rarely
+what one wants.
+<<add quizzes attempts command to subp>>=
+attempts_parser = subp.add_parser("attempts",
+  help="Show how students did over their attempts at a quiz",
+  description="""Shows how students did over all their attempts at a quiz:
+by default, how hard each question was (how many got it right on their
+first try, how many attempts it took, how many never got it right);
+with --answers, the wrong answers students gave on each attempt; with
+--table, every answer as a row. Works for New Quizzes and for Classic
+Quizzes that have an assignment, whose submission history holds the
+attempts.""")
+attempts_parser.set_defaults(func=attempts_command)
+add_quiz_option(attempts_parser, required=True)
+attempts_view = attempts_parser.add_mutually_exclusive_group()
+attempts_view.add_argument("--answers", action="store_true",
+  help="List the wrong answers to each question, counted per attempt")
+attempts_view.add_argument("--table", action="store_true",
+  help="Print every answer as a row: quiz, student, attempt, question, "
+       "answer, points and whether it was right")
+attempts_parser.add_argument("--attempts", choices=ATTEMPT_SELECTIONS,
+  default="all",
+  help="Which attempts to count: all (default), or each student's first, "
+       "last or best (most points)")
+attempts_parser.add_argument("--answered", choices=ANSWERED_SELECTIONS,
+  default="any",
+  help="Which attempts to keep: any (default), those that answered some "
+       "question, or those that answered all; applied before --attempts")
+attempts_parser.add_argument("--skip-unanswered", action="store_true",
+  help="Leave out questions left unanswered, so that a blank is not "
+       "counted as a failed try")
+@
+
+The selections apply in the order \cref{sec:quiz-attempts-abandoned}
+explains: [[--answered]], then [[--attempts]], then the overview, then
+[[--skip-unanswered]].
+The time limit, which only the overview needs, is read from a New Quiz's
+settings; for a Classic Quiz there are no times to compare with it.
+A quiz without attempts to show raises [[EmptyListError]], which we turn
+into a warning so that the other quizzes are still shown; only when no
+quiz had any does the command fail.
+A quiz whose attempts Canvas would not give us, because a request failed
+or the report could not be downloaded, is treated the same way: one
+failing quiz must not hide the others.
+<<functions>>=
+def attempts_time_limit(quiz):
+  """Returns the time limit of a New Quiz in seconds, else None"""
+  if not is_new_quiz(quiz):
+    return None
+  return quiz_settings_time_limit(getattr(quiz, "quiz_settings", None))
+
+def attempts_command(config, canvas, args):
+  """Shows how students did over their attempts at the selected quizzes"""
+  requester = canvas._Canvas__requester
+  markdown = []
+  found = False
+  for quiz in process_quiz_option(canvas, args):
+    try:
+      if is_new_quiz(quiz):
+        responses = fetch_new_quiz_attempts(quiz, requester)
+      else:
+        responses = fetch_classic_attempts(quiz)
+    except canvaslms.cli.EmptyListError as error:
+      canvaslms.cli.warn(str(error))
+      continue
+    except (CanvasException, requests.RequestException) as error:
+      canvaslms.cli.warn(f"{quiz.title}: could not read the attempts: {error}")
+      continue
+    responses = select_attempts(filter_answered(responses, args.answered),
+                                args.attempts)
+    if not responses:
+      canvaslms.cli.warn(f"{quiz.title}: no submitted attempts")
+      continue
+    overview = attempt_overview(responses, attempts_time_limit(quiz))
+    if args.skip_unanswered:
+      responses = answered_only(responses)
+    if args.table:
+      write_attempt_table(responses, quiz.title, args.delimiter,
+                          header=not found)
+    elif args.answers:
+      markdown.append(format_wrong_answers(
+        wrong_answers_by_attempt(responses), quiz.title, overview))
+    else:
+      markdown.append(format_difficulty(
+        attempt_difficulty(responses), quiz.title, overview))
+    found = True
+  if not found:
+    raise canvaslms.cli.EmptyListError(
+      "No submitted attempts at the selected quizzes")
+  if markdown:
+    page_markdown("".join(markdown))
+@
+
+Let's verify the command end to end, through the parser that
+[[add_command]] builds, on a course with a Classic Quiz and a New Quiz.
+Only the course selection is patched, as in the other command tests; the
+quizzes are found by [[process_quiz_option]] in the listings that
+[[responses]] answers.
+Student 7 got the Classic Quiz's question wrong and then right; student 5
+did the same on the New Quiz.
+The submissions are answered only when the request includes their history,
+since without it Canvas sends none.
+<<test functions>>=
+def course_with_attempts(classic_quiz=None, submissions=None,
+                         new_quiz=None, report=None):
+  """A real course with Classic Quiz 9 and New Quiz 42, both attempted
+
+  `submissions` replaces the Classic Quiz's submissions, `new_quiz` the New
+  Quiz as listed and `report` its report.
+  """
+  api = f"{CACHE_API}/courses/1"
+  responses.get(f"{api}/quizzes", json=[classic_quiz or {
+    "id": 9, "title": "Honour code", "course_id": 1, "assignment_id": 50,
+    "quiz_type": "assignment"}])
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes",
+                json=[new_quiz or {"id": "42", "title": "Ciphers"}])
+  responses.get(f"{api}/assignments/50",
+                json={"id": 50, "course_id": 1, "name": "Honour code"})
+  responses.get(f"{api}/assignments/50/submissions", match=[
+    responses.matchers.query_param_matcher(
+      {"include[]": "submission_history"}, strict_match=False)],
+    json=submissions if submissions is not None else [
+    {"id": 1, "user_id": 7, "assignment_id": 50, "attempt": 2,
+     "grade": "1", "submission_history": [
+       classic_entry(2, (11, True, 1.0, "1", {"answer_id": 1})),
+       classic_entry(1, (11, False, 0.0, "2", {"answer_id": 2}))]}])
+  responses.get(f"{api}/search_users", json=[{"id": 7, "name": "Student Seven"}])
+  responses.get(f"{api}/quizzes/9/questions", json=[{
+    "id": 11, "quiz_id": 9, "position": 1, "question_type":
+    "multiple_choice_question", "question_text": "<p>Allowed?</p>",
+    "points_possible": 1.0, "answers": [{"id": 1, "text": "No"},
+                                        {"id": 2, "text": "Yes"}]}])
+  progress = {"id": 3, "workflow_state": "completed",
+              "results": {"url": "https://files.example.invalid/r.json"}}
+  responses.post(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                 json={"progress": progress})
+  responses.get(f"{CACHE_API}/progress/3", json=progress)
+  responses.get("https://files.example.invalid/r.json", json=report or [
+    new_quiz_attempt(5, 1, (185, "DES", 0.0)),
+    new_quiz_attempt(5, 2, (185, "AES", 1.0))])
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+                json=[listed_new_quiz_item(307, 185, 1, "<p>Which cipher?</p>")])
+  return wrapped_course()
+
+def run_attempts(course, *options):
+  """Run quizzes attempts on `course` with the command-line `options`"""
+  parser = argparse.ArgumentParser()
+  parser.add_argument("-d", "--delimiter", default="\t")
+  quizzes.add_command(parser.add_subparsers())
+  args = parser.parse_args(["quizzes", "attempts", "-c", "SBX", *options])
+  canvas = MagicMock()
+  canvas._Canvas__requester = course._requester
+  with patch("canvaslms.cli.courses.process_course_option",
+             return_value=[course]):
+    args.func({}, canvas, args)
+
+@responses.activate
+def test_attempts_command_summarises_both_quiz_systems(capsys):
+  run_attempts(course_with_attempts(), "-a", ".")
+  out = capsys.readouterr().out
+  classic, new = out.split("## Ciphers")
+  assert "## Honour code" in classic
+  assert "| 1 | Allowed? | 1 | 0% | 2 | 0 | 1: 0% (1), 2: 100% (1) |" \
+    in classic
+  assert "| 1 | Which cipher? | 1 | 0% | 2 | 0 | 1: 0% (1), 2: 100% (1) |" \
+    in new
+
+@responses.activate
+def test_attempts_command_tables_both_quizzes_under_one_header(capsys):
+  run_attempts(course_with_attempts(), "-a", ".", "--table",
+               "--attempts", "last")
+  header, *rows = capsys.readouterr().out.splitlines()
+  assert header.startswith("quiz\tstudent_id")
+  assert [row.split("\t")[:4] + row.split("\t")[-1:] for row in rows] == [
+    ["Honour code", "7", "Student Seven", "2", "1"],
+    ["Ciphers", "5", "Student 5", "2", "1"]]
+
+@responses.activate
+def test_attempts_command_lists_the_wrong_answers(capsys):
+  run_attempts(course_with_attempts(), "-a", "Honour", "--answers")
+  out = capsys.readouterr().out
+  assert "### 1 Allowed?" in out and "| Yes | 1 | 1: 1 |" in out
+@
+
+A Classic Quiz without an assignment has no attempts to read.
+The command warns about it and goes on with the other quizzes; only when no
+quiz has attempts does it fail.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_skips_a_quiz_without_assignment(capsys, caplog):
+  course = course_with_attempts({"id": 9, "title": "Practice", "course_id": 1,
+                                 "quiz_type": "practice_quiz"})
+  run_attempts(course, "-a", ".")
+  assert "## Ciphers" in capsys.readouterr().out
+  assert "Practice: the quiz has no assignment" in caplog.text
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_attempts(course, "-a", "Practice")
+
+@responses.activate
+def test_attempts_command_warns_about_a_quiz_not_taken(caplog):
+  course = course_with_attempts(submissions=[
+    {"id": 1, "user_id": 7, "assignment_id": 50, "attempt": None,
+     "grade": None, "submission_history": [
+       {"attempt": None, "workflow_state": "unsubmitted",
+        "submission_data": None}]}])
+  with pytest.raises(quizzes.canvaslms.cli.EmptyListError):
+    run_attempts(course, "-a", "Honour")
+  assert "Honour code: no submitted attempts" in caplog.text
+@
+
+When Canvas refuses one quiz's report, the command still shows the
+other quiz and names the one it could not read.
+<<test functions>>=
+@responses.activate
+def test_attempts_command_goes_on_after_a_refused_report(capsys, caplog):
+  course = course_with_attempts()
+  responses.replace(responses.POST,
+                    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports",
+                    status=500, json={"errors": [{"message": "busy"}]})
+  run_attempts(course, "-a", ".")
+  assert "## Honour code" in capsys.readouterr().out
+  assert "Ciphers: could not read the attempts" in caplog.text
+@
+
+The options for abandoned attempts work through the command too.
+Student 5 opened the timed New Quiz, answered nothing and let the hour run
+out, then answered it right in five minutes.
+By default the abandoned attempt is a failed first try.
+[[--answered some]] drops it, so the first try is the right one;
+[[--skip-unanswered]] drops only its blank answer, with the same effect on
+the table, while the overview, made before, still counts both attempts.
+<<test functions>>=
+def abandoned_then_right():
+  """A course whose timed New Quiz was first abandoned, then done"""
+  first = new_quiz_attempt(5, 1, (185, "", 0.0))
+  first["student_data"]["elapsed_time"] = "01:00:00"
+  return course_with_attempts(
+    new_quiz={"id": "42", "title": "Ciphers", "quiz_settings": {
+      "has_time_limit": True, "session_time_limit_in_seconds": 3600}},
+    report=[first, new_quiz_attempt(5, 2, (185, "AES", 1.0))])
+
+@pytest.mark.parametrize("options, first_try, attempts", [
+  ([], "0%", "2 attempts"),
+  (["--answered", "some"], "100%", "1 attempt"),
+  (["--skip-unanswered"], "100%", "2 attempts")])
+@responses.activate
+def test_attempts_command_leaves_out_abandoned_attempts(
+    capsys, options, first_try, attempts):
+  run_attempts(abandoned_then_right(), "-a", "Ciphers", *options)
+  out = capsys.readouterr().out
+  assert f"| 1 | Which cipher? | 1 | {first_try} |" in out
+  assert f"{attempts} by 1 student:" in out
+  if attempts == "2 attempts":
+    assert "Of those that ended at the limit, 0 answered every question, " \
+           "0 some and 1 none." in out
+@
+
+The options keep the views apart and require a quiz.
+<<test functions>>=
+@pytest.mark.parametrize("options", [
+  [], ["-a", "Quiz", "--answers", "--table"],
+  ["-a", "Quiz", "--attempts", "middle"]])
+def test_attempts_command_refuses_bad_options(options):
+  parser = argparse.ArgumentParser()
+  quizzes.add_command(parser.add_subparsers())
+  with pytest.raises(SystemExit):
+    parser.parse_args(["quizzes", "attempts", "-c", "SBX", *options])
+
+def test_attempts_command_counts_all_attempts_by_default():
+  parser = argparse.ArgumentParser()
+  quizzes.add_command(parser.add_subparsers())
+  args = parser.parse_args(["quizzes", "attempts", "-c", "SBX", "-a", "Q"])
+  assert (args.attempts, args.answers, args.table) == ("all", False, False)
+  assert (args.answered, args.skip_unanswered) == ("any", False)
 @
 
 

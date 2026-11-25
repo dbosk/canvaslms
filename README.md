@@ -92,6 +92,29 @@ If you installed with the `[llm]` extra, configure your API keys:
 llm keys set openai  # or another provider
 ```
 
+### Following Students over Their Quiz Attempts
+
+When students may take a quiz several times, `quizzes attempts` shows how
+they did over all their attempts, both while the quiz is open and after it:
+
+```bash
+# Per question: right on the first try, attempts until right, never right
+canvaslms quizzes attempts -c COURSE -a "Quiz title"
+
+# The wrong answers students gave, counted per attempt
+canvaslms quizzes attempts -c COURSE -a "Quiz title" --answers
+
+# Only each student's first attempt; every answer as a TSV row
+canvaslms quizzes attempts -c COURSE -a "Quiz title" --attempts first --table
+```
+
+Each quiz opens with an overview of its attempts: how many answered all,
+some or none of the questions and, for a New Quiz with a time limit, how
+many ended at the limit. `--answered some` leaves out attempts that were
+opened and abandoned, and `--skip-unanswered` leaves out blank answers.
+
+It works for New Quizzes and for Classic Quizzes that have an assignment.
+
 ### Managing Quiz Content
 
 Quizzes written elsewhere, for example with `text2qti`, can be imported as
