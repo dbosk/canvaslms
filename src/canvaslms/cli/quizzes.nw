@@ -3111,6 +3111,9 @@ answers to items that an attempt never showed.
 The records become rows by [[attempt_rows]] (\cref{sec:quiz-attempts-rows}).
 We compared the two formats of one report and found the answers identical,
 all 5580 of them, so reading JSON changes the titles but no answer.
+That quiz had no true/false questions, though, whose false answers the
+JSON report leaves empty; the records take them from the CSV
+(\cref{sec:quiz-true-false-answers}).
 <<read the attempts at the New Quiz as [[rows]]>>=
 try:
   rows = attempt_rows(pick_attempts(
@@ -4115,12 +4118,46 @@ def new_quiz_attempt_responses(report, items, bank=None):
         position=position,
         question_id=item_id,
         question=question,
-        answer=plain_text(response.get("answer")) or None,
+        answer=new_quiz_answer(response, entry) or None,
         question_html=question_html,
         points=score,
         right=right,
         elapsed=elapsed_seconds(student.get("elapsed_time")),
         submitted=student.get("submitted_at") or "")
+@
+
+An answer is mostly HTML, but the answer to a true/false item is a JSON
+boolean, which made every view crash on such a quiz (issue~655).
+We show it as the item's own label for the choice, from its
+[[interaction_data]], since that is what the student saw: the consent
+question of issue~655 labels its choices \enquote{Yes} and \enquote{No}.
+An item without labels, or a question drawn from a bank, whose item we do
+not have, gets \enquote{True} or \enquote{False}.
+The type is tested before anything else because [[False]] is falsy: read
+as text, a student who answered false would vanish as a blank, both from
+the records and from the tests of what an attempt showed or drew.
+So those tests ask [[given_answer]] instead of the answer's truth.
+In the JSON report a false answer is in fact mostly empty, which
+\cref{sec:quiz-true-false-answers} puts right.
+<<functions>>=
+def given_answer(response):
+  """True if a New Quiz report `response` holds an answer, false included"""
+  answer = response.get("answer")
+  return isinstance(answer, bool) or bool(answer)
+
+def new_quiz_answer(response, entry=None):
+  """Returns the answer in a New Quiz report `response` as plain text
+
+  A true/false answer is a boolean, which becomes its label in `entry`,
+  the item's entry, or "True" or "False" without one.  Returns "" for no
+  answer.
+  """
+  answer = response.get("answer")
+  if isinstance(answer, bool):
+    labels = (entry or {}).get("interaction_data") or {}
+    label = labels.get("true_choice" if answer else "false_choice")
+    return plain_text(label) or str(answer)
+  return plain_text(answer)
 @
 
 We compare the times as instants, since Canvas writes them with and
@@ -4134,11 +4171,23 @@ def shown_in_attempt(response, entry, submitted_at):
   submitted.
   """
   if entry is None:
-    return bool(response.get("answer"))
+    return given_answer(response)
   created_at = entry.get("created_at")
   if created_at and submitted_at:
     return arrow.get(created_at) <= arrow.get(submitted_at)
   return True
+@
+
+Let's verify that a false answer counts as an answer, also when it
+decides whether an attempt showed a question, and that an empty one does
+not.
+The same holds for the bank draws, which \cref{sec:quiz-bank-draws} checks.
+<<test functions>>=
+def test_a_false_answer_is_an_answer():
+  assert quizzes.given_answer({"answer": False})
+  assert not quizzes.given_answer({"answer": ""})
+  assert not quizzes.given_answer({})
+  assert quizzes.shown_in_attempt({"answer": False}, None, None)
 @
 
 Let's verify it on records shaped as Canvas sent them, with made-up
@@ -4211,6 +4260,47 @@ def test_new_quiz_attempts_become_one_record_per_answer():
   assert records[0].elapsed == 300
 @
 
+Let's verify the true/false answers on items shaped as the New Quizzes API
+listed the one of issue~655, a consent question worth no points whose
+choices are labelled \enquote{Yes} and \enquote{No}, and on an item worth a
+point without labels.
+Student 7 left the first question blank.
+That the answers then reach the views that crashed on them is checked
+with the command (\cref{sec:quiz-attempts}).
+<<test functions>>=
+def true_false_item(item_id, entry_id, position, points=0.0,
+                    labels={"true_choice": "Yes", "false_choice": "No"}):
+  """A New Quiz true/false item as the New Quizzes API lists it"""
+  item = listed_new_quiz_item(item_id, entry_id, position, "<p>Agree?</p>",
+                              points)
+  item["entry"].update({"interaction_type_slug": "true-false",
+                        "interaction_data": labels,
+                        "scoring_data": {"value": True}})
+  return item
+
+def true_false_attempt(student_id, attempt, *answers):
+  """A report record whose `answers` (entry ID, answer, score) are true/false"""
+  record = new_quiz_attempt(student_id, attempt, *answers)
+  for response in record["item_responses"]:
+    response["item_type"] = "true-false"
+  return record
+
+def test_true_false_answers_become_the_items_labels():
+  items = [true_false_item(306, 190, 1),
+           true_false_item(307, 191, 2, points=1.0, labels={})]
+  report = [true_false_attempt(5, 1, (190, False, 0.0), (191, True, 1.0)),
+            true_false_attempt(6, 1, (190, True, 0.0), (191, False, 0.0)),
+            true_false_attempt(7, 1, (190, "", 0.0), (191, True, 1.0))]
+
+  records = list(quizzes.new_quiz_attempt_responses(report, items))
+
+  assert [(r.student_id, r.position, r.answer, r.right, r.answered)
+          for r in records] == [
+    (5, 1, "No", None, True), (5, 2, "True", True, True),
+    (6, 1, "Yes", None, True), (6, 2, "False", False, True),
+    (7, 1, None, None, False), (7, 2, "True", True, True)]
+@
+
 \subsubsection{Questions drawn at random from a bank}
 \label{sec:quiz-bank-draws}
 
@@ -4277,7 +4367,7 @@ class BankDraws:
     key = (str(student["id"]), str(student["attempt"]), item_id)
     status = self.statuses.get(key)
     if status is None:
-      return bool(response.get("answer"))
+      return given_answer(response)
     return status != NOT_DRAWN
 
   def right(self, item_id, score):
@@ -4293,16 +4383,35 @@ class BankDraws:
 <<constants>>=
 NOT_DRAWN = "Not Attempted"
 <<functions>>=
-def read_bank_draws(csv_text):
-  """Returns the titles and statuses of a New Quiz report in CSV"""
+@dataclass
+class CsvQuestion:
+  """One question of one attempt in a New Quiz report in CSV, as strings"""
+  student: str
+  attempt: str
+  item_id: str
+  item_type: str
+  title: str
+  answer: str
+  status: str
+
+def csv_report_questions(csv_text):
+  """Yields a `CsvQuestion` for each question of each attempt in `csv_text`"""
   header, *rows = list(csv.reader(io.StringIO(csv_text)))
   student, attempt = header.index("ID"), header.index("Attempt")
   groups = [column for column, name in enumerate(header) if name == "ItemID"]
-  titles, statuses = {}, {}
   for row in rows:
     for column in groups:
-      titles[row[column]] = header[column + 2]
-      statuses[(row[student], row[attempt], row[column])] = row[column + 4]
+      yield CsvQuestion(row[student], row[attempt], row[column],
+                        row[column + 1], header[column + 2], row[column + 2],
+                        row[column + 4])
+
+def read_bank_draws(csv_text):
+  """Returns the titles and statuses of a New Quiz report in CSV"""
+  titles, statuses = {}, {}
+  for question in csv_report_questions(csv_text):
+    titles[question.item_id] = question.title
+    statuses[(question.student, question.attempt, question.item_id)] = \
+      question.status
   return titles, statuses
 @
 
@@ -4413,7 +4522,7 @@ for record in report:
         drawn.append((item_id, score))
         bank.best[item_id] = max(bank.best.get(item_id, 0), score)
         uncertain |= score <= 0 and bank.zero_possible
-    elif response.get("answer") or score > 0:
+    elif given_answer(response) or score > 0:
       uncertain = True
   attempts.append((record.get("summary", {}).get("number_of_correct"),
                    known_right, drawn, uncertain))
@@ -4554,11 +4663,13 @@ fourth a question nobody scored on is no candidate, so the other one is.
 A missing status must not make a question count as drawn: then only an
 answered question does, so that a question the attempt did not draw is
 not taken for a blank.
+A false answer is an answer there too.
 <<test functions>>=
 def test_a_missing_status_counts_only_answers_as_drawn():
   bank = quizzes.BankDraws({"501": "a"}, {})
   student = {"id": 5, "attempt": 2}
   assert bank.drawn(student, "501", {"answer": "for"})
+  assert bank.drawn(student, "501", {"answer": False})
   assert not bank.drawn(student, "501", {"answer": ""})
 @
 
@@ -4587,9 +4698,141 @@ def test_bank_draws_become_records():
   assert opinion.right is None
 @
 
+\subsubsection{True/false answers}
+\label{sec:quiz-true-false-answers}
+
+The JSON report does not hold every true/false answer.
+We compared the two reports of the quiz of issue~655, whose first item is
+a true/false question, in November 2026.
+The JSON report had [[True]] for exactly the answers that the CSV report
+gave as [[true]], and an empty answer both for those that it gave as
+[[false]] and for those that it left empty with the status
+\enquote{No Answer}.
+So the JSON report writes a false answer as it writes a blank, and only
+the CSV tells them apart.
+(We saw no [[False]] in the JSON report, but [[new_quiz_answer]] takes one
+all the same.)
+
+When the JSON report has an empty answer to a true/false question, which
+the response's [[item_type]] names, we therefore read the CSV report too
+and take the answer from it.
+The CSV costs a second report, which Canvas takes a while to make, so we
+ask for it only when an answer may have been lost: a quiz whose
+true/false answers are all true, or that has none, is read from the JSON
+report alone.
+We take the answer from the CSV's answer cell, [[true]] or [[false]],
+rather than from its status, since a cell that Canvas fills in is the
+answer itself, while a status we would have to interpret.
+The answers are matched by student, attempt and item, as the statuses
+of \cref{sec:quiz-bank-draws} are, so two submissions with the same
+attempt number both get the answer of the one the CSV lists last.
+<<constants>>=
+TRUE_FALSE = "true-false"
+CSV_TRUE_FALSE = {"true": True, "false": False}
+<<functions>>=
+def read_true_false_answers(csv_text):
+  """Returns the true/false answers of a New Quiz report in CSV
+
+  Maps (student ID, attempt, item ID), all strings, to the answer as a
+  bool.  Questions left blank, and questions of other types, are left out.
+  """
+  return {(question.student, question.attempt, question.item_id):
+            CSV_TRUE_FALSE[question.answer]
+          for question in csv_report_questions(csv_text)
+          if question.item_type == TRUE_FALSE
+          and question.answer in CSV_TRUE_FALSE}
+@
+
+The answers are put back into the JSON report itself, so that the code
+that turns it into records needs no second source of answers.
+The bank draws (\cref{sec:quiz-bank-draws}) are not affected either way:
+a restored answer is one the CSV holds, so the CSV also gives that
+question a status, which decides whether it was drawn.
+Only an empty answer to a true/false question is replaced: any other
+answer is the JSON report's own, which we trust.
+<<functions>>=
+def lost_true_false_answers(report):
+  """True if a New Quiz `report` in JSON has an empty true/false answer"""
+  return any(empty_true_false_answer(response)
+             for record in report for response in record["item_responses"])
+
+def restore_true_false_answers(report, answers):
+  """Puts the true/false `answers` from the CSV into `report`'s empty ones
+
+  `answers` is what `read_true_false_answers` returns; `report` is the
+  JSON report, which is changed in place.
+  """
+  for record in report:
+    student = record["student_data"]
+    for response in record["item_responses"]:
+      key = (str(student["id"]), str(student["attempt"]),
+             str(response["item_id"]))
+      if empty_true_false_answer(response) and key in answers:
+        response["answer"] = answers[key]
+
+def empty_true_false_answer(response):
+  """True if `response` is a true/false question's answer left empty"""
+  return (response.get("item_type") == TRUE_FALSE
+          and response.get("answer") in ("", None))
+@
+
+Let's verify the reading on a report shaped as Canvas sent the one of
+issue~655, with made-up values: a true/false question, which students 5
+and 6 answered and student 7 left blank, and a choice question, whose
+answers are not true/false answers even where they read so.
+<<test functions>>=
+TRUE_FALSE_CSV = (
+  "Name,ID,SectionIDs,SectionNames,Submitted,ElapsedTime,Attempt,"
+  "ItemID,ItemType,Agree?,EarnedPoints,Status,"
+  "ItemID,ItemType,Which word?,EarnedPoints,Status,"
+  "NumberOfCorrect,NumberOfIncorrect,NoResponse,PointsPossible,OverallScore\n"
+  "Student 5,5,1,S,2026-11-20 10:00:00 UTC,00:05:00,1,"
+  "190,true-false,false,0.0,Graded,185,choice,true,1.0,Graded,1,0,0,1.0,1.0\n"
+  "Student 6,6,1,S,2026-11-20 10:00:00 UTC,00:05:00,1,"
+  "190,true-false,true,0.0,Graded,185,choice,false,0.0,Graded,0,1,0,1.0,0.0\n"
+  "Student 7,7,1,S,2026-11-20 10:00:00 UTC,00:05:00,1,"
+  "190,true-false,,,No Answer,185,choice,,,No Answer,0,0,2,1.0,0.0\n")
+
+def test_read_true_false_answers_reads_only_true_false_questions():
+  assert quizzes.read_true_false_answers(TRUE_FALSE_CSV) == {
+    ("5", "1", "190"): False, ("6", "1", "190"): True}
+@
+
+The JSON report of the same attempts has [[True]] for student 6 and empty
+answers for students 5 and 7.
+Restored, student 5's answer is \enquote{No} and student 7's stays blank;
+a response that is not a true/false answer is left as it is, also when
+the CSV holds an answer for it.
+<<test functions>>=
+def test_restored_true_false_answers_tell_false_from_blank():
+  report = [true_false_attempt(5, 1, (190, "", 0.0)),
+            true_false_attempt(6, 1, (190, True, 0.0)),
+            true_false_attempt(7, 1, (190, "", 0.0)),
+            new_quiz_attempt(8, 1, (185, "", 0.0))]
+  assert quizzes.lost_true_false_answers(report)
+  answers = quizzes.read_true_false_answers(TRUE_FALSE_CSV)
+  answers[("8", "1", "185")] = True
+
+  quizzes.restore_true_false_answers(report, answers)
+
+  records = quizzes.new_quiz_attempt_responses(
+    report, [true_false_item(306, 190, 1),
+             listed_new_quiz_item(307, 185, 2, "<p>Which word?</p>")])
+  assert [(r.student_id, r.answer) for r in records] == [
+    (5, "No"), (6, "Yes"), (7, None), (8, None)]
+  assert not quizzes.lost_true_false_answers(
+    [true_false_attempt(6, 1, (190, True, 0.0)),
+     new_quiz_attempt(8, 1, (185, "", 0.0))])
+@
+
+\subsubsection{Fetching the reports}
+
 To fetch the report, we request it (\cref{sec:quiz-new-quiz-report}) and
-poll it until Canvas has made the file; for a quiz with [[Bank]] items we
-fetch it as CSV too (\cref{sec:quiz-bank-draws}).
+poll it until Canvas has made the file.
+We fetch it as CSV too for a quiz with [[Bank]] items
+(\cref{sec:quiz-bank-draws}) and for one whose JSON report may have lost
+true/false answers (\cref{sec:quiz-true-false-answers}), but only once for
+both.
 The CSV starts with a byte-order mark, which [[utf-8-sig]] removes; it
 would otherwise stick to the name of the first column, which we do not
 read, so this is tidiness rather than need.
@@ -4599,11 +4842,15 @@ def fetch_new_quiz_attempts(quiz, requester):
   report = json.loads(download_new_quiz_report(quiz, requester, "json"))
   items = get_new_quizzes_list(
     requester, f"courses/{quiz.course.id}/quizzes/{quiz.id}/items")
+  draws_from_banks = any(item.get("entry_type") == "Bank" for item in items)
   bank = None
-  if any(item.get("entry_type") == "Bank" for item in items):
-    bank = BankDraws(*read_bank_draws(download_new_quiz_report(
-      quiz, requester, "csv").decode("utf-8-sig")))
-    settle_bank_rightness(report, items, bank)
+  if draws_from_banks or lost_true_false_answers(report):
+    csv_text = download_new_quiz_report(
+      quiz, requester, "csv").decode("utf-8-sig")
+    restore_true_false_answers(report, read_true_false_answers(csv_text))
+    if draws_from_banks:
+      bank = BankDraws(*read_bank_draws(csv_text))
+      settle_bank_rightness(report, items, bank)
   return list(new_quiz_attempt_responses(report, items, bank))
 
 def download_new_quiz_report(quiz, requester, report_format):
@@ -4678,6 +4925,43 @@ def test_fetching_a_quiz_with_bank_items_reads_the_csv_too():
 
   assert [(r.question, r.answer, r.right) for r in records] \
     == [("Which loop? for i in x", "for", True)]
+@
+
+A quiz whose JSON report has an empty true/false answer gets its CSV too,
+and the false answer the CSV holds reaches the records.
+<<test functions>>=
+def reports_in_both_formats(json_report, csv_text):
+  """Lets Canvas answer New Quiz 42's report requests in JSON and CSV"""
+  reports = f"{NEW_QUIZZES_API}/courses/1/quizzes/42/reports"
+  for number, ending in ((3, "json"), (4, "csv")):
+    progress = {"id": number, "workflow_state": "completed",
+                "results": {"url": f"https://files.example.invalid/r.{ending}"}}
+    responses.post(reports, json={"progress": progress},
+                   match=[responses.matchers.urlencoded_params_matcher(
+                     {"quiz_report[report_type]": "student_analysis",
+                      "quiz_report[format]": ending})])
+    responses.get(f"https://canvas.example.invalid/api/v1/progress/{number}",
+                  json=progress)
+  responses.get("https://files.example.invalid/r.json", json=json_report)
+  responses.get("https://files.example.invalid/r.csv",
+                body=("﻿" + csv_text).encode("utf-8"))
+
+@responses.activate
+def test_fetching_a_quiz_with_empty_true_false_answers_reads_the_csv_too():
+  canvas = Canvas("https://canvas.example.invalid", "token")
+  requester = canvas._Canvas__requester
+  quiz = make_new_quiz(make_course(requester=requester), id="42")
+  reports_in_both_formats(
+    [true_false_attempt(5, 1, (190, "", 0.0)),
+     true_false_attempt(6, 1, (190, True, 0.0)),
+     true_false_attempt(7, 1, (190, "", 0.0))], TRUE_FALSE_CSV)
+  responses.get(f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+                json=[true_false_item(306, 190, 1)])
+
+  records = quizzes.fetch_new_quiz_attempts(quiz, requester)
+
+  assert [(r.student_id, r.answer) for r in records] \
+    == [(5, "No"), (6, "Yes"), (7, None)]
 @
 
 A report that Canvas did not finish has no file to read, and a file that
@@ -6419,6 +6703,41 @@ def test_attempts_command_counts_every_option(capsys):
   run_attempts(course_with_attempts(), "-a", "Honour", "--options")
   out = capsys.readouterr().out
   assert "| No | right | 1 | 2: 1 |" in out and "| Yes | wrong | 1 | 1: 1 |" in out
+@
+
+A New Quiz with a true/false item made every view of [[quizzes attempts]]
+and [[analyse]] crash (issue~655), so let's verify each of them on such a
+quiz.
+Both students answered with the boolean Canvas sends for true, which needs
+no CSV report (\cref{sec:quiz-true-false-answers}).
+The difficulty that [[quizzes attempts]] shows by default has no answers,
+so there we check that both attempts count as answered.
+<<test functions>>=
+def course_with_a_true_false_item():
+  """The course of `course_with_attempts` whose New Quiz asks true/false"""
+  course = course_with_attempts(report=[
+    true_false_attempt(5, 1, (190, True, 0.0)),
+    true_false_attempt(6, 1, (190, True, 0.0))])
+  responses.replace(responses.GET,
+    f"{NEW_QUIZZES_API}/courses/1/quizzes/42/items",
+    json=[true_false_item(306, 190, 1)])
+  return course
+
+@pytest.mark.parametrize("options,shown", [
+  ([], ["2 answered every question", "| 1 | Agree? | 2 |"]),
+  (["--options"], ["| Yes | ? | 2 | 1: 2 |"]),
+  (["--table"], ["\tAgree?\tYes\t"])])
+@responses.activate
+def test_attempts_command_reads_a_true_false_item(capsys, options, shown):
+  run_attempts(course_with_a_true_false_item(), "-a", "Ciph", *options)
+  out = capsys.readouterr().out
+  assert all(text in out for text in shown)
+
+@responses.activate
+def test_analyse_reads_a_true_false_item(capsys):
+  run_analyse(course_with_a_true_false_item(), "-c", "SBX", "-a", "Ciph",
+              "--no-ai")
+  assert "- Yes: 2 (100.0%)" in capsys.readouterr().out
 @
 
 A student whose attempt 1 started before the period has no first attempt
